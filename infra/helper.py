@@ -244,6 +244,10 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = reproduce(args)
   elif args.command == 'shell':
     result = shell(args)
+  elif args.command == 'build_version':
+    result = build_version(args)
+  elif args.command == 'collect_trace':
+    result = collect_trace(args)
   elif args.command == 'pull_images':
     result = pull_images()
   elif args.command == 'run_clusterfuzzlite':
@@ -505,6 +509,48 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_sanitizer_args(shell_parser)
   _add_environment_args(shell_parser)
   _add_external_project_args(shell_parser)
+
+  build_version_parser = subparsers.add_parser(
+      'build_version', help='Run /bin/bash within the builder container.')
+  build_version_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  build_version_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  build_version_parser.add_argument('--commit',
+                            help='commit hash to checkout in the builder')
+  build_version_parser.add_argument('--allowlist',
+                            help='path to allowlist.txt file')
+  build_version_parser.add_argument('--test_input',
+                            help='path to test_input file or directory')
+  _add_architecture_args(build_version_parser)
+  _add_engine_args(build_version_parser)
+  _add_sanitizer_args(build_version_parser)
+  _add_environment_args(build_version_parser)
+  _add_external_project_args(build_version_parser)
+
+  collect_trace_parser = subparsers.add_parser(
+      'collect_trace', help='Collect trace for a specific version with a specific input.')
+  collect_trace_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  collect_trace_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  collect_trace_parser.add_argument('fuzzer_name',
+                            help='name of the fuzzer')
+  collect_trace_parser.add_argument('--buggy_commit',
+                            help='commit hash to collect bug trace')
+  collect_trace_parser.add_argument('--base_commit',
+                            help='commit hash to migrate bug')
+  collect_trace_parser.add_argument('--allowlist',
+                            help='path to store allowlist.txt file')
+  collect_trace_parser.add_argument('--test_input',
+                            help='test_input name')
+  _add_architecture_args(collect_trace_parser)
+  _add_engine_args(collect_trace_parser)
+  _add_sanitizer_args(collect_trace_parser)
+  _add_environment_args(collect_trace_parser)
+  _add_external_project_args(collect_trace_parser)
 
   run_clusterfuzzlite_parser = subparsers.add_parser(
       'run_clusterfuzzlite', help='Run ClusterFuzzLite on a project.')
@@ -1575,7 +1621,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       'gcr.io/oss-fuzz-base/%s' % image_name,
       'reproduce',
       fuzzer_name,
-      '-runs=100',
+      '-runs=10',
   ] + fuzzer_args
 
   return run_function(run_args, architecture=architecture)
@@ -1714,7 +1760,164 @@ def shell(args):
       '%s:/work' % args.project.work, '-t',
       'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash'
   ])
+  docker_run(run_args, architecture=args.architecture)
+  return True
 
+
+def build_version(args):
+  """Build in a specific commit."""
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=' + args.engine,
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  # Mount allowlist if provided
+  if args.allowlist:
+    allowlist_path = _get_absolute_path(args.allowlist)
+    if os.path.exists(allowlist_path):
+      run_args.extend([
+          '-v',
+          '%s:/corpus' % allowlist_path,
+      ])
+    else:
+      logger.error('Allowlist path %s does not exist.', args.allowlist)
+      return False
+  
+  test_input = args.test_input
+
+  run_args.extend([
+      '-v',
+      '%s:/out' % out_dir, '-v',
+      '%s:/work' % args.project.work, '-t',
+      'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
+      '-c', 'cd /src/%s && git checkout -f %s && mkdir ./tmpfolder && cp /corpus/%s ./tmpfolder/ && compile && /bin/bash' %(args.project.name, args.commit, test_input)
+  ])
+  docker_run(run_args, architecture=args.architecture)
+  return True
+
+
+def collect_trace(args):
+  """collect execution trace"""
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=' + args.engine,
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+    
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  # Mount allowlist if provided
+  if args.allowlist:
+    allowlist_path = _get_absolute_path(args.allowlist)
+    if os.path.exists(allowlist_path):
+      run_args.extend([
+          '-v',
+          '%s:/corpus' % allowlist_path,
+      ])
+    else:
+      logger.error('Allowlist path %s does not exist.', args.allowlist)
+      return False
+  
+  test_input = args.test_input
+
+  # Create a more readable multi-line bash script
+  bash_script = f'''
+    cd /src/{args.project.name}; 
+    # Checkout buggy commit and set up environment
+    git checkout -f {args.buggy_commit}; 
+    mkdir -p /tmpfolder; 
+    cp /corpus/{test_input} /tmpfolder/;
+    
+    # Compile and collect trace
+    compile; 
+    collect_trace/{args.fuzzer_name} /corpus/{test_input} &> ./tmp; 
+    rm -rf collect_trace; 
+    
+    # go to base commit and get no bug trace
+    # git checkout -f {args.base_commit}; 
+    # compile;
+    # collect_trace/{args.fuzzer_name} /corpus/{test_input} &> ./tmp1; 
+    # rm -rf collect_trace; 
+    
+    python3 /script/read_func_trace.py tmp;
+    cp allowlist.txt /out/allowlist-{args.buggy_commit}-{test_input}.txt; 
+    
+    # Recompile and run with crash input
+    git checkout -f {args.buggy_commit}; 
+    compile; 
+    /out/{args.fuzzer_name} /corpus/{test_input} &> ./target_crash.txt;
+    
+    # Fuzz with base commit
+    git checkout -f {args.base_commit}; 
+    compile; 
+    python3 /script/monitor_crash.py target_crash.txt &> /work/{test_input}-fuzzlog; 
+    
+    # Fuzz with generic allowlist
+    echo -e "fun:*\\nsrc:*" > allowlist.txt;
+    make clean;
+    compile;
+    python3 /script/monitor_crash.py target_crash.txt &> /work/{test_input}-noselect-fuzzlog
+  '''
+  
+  script_folder = os.path.join(OSS_FUZZ_DIR, 'script')
+
+  # Use the formatted script
+  run_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', bash_script
+  ])
   docker_run(run_args, architecture=args.architecture)
   return True
 
