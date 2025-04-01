@@ -274,8 +274,12 @@ if __name__ == "__main__":
     print('Bug Stack:\n', REFERENCE_STACK)
     # Run the main function 5 times and calculate average time
     
+    if len(REFERENCE_STACK) == 0:
+        print("Error: The reference stack trace is empty. Please provide a valid stack trace file.")
+        exit(1)
+    
     total_time = 0
-    runs = 5
+    runs = 10
     
     print(f"Running main() {runs} times...")
     
