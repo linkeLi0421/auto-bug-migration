@@ -1882,12 +1882,6 @@ def collect_trace(args):
     collect_trace/{args.fuzzer_name} /corpus/{test_input} &> ./tmp; 
     rm -rf collect_trace; 
     
-    # go to base commit and get no bug trace
-    # git checkout -f {args.base_commit}; 
-    # compile;
-    # collect_trace/{args.fuzzer_name} /corpus/{test_input} &> ./tmp1; 
-    # rm -rf collect_trace; 
-    
     python3 /script/read_func_trace.py tmp;
     cp allowlist.txt /out/allowlist-{args.buggy_commit}-{test_input}.txt; 
     
@@ -1899,7 +1893,7 @@ def collect_trace(args):
     # Fuzz with base commit
     git checkout -f {args.base_commit}; 
     compile; 
-    python3 /script/monitor_crash.py target_crash.txt &> /work/{test_input}-fuzzlog; 
+    python3 /script/monitor_crash.py target_crash.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
     
     # Fuzz with generic allowlist
     echo -e "fun:*\\nsrc:*" > allowlist.txt;
