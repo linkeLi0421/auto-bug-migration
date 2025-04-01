@@ -42,7 +42,7 @@ def run_fuzz_test(args):
     
         cmd.extend(['--allowlist', '/home/yun/tmp_corpus'])
     
-        cmd.extend(['--test_input', bug_id])
+        cmd.extend(['--test_input', 'testcase-' + bug_id])
     
         cmd.extend(['-e', 'ASAN_OPTIONS=detect_leaks=0'])
         
