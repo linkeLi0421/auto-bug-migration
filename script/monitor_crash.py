@@ -168,7 +168,7 @@ def main(timeout_hours=12):
     
     # Start the fuzzer with -ignore_crashes=1 to keep it running
     fuzzer_cmd = [
-        "/out/decompress_frame_fuzzer",
+        f"/out/{args.fuzzer}",
         f"-artifact_prefix={artifacts_dir}/",
         "-rss_limit_mb=2560",
         "-timeout=2",
@@ -265,6 +265,7 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Monitor fuzzing for specific crash patterns')
     parser.add_argument('stack_file', help='Path to a file containing a crash stack trace to extract reference stack')
+    parser.add_argument('fuzzer', help='Path to the fuzzer binary to execute')
     args = parser.parse_args()
 
     # Set the reference stack trace
