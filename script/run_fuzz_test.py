@@ -56,10 +56,8 @@ def run_fuzz_test(args):
         try:
             result = subprocess.run(cmd, check=True, text=True)
             print(f"Command completed with exit code {result.returncode}")
-            return result.returncode
         except subprocess.CalledProcessError as e:
             print(f"Command failed with exit code {e.returncode}")
-            return e.returncode
 
 if __name__ == "__main__":
     args = parse_arguments()
