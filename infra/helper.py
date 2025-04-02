@@ -1869,13 +1869,11 @@ def collect_trace(args):
   
   test_input = args.test_input
 
-  # Create a more readable multi-line bash script
-  bash_script = f'''
+  bash_prepare = f'''
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
     git checkout -f {args.buggy_commit}; 
-    mkdir -p /tmpfolder; 
-    cp /corpus/{test_input} /tmpfolder/;
+
     
     # Compile and collect trace
     compile; 
@@ -1886,23 +1884,30 @@ def collect_trace(args):
     cp allowlist.txt /out/allowlist-{args.buggy_commit}-{test_input}.txt; 
     
     # Recompile and run with crash input
-    git checkout -f {args.buggy_commit}; 
     compile; 
-    /out/{args.fuzzer_name} /corpus/{test_input} &> ./target_crash.txt;
-    
+    /out/{args.fuzzer_name} /corpus/{test_input} &> /out/target_crash-{args.buggy_commit}-{test_input}.txt;
+  '''
+  
+  bash_runfuzzer = f'''
     # Fuzz with base commit
+    mkdir -p /tmpfolder; 
+    cp /corpus/{test_input} /tmpfolder/;
+    
     git checkout -f {args.base_commit}; 
-    compile; 
-    python3 /script/monitor_crash.py target_crash.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
+    cp /out/allowlist-{args.buggy_commit}-{test_input}.txt allowlist.txt;
+    compile;
+    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
     
     # Fuzz with generic allowlist
     echo -e "fun:*\\nsrc:*" > allowlist.txt;
-    make clean;
+    find . -type f -name "*fuzzer" -exec rm -v {{}} \\;
     compile;
-    python3 /script/monitor_crash.py target_crash.txt &> /work/{test_input}-noselect-fuzzlog
+    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-noselect-fuzzlog
   '''
   
   script_folder = os.path.join(OSS_FUZZ_DIR, 'script')
+
+  run_args_runfuzzer = run_args.copy()
 
   # Use the formatted script
   run_args.extend([
@@ -1910,9 +1915,19 @@ def collect_trace(args):
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', bash_script
+      '/bin/bash', '-c', bash_prepare
   ])
+  
+  run_args_runfuzzer.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', bash_runfuzzer
+  ])
+  
   docker_run(run_args, architecture=args.architecture)
+  docker_run(run_args_runfuzzer, architecture=args.architecture)
   return True
 
 
