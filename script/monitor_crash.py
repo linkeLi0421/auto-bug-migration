@@ -281,6 +281,7 @@ if __name__ == "__main__":
     
     total_time = 0
     runs = 10
+    runtime_list = []
     
     print(f"Running main() {runs} times...")
     
@@ -289,6 +290,7 @@ if __name__ == "__main__":
         start_time = time.time()
         main()
         run_time = time.time() - start_time
+        runtime_list.append(run_time)
         total_time += run_time
         print(f"Run {i+1} completed in {run_time:.2f} seconds")
         # Clean up files in /tmpfolder/ except testcase files
@@ -307,3 +309,4 @@ if __name__ == "__main__":
     
     avg_time = total_time / runs
     print(f"\nAverage execution time over {runs} runs: {avg_time:.2f} seconds")
+    print(f"Execution times: {runtime_list}")
