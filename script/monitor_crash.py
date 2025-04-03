@@ -24,7 +24,7 @@ def analyze_crash_file(crash_file, target_crashes_dir):
     try:
         # Run the fuzzer with the crash file as input (without -ignore_crashes)
         cmd = [
-            "/out/decompress_frame_fuzzer",
+            f"/out/{args.fuzzer}",
             "-runs=1",  # Run exactly once
             crash_file
         ]
@@ -173,6 +173,7 @@ def main(timeout_hours=12):
         "-rss_limit_mb=2560",
         "-timeout=2",
         "/tmpfolder/",
+        "-fork=1",  # Fork server mode
         "-ignore_crashes=1",  # Keep running after crashes
         "-use_value_profile=1",
         "-print_final_stats=1",
