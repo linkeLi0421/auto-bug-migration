@@ -1897,10 +1897,15 @@ def collect_trace(args):
     cp /out/allowlist-{args.buggy_commit}-{test_input}.txt allowlist.txt;
     compile;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
-    
+  '''
+  
+  bash_runfuzzer_noselect = f'''
     # Fuzz with generic allowlist
+    mkdir -p /tmpfolder; 
+    cp /corpus/{test_input} /tmpfolder/;
+    
+    git checkout -f {args.base_commit}; 
     echo -e "fun:*\\nsrc:*" > allowlist.txt;
-    find . -type f -name "*fuzzer" -exec rm -v {{}} \\;
     compile;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-noselect-fuzzlog
   '''
@@ -1908,6 +1913,7 @@ def collect_trace(args):
   script_folder = os.path.join(OSS_FUZZ_DIR, 'script')
 
   run_args_runfuzzer = run_args.copy()
+  run_args_runfuzzer_noselect = run_args.copy()
 
   # Use the formatted script
   run_args.extend([
@@ -1926,8 +1932,17 @@ def collect_trace(args):
       '/bin/bash', '-c', bash_runfuzzer
   ])
   
+  run_args_runfuzzer_noselect.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', bash_runfuzzer_noselect
+  ])
+
   docker_run(run_args, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
+  docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
   return True
 
 
