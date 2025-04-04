@@ -265,10 +265,10 @@ def main(timeout_hours=12):
         for crash_file in artifacts_dir.glob("crash-*"):
             dest_file = out_crash_dir / crash_file.name
             try:
-            shutil.copy2(crash_file, dest_file)
-            print(f"  - Moved {crash_file.name}")
+                shutil.copy2(crash_file, dest_file)
+                print(f"  - Moved {crash_file.name}")
             except Exception as e:
-            print(f"  - Failed to move {crash_file.name}: {e}")
+                print(f"  - Failed to move {crash_file.name}: {e}")
         print(f"[+] All crash inputs moved to: {out_crash_dir}")
         
         # Move target crashes to /out directory
