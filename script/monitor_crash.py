@@ -173,7 +173,7 @@ def main(timeout_hours=12):
         "-rss_limit_mb=2560",
         "-timeout=2",
         "/tmpfolder/",
-        "-fork=1",  # Fork server mode
+        "-fork=10",  # Fork server mode
         "-ignore_crashes=1",  # Keep running after crashes
         "-use_value_profile=1",
         "-print_final_stats=1",
