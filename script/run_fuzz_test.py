@@ -24,7 +24,8 @@ def run_fuzz_test(args):
     
     for bug_id, commits in bug_data.items():
         base_commit = commits['base']
-        buggy_commit = commits['buggy']
+        buggy_commit1 = commits['buggy1']
+        buggy_commit2 = commits['buggy2']
         
         bug_info = bug_info_dataset[bug_id]
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
@@ -38,7 +39,9 @@ def run_fuzz_test(args):
     
         cmd.extend(['--base_commit', base_commit])
     
-        cmd.extend(['--buggy_commit', buggy_commit])
+        cmd.extend(['--buggy_commit1', buggy_commit1])
+        
+        cmd.extend(['--buggy_commit2', buggy_commit2])
     
         cmd.extend(['--allowlist', '/home/yun/tmp_corpus'])
     
