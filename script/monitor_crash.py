@@ -302,7 +302,6 @@ if __name__ == "__main__":
         print("Error: The reference stack trace is empty. Please provide a valid stack trace file.")
         exit(1)
     
-    total_time = 0
     runs = 10
     runtime_list = []
     
@@ -314,7 +313,6 @@ if __name__ == "__main__":
         main()
         run_time = time.time() - start_time
         runtime_list.append(run_time)
-        total_time += run_time
         print(f"Run {i+1} completed in {run_time:.2f} seconds")
         # Clean up files in /tmpfolder/ except testcase files
         print("Cleaning up /tmpfolder/ directory...")
@@ -330,6 +328,14 @@ if __name__ == "__main__":
         else:
             print("Warning: /tmpfolder/ directory not found")
     
-    avg_time = total_time / runs
+    # Sort the list to easily exclude the smallest and largest values
+    sorted_numbers = sorted(runtime_list)
+
+    # Remove the first (smallest) and last (largest) elements
+    trimmed_list = sorted_numbers[1:-1]
+
+    # Calculate the average of the trimmed list
+    avg_time = sum(trimmed_list) / len(trimmed_list)
+    
     print(f"\nAverage execution time over {runs} runs: {avg_time:.2f} seconds")
     print(f"Execution times: {runtime_list}")
