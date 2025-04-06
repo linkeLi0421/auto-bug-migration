@@ -1908,7 +1908,7 @@ def collect_trace(args):
     git checkout -f {args.base_commit}; 
     cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt allowlist.txt;
     compile;
-    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
+    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
   '''
   
   bash_runfuzzer_noselect = f'''
