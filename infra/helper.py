@@ -538,8 +538,10 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             nargs='?')
   collect_trace_parser.add_argument('fuzzer_name',
                             help='name of the fuzzer')
-  collect_trace_parser.add_argument('--buggy_commit',
-                            help='commit hash to collect bug trace')
+  collect_trace_parser.add_argument('--buggy_commit1',
+                            help='commit hash 1 to collect bug trace')
+  collect_trace_parser.add_argument('--buggy_commit2',
+                            help='commit hash 2 to collect bug trace')
   collect_trace_parser.add_argument('--base_commit',
                             help='commit hash to migrate bug')
   collect_trace_parser.add_argument('--allowlist',
@@ -1872,20 +1874,30 @@ def collect_trace(args):
   bash_prepare = f'''
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
-    git checkout -f {args.buggy_commit}; 
+    git checkout -f {args.buggy_commit1}; 
 
-    
     # Compile and collect trace
     compile; 
-    collect_trace/{args.fuzzer_name} /corpus/{test_input} &> ./tmp; 
+    collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit1}-{test_input}.txt; 
     rm -rf collect_trace; 
     
-    python3 /script/read_func_trace.py tmp;
-    cp allowlist.txt /out/allowlist-{args.buggy_commit}-{test_input}.txt; 
-    
     # Recompile and run with crash input
+    touch allowlist.txt;
     compile; 
-    /out/{args.fuzzer_name} /corpus/{test_input} &> /out/target_crash-{args.buggy_commit}-{test_input}.txt;
+    /out/{args.fuzzer_name} /corpus/{test_input} &> /out/target_crash-{args.buggy_commit1}-{test_input}.txt;
+  '''
+  
+  bash_prepare_buggy2 = f'''
+    cd /src/{args.project.name}; 
+    # Checkout buggy commit and set up environment
+    git checkout -f {args.buggy_commit2}; 
+
+    # Compile and collect trace
+    compile; 
+    collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
+    rm -rf collect_trace; 
+    
+    python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{test_input}.txt /out/target_trace-{args.buggy_commit2}-{test_input}.txt > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
   '''
   
   bash_runfuzzer = f'''
@@ -1894,7 +1906,7 @@ def collect_trace(args):
     cp /corpus/{test_input} /tmpfolder/;
     
     git checkout -f {args.base_commit}; 
-    cp /out/allowlist-{args.buggy_commit}-{test_input}.txt allowlist.txt;
+    cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt allowlist.txt;
     compile;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
   '''

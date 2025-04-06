@@ -37,11 +37,16 @@ def main():
             prev_value = df.loc[i - 1, bug]
             curr_value = df.loc[i, bug]
             # Check if the previous commit had "0|1" and the current one "1|1"
-            if prev_value == "0|1" and curr_value == "1|1":
-                # Store the previous (base) and current (buggy) commit
+            # Check if there's at least one "1|1" in the previous rows for this bug
+            previous_one_one = df.loc[:i-1, bug][df.loc[:i-1, bug] == "1|1"]
+            
+            if prev_value == "0|1" and curr_value == "1|1" and not previous_one_one.empty:
+                # Find the closest "1|1" commit to the base commit in previous rows
+                closest_index = previous_one_one.index[-1]
                 results[bug] = {
-                    "base": df.loc[i-1, "commit"][:6],  # First 6 chars of commit hash
-                    "buggy": df.loc[i, "commit"][:6]    # First 6 chars of commit hash
+                    "base": df.loc[i-1, "commit"][:6],
+                    "buggy1": df.loc[i, "commit"][:6],
+                    "buggy2": df.loc[closest_index, "commit"][:6]
                 }
                 # Once the border is found, break out of this bug's loop.
                 break
