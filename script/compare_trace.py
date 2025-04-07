@@ -1,4 +1,5 @@
 import sys
+import argparse
 
 def extract_function_calls(file_path):
     """Extract 'Entering function' lines with their positions from the given file, keeping only one adjacent same function."""
@@ -22,24 +23,31 @@ def compare_traces(trace1, trace2):
     return common_part, trace1[min_length:], trace2[min_length:]
 
 def main():
-    if len(sys.argv) != 3:
-        print("Usage: python compare_trace.py <file1> <file2>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Compare traces from two files.")
+    parser.add_argument("file1", help="Path to the first trace file")
+    parser.add_argument("file2", help="Path to the second trace file")
+    parser.add_argument("--twobuggy", action="store_true", help="Enable two buggy mode, false means one buggy one base commit trace to compare")
+    args = parser.parse_args()
 
-    file1, file2 = sys.argv[1], sys.argv[2]
-    trace1 = extract_function_calls(file1)
-    trace2 = extract_function_calls(file2)
+    trace1 = extract_function_calls(args.file1)
+    trace2 = extract_function_calls(args.file2)
 
     common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
 
     remaining_funcs1 = {func for _, func in remaining_trace1}
     remaining_funcs2 = {func for _, func in remaining_trace2}
     common_funcs = remaining_funcs1.intersection(remaining_funcs2)
-    for func in common_funcs:
-        print(f"fun:{func}")
-    if len(common_funcs) == 0:
-        for _, func in common_part:
+
+    if args.twobuggy:
+        for func in common_funcs:
             print(f"fun:{func}")
+        print(f"src:*")
+        if len(common_funcs) == 0:
+            for _, func in common_part:
+                print(f"fun:{func}")
+    else:
+        for func in remaining_funcs1:
+            print(f'fun:{func}')
     print(f"src:*")
 
 if __name__ == "__main__":
