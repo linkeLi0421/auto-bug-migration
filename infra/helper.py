@@ -1926,6 +1926,7 @@ def collect_trace(args):
 
   run_args_runfuzzer = run_args.copy()
   run_args_runfuzzer_noselect = run_args.copy()
+  run_args_prepare_buggy2 = run_args.copy()
 
   # Use the formatted script
   run_args.extend([
@@ -1935,7 +1936,15 @@ def collect_trace(args):
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', bash_prepare
   ])
-  
+
+  run_args_prepare_buggy2.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', bash_prepare_buggy2
+  ])  
+
   run_args_runfuzzer.extend([
       '-v', f'{out_dir}:/out', 
       '-v', f'{args.project.work}:/work', 
@@ -1953,6 +1962,7 @@ def collect_trace(args):
   ])
 
   docker_run(run_args, architecture=args.architecture)
+  docker_run(run_args_prepare_buggy2, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
   docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
   return True
