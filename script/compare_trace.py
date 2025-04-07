@@ -37,6 +37,9 @@ def main():
     common_funcs = remaining_funcs1.intersection(remaining_funcs2)
     for func in common_funcs:
         print(f"fun:{func}")
+    if len(common_funcs) == 0:
+        for _, func in common_part:
+            print(f"fun:{func}")
     print(f"src:*")
 
 if __name__ == "__main__":
