@@ -274,13 +274,13 @@ def main(timeout_hours=12):
         # Move target crashes to /out directory
         out_target_dir = Path("/out/target_crashes")
         out_target_dir.mkdir(exist_ok=True)
-        for target_file in target_crashes_dir.glob("*"):
-            dest_file = out_target_dir / target_file.name
-            try:
-                shutil.copy2(target_file, dest_file)
-                print(f"  - Moved target crash {target_file.name}")
-            except Exception as e:
-                print(f"  - Failed to move target crash {target_file.name}: {e}")
+        # for target_file in target_crashes_dir.glob("*"):
+        #     dest_file = out_target_dir / target_file.name
+        #     try:
+        #         shutil.copy2(target_file, dest_file)
+        #         print(f"  - Moved target crash {target_file.name}")
+        #     except Exception as e:
+        #         print(f"  - Failed to move target crash {target_file.name}: {e}")
         print(f"[+] All target crashes moved to: {out_target_dir}")
         print("[*] Note: These directories were not deleted for your analysis.")
 

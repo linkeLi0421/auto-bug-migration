@@ -1873,7 +1873,7 @@ def collect_trace(args):
 
   bash_prepare = f'''
     cd /src/{args.project.name}; 
-    # Checkout buggy commit and set up environment
+    # Checkout base commit and set up environment
     git checkout -f {args.buggy_commit1}; 
 
     # Compile and collect trace
