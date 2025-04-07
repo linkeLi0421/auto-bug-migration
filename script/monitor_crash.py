@@ -178,7 +178,7 @@ def main(timeout_hours=12):
         "-use_value_profile=1",
         "-print_final_stats=1",
         "-print_corpus_stats=1",
-        "-dict=/corpus/c-blosc2.dict"
+        # "-dict=/corpus/c-blosc2.dict"
     ]
     print(' '.join(fuzzer_cmd))
     # Event to signal threads to stop
@@ -259,28 +259,28 @@ def main(timeout_hours=12):
         print(f"\n[+] Fuzzer ran for {runtime_minutes:.2f} minutes")
         print(f"[+] Crash inputs are in: {artifacts_dir}")
         print(f"[+] Target crashes are in: {target_crashes_dir}")
-        # Move crash inputs to /out directory
-        out_crash_dir = Path("/out/crash_inputs")
-        out_crash_dir.mkdir(exist_ok=True)
-        for crash_file in artifacts_dir.glob("crash-*"):
-            dest_file = out_crash_dir / crash_file.name
-            try:
-                shutil.copy2(crash_file, dest_file)
-                print(f"  - Moved {crash_file.name}")
-            except Exception as e:
-                print(f"  - Failed to move {crash_file.name}: {e}")
-        print(f"[+] All crash inputs moved to: {out_crash_dir}")
+        # # Move crash inputs to /out directory
+        # out_crash_dir = Path("/out/crash_inputs")
+        # out_crash_dir.mkdir(exist_ok=True)
+        # for crash_file in artifacts_dir.glob("crash-*"):
+        #     dest_file = out_crash_dir / crash_file.name
+        #     try:
+        #         shutil.copy2(crash_file, dest_file)
+        #         print(f"  - Moved {crash_file.name}")
+        #     except Exception as e:
+        #         print(f"  - Failed to move {crash_file.name}: {e}")
+        # print(f"[+] All crash inputs moved to: {out_crash_dir}")
         
         # Move target crashes to /out directory
         out_target_dir = Path("/out/target_crashes")
         out_target_dir.mkdir(exist_ok=True)
-        # for target_file in target_crashes_dir.glob("*"):
-        #     dest_file = out_target_dir / target_file.name
-        #     try:
-        #         shutil.copy2(target_file, dest_file)
-        #         print(f"  - Moved target crash {target_file.name}")
-        #     except Exception as e:
-        #         print(f"  - Failed to move target crash {target_file.name}: {e}")
+        for target_file in target_crashes_dir.glob("*"):
+            dest_file = out_target_dir / target_file.name
+            try:
+                shutil.copy2(target_file, dest_file)
+                print(f"  - Moved target crash {target_file.name}")
+            except Exception as e:
+                print(f"  - Failed to move target crash {target_file.name}: {e}")
         print(f"[+] All target crashes moved to: {out_target_dir}")
         print("[*] Note: These directories were not deleted for your analysis.")
 
