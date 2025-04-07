@@ -1964,7 +1964,7 @@ def collect_trace(args):
   docker_run(run_args, architecture=args.architecture)
   docker_run(run_args_prepare_buggy2, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
-  docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
+  # docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
   return True
 
 
