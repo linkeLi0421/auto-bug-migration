@@ -14,18 +14,51 @@
 # limitations under the License.
 #
 ################################################################################
+if [ ! -f "/src/c-blosc2/allowlist.txt" ]; then
 
-./bootstrap
-# FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
-./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
-make -j4
+    export CFLAGS="$CFLAGS -fpass-plugin=/src/Function_instrument/libPrint_trace.so /src/Function_instrument/print_func.o"
+    export CXXFLAGS="$CXXFLAGS -fpass-plugin=/src/Function_instrument/libPrint_trace.so /src/Function_instrument/print_func.o"
 
-fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
+    ./bootstrap
+    # FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
+    ./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
+    make -j4
 
-for F in $fuzzerFiles; do
-    fuzzerName=$(basename $F .c)
-    cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" $OUT
-    if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
-        zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
-    fi
-done
+    fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
+
+    for F in $fuzzerFiles; do
+        fuzzerName=$(basename $F .c)
+        cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" $OUT
+        if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
+            zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
+        fi
+    done
+
+    mkdir collect_trace
+    find . -name '*_fuzzer' -exec mv -v '{}' collect_trace ';'
+fi
+
+
+if [ -f "/src/c-blosc2/allowlist.txt" ]; then
+
+    export CFLAGS="$CFLAGS -fsanitize-coverage-allowlist=/src/c-blosc2/allowlist.txt"
+    export CXXFLAGS="$CXXFLAGS -fsanitize-coverage-allowlist=/src/c-blosc2/allowlist.txt"
+
+    ./bootstrap
+    # FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
+    ./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
+    make -j4
+
+    fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
+
+    for F in $fuzzerFiles; do
+        fuzzerName=$(basename $F .c)
+        cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" $OUT
+        if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
+            zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
+        fi
+    done
+    
+    mkdir collect_trace
+    find . -name '*_fuzzer' -exec mv -v '{}' collect_trace ';'
+fi
