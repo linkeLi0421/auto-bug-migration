@@ -1818,7 +1818,7 @@ def build_version(args):
       '%s:/out' % out_dir, '-v',
       '%s:/work' % args.project.work, '-t',
       'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
-      '-c', 'cd /src/%s && git checkout -f %s && mkdir ./tmpfolder && cp /corpus/%s ./tmpfolder/ && compile && /bin/bash' %(args.project.name, args.commit, test_input)
+      '-c', 'cd /src/%s && git checkout -f %s && touch allowlist.txt && /bin/bash && compile' %(args.project.name, args.commit)
   ])
   docker_run(run_args, architecture=args.architecture)
   return True
@@ -1961,10 +1961,10 @@ def collect_trace(args):
       '/bin/bash', '-c', bash_runfuzzer_noselect
   ])
 
-  docker_run(run_args, architecture=args.architecture)
-  docker_run(run_args_prepare_buggy2, architecture=args.architecture)
+  # docker_run(run_args, architecture=args.architecture)
+  # docker_run(run_args_prepare_buggy2, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
-  # docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
+  docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
   return True
 
 

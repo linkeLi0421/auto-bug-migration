@@ -14,9 +14,14 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/base-builder
+FROM gcr.io/oss-fuzz-base/builder
+RUN apt-get update && apt-get install -y cmake make
+RUN git clone https://github.com/linkeLi0421/Function_instrument.git
+WORKDIR Function_instrument
+RUN cmake . && make
+WORKDIR $SRC/
 RUN apt-get update && \
     apt-get install -y autoconf automake autopoint libtool
-RUN git clone --depth 1 https://github.com/hunspell/hunspell.git hunspell
+RUN git clone https://github.com/hunspell/hunspell.git hunspell
 WORKDIR hunspell
 COPY build.sh $SRC/
