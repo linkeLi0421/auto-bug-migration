@@ -1878,6 +1878,7 @@ def collect_trace(args):
 
     # Compile and collect trace
     compile; 
+    cd -;
     collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit1}-{test_input}.txt; 
     rm -rf collect_trace; 
     
@@ -1894,6 +1895,7 @@ def collect_trace(args):
 
     # Compile and collect trace
     compile; 
+    cd -;
     collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
     rm -rf collect_trace; 
     
@@ -1908,6 +1910,7 @@ def collect_trace(args):
     git checkout -f {args.base_commit}; 
     cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt allowlist.txt;
     compile;
+    pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
   '''
   

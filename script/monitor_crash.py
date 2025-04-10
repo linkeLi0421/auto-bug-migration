@@ -10,6 +10,7 @@ import threading
 import queue
 import re
 import argparse
+import cxxfilt
 
 # Queue for new crash files that need to be analyzed
 crash_queue = queue.Queue()
@@ -74,7 +75,7 @@ def check_stack_trace(log_content):
     """Check if the log content contains our reference stack trace."""
     current_stack = []
     for line in log_content.splitlines():
-        match = re.search(r'#\d+\s+0x[0-9a-f]+\s+in\s+(\w+)', line)
+        match = re.search(r'^\s*#\d+\s+0x[\da-f]+\s+in\s+((?:\w+::)*\w+\(.*?\))(?:\s+const)?\s+.*', line)
         if match:
             function_name = match.group(1)
             current_stack.append(function_name)
@@ -141,18 +142,22 @@ def monitor_crashes_thread(artifacts_dir, stop_event):
 def extract_function_stack(file_path):
     """
     Extracts the function call stack from an AddressSanitizer crash report.
-    Returns list of function names in call order (leaf to root).
+    Demangles C++ function names and includes C function names.
+    Returns a list of function names in call order (leaf to root).
     """
     stack = []
-    pattern = re.compile(r'^\s*#\d+\s+0x[0-9a-f]+\s+in\s+(\w+)')
-    
+    # Updated regex to handle C++ symbols with namespaces, templates, and arguments
+    pattern = re.compile(r'^\s*#\d+\s+0x[\da-f]+\s+in\s+((?:\w+::)*\w+\(.*?\))(?:\s+const)?\s+.*')
+
     with open(file_path, 'r') as f:
         for line in f:
             match = pattern.match(line)
             if match:
-                function_name = match.group(1)
+                mangled_name = match.group(1)
+                    # Attempt to demangle C++ function names
+                function_name = cxxfilt.demangle(mangled_name)
+                # If demangling fails, assume it's a C function or invalid name
                 stack.append(function_name)
-                
     return stack
 
 def main(timeout_hours=12):
@@ -296,7 +301,6 @@ if __name__ == "__main__":
     global REFERENCE_STACK
     REFERENCE_STACK = extract_function_stack(args.stack_file)
     print('Bug Stack:\n', REFERENCE_STACK)
-    # Run the main function 5 times and calculate average time
     
     if len(REFERENCE_STACK) == 0:
         print("Error: The reference stack trace is empty. Please provide a valid stack trace file.")
