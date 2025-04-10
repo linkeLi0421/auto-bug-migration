@@ -1876,16 +1876,19 @@ def collect_trace(args):
     # Checkout base commit and set up environment
     git checkout -f {args.buggy_commit1}; 
 
-    # Compile and collect trace
-    compile; 
+    # Compile and run with crash input
     cd -;
-    collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit1}-{test_input}.txt; 
-    rm -rf collect_trace; 
-    
-    # Recompile and run with crash input
-    touch allowlist.txt;
-    compile; 
+    compile &> /dev/null;
     /out/{args.fuzzer_name} /corpus/{test_input} &> /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
+
+    cd /Function_instrument && cmake . && make && cd -;
+
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+
+    # Compile and collect trace
+    compile &> /dev/null; 
+    /out/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit1}-{test_input}.txt; 
   '''
   
   bash_prepare_buggy2 = f'''
@@ -1893,11 +1896,16 @@ def collect_trace(args):
     # Checkout buggy commit and set up environment
     git checkout -f {args.buggy_commit2}; 
 
+    cd /Function_instrument && cmake . && make && cd -;
+
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+
     # Compile and collect trace
-    compile; 
     cd -;
-    collect_trace/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
-    rm -rf collect_trace; 
+    compile &> /dev/null; 
+    /out/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
+    rm -rf ; 
     
     python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{test_input}.txt /out/target_trace-{args.buggy_commit2}-{test_input}.txt > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
   '''
@@ -1909,7 +1917,7 @@ def collect_trace(args):
     
     git checkout -f {args.base_commit}; 
     cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt allowlist.txt;
-    compile;
+    compile &> /dev/null;
     pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
   '''
@@ -1921,11 +1929,12 @@ def collect_trace(args):
     
     git checkout -f {args.base_commit}; 
     echo -e "fun:*\\nsrc:*" > allowlist.txt;
-    compile;
+    compile &> /dev/null;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-noselect-fuzzlog
   '''
   
   script_folder = os.path.join(OSS_FUZZ_DIR, 'script')
+  Function_instrument = os.path.join(OSS_FUZZ_DIR, 'Function_instrument')
 
   run_args_runfuzzer = run_args.copy()
   run_args_runfuzzer_noselect = run_args.copy()
@@ -1936,6 +1945,7 @@ def collect_trace(args):
       '-v', f'{out_dir}:/out', 
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', bash_prepare
   ])
@@ -1944,6 +1954,7 @@ def collect_trace(args):
       '-v', f'{out_dir}:/out', 
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', bash_prepare_buggy2
   ])  
