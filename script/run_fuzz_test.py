@@ -2,6 +2,7 @@ import argparse
 import subprocess
 import sys
 import json
+import os
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run fuzzing tests with trace collection')
@@ -21,6 +22,7 @@ def run_fuzz_test(args):
     # Check if config file is provided
     bug_data = read_json_file(args.target_bugs)
     bug_info_dataset = read_json_file(args.bug_info)
+    current_file_path = os.path.dirname(os.path.abspath(__file__))
     
     for bug_id, commits in bug_data.items():
         base_commit = commits['base']
@@ -32,6 +34,17 @@ def run_fuzz_test(args):
         target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         
+        target_dockerfile_path = f'{current_file_path}/../projects/{target}/Dockerfile'
+        # Replace '--depth=1' in the Dockerfile
+        with open(target_dockerfile_path, 'r') as dockerfile:
+            dockerfile_content = dockerfile.read()
+        
+        updated_content = dockerfile_content.replace('--depth 1', '')
+        updated_content = updated_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/builder')
+        
+        with open(target_dockerfile_path, 'w') as dockerfile:
+            dockerfile.write(updated_content)
+        print(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
         # Build the command
         cmd = ['python3', 'infra/helper.py', 'collect_trace']
     
