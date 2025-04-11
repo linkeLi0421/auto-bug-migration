@@ -44,7 +44,7 @@ def analyze_crash_file(crash_file, target_crashes_dir):
             f.write(result.stdout)
         
         # Check if this crash matches our target stack trace
-        if check_stack_trace(result.stdout):
+        if check_stack_trace(log_file):
             print(f"\n[!] Found target crash: {crash_file}")
             
             # Copy the crash file to target directory
@@ -68,24 +68,6 @@ def analyze_crash_file(crash_file, target_crashes_dir):
         # Clean up
         if os.path.exists(log_file):
             os.remove(log_file)
-    
-    return False
-
-def check_stack_trace(log_content):
-    """Check if the log content contains our reference stack trace."""
-    current_stack = []
-    for line in log_content.splitlines():
-        match = re.search(r'^\s*#\d+\s+0x[\da-f]+\s+in\s+((?:\w+::)*\w+\(.*?\))(?:\s+const)?\s+.*', line)
-        if match:
-            function_name = match.group(1)
-            current_stack.append(function_name)
-    
-    # Check if the stack matches the reference stack
-    print('current_stack: ', current_stack)
-    if len(current_stack) >= len(REFERENCE_STACK):
-        for i in range(len(current_stack) - len(REFERENCE_STACK) + 1):
-            if current_stack[i:i+len(REFERENCE_STACK)] == REFERENCE_STACK:
-                return True
     
     return False
 
@@ -140,25 +122,29 @@ def monitor_crashes_thread(artifacts_dir, stop_event):
             print(f"[-] Error in crash monitor thread: {e}")
 
 def extract_function_stack(file_path):
-    """
-    Extracts the function call stack from an AddressSanitizer crash report.
-    Demangles C++ function names and includes C function names.
-    Returns a list of function names in call order (leaf to root).
-    """
     stack = []
-    # Updated regex to handle C++ symbols with namespaces, templates, and arguments
-    pattern = re.compile(r'^\s*#\d+\s+0x[\da-f]+\s+in\s+((?:\w+::)*\w+\(.*?\))(?:\s+const)?\s+.*')
 
     with open(file_path, 'r') as f:
         for line in f:
-            match = pattern.match(line)
-            if match:
-                mangled_name = match.group(1)
-                    # Attempt to demangle C++ function names
-                function_name = cxxfilt.demangle(mangled_name)
-                # If demangling fails, assume it's a C function or invalid name
+            if 'LLVMFuzzerTestOneInput' in line:
+                break
+            if re.search(r"#\d+", line):
+                function_name = ''.join(line.split(' ')[7:-1])
                 stack.append(function_name)
     return stack
+
+def check_stack_trace(log_file):
+    """Check if the log content contains our reference stack trace."""
+    current_stack = extract_function_stack(log_file)
+    
+    # Check if the stack matches the reference stack
+    print('current_stack: ', current_stack)
+    if len(current_stack) >= len(REFERENCE_STACK):
+        for i in range(len(current_stack) - len(REFERENCE_STACK) + 1):
+            if current_stack[i:i+len(REFERENCE_STACK)] == REFERENCE_STACK:
+                return True
+    
+    return False
 
 def main(timeout_hours=12):
     print(f"Starting continuous fuzzer monitoring with {timeout_hours} hours timeout...\n")

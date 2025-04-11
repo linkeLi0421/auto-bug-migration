@@ -3,6 +3,7 @@ import subprocess
 import sys
 import json
 import os
+import signal
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run fuzzing tests with trace collection')
@@ -89,9 +90,15 @@ def run_fuzz_test(args):
         except subprocess.CalledProcessError as e:
             print(f"Command failed with exit code {e.returncode}")
         
-        # keep the original Dockerfile
-        with open(target_dockerfile_path, 'w') as dockerfile:
-            dockerfile.write(dockerfile_content)
+        def restore_dockerfile(signal_received, frame):
+            with open(target_dockerfile_path, 'w') as dockerfile:
+                dockerfile.write(dockerfile_content)
+            print(f"Restored original Dockerfile for {target_dockerfile_path}")
+            sys.exit(0)
+
+        # Register signal handlers to restore Dockerfile on termination
+        signal.signal(signal.SIGINT, restore_dockerfile)  # Handle Ctrl+C
+        signal.signal(signal.SIGTERM, restore_dockerfile)  # Handle termination signals
 
 if __name__ == "__main__":
     args = parse_arguments()
