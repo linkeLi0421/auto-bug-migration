@@ -34,6 +34,19 @@ def run_fuzz_test(args):
         target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         
+        # Run the command to get the dictionary for the target
+        get_dict_cmd = ['python3', 'infra/helper.py', 'get_dict', target]
+
+        # Print the command being executed
+        print("Running command:", " ".join(get_dict_cmd))
+
+        # Execute the command
+        try:
+            subprocess.run(get_dict_cmd, check=True, text=True)
+            print(f"Successfully retrieved dictionary for target: {target}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to retrieve dictionary for target: {target} with exit code {e.returncode}")
+        
         target_dockerfile_path = f'{current_file_path}/../projects/{target}/Dockerfile'
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
@@ -45,6 +58,7 @@ def run_fuzz_test(args):
         with open(target_dockerfile_path, 'w') as dockerfile:
             dockerfile.write(updated_content)
         print(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
+
         # Build the command
         cmd = ['python3', 'infra/helper.py', 'collect_trace']
     
@@ -74,6 +88,10 @@ def run_fuzz_test(args):
             print(f"Command completed with exit code {result.returncode}")
         except subprocess.CalledProcessError as e:
             print(f"Command failed with exit code {e.returncode}")
+        
+        # keep the original Dockerfile
+        with open(target_dockerfile_path, 'w') as dockerfile:
+            dockerfile.write(dockerfile_content)
 
 if __name__ == "__main__":
     args = parse_arguments()

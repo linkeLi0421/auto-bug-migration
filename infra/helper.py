@@ -244,6 +244,8 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = reproduce(args)
   elif args.command == 'shell':
     result = shell(args)
+  elif args.command == 'get_dict':
+    result = get_dict(args)
   elif args.command == 'build_version':
     result = build_version(args)
   elif args.command == 'collect_trace':
@@ -509,6 +511,21 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_sanitizer_args(shell_parser)
   _add_environment_args(shell_parser)
   _add_external_project_args(shell_parser)
+
+  get_dict_parser = subparsers.add_parser(
+      'get_dict', help='get fuzz dict using afl')
+  get_dict_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  get_dict_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  get_dict_parser.add_argument('--commit',
+                            help='commit hash to checkout in the builder')
+  _add_architecture_args(get_dict_parser)
+  _add_engine_args(get_dict_parser)
+  _add_sanitizer_args(get_dict_parser)
+  _add_environment_args(get_dict_parser)
+  _add_external_project_args(get_dict_parser)
 
   build_version_parser = subparsers.add_parser(
       'build_version', help='Run /bin/bash within the builder container.')
@@ -1902,10 +1919,8 @@ def collect_trace(args):
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
 
     # Compile and collect trace
-    cd -;
     compile &> /dev/null; 
     /out/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
-    rm -rf ; 
     
     python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{test_input}.txt /out/target_trace-{args.buggy_commit2}-{test_input}.txt > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
   '''
@@ -1917,6 +1932,10 @@ def collect_trace(args):
     
     git checkout -f {args.base_commit}; 
     cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt allowlist.txt;
+    
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+    
     compile &> /dev/null;
     pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
@@ -1929,7 +1948,12 @@ def collect_trace(args):
     
     git checkout -f {args.base_commit}; 
     echo -e "fun:*\\nsrc:*" > allowlist.txt;
+
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+
     compile &> /dev/null;
+    pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-noselect-fuzzlog
   '''
   
@@ -1966,7 +1990,7 @@ def collect_trace(args):
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', bash_runfuzzer
   ])
-  
+
   run_args_runfuzzer_noselect.extend([
       '-v', f'{out_dir}:/out', 
       '-v', f'{args.project.work}:/work', 
@@ -1975,10 +1999,63 @@ def collect_trace(args):
       '/bin/bash', '-c', bash_runfuzzer_noselect
   ])
 
-  # docker_run(run_args, architecture=args.architecture)
-  # docker_run(run_args_prepare_buggy2, architecture=args.architecture)
+  docker_run(run_args, architecture=args.architecture)
+  docker_run(run_args_prepare_buggy2, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
   docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
+  return True
+
+
+def get_dict(args):
+  """get fuzzing dict using afl"""
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=afl',
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+      'CC=afl-clang-fast',
+      'CXX=afl-clang-fast++',
+      'AFL_LLVM_DICT2FILE=/out/fuzz.dict'
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  bash_getdict = f'''
+    # Using afl to get fuzzing dictionary
+    git checkout -f {args.commit}; 
+    compile;
+  '''
+
+  run_args.extend([
+      '-v',
+      '%s:/out' % out_dir, '-v',
+      '%s:/work' % args.project.work, '-t',
+      'gcr.io/%s/%s' % (image_project, args.project.name),
+      '/bin/bash', '-c', bash_getdict
+  ])
+  docker_run(run_args, architecture=args.architecture)
   return True
 
 
