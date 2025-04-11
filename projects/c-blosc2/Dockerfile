@@ -14,12 +14,7 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/builder
-RUN apt-get update && apt-get install -y cmake make
-RUN git clone https://github.com/linkeLi0421/Function_instrument.git
-WORKDIR Function_instrument
-RUN cmake . && make
-WORKDIR $SRC/
+FROM gcr.io/oss-fuzz-base/base-builder
 RUN git clone  https://github.com/Blosc/c-blosc2.git c-blosc2
 WORKDIR c-blosc2
 COPY build.sh $SRC/

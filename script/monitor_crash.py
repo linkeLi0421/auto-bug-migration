@@ -183,7 +183,7 @@ def main(timeout_hours=12):
         "-use_value_profile=1",
         "-print_final_stats=1",
         "-print_corpus_stats=1",
-        # "-dict=/corpus/c-blosc2.dict"
+        "-dict=/out/fuzz.dict"
     ]
     print(' '.join(fuzzer_cmd))
     # Event to signal threads to stop
