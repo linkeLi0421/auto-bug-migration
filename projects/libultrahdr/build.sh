@@ -15,17 +15,4 @@
 #
 ################################################################################
 # Run the OSS-Fuzz script in the project.
-if [ ! -f "/src/libultrahdr/allowlist.txt" ]; then
-    export CFLAGS="${CFLAGS:-} -fno-inline-functions -fpass-plugin=/src/Function_instrument/libPrint_trace.so"
-    export CXXFLAGS="${CXXFLAGS:-} -fno-inline-functions -fpass-plugin=/src/Function_instrument/libPrint_trace.so"
-    export LDFLAGS="${LDFLAGS:-} /src/Function_instrument/print_func.o"
-    $SRC/libultrahdr/fuzzer/ossfuzz.sh
-    mkdir collect_trace
-    mv /out/*fuzzer collect_trace/
-fi
-
-if [ -f "/src/libultrahdr/allowlist.txt" ]; then
-    export CFLAGS="${CFLAGS:-} -fno-inline-functions  -fsanitize-coverage-allowlist=/src/libultrahdr/allowlist.txt"
-    export CXXFLAGS="${CXXFLAGS:-} -fno-inline-functions -fsanitize-coverage-allowlist=/src/libultrahdr/allowlist.txt"
-    $SRC/libultrahdr/fuzzer/ossfuzz.sh
-fi
+$SRC/libultrahdr/fuzzer/ossfuzz.sh
