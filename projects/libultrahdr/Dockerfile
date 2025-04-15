@@ -14,7 +14,7 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/builder
+FROM gcr.io/oss-fuzz-base/base-builder
 RUN git clone https://github.com/google/libultrahdr.git
 COPY build.sh $SRC/
 WORKDIR libultrahdr

@@ -14,7 +14,7 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/builder
+FROM gcr.io/oss-fuzz-base/base-builder
 RUN git clone  https://github.com/Blosc/c-blosc2.git c-blosc2
 WORKDIR c-blosc2
 COPY build.sh $SRC/

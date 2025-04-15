@@ -14,7 +14,7 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/builder
+FROM gcr.io/oss-fuzz-base/base-builder
 ARG TARGETPLATFORM
 
 RUN apt-get update && \
