@@ -10,7 +10,6 @@ import threading
 import queue
 import re
 import argparse
-import cxxfilt
 
 # Queue for new crash files that need to be analyzed
 crash_queue = queue.Queue()

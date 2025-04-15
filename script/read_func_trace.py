@@ -43,17 +43,12 @@ if __name__ == '__main__':
         print(f"Error: '{file_path}' is not a valid file")
         sys.exit(1)
         
-    print(f"Processing trace file: {file_path}")
     function_set = read_func_trace(file_path)
-    print(f"Found {len(function_set)} function entries")
-        
+    
     # Write functions to allowlist.txt
     allowlist_content = ""
     for func in function_set:
         allowlist_content += f"fun:{func}\n"
     allowlist_content += "src:*\n"
 
-    with open("allowlist.txt", "w") as f:
-        f.write(allowlist_content)
-        
-    print(f"Wrote {len(function_set)} functions to allowlist.txt")
+    print(allowlist_content)

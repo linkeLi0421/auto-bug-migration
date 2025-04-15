@@ -1,4 +1,3 @@
-import sys
 import argparse
 
 def extract_function_calls(file_path):
@@ -41,7 +40,6 @@ def main():
     if args.twobuggy:
         for func in common_funcs:
             print(f"fun:{func}")
-        print(f"src:*")
         if len(common_funcs) == 0:
             for _, func in common_part:
                 print(f"fun:{func}")
