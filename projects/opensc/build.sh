@@ -14,55 +14,18 @@
 # limitations under the License.
 #
 ################################################################################
-# Install libc++ dependencies
-apt-get install -y libc++-dev libc++abi-dev
 
-# Initialize variables safely (fixes "unbound variable" error)
-export CXXFLAGS="${CXXFLAGS:-} -stdlib=libc++"
-export LDFLAGS="${LDFLAGS:-} -stdlib=libc++ -lc++ -lc++abi"
+./bootstrap
+# FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
+./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
+make -j4
 
-if [ ! -f "/src/opensc/allowlist.txt" ]; then
+fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
 
-    # Initialize variables safely
-    export CFLAGS="${CFLAGS:-} -fno-inline-functions -fpass-plugin=/src/Function_instrument/libPrint_trace.so"
-    export CXXFLAGS="${CXXFLAGS:-} -fno-inline-functions -fpass-plugin=/src/Function_instrument/libPrint_trace.so"
-    export LDFLAGS="${LDFLAGS:-} /src/Function_instrument/print_func.o"
-    ./bootstrap
-    # FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
-    ./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
-    make -j4
-
-    fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
-
-    mkdir collect_trace
-    for F in $fuzzerFiles; do
-        fuzzerName=$(basename $F .c)
-        cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" collect_trace
-        if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
-            zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
-        fi
-    done
-fi
-
-
-if [ -f "/src/opensc/allowlist.txt" ]; then
-
-    # Initialize variables safely
-    export CFLAGS="${CFLAGS:-} -fno-inline-functions  -fsanitize-coverage-allowlist=/src/opensc/allowlist.txt"
-    export CXXFLAGS="${CXXFLAGS:-} -fno-inline-functions -fsanitize-coverage-allowlist=/src/opensc/allowlist.txt"
-
-    ./bootstrap
-    # FIXME FUZZING_LIBS="$LIB_FUZZING_ENGINE" fails with some missing C++ library, I don't know how to fix this
-    ./configure --disable-optimization --disable-shared --disable-pcsc --enable-ctapi --enable-fuzzing FUZZING_LIBS="$LIB_FUZZING_ENGINE"
-    make -j4
-
-    fuzzerFiles=$(find $SRC/opensc/src/tests/fuzzing/ -name "fuzz_*.c")
-
-    for F in $fuzzerFiles; do
-        fuzzerName=$(basename $F .c)
-        cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" $OUT
-        if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
-            zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
-        fi
-    done
-fi
+for F in $fuzzerFiles; do
+    fuzzerName=$(basename $F .c)
+    cp "$SRC/opensc/src/tests/fuzzing/$fuzzerName" $OUT
+    if [ -d "$SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}" ]; then
+        zip -j $OUT/${fuzzerName}_seed_corpus.zip $SRC/opensc/src/tests/fuzzing/corpus/${fuzzerName}/*
+    fi
+done
