@@ -14,12 +14,7 @@
 #
 ################################################################################
 
-FROM gcr.io/oss-fuzz-base/builder
-RUN apt-get update && apt-get install -y cmake make
-RUN git clone https://github.com/linkeLi0421/Function_instrument.git
-WORKDIR Function_instrument
-RUN cmake . && make
-WORKDIR $SRC/
+FROM gcr.io/oss-fuzz-base/base-builder
 RUN apt-get update && apt-get install -y pcscd libccid libpcsclite-dev libssl-dev libreadline-dev autoconf automake build-essential docbook-xsl xsltproc libtool pkg-config zlib1g-dev
 RUN git clone --single-branch --branch master https://github.com/OpenSC/OpenSC opensc
 WORKDIR opensc
