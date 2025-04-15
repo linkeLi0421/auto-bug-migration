@@ -1816,26 +1816,12 @@ def build_version(args):
         '%s:%s' % (_get_absolute_path(args.source_path), workdir),
     ])
 
-  # Mount allowlist if provided
-  if args.allowlist:
-    allowlist_path = _get_absolute_path(args.allowlist)
-    if os.path.exists(allowlist_path):
-      run_args.extend([
-          '-v',
-          '%s:/corpus' % allowlist_path,
-      ])
-    else:
-      logger.error('Allowlist path %s does not exist.', args.allowlist)
-      return False
-  
-  test_input = args.test_input
-
   run_args.extend([
       '-v',
       '%s:/out' % out_dir, '-v',
       '%s:/work' % args.project.work, '-t',
       'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
-      '-c', 'cd /src/%s && git checkout -f %s && touch allowlist.txt && /bin/bash && compile' %(args.project.name, args.commit)
+      '-c', 'cd /src/%s && git checkout -f %s && cd - && compile' %(args.project.name, args.commit)
   ])
   docker_run(run_args, architecture=args.architecture)
   return True
@@ -1895,13 +1881,16 @@ def collect_trace(args):
 
     # Compile and run with crash input
     cd -;
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions";
+    
     compile &> /dev/null;
     /out/{args.fuzzer_name} /corpus/{test_input} &> /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
 
     cd /Function_instrument && cmake . && make && cd -;
 
-    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
-    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+    export CFLAGS="${{CFLAGS:-}} -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fpass-plugin=/Function_instrument/libPrint_trace.so /Function_instrument/print_func.o";
 
     # Compile and collect trace
     compile &> /dev/null; 
@@ -2021,11 +2010,11 @@ def collect_trace(args):
       '/bin/bash', '-c', bash_runfuzzer_fullselect
   ])
 
-  docker_run(run_args, architecture=args.architecture)
-  docker_run(run_args_prepare_buggy2, architecture=args.architecture)
-  docker_run(run_args_runfuzzer, architecture=args.architecture)
+  # docker_run(run_args, architecture=args.architecture)
+  # docker_run(run_args_prepare_buggy2, architecture=args.architecture)
+  # docker_run(run_args_runfuzzer, architecture=args.architecture)
   docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
-  docker_run(run_args_runfuzzer_fullselect, architecture=args.architecture)
+  # docker_run(run_args_runfuzzer_fullselect, architecture=args.architecture)
   return True
 
 
