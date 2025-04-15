@@ -1906,6 +1906,7 @@ def collect_trace(args):
     # Compile and collect trace
     compile &> /dev/null; 
     /out/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit1}-{test_input}.txt; 
+    python3 /script/read_func_trace.py /out/target_trace-{args.buggy_commit1}-{test_input}.txt > /out/allowlist-{args.buggy_commit1}-full-{test_input}.txt;
   '''
   
   bash_prepare_buggy2 = f'''
@@ -1921,7 +1922,6 @@ def collect_trace(args):
     # Compile and collect trace
     compile &> /dev/null; 
     /out/{args.fuzzer_name} /corpus/{test_input} > /out/target_trace-{args.buggy_commit2}-{test_input}.txt; 
-    
     python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{test_input}.txt /out/target_trace-{args.buggy_commit2}-{test_input}.txt > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt;
   '''
   
@@ -1937,7 +1937,6 @@ def collect_trace(args):
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
     
     compile &> /dev/null;
-    pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
   '''
   
@@ -1953,8 +1952,22 @@ def collect_trace(args):
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
 
     compile &> /dev/null;
-    pip3 install cxxfilt;
     python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-noselect-fuzzlog
+  '''
+  
+  bash_runfuzzer_fullselect = f'''
+    # Fuzz with generic allowlist
+    mkdir -p /tmpfolder; 
+    cp /corpus/{test_input} /tmpfolder/;
+    
+    git checkout -f {args.base_commit}; 
+    cp /out/allowlist-{args.buggy_commit1}-full-{test_input}.txt allowlist.txt;
+
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+
+    compile;
+    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fullselect-fuzzlog
   '''
   
   script_folder = os.path.join(OSS_FUZZ_DIR, 'script')
@@ -1963,6 +1976,7 @@ def collect_trace(args):
   run_args_runfuzzer = run_args.copy()
   run_args_runfuzzer_noselect = run_args.copy()
   run_args_prepare_buggy2 = run_args.copy()
+  run_args_runfuzzer_fullselect = run_args.copy()
 
   # Use the formatted script
   run_args.extend([
@@ -1998,11 +2012,20 @@ def collect_trace(args):
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', bash_runfuzzer_noselect
   ])
+  
+  run_args_runfuzzer_fullselect.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', bash_runfuzzer_fullselect
+  ])
 
   docker_run(run_args, architecture=args.architecture)
   docker_run(run_args_prepare_buggy2, architecture=args.architecture)
   docker_run(run_args_runfuzzer, architecture=args.architecture)
   docker_run(run_args_runfuzzer_noselect, architecture=args.architecture)
+  docker_run(run_args_runfuzzer_fullselect, architecture=args.architecture)
   return True
 
 
