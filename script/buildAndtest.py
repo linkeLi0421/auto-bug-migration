@@ -1,4 +1,5 @@
 import git
+from git.exc import BadName, GitCommandError, InvalidGitRepositoryError
 import argparse
 import os
 import glob
@@ -13,30 +14,6 @@ sanitizer_mapping = {
 }
 
 os.environ["ASAN_OPTIONS"] = "detect_leaks=0"
-
-project_end_commit = {
-    'c-blosc2': '34db770e436aa4ceaa9b9110948f8dac1f1f443d',
-    'libdwarf': '623511122046fca0aefcfbd86f9e41338e95b083',
-    'libavc': '3916f3eea4a89090d017aa04981022e1cb49f207',
-    'libaom': '5f6ce718d903dca3e49c5c10db0859a394c9be84',
-    'jq': '94fd973ebbb49cb00c5f21359c7a57d6f9047e94',
-    'cyclonedds': '569d690d3c6f35a15bb72ac62a83539fffda4894',
-    'hunspell': '99ba9b5e47a5d5fd851c7986f714d5dd60102625',
-    'exiv2': '10dfab262cb470e19e504047887f4a21e75971a0',
-    'lcms': 'e19dc49853f7a9e23501b4579fe6274c4fd8f4a9',
-    'libexif': '8f013418c2ee71f7aaa81b1699e48d9d3c22dd9b',
-    'libjxl': '92c8bef189dd742104f009ea4c3cb1d6a7255e21',
-    'libultrahdr': 'bf2aa439eea9ad5da483003fa44182f990f74091',
-    'libxml2': '38f475072aefe032fff1dc058df3e56c1e7062fa',
-    'ndpi': 'c49d126d3642d5b1f5168d049e3ebf0ee3451edc',
-    'openexr': '6cb7d97b2080134def6058dfcbff47abf988fe03',
-    'opensc': 'f923dc712516551ce0f17496cfa220b1536f4a6f',
-    'quickjs': '6e2e68fd0896957f92eb6c242a2e048c1ef3cae0',
-    'mongoose': '4258f6256001f7635f3622aed21867758f5a3fec',
-    'espeak-ng': '034807a91dc2abb86ed2012121ca8dbc691dcdb4',
-    'harfbuzz': 'e9348cd76d38f72cf881cc860035403220ffbe0b',
-    'arduinojson': 'deab127a2fc846c80fe4691489e54fcf9fe2f95f'
-}
 
 # Create a logger
 logger = logging.getLogger(__name__)
@@ -252,15 +229,15 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     '''
     repo = git.Repo(repo_path)
     # Get commit objects
-    commit_a = repo.commit(commit_id)
-    commit_b = repo.commit(ancestor_id)
-    common_ancestor = repo.git.merge_base(commit_a, commit_b)
-    if common_ancestor == commit_b.hexsha:
+    start_commit = repo.commit(commit_id)
+    end_commit = repo.commit(ancestor_id)
+    common_ancestor = repo.git.merge_base(start_commit, end_commit)
+    if common_ancestor == end_commit.hexsha:
         return True
     else:
         return False
 
-def do_bug_test(target_path, bug_path, commit_id, writer, is_hot_commit, commit_trigger_count):
+def do_bug_test(target_path, bug_path, commit_id, writer, commit_trigger_count):
     '''
     Run helper.py reproduce
     '''
@@ -343,6 +320,49 @@ def do_bug_test(target_path, bug_path, commit_id, writer, is_hot_commit, commit_
     writer.writerow(row)
 
 
+def get_commits_by_time_window(repo_path, start_commit, end_commit):
+    """
+    Get all commits with commit times between two specified commits.
+    
+    Args:
+        repo_path (str): Path to Git repository
+        start_commit (str): First boundary commit hash
+        end_commit (str): Second boundary commit hash
+    
+    Returns:
+        list: Commit hashes in chronological order between the timestamps
+    """
+    try:
+        repo = git.Repo(repo_path)
+    except InvalidGitRepositoryError:
+        raise ValueError(f"Invalid repository: {repo_path}")
+
+    try:
+        a = repo.commit(start_commit)
+        b = repo.commit(end_commit)
+    except BadName:
+        raise ValueError("Invalid commit hash")
+
+    # Get time boundaries
+    time_a = a.committed_datetime
+    time_b = b.committed_datetime
+    start_time = min(time_a, time_b)
+    end_time = max(time_a, time_b)
+
+    # Get all commits across all branches
+    all_commits = list(repo.iter_commits(all=True))
+
+    # Filter commits within time window
+    filtered = [
+        c for c in all_commits
+        if start_time < c.committed_datetime < end_time
+    ]
+
+    # Sort chronologically
+    filtered.sort(key=lambda x: x.committed_datetime)
+
+    return [c.hexsha for c in filtered]
+
 def get_commits_between(repo_path, start_commit, end_commit):
     """
     Get all commit IDs between two given commits in a Git repository.
@@ -353,22 +373,114 @@ def get_commits_between(repo_path, start_commit, end_commit):
         end_commit (str): The ending commit ID (newer).
 
     Returns:
-        list: A list of commit hashes between the given commits.
+        list: A list of commit hashes between the given commits, in chronological order.
+
+    Raises:
+        ValueError: For invalid repository path or commit hashes
     """
+    try:
+        repo = git.Repo(repo_path)
+    except InvalidGitRepositoryError:
+        raise ValueError(f"'{repo_path}' is not a valid Git repository")
+
+    try:
+        start = repo.commit(start_commit)
+        end = repo.commit(end_commit)
+    except BadName as e:
+        raise ValueError(f"Invalid commit hash: {e}")
+
+    # Verify start is an ancestor of end
+    try:
+        repo.git.merge_base('--is-ancestor', start.hexsha, end.hexsha)
+    except GitCommandError as e:
+        if e.status == 1:
+            # Not in ancestor path
+            logger.info(f"start commit {start_commit} is not ancestor of End commit {end_commit}! Use commits that timestamp between them instead.")
+            return get_commits_by_time_window(repo_path, start_commit, end_commit)
+
+    # Get commits in reverse chronological order (newest first)
+    rev_list = repo.iter_commits(f"{start.hexsha}..{end.hexsha}")
+
+    # Reverse to get chronological order (oldest first)
+    commits = list(rev_list)[::-1]
+
+    return [c.hexsha for c in commits]
+
+
+def get_next_commits(repo_path, target_commit_hash, num_commits=10):
+    # Open the repository
     repo = git.Repo(repo_path)
     
-    # Get commits between the specified commits, including the start and end commits
-    commits = list(repo.iter_commits(f"{start_commit}..{end_commit}"))
+    try:
+        # Get the target commit
+        target_commit = repo.commit(target_commit_hash)
+    except git.BadName:
+        logger.info(f"Commit {target_commit_hash} not found.")
+        return []
     
-    # Make sure start_commit and end_commit are in the list
-    start_commit_obj = repo.commit(start_commit)
-    end_commit_obj = repo.commit(end_commit)
+    # Get all commits after the target commit (exclusive)
+    # Using 'target_commit_hash..HEAD' to specify the commit range
+    commits = list(repo.iter_commits(f"{target_commit_hash}..HEAD"))
     
-    commits.append(start_commit_obj)
-    commits.append(end_commit_obj)
-    commit_hexes = [c.hexsha for c in commits]
-    return commit_hexes
+    # Reverse to get chronological order (oldest first)
+    commits.reverse()
+    
+    # Return the first 'num_commits' commits
+    return commits[num_commits] if num_commits < len(commits) else commits[-1]
 
+
+def get_nth_end_commitefore(repo_path, target_commit_hash, num_commits=10):
+    repo = git.Repo(repo_path)
+    current_commit = target_commit_hash
+    try:
+        current_commit = repo.commit(target_commit_hash)
+    except git.BadName:
+        logger.info(f"Error: Commit {target_commit_hash} not found.")
+        return None
+    
+    for _ in range(num_commits):
+        if not current_commit.parents:
+            logger.info(f"Error: Only {_} ancestors exist before {target_commit_hash}.")
+            return None
+        current_commit = current_commit.parents[0]  # Follow first parent (linear history)
+    
+    return current_commit
+
+
+def checkout_latest_commit(repo_path):
+    """
+    Checkout the latest commit of the repository's default branch.
+    
+    Args:
+        repo_path (str): Path to the Git repository
+    
+    Returns:
+        str: Latest commit hash
+    
+    Raises:
+        RuntimeError: If checkout fails
+        InvalidGitRepositoryError: If path is not a valid repo
+    """
+    try:
+        # Open repository
+        repo = git.Repo(repo_path)
+        
+        # Ensure we have latest remote data
+        if 'origin' in repo.remotes:
+            repo.remotes.origin.fetch()
+        
+        # Get default branch name (e.g., 'main', 'master')
+        default_branch = repo.remotes.origin.refs['HEAD'].ref.remote_head
+        
+        # Checkout default branch and reset to latest
+        repo.git.checkout(default_branch)
+        repo.git.reset('--hard', f'origin/{default_branch}')
+        
+        return repo.head.commit.hexsha
+        
+    except (GitCommandError, ValueError) as e:
+        raise RuntimeError(f"Failed to checkout latest commit: {str(e)}")
+    
 
 if __name__ == "__main__":
     # sudo ~/script/myenv/bin/python3 /home/yun/script/test.py --bug  ~/tasks-simple/libavc/ --repo /home/yun/tasks-git/libavc/ --target libavc --mode test &> /home/yun/test-log/libavc_test_log
@@ -389,18 +501,21 @@ if __name__ == "__main__":
     repo_path = args.repo
     bug_path = args.bug
     poc_list, lastest_commit = get_pocs(bug_path)
-    print(lastest_commit)
+    checkout_latest_commit(repo_path)
+    last_build_commit = get_next_commits(repo_path, lastest_commit, 20).hexsha
+    first_build_commit = get_nth_end_commitefore(repo_path, poc_list[0]['introduced_commit'], 20)
     
     target_dockerfile_path = f'{current_file_path}/../projects/{target}/Dockerfile'
     # Replace '--depth=1' in the Dockerfile
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
+    updated_content = updated_content.replace('--depth=1', '')
     with open(target_dockerfile_path, 'w') as dockerfile:
         dockerfile.write(updated_content)
-    print(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
+    logger.info(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
     
-    do_stat = True
+    do_stat = False
     if do_stat:
         # Do summary statistics
         start_time, end_time, max_poc_num = find_max_valid_period(poc_list)
@@ -409,14 +524,15 @@ if __name__ == "__main__":
         pocs_work = find_pocs_in_time_period(poc_list, start_time, end_time)
         os.chdir(repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
-        subprocess.run(["git", "checkout", '-f', project_end_commit[target]], encoding='utf-8')
+        subprocess.run(["git", "checkout", '-f', last_build_commit], encoding='utf-8')
 
         repo = git.Repo(repo_path)
         hot_commits = list(repo.iter_commits(since=start_time, until=end_time))
         hot_commits = set([commit.hexsha for commit in hot_commits])
-    
-    commits = get_commits_between(repo_path, poc_list[0]['introduced_commit'], project_end_commit[target])
-    print(f'from {poc_list[0]["introduced_commit"]} to {project_end_commit[target]}')
+
+
+    commits = get_commits_between(repo_path, first_build_commit, last_build_commit)
+    logger.info(f'from {first_build_commit} to {last_build_commit}')
     logger.info(len(commits))
 
     if args.mode in ["build", "both"]:
@@ -442,8 +558,7 @@ if __name__ == "__main__":
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            is_hot_commit = commit in hot_commits
-            do_bug_test(repo_path, bug_path, commit, test_writer, is_hot_commit, commit_trigger_count)
+            do_bug_test(repo_path, bug_path, commit, test_writer, commit_trigger_count)
         test_csv_file.close()
         
         # Save commit_trigger_count to a new CSV file
