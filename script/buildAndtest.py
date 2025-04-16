@@ -483,8 +483,7 @@ def checkout_latest_commit(repo_path):
     
 
 if __name__ == "__main__":
-    # sudo ~/script/myenv/bin/python3 /home/yun/script/test.py --bug  ~/tasks-simple/libavc/ --repo /home/yun/tasks-git/libavc/ --target libavc --mode test &> /home/yun/test-log/libavc_test_log
-    # sudo ~/script/myenv/bin/python3 /home/yun/script/test.py --bug  ~/tasks-simple/libavc/ --repo /home/yun/tasks-git/libavc/ --target libavc --mode test &> /home/yun/test-log/libavc_build_log
+    # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/usr/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/usr/log/c-blosc2_test_log
     parser = argparse.ArgumentParser()
     parser.add_argument("--bug", help="Path to the folder")
     parser.add_argument("--repo", help="Path to the repository")
@@ -495,8 +494,15 @@ if __name__ == "__main__":
     target = args.target
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     oss_fuzz_path = os.path.dirname(current_file_path)
-    log_path = '/home/yun/log'
-    storage_path = '/mnt/nas/linke/' + target + '/'
+    log_path = os.getenv('LOG_PATH')
+    if not log_path:
+        logger.error("Environment variable 'LOG_PATH' is not set. Run source setenv.sh first. Exiting.")
+        exit(1)
+    storage_path = os.getenv('STORAGE_PATH')
+    if not storage_path:
+        logger.error("Environment variable 'STORAGE_PATH' is not set. Run source setenv.sh first. Exiting.")
+        exit(1)
+    target_storage_path = storage_path + target + '/'
         
     repo_path = args.repo
     bug_path = args.bug
