@@ -191,7 +191,7 @@ def do_bug_build(target_path, bug_path, commit_id):
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
     subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8')
     for sanitizer in sanitizers:
-        if os.path.exists(storage_path + target + '-' + commit_id + '-' + sanitizer):
+        if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)):
             return
 
         os.chdir(oss_fuzz_path)
@@ -210,8 +210,8 @@ def do_bug_build(target_path, bug_path, commit_id):
             writer.writerow(row)
         else:
             # Create directory for storing output files if it doesn't exist
-            os.makedirs(storage_path, exist_ok=True)
-            subprocess.run(["mv", "-T", oss_fuzz_path + "/build/out/" + target, storage_path + target + '-' + commit_id + '-' + sanitizer], encoding='utf-8')
+            os.makedirs(target_storage_path, exist_ok=True)
+            subprocess.run(["mv", "-T", oss_fuzz_path + "/build/out/" + target, os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)], encoding='utf-8')
     csv_file.close()
 
 
@@ -267,7 +267,7 @@ def do_bug_test(target_path, bug_path, commit_id, writer, commit_trigger_count):
             if bug_exist:
                 bug_exist_count += 1
 
-            source_dir = storage_path + target + '-' + commit_id + '-' + sanitizer
+            source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)
 
             if os.path.exists(source_dir):
                 pass
@@ -502,8 +502,8 @@ if __name__ == "__main__":
     if not storage_path:
         logger.error("Environment variable 'STORAGE_PATH' is not set. Run source setenv.sh first. Exiting.")
         exit(1)
-    target_storage_path = storage_path + target + '/'
-        
+    target_storage_path = os.path.join(storage_path, target)
+    
     repo_path = args.repo
     bug_path = args.bug
     poc_list, lastest_commit = get_pocs(bug_path)
