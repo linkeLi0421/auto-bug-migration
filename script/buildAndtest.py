@@ -191,7 +191,9 @@ def do_bug_build(target_path, bug_path, commit_id):
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
     subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8')
     for sanitizer in sanitizers:
-        if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)):
+        if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer))) > 3:
+            # build finish here
+            logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer}")
             return
 
         os.chdir(oss_fuzz_path)
@@ -483,7 +485,7 @@ def checkout_latest_commit(repo_path):
     
 
 if __name__ == "__main__":
-    # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/usr/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/usr/log/c-blosc2_test_log
+    # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
     parser = argparse.ArgumentParser()
     parser.add_argument("--bug", help="Path to the folder")
     parser.add_argument("--repo", help="Path to the repository")
