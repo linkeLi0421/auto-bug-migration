@@ -36,27 +36,46 @@ def main():
         for i in range(1, len(df)):
             prev_value = df.loc[i - 1, bug]
             curr_value = df.loc[i, bug]
-            # Check if the previous commit had "0|1" and the current one "1|1"
-            # Check if there's at least one "1|1" in the previous rows for this bug
-            previous_one_one = df.loc[:i-1, bug][df.loc[:i-1, bug] == "1|1"]
+            next_value = df.loc[i + 1, bug] if i + 1 < len(df) else None
             
-            if prev_value == "0|1" and curr_value == "1|1" and not previous_one_one.empty:
-                # Find the closest "1|1" commit to the base commit in previous rows
-                closest_index = previous_one_one.index[-1]
-                results[bug] = {
+            if prev_value == "1|1" and curr_value == "0|1":
+                if next_value == "1|1":
+                    # two bug mode, two buggy commits traces can help fuzzing
+                    if bug not in results:
+                        results[bug] = []
+                    results[bug].append({
+                        "base": df.loc[i, "commit"][:6],
+                        "buggy1": df.loc[i-1, "commit"][:6],
+                        "buggy2": df.loc[i+1, "commit"][:6]
+                    })
+                else:
+                    if bug not in results:
+                        results[bug] = []
+                    results[bug].append({
+                        "base": df.loc[i, "commit"][:6],
+                        "buggy": df.loc[i-1, "commit"][:6],
+                    })
+            elif prev_value == "0|1" and curr_value == "1|1":
+                if bug not in results:
+                    results[bug] = []
+                results[bug].append({
                     "base": df.loc[i-1, "commit"][:6],
-                    "buggy1": df.loc[i, "commit"][:6],
-                    "buggy2": df.loc[closest_index, "commit"][:6]
-                }
-                # Once the border is found, break out of this bug's loop.
-                break
+                    "buggy": df.loc[i, "commit"][:6],
+                })
     # Extract the base filename from the input file path
     input_filename = os.path.basename(args.file)
     output_filename = os.path.splitext(input_filename)[0] + '_results.json'
     
     # Write the results to a JSON file
+    formatted_results = {}
+    for bug, infos in results.items():
+        for index, info in enumerate(infos):
+            formatted_info = {"id": bug}
+            formatted_info.update(info)
+            formatted_results[f"{bug}-{index}"] = formatted_info
+    
     with open(output_filename, 'w') as f:
-        json.dump(results, indent=4, fp=f)
+        json.dump(formatted_results, f, indent=4)
     
     print(f"Results written to {output_filename}")
 
