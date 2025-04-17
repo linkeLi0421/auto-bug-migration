@@ -37,6 +37,7 @@ def main():
             prev_value = df.loc[i - 1, bug]
             curr_value = df.loc[i, bug]
             next_value = df.loc[i + 1, bug] if i + 1 < len(df) else None
+            prev_prev_value = df.loc[i - 2, bug] if i - 2 >= 0 else None
             
             if prev_value == "1|1" and curr_value == "0|1":
                 if next_value == "1|1":
@@ -55,7 +56,7 @@ def main():
                         "base": df.loc[i, "commit"][:6],
                         "buggy": df.loc[i-1, "commit"][:6],
                     })
-            elif prev_value == "0|1" and curr_value == "1|1":
+            elif prev_value == "0|1" and curr_value == "1|1" and prev_prev_value != "1|1":
                 if bug not in results:
                     results[bug] = []
                 results[bug].append({
