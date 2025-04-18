@@ -1,0 +1,16 @@
+*.json
+*/build/
+/.vscode/
+*.pyc
+/build/
+*~
+.DS_Store
+*.swp
+.venv
+.gdb_history
+
+# IntelliJ IDEA
+/.idea
+**/*.iml
+*.json
+llvm_build_dirs
