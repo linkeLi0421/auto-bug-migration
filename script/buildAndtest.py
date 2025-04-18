@@ -171,6 +171,19 @@ def do_bug_build(target_path, bug_path, commit_id):
     '''
     Run helper.py build_image and build_fuzzers
     ''' 
+    oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id)
+    os.chdir(oss_fuzz_path)
+    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
+    subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], encoding='utf-8')
+    
+    target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
+    # Replace '--depth=1' in the Dockerfile
+    with open(target_dockerfile_path, 'r') as dockerfile:
+        dockerfile_content = dockerfile.read()
+    updated_content = dockerfile_content.replace('--depth 1', '')
+    updated_content = updated_content.replace('--depth=1', '')
+    with open(target_dockerfile_path, 'w') as dockerfile:
+        dockerfile.write(updated_content)
     
     json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
     sanitizers = set()
@@ -198,7 +211,7 @@ def do_bug_build(target_path, bug_path, commit_id):
 
         os.chdir(oss_fuzz_path)
         cmd = [
-            "python3", "infra/helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+            "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
             target
         ]
 
@@ -422,11 +435,15 @@ def get_next_commits(repo_path, target_commit_hash, num_commits=10):
     
     # Get all commits after the target commit (exclusive)
     # Using 'target_commit_hash..HEAD' to specify the commit range
-    commits = list(repo.iter_commits(f"{target_commit_hash}..HEAD"))
+    is_ancestor = repo.git.merge_base('--is-ancestor', target_commit_hash, 'HEAD', with_exceptions=False)
+    if is_ancestor != 0:
+        commits = list(repo.iter_commits(f"{target_commit_hash}..HEAD"))
+    else:
+        return target_commit_hash
     
     # Reverse to get chronological order (oldest first)
     commits.reverse()
-    
+
     # Return the first 'num_commits' commits
     return commits[num_commits] if num_commits < len(commits) else commits[-1]
 
@@ -463,26 +480,51 @@ def checkout_latest_commit(repo_path):
         RuntimeError: If checkout fails
         InvalidGitRepositoryError: If path is not a valid repo
     """
-    try:
-        # Open repository
-        repo = git.Repo(repo_path)
-        
-        # Ensure we have latest remote data
-        if 'origin' in repo.remotes:
-            repo.remotes.origin.fetch()
-        
-        # Get default branch name (e.g., 'main', 'master')
-        default_branch = repo.remotes.origin.refs['HEAD'].ref.remote_head
-        
-        # Checkout default branch and reset to latest
-        repo.git.checkout(default_branch)
-        repo.git.reset('--hard', f'origin/{default_branch}')
-        
-        return repo.head.commit.hexsha
-        
-    except (GitCommandError, ValueError) as e:
-        raise RuntimeError(f"Failed to checkout latest commit: {str(e)}")
+    # Open repository
+    repo = git.Repo(repo_path)
+    repo.git.reset('--hard')
+    repo.git.clean('-fdx')
     
+    # Ensure we have latest remote data
+    if 'origin' in repo.remotes:
+        repo.remotes.origin.fetch()
+    
+    # Get default branch name (e.g., 'main', 'master')
+    default_branch = repo.remotes.origin.refs['HEAD'].ref.remote_head
+    
+    # Checkout default branch and reset to latest
+    repo.git.checkout(default_branch)
+    repo.git.reset('--hard', f'origin/{default_branch}')
+    
+    return repo.head.commit.hexsha
+
+def find_matching_commit(repo1_path: str,
+                         repo2_path: str,
+                         repo1_commit: str) -> str | None:
+    """
+    Given two local Git repos and a commit SHA in repo1, find the commit in
+    repo2 whose timestamp is the latest one on or before the timestamp of
+    repo1_commit.
+    """
+    # 1. Open repo1 and get the specified commit
+    repo1 = git.Repo(repo1_path)
+    commit1 = repo1.commit(repo1_commit)
+
+    # 2. Extract its committed_datetime
+    #    This is a timezone-aware datetime.datetime
+    commit_time: datetime = commit1.committed_datetime
+
+    # 3. Open repo2 and run `git log`
+    repo2 = git.Repo(repo2_path)
+    iso_time = commit_time.isoformat()
+    iso_tomorow = (commit_time + timedelta(days=1)).isoformat()
+    commits = list(repo2.iter_commits('--all', reverse=True))  # oldest to newest
+    for commit in commits:
+        commit_time = commit.committed_datetime.isoformat()
+        if commit_time > iso_tomorow:
+            return commit.hexsha
+    return commits[-1].hexsha
+
 
 if __name__ == "__main__":
     # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
@@ -495,7 +537,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     target = args.target
     current_file_path = os.path.dirname(os.path.abspath(__file__))
-    oss_fuzz_path = os.path.dirname(current_file_path)
+    oss_fuzz_path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
     log_path = os.getenv('LOG_PATH')
     if not log_path:
         logger.error("Environment variable 'LOG_PATH' is not set. Run source setenv.sh first. Exiting.")
@@ -510,37 +552,13 @@ if __name__ == "__main__":
     bug_path = args.bug
     poc_list, lastest_commit = get_pocs(bug_path)
     checkout_latest_commit(repo_path)
-    last_build_commit = get_next_commits(repo_path, lastest_commit, 20).hexsha
-    first_build_commit = get_nth_end_commitefore(repo_path, poc_list[0]['introduced_commit'], 20)
+    checkout_latest_commit(oss_fuzz_path)
     
-    target_dockerfile_path = f'{current_file_path}/../projects/{target}/Dockerfile'
-    # Replace '--depth=1' in the Dockerfile
-    with open(target_dockerfile_path, 'r') as dockerfile:
-        dockerfile_content = dockerfile.read()
-    updated_content = dockerfile_content.replace('--depth 1', '')
-    updated_content = updated_content.replace('--depth=1', '')
-    with open(target_dockerfile_path, 'w') as dockerfile:
-        dockerfile.write(updated_content)
-    logger.info(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
-    
-    do_stat = False
-    if do_stat:
-        # Do summary statistics
-        start_time, end_time, max_poc_num = find_max_valid_period(poc_list)
-        logger.info(f"Time period with most valid POCs: {start_time} to {end_time}, {max_poc_num} POCs are valid.")
-        logger.info(end_time - start_time)
-        pocs_work = find_pocs_in_time_period(poc_list, start_time, end_time)
-        os.chdir(repo_path)
-        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
-        subprocess.run(["git", "checkout", '-f', last_build_commit], encoding='utf-8')
-
-        repo = git.Repo(repo_path)
-        hot_commits = list(repo.iter_commits(since=start_time, until=end_time))
-        hot_commits = set([commit.hexsha for commit in hot_commits])
-
+    first_build_commit = poc_list[0]['introduced_commit']
+    last_build_commit = lastest_commit
 
     commits = get_commits_between(repo_path, first_build_commit, last_build_commit)
-    logger.info(f'from {first_build_commit} to {last_build_commit}')
+    logger.info(f'from {commits[0]} to {commits[-1]}')
     logger.info(len(commits))
 
     if args.mode in ["build", "both"]:
