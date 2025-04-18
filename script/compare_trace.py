@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description="Compare traces from two files.")
     parser.add_argument("file1", help="Path to the first trace file")
     parser.add_argument("file2", help="Path to the second trace file")
-    parser.add_argument("--twobuggy", action="store_true", help="Enable two buggy mode, false means one buggy one base commit trace to compare")
+    parser.add_argument("--two_bug_mode", action="store_true", help="Enable two buggy mode, false means one buggy one base commit trace to compare")
     args = parser.parse_args()
 
     trace1 = extract_function_calls(args.file1)
@@ -37,7 +37,7 @@ def main():
     remaining_funcs2 = {func for _, func in remaining_trace2}
     common_funcs = remaining_funcs1.intersection(remaining_funcs2)
 
-    if args.twobuggy:
+    if args.two_bug_mode:
         for func in common_funcs:
             print(f"fun:{func}")
         if len(common_funcs) == 0:

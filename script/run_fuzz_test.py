@@ -24,19 +24,26 @@ def run_fuzz_test(args):
     bug_data = read_json_file(args.target_bugs)
     bug_info_dataset = read_json_file(args.bug_info)
     current_file_path = os.path.dirname(os.path.abspath(__file__))
+    ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
     
-    for bug_id, commits in bug_data.items():
-        base_commit = commits['base']
-        buggy_commit1 = commits['buggy1']
-        buggy_commit2 = commits['buggy2']
-        
+    for test_id, bug_info in bug_data.items():
+        two_bug_mode = False
+        bug_id = bug_info['id']
+        base_commit = bug_info['base']
+        if 'buggy' in bug_info:
+            buggy_commit = bug_info['buggy']
+        else:
+            buggy_commit1 = bug_info.get('buggy1')
+            buggy_commit2 = bug_info.get('buggy2')
+            two_bug_mode = True
+
         bug_info = bug_info_dataset[bug_id]
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         
         # Run the command to get the dictionary for the target
-        get_dict_cmd = ['python3', 'infra/helper.py', 'get_dict', target]
+        get_dict_cmd = ['python3', f'{current_file_path}/fuzz_helper.py', 'get_dict', target, '--commit', base_commit]
 
         # Print the command being executed
         print("Running command:", " ".join(get_dict_cmd))
@@ -48,30 +55,38 @@ def run_fuzz_test(args):
         except subprocess.CalledProcessError as e:
             print(f"Failed to retrieve dictionary for target: {target} with exit code {e.returncode}")
         
-        target_dockerfile_path = f'{current_file_path}/../projects/{target}/Dockerfile'
+        target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
         
         updated_content = dockerfile_content.replace('--depth 1', '')
-        updated_content = updated_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/builder')
         
         with open(target_dockerfile_path, 'w') as dockerfile:
             dockerfile.write(updated_content)
         print(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
 
         # Build the command
-        cmd = ['python3', 'infra/helper.py', 'collect_trace']
+        cmd = ['python3', f'{current_file_path}/fuzz_helper.py', 'collect_trace']
     
         cmd.extend(['--sanitizer', sanitizer])
     
         cmd.extend(['--base_commit', base_commit])
     
-        cmd.extend(['--buggy_commit1', buggy_commit1])
-        
-        cmd.extend(['--buggy_commit2', buggy_commit2])
+        if two_bug_mode:
+            cmd.extend(['--buggy_commit1', buggy_commit1])
+            cmd.extend(['--buggy_commit2', buggy_commit2])
+            cmd.extend(['--two_bug_mode'])
+        else:
+            cmd.extend(['--buggy_commit1', buggy_commit])
+            cmd.extend(['--buggy_commit2', base_commit])
     
-        cmd.extend(['--allowlist', '/home/yun/tmp_corpus'])
+        testcases_env = os.getenv('TESTCASES', '')
+        if testcases_env:
+            cmd.extend(['--testcases', testcases_env])
+        else:
+            print("TESTCASES environment variable not set. Exiting.")
+            exit(1)
     
         cmd.extend(['--test_input', 'testcase-' + bug_id])
     
