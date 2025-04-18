@@ -56,11 +56,12 @@ def get_commit_timestamp(repo_path, commit_hash):
     return commit_timestamp
 
 
-def get_pocs(folder_path):
-    # Initialize an empty list to store all the POC data, return the lastest commit also
-    poc = []
-    lastest_commit = None
-    latsest_time = None
+def git_first_last_commit(folder_path):
+    # Initialize variables to store the oldest introduced and newest fixed commits
+    oldest_introduced_commit = None
+    newest_fixed_commit = None
+    oldest_time = None
+    newest_time = None
 
     # Use glob to search for all bug_info.json files recursively in subdirectories
     json_files = glob.glob(os.path.join(folder_path, '**', 'bug_info.json'), recursive=True)
@@ -69,31 +70,23 @@ def get_pocs(folder_path):
     for file in json_files:
         with open(file, 'r') as f:
             data = json.load(f)
-            
+
             # Extract information for each bug in the JSON data
             for bug_id, bug_info in data.items():
-                bug_data = {
-                    "poc_name": bug_id,
-                    "introduced_commit": bug_info["introduced"],
-                    "fixed_commit": bug_info["fixed"]
-                }
-                
-
-                # Get the timestamp for both introduced and fixed commits
                 introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
                 fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
-                if latsest_time == None or fixed_timestamp > latsest_time:
-                    lastest_commit = bug_info["fixed"]
-                    latsest_time = introduced_timestamp
 
-                # Add timestamps to the data structure
-                bug_data["introduced_timestamp"] = introduced_timestamp
-                bug_data["fixed_timestamp"] = fixed_timestamp
-                # Append the extracted data to the poc list
-                poc.append(bug_data)
+                # Update the oldest introduced commit
+                if oldest_time is None or introduced_timestamp < oldest_time:
+                    oldest_introduced_commit = bug_info["introduced"]
+                    oldest_time = introduced_timestamp
 
-    sorted_poc = sorted(poc, key=lambda x: x["introduced_timestamp"])
-    return sorted_poc, lastest_commit
+                # Update the newest fixed commit
+                if newest_time is None or fixed_timestamp > newest_time:
+                    newest_fixed_commit = bug_info["fixed"]
+                    newest_time = fixed_timestamp
+
+    return oldest_introduced_commit, newest_fixed_commit
 
 
 def find_max_valid_period(pocs):
@@ -550,11 +543,11 @@ if __name__ == "__main__":
     
     repo_path = args.repo
     bug_path = args.bug
-    poc_list, lastest_commit = get_pocs(bug_path)
+    newest_commit, lastest_commit = git_first_last_commit(bug_path)
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
-    first_build_commit = poc_list[0]['introduced_commit']
+    first_build_commit = newest_commit
     last_build_commit = lastest_commit
 
     commits = get_commits_between(repo_path, first_build_commit, last_build_commit)
