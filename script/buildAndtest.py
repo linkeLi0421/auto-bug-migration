@@ -172,6 +172,9 @@ def do_bug_build(target_path, bug_path, commit_id, month=1):
     
     target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
     # Replace '--depth=1' in the Dockerfile
+    if not os.path.exists(target_dockerfile_path):
+        logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
+        return do_bug_build(target_path, bug_path, commit_id, month+1)
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
@@ -213,7 +216,7 @@ def do_bug_build(target_path, bug_path, commit_id, month=1):
         result = subprocess.run(cmd, capture_output=True, text=True)
         if "Building fuzzers failed" in result.stderr or "Docker build failed" in result.stderr:
             logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}, will try newer oss-fuzz again.")
-            return do_bug_build(target_path, bug_path, commit_id, month=2)
+            return do_bug_build(target_path, bug_path, commit_id, month+1)
         else:
             # Create directory for storing output files if it doesn't exist
             os.makedirs(target_storage_path, exist_ok=True)
@@ -486,6 +489,7 @@ def checkout_latest_commit(repo_path):
     # Checkout default branch and reset to latest
     repo.git.checkout(default_branch)
     repo.git.reset('--hard', f'origin/{default_branch}')
+    logger.info(f'Checked out latest commit of {repo.head.commit.hexsha} in {repo_path}')
     
     return repo.head.commit.hexsha
 
