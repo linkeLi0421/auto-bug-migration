@@ -160,14 +160,15 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
     return valid_pocs
 
 
-def do_bug_build(target_path, bug_path, commit_id):
+def do_bug_build(target_path, bug_path, commit_id, month=1):
     '''
     Run helper.py build_image and build_fuzzers
     ''' 
-    oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id)
+    oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id, month)
     os.chdir(oss_fuzz_path)
-    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
-    subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], encoding='utf-8')
+    subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
+    subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
+    logger.info(f"Building {target} with oss-fuzz in commit {oss_fuzz_commit}")
     
     target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
     # Replace '--depth=1' in the Dockerfile
@@ -210,12 +211,9 @@ def do_bug_build(target_path, bug_path, commit_id):
 
         logger.info(' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
-        if "Building fuzzers failed" in result.stdout.lower() or "Building fuzzers failed" in result.stderr.lower():
-            logger.info(result.stdout)
-            logger.info(result.stderr)
-            logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}")
-            row = [target, commit_id, sanitizer]
-            writer.writerow(row)
+        if "Building fuzzers failed" in result.stderr or "Docker build failed" in result.stderr:
+            logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}, will try newer oss-fuzz again.")
+            return do_bug_build(target_path, bug_path, commit_id, month=2)
         else:
             # Create directory for storing output files if it doesn't exist
             os.makedirs(target_storage_path, exist_ok=True)
@@ -493,7 +491,8 @@ def checkout_latest_commit(repo_path):
 
 def find_matching_commit(repo1_path: str,
                          repo2_path: str,
-                         repo1_commit: str) -> str | None:
+                         repo1_commit: str,
+                         mon: int) -> str | None:
     """
     Given two local Git repos and a commit SHA in repo1, find the commit in
     repo2 whose timestamp is the latest one on or before the timestamp of
@@ -510,11 +509,11 @@ def find_matching_commit(repo1_path: str,
     # 3. Open repo2 and run `git log`
     repo2 = git.Repo(repo2_path)
     iso_time = commit_time.isoformat()
-    iso_tomorow = (commit_time + timedelta(days=1)).isoformat()
+    iso_next = (commit_time + timedelta(days=30*mon)).isoformat()
     commits = list(repo2.iter_commits('--all', reverse=True))  # oldest to newest
     for commit in commits:
         commit_time = commit.committed_datetime.isoformat()
-        if commit_time > iso_tomorow:
+        if commit_time > iso_next:
             return commit.hexsha
     return commits[-1].hexsha
 
