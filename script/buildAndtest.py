@@ -407,8 +407,7 @@ def get_commits_between(repo_path, start_commit, end_commit):
             logger.info(f"start commit {start_commit} is not ancestor of End commit {end_commit}! Use commits that timestamp between them instead.")
             return get_commits_by_time_window(repo_path, start_commit, end_commit)
 
-    # Get commits in reverse chronological order (newest first)
-    rev_list = repo.iter_commits(f"{start.hexsha}..{end.hexsha}")
+    rev_list = repo.iter_commits(f"{start.hexsha}^...{end.hexsha}")
 
     # Reverse to get chronological order (oldest first)
     commits = list(rev_list)[::-1]
