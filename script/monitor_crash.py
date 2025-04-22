@@ -24,7 +24,7 @@ def analyze_crash_file(crash_file, target_crashes_dir):
     try:
         # Run the fuzzer with the crash file as input (without -ignore_crashes)
         cmd = [
-            f"/out/{args.fuzzer}",
+            f"/data/{args.fuzzer}",
             "-runs=1",  # Run exactly once
             crash_file
         ]
@@ -168,7 +168,7 @@ def main(timeout_hours=12):
         "-use_value_profile=1",
         "-print_final_stats=1",
         "-print_corpus_stats=1",
-        "-dict=/out/fuzz.dict"
+        "-dict=/data/fuzz.dict"
     ]
     print(' '.join(fuzzer_cmd))
     # Event to signal threads to stop
@@ -178,6 +178,7 @@ def main(timeout_hours=12):
     timeout_seconds = timeout_hours * 60 * 60
     start_time = time.time()
     
+    process = None
     try:
         # Start the fuzzer
         process = subprocess.Popen(
@@ -219,7 +220,7 @@ def main(timeout_hours=12):
             if time.time() - start_time > timeout_seconds:
                 print(f"\n[!] Timeout of {timeout_hours} hour reached. Stopping fuzzer...")
                 stop_event.set()
-                break
+                return 1
             time.sleep(0.5)
         
         # If stop_event is set but process is still running, terminate it
@@ -233,7 +234,7 @@ def main(timeout_hours=12):
     
     finally:
         # Make sure the fuzzer is terminated
-        if process.poll() is None:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=5)
@@ -249,20 +250,9 @@ def main(timeout_hours=12):
         print(f"\n[+] Fuzzer ran for {runtime_minutes:.2f} minutes")
         print(f"[+] Crash inputs are in: {artifacts_dir}")
         print(f"[+] Target crashes are in: {target_crashes_dir}")
-        # # Move crash inputs to /out directory
-        # out_crash_dir = Path("/out/crash_inputs")
-        # out_crash_dir.mkdir(exist_ok=True)
-        # for crash_file in artifacts_dir.glob("crash-*"):
-        #     dest_file = out_crash_dir / crash_file.name
-        #     try:
-        #         shutil.copy2(crash_file, dest_file)
-        #         print(f"  - Moved {crash_file.name}")
-        #     except Exception as e:
-        #         print(f"  - Failed to move {crash_file.name}: {e}")
-        # print(f"[+] All crash inputs moved to: {out_crash_dir}")
         
         # Move target crashes to /out directory
-        out_target_dir = Path("/out/target_crashes")
+        out_target_dir = Path("/data/target_crashes")
         out_target_dir.mkdir(exist_ok=True)
         for target_file in target_crashes_dir.glob("*"):
             dest_file = out_target_dir / target_file.name
@@ -273,6 +263,7 @@ def main(timeout_hours=12):
                 print(f"  - Failed to move target crash {target_file.name}: {e}")
         print(f"[+] All target crashes moved to: {out_target_dir}")
         print("[*] Note: These directories were not deleted for your analysis.")
+        return 0
 
 if __name__ == "__main__":
     # Parse command-line arguments
@@ -299,7 +290,9 @@ if __name__ == "__main__":
     for i in range(runs):
         print(f"Run {i+1}/{runs}")
         start_time = time.time()
-        main()
+        if main():
+            # if timeout, don't run it again
+            exit(0)
         run_time = time.time() - start_time
         runtime_list.append(run_time)
         print(f"Run {i+1} completed in {run_time:.2f} seconds")

@@ -1782,6 +1782,30 @@ def shell(args):
   return True
 
 
+def clean(args, out_dir):
+  logger.info('Cleaning existing build artifacts.')
+
+  # Clean old and possibly conflicting artifacts in project's out directory.
+  docker_run([
+      '-v', f'{out_dir}:/out', '-t', f'gcr.io/oss-fuzz/{args.project.name}',
+      '/bin/bash', '-c', 'rm -rf /out/*'
+  ],
+              architecture=args.architecture)
+
+  docker_run([
+      '-v',
+      '%s:/work' % args.project.work, '-t',
+      'gcr.io/oss-fuzz/%s' % args.project.name, '/bin/bash', '-c', 'rm -rf /work/*'
+  ],
+              architecture=args.architecture)
+  if not os.listdir(out_dir):
+      logger.info('Out directory is empty. Deleting the folder.')
+      shutil.rmtree(out_dir)
+  if not os.listdir(args.project.work):
+      logger.info('Work directory is empty. Deleting the folder.')
+      shutil.rmtree(args.project.work)
+
+
 def build_version(args):
   """Build in a specific commit."""
   if not build_image_impl(args.project):
@@ -1822,6 +1846,7 @@ def build_version(args):
       'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
       '-c', 'cd /src/%s && git checkout -f %s && cd - && compile' %(args.project.name, args.commit)
   ])
+  clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   return True
 
@@ -1838,14 +1863,14 @@ def get_crash_log_bash(commit:str, args):
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
     
     compile &> /dev/null;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /out/target_crash-{commit}-{args.test_input}.txt;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit}-{args.test_input}.txt;
   '''
   return bash_crash
 
 
 def get_trace_log_bash(commit:str, args):
   bash_trace = f'''
-    cd /llvm/build && make install -j$(nproc) && cd -;
+    cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
     [ -d "/Function_instrument/build" ] && rm -rf /Function_instrument/build
     mkdir /Function_instrument/build
     
@@ -1860,8 +1885,8 @@ def get_trace_log_bash(commit:str, args):
     cd -;
     
     # Compile and collect trace
-    compile;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /out/target_trace-{commit}-{args.test_input}.txt; 
+    compile &> /dev/null;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_trace-{commit}-{args.test_input}.txt; 
   '''
   return bash_trace
 
@@ -1869,38 +1894,41 @@ def get_trace_log_bash(commit:str, args):
 def get_allowlist_bash(args):
   if args.two_bug_mode:
     bash_allowlist = f'''
-      python3 /script/read_func_trace.py /out/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /out/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-      python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{args.test_input}.txt /out/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
     '''
   else:
     bash_allowlist = f'''
-      python3 /script/read_func_trace.py /out/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /out/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-      python3 /script/compare_trace.py /out/target_trace-{args.buggy_commit1}-{args.test_input}.txt /out/target_trace-{args.buggy_commit2}-{args.test_input}.txt > /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
     '''
   return bash_allowlist
 
 
 def get_runfuzzer_bash(args, allowlist_type):
   if allowlist_type == 'full':
-    allowlist_cmd = f'cp /out/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'diff':
-    allowlist_cmd = f'cp /out/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'noselect':
-    allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > allowlist.txt;'
+    allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > /allowlist.txt;'
   bash_runfuzzer = f'''
     # Fuzz with base commit
     mkdir -p /tmpfolder; 
-    cp /corpus/{test_input} /tmpfolder/;
+    cp /corpus/{args.test_input} /tmpfolder/;
     
+    cd /src/{args.project.name};
     git checkout -f {args.base_commit}; 
+    cd -;
     {allowlist_cmd}
     
-    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
-    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/src/{args.project.name}/allowlist.txt";
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
     
     compile &> /dev/null;
-    python3 /script/monitor_crash.py /out/target_crash-{args.buggy_commit1}-{args.buggy_commit2}-{test_input}.txt {args.fuzzer_name} &> /work/{test_input}-fuzzlog; 
+    python3 /script/monitor_crash.py /data/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/{args.test_input}-fuzzlog; 
   '''
+  return bash_runfuzzer
 
 
 def build_llvm_from_source():
@@ -1983,7 +2011,11 @@ def collect_trace(args):
   script_folder = os.path.join(HOME_DIR, 'script')
   Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
   LLVM_PROEJCT = os.path.join(HOME_DIR, 'llvm-project')
+  result_dir = os.path.join(HOME_DIR, 'data')
   run_fuzzer_args = run_args.copy()
+  
+  if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
   
   if not os.path.exists(LLVM_PROEJCT):
     os.makedirs(LLVM_PROEJCT)
@@ -1996,50 +2028,60 @@ def collect_trace(args):
       '-v', f'{script_folder}:/script', 
       '-v', f'{Function_instrument}:/Function_instrument', 
       '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{result_dir}:/data',
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', build_llvm_from_source()
     ])
     
     docker_run(llvm_builder, architecture=args.architecture)
 
-  # Prepare part. 
-  # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
-  run_args.extend([
-      '-v', f'{out_dir}:/out', 
-      '-v', f'{args.project.work}:/work', 
-      '-v', f'{script_folder}:/script', 
-      '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROEJCT}:/llvm',
-      '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
-  ])
-  docker_run(run_args, architecture=args.architecture)
-
-  run_args.pop()
-  run_args.extend([get_trace_log_bash(args.buggy_commit1, args)])
-  docker_run(run_args, architecture=args.architecture)
-  
-  run_args.pop()
-  run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
-  docker_run(run_args, architecture=args.architecture)
-
-  # # Fuzzing part
-  # run_fuzzer_args.extend([
+  # # Prepare part. 
+  # # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
+  # run_args.extend([
   #     '-v', f'{out_dir}:/out', 
   #     '-v', f'{args.project.work}:/work', 
   #     '-v', f'{script_folder}:/script', 
+  #     '-v', f'{Function_instrument}:/Function_instrument', 
+  #     '-v', f'{LLVM_PROEJCT}:/llvm',
+  #     '-v', f'{result_dir}:/data',
   #     '-t', f'gcr.io/{image_project}/{args.project.name}', 
-  #     '/bin/bash', '-c', get_runfuzzer_bash(args, 'diff')
+  #     '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
   # ])
+  # clean(args, out_dir)
+  # docker_run(run_args, architecture=args.architecture)
+
+  # run_args.pop()
+  # run_args.extend([get_trace_log_bash(args.buggy_commit1, args)])
+  # clean(args, out_dir)
   # docker_run(run_args, architecture=args.architecture)
   
   # run_args.pop()
-  # run_fuzzer_args.extend([get_runfuzzer_bash(args, 'full')])
+  # run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
+  # clean(args, out_dir)
   # docker_run(run_args, architecture=args.architecture)
+
+  # Fuzzing part
+  run_fuzzer_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument',
+      '-v', f'{result_dir}:/data',
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', get_runfuzzer_bash(args, 'diff')
+  ])
+  clean(args, out_dir)
+  docker_run(run_fuzzer_args, architecture=args.architecture)
   
-  # run_args.pop()
-  # run_fuzzer_args.extend([get_runfuzzer_bash(args, 'noselect')])
-  # docker_run(run_args, architecture=args.architecture)
+  run_args.pop()
+  run_fuzzer_args.extend([get_runfuzzer_bash(args, 'full')])
+  clean(args, out_dir)
+  docker_run(run_fuzzer_args, architecture=args.architecture)
+  
+  run_args.pop()
+  run_fuzzer_args.extend([get_runfuzzer_bash(args, 'noselect')])
+  clean(args, out_dir)
+  docker_run(run_fuzzer_args, architecture=args.architecture)
   
   return True
 
@@ -2056,7 +2098,7 @@ def get_dict(args):
       'HELPER=True',
       'CC=afl-clang-fast',
       'CXX=afl-clang-fast++',
-      'AFL_LLVM_DICT2FILE=/out/fuzz.dict'
+      'AFL_LLVM_DICT2FILE=/data/fuzz.dict'
   ]
 
   if args.project.name != 'base-runner-debug':
@@ -2071,6 +2113,10 @@ def get_dict(args):
   else:
     image_project = 'oss-fuzz'
     out_dir = args.project.out
+
+  result_dir = os.path.join(HOME_DIR, 'data')
+  if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
 
   run_args = _env_to_docker_args(env)
   if args.source_path:
@@ -2090,6 +2136,7 @@ def get_dict(args):
       '-v',
       '%s:/out' % out_dir, '-v',
       '%s:/work' % args.project.work, '-t',
+      '-v', f'{result_dir}:/data',
       'gcr.io/%s/%s' % (image_project, args.project.name),
       '/bin/bash', '-c', bash_getdict
   ])
