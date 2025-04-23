@@ -423,10 +423,11 @@ def get_commits_between(repo_path, start_commit, end_commit):
             logger.info(f"start commit {start_commit} is not ancestor of End commit {end_commit}! Use commits that timestamp between them instead.")
             return get_commits_by_time_window(repo_path, start_commit, end_commit)
 
-    rev_list = repo.iter_commits(f"{start.hexsha}^...{end.hexsha}")
+    rev_list = repo.iter_commits(f"{start.hexsha}..{end.hexsha}", ancestry_path=True)
 
     # Reverse to get chronological order (oldest first)
     commits = list(rev_list)[::-1]
+    commits.insert(0, start)
 
     return [c.hexsha for c in commits]
 
@@ -561,11 +562,11 @@ if __name__ == "__main__":
     
     repo_path = args.repo
     bug_path = args.bug
-    newest_commit, lastest_commit = git_first_last_commit(bug_path)
+    first_commit, lastest_commit = git_first_last_commit(bug_path)
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
-    first_build_commit = newest_commit
+    first_build_commit = first_commit
     last_build_commit = lastest_commit
 
     commits = get_commits_between(repo_path, first_build_commit, last_build_commit)
