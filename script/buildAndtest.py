@@ -160,11 +160,15 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
     return valid_pocs
 
 
-def do_bug_build(target_path, bug_path, commit_id, month=1):
+def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     '''
     Run helper.py build_image and build_fuzzers
     ''' 
     oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id, month)
+    if not oss_fuzz_commit:
+        # commit timestamp add month is newer than Head in oss-fuzz, so we can't find a version of oss-fuzz to build
+        return "No appropriate version os oss-fuzz, stop try newer. Try build next version of target project"
+        
     os.chdir(oss_fuzz_path)
     subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
     subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
@@ -174,7 +178,7 @@ def do_bug_build(target_path, bug_path, commit_id, month=1):
     # Replace '--depth=1' in the Dockerfile
     if not os.path.exists(target_dockerfile_path):
         logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
-        return do_bug_build(target_path, bug_path, commit_id, month+1)
+        return do_bug_build(target_path, bug_path, commit_id, month+1, build_writer)
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
@@ -208,15 +212,33 @@ def do_bug_build(target_path, bug_path, commit_id, month=1):
 
         logger.info(' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
-        if "Building fuzzers failed" in result.stderr or "Docker build failed" in result.stderr:
+        if any(error_pattern in result.stderr for error_pattern in [
+            "Building fuzzers failed",
+            "Docker build failed",
+            "clang++: error:",
+            "g++: error:",
+            "cmake: error:",
+            "fatal error:",
+            "undefined reference to",
+            "cannot find -l",
+            "No such file or directory",
+            "error: command",
+            "error: 'struct",
+            "error: conflicting types",
+            "error: invalid conversion",
+            "make: *** [Makefile:",
+            "ninja: build stopped:",
+            "Compilation failed",
+            "failed with exit status"
+        ]) or result.returncode != 0:
             logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}, will try newer oss-fuzz again.")
-            return do_bug_build(target_path, bug_path, commit_id, month+1)
+            return do_bug_build(target_path, bug_path, commit_id, month+1, build_writer)
         else:
             # Create directory for storing output files if it doesn't exist
             os.makedirs(target_storage_path, exist_ok=True)
             subprocess.run(["mv", "-T", oss_fuzz_path + "/build/out/" + target, os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)], encoding='utf-8')
-    csv_file.close()
 
+    build_writer.writerow([target, commit_id, oss_fuzz_commit])
 
 def is_second_day_or_greater(t1, t2):
     # Start of the second day (midnight of t1's date + 1 day)
@@ -264,6 +286,7 @@ def do_bug_test(target_path, bug_path, commit_id, writer):
             fuzzing_engine = bug_info['reproduce']['fuzzing_engine']
             fuzz_target = bug_info['reproduce']['fuzz_target']
             sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
+            crash_type = bug_info['reproduce']['crash_type']
 
             bug_exist = is_ancestor(repo_path, commit_id, bug_info["introduced"])\
               and is_ancestor(repo_path, bug_info["fixed"], commit_id) and commit_id != bug_info["fixed"]  
@@ -297,7 +320,7 @@ def do_bug_test(target_path, bug_path, commit_id, writer):
             logger.info(' '.join(cmd))
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                if 'Sanitizer' in result.stdout or 'Sanitizer' in result.stderr:
+                if 'Sanitizer'.lower() in result.stderr.lower() and crash_type.lower() in result.stderr.lower():
                     # poc works
                     if bug_exist:
                         row.append('1|1')
@@ -511,7 +534,7 @@ def find_matching_commit(repo1_path: str,
         commit_time = commit.committed_datetime.isoformat()
         if commit_time > iso_next:
             return commit.hexsha
-    return commits[-1].hexsha
+    return False
 
 
 if __name__ == "__main__":
@@ -550,8 +573,19 @@ if __name__ == "__main__":
     logger.info(len(commits))
 
     if args.mode in ["build", "both"]:
-        for commit in commits:  # from latest to old
-            do_bug_build(repo_path, bug_path, commit)
+        # Save build information to CSV
+        build_csv_path = os.path.join(log_path, f"{target}_builds.csv")
+        build_file_exists = os.path.exists(build_csv_path)
+        
+        with open(build_csv_path, mode='w', newline='') as build_csv_file:
+            build_writer = csv.writer(build_csv_file)
+            
+            # Write header if file doesn't exist
+            if not build_file_exists:
+                build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit'])
+            for commit in commits:  # from latest to old
+                do_bug_build(repo_path, bug_path, commit, 1, build_writer)
+        
     
     if args.mode in ["test", "both"]:
         test_csv_file_path = os.path.join(log_path, target + '.csv')
