@@ -32,6 +32,7 @@ import tempfile
 
 import constants
 import templates
+from buildAndtest import checkout_latest_commit
 
 OSS_FUZZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
 BUILD_DIR = os.path.join(OSS_FUZZ_DIR, 'build')
@@ -521,6 +522,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             nargs='?')
   get_dict_parser.add_argument('--commit',
                             help='commit hash to checkout in the builder')
+  get_dict_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
   _add_architecture_args(get_dict_parser)
   _add_engine_args(get_dict_parser)
   _add_sanitizer_args(get_dict_parser)
@@ -564,6 +567,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   collect_trace_parser.add_argument('--two_bug_mode',
                             action='store_true',
                             help='Specify if there are two buggy commits to analyze. False means buggy_commit2==base_commit and is not buggy')
+  collect_trace_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
   _add_architecture_args(collect_trace_parser)
   _add_engine_args(collect_trace_parser)
   _add_sanitizer_args(collect_trace_parser)
@@ -1861,6 +1866,7 @@ def get_crash_log_bash(commit:str, args):
     cd -;
     export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
+    /bin/bash;
     
     compile &> /dev/null;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit}-{args.test_input}.txt;
@@ -1963,6 +1969,22 @@ def build_llvm_from_source():
   return bash_commands
 
 
+def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
+  """Prepares the repository by checking out to the specific commit and modifying the Dockerfile."""
+  checkout_latest_commit(oss_fuzz_dir)
+  os.chdir(oss_fuzz_dir)
+  subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
+  subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
+  target_dockerfile_path = f'{oss_fuzz_dir}/projects/{target}/Dockerfile'
+  # Replace '--depth=1' in the Dockerfile
+  with open(target_dockerfile_path, 'r') as dockerfile:
+      dockerfile_content = dockerfile.read()
+  updated_content = dockerfile_content.replace('--depth 1', '')
+  updated_content = updated_content.replace('--depth=1', '')
+  with open(target_dockerfile_path, 'w') as dockerfile:
+      dockerfile.write(updated_content)
+
+
 def collect_trace(args):
   """collect execution trace"""
   if not build_image_impl(args.project):
@@ -2014,6 +2036,32 @@ def collect_trace(args):
   result_dir = os.path.join(HOME_DIR, 'data')
   run_fuzzer_args = run_args.copy()
   
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+        
+        if args.buggy_commit1 in target_commit or target_commit in args.buggy_commit1:
+          logger.info('Found matching commit for buggy_commit1 in CSV: %s -> %s', 
+          args.buggy_commit1, oss_fuzz_commit)
+          oss_fuzz_commit1 = oss_fuzz_commit
+          
+        if args.buggy_commit2 in target_commit or target_commit in args.buggy_commit2:
+          logger.info('Found matching commit for buggy_commit2 in CSV: %s -> %s', 
+          args.buggy_commit2, oss_fuzz_commit)
+          oss_fuzz_commit2 = oss_fuzz_commit
+          
+        if args.base_commit in target_commit or target_commit in args.base_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+          args.base_commit, oss_fuzz_commit)
+          oss_fuzz_commit_base = oss_fuzz_commit
+  
   if not os.path.exists(result_dir):
     os.makedirs(result_dir)
   
@@ -2048,6 +2096,7 @@ def collect_trace(args):
       '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
   ])
   clean(args, out_dir)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name)
   docker_run(run_args, architecture=args.architecture)
 
   run_args.pop()
@@ -2056,6 +2105,7 @@ def collect_trace(args):
   docker_run(run_args, architecture=args.architecture)
   
   run_args.pop()
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name)
   run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
   clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
@@ -2071,6 +2121,7 @@ def collect_trace(args):
       '/bin/bash', '-c', get_runfuzzer_bash(args, 'diff')
   ])
   clean(args, out_dir)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
   docker_run(run_fuzzer_args, architecture=args.architecture)
   
   run_args.pop()
@@ -2107,6 +2158,22 @@ def get_dict(args):
   if args.e:
     env += args.e
 
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+                args.commit, oss_fuzz_commit)
+          oss_fuzz_commit = oss_fuzz_commit
+
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
     out_dir = _get_out_dir()
@@ -2140,6 +2207,7 @@ def get_dict(args):
       'gcr.io/%s/%s' % (image_project, args.project.name),
       '/bin/bash', '-c', bash_getdict
   ])
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   docker_run(run_args, architecture=args.architecture)
   return True
 

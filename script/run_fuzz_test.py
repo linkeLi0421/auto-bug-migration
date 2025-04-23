@@ -4,6 +4,9 @@ import sys
 import json
 import os
 import signal
+from buildAndtest import checkout_latest_commit
+
+py3 = "/home/user/pyenv/venv/bin/python3"
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run fuzzing tests with trace collection')
@@ -11,6 +14,8 @@ def parse_arguments():
                         help='JSON config file containing commit and test input info')
     parser.add_argument('--bug_info', required=False,
                         help='JSON config all bug info details')
+    parser.add_argument('--build_csv', required=False,
+                        help='this file contains a target project commit id and corresponding commit id')
     return parser.parse_args()
 
 def read_json_file(file_path):
@@ -26,6 +31,7 @@ def run_fuzz_test(args):
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
     
+    checkout_latest_commit(ossfuzz_path)
     for test_id, bug_info in bug_data.items():
         two_bug_mode = False
         bug_id = bug_info['id']
@@ -42,8 +48,20 @@ def run_fuzz_test(args):
         target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         
+        target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
+        print(target_dockerfile_path)
+        # Replace '--depth=1' in the Dockerfile
+        with open(target_dockerfile_path, 'r') as dockerfile:
+            dockerfile_content = dockerfile.read()
+        
+        dockerfile_content = dockerfile_content.replace('--depth 1', '')
+        updated_content = dockerfile_content.replace('--depth=1', '')
+        
+        with open(target_dockerfile_path, 'w') as dockerfile:
+            dockerfile.write(updated_content)
+        
         # Run the command to get the dictionary for the target
-        get_dict_cmd = ['python3', f'{current_file_path}/fuzz_helper.py', 'get_dict', target, '--commit', base_commit]
+        get_dict_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_dict', target, '--commit', base_commit, '--build_csv', args.build_csv]
 
         # Print the command being executed
         print("Running command:", " ".join(get_dict_cmd))
@@ -54,20 +72,20 @@ def run_fuzz_test(args):
             print(f"Successfully retrieved dictionary for target: {target}")
         except subprocess.CalledProcessError as e:
             print(f"Failed to retrieve dictionary for target: {target} with exit code {e.returncode}")
-        
+        return
         target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
         
-        updated_content = dockerfile_content.replace('--depth 1', '')
+        dockerfile_content = dockerfile_content.replace('--depth 1', '')
+        updated_content = dockerfile_content.replace('--depth=1', '')
         
         with open(target_dockerfile_path, 'w') as dockerfile:
             dockerfile.write(updated_content)
-        print(f"Updated Dockerfile for {target_dockerfile_path} to remove --depth 1")
 
         # Build the command
-        cmd = ['python3', f'{current_file_path}/fuzz_helper.py', 'collect_trace']
+        cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace']
     
         cmd.extend(['--sanitizer', sanitizer])
     
@@ -88,6 +106,8 @@ def run_fuzz_test(args):
             print("TESTCASES environment variable not set. Exiting.")
             exit(1)
     
+        cmd.extend(['--build_csv', args.build_csv])
+    
         cmd.extend(['--test_input', 'testcase-' + bug_id])
     
         cmd.extend(['-e', 'ASAN_OPTIONS=detect_leaks=0'])
@@ -105,15 +125,15 @@ def run_fuzz_test(args):
         except subprocess.CalledProcessError as e:
             print(f"Command failed with exit code {e.returncode}")
         
-        def restore_dockerfile(signal_received, frame):
-            with open(target_dockerfile_path, 'w') as dockerfile:
-                dockerfile.write(dockerfile_content)
-            print(f"Restored original Dockerfile for {target_dockerfile_path}")
-            sys.exit(0)
+        # def restore_dockerfile(signal_received, frame):
+        #     with open(target_dockerfile_path, 'w') as dockerfile:
+        #         dockerfile.write(dockerfile_content)
+        #     print(f"Restored original Dockerfile for {target_dockerfile_path}")
+        #     sys.exit(0)
 
         # Register signal handlers to restore Dockerfile on termination
-        signal.signal(signal.SIGINT, restore_dockerfile)  # Handle Ctrl+C
-        signal.signal(signal.SIGTERM, restore_dockerfile)  # Handle termination signals
+        # signal.signal(signal.SIGINT, restore_dockerfile)  # Handle Ctrl+C
+        # signal.signal(signal.SIGTERM, restore_dockerfile)  # Handle termination signals
 
 if __name__ == "__main__":
     args = parse_arguments()
