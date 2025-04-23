@@ -292,7 +292,7 @@ if __name__ == "__main__":
         start_time = time.time()
         if main():
             # if timeout, don't run it again
-            exit(0)
+            break
         run_time = time.time() - start_time
         runtime_list.append(run_time)
         print(f"Run {i+1} completed in {run_time:.2f} seconds")
