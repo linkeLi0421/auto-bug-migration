@@ -184,12 +184,6 @@ def do_bug_build(target_path, bug_path, commit_id, month=1):
     
     json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
     sanitizers = set()
-    csv_file_path = os.path.join(log_path, target + '_fail_to_build.csv')
-    csv_file = open(csv_file_path, mode='a', newline='')
-    writer = csv.writer(csv_file)
-    write_header = not os.path.exists(csv_file_path) or os.stat(csv_file_path).st_size == 0
-    if write_header:
-        writer.writerow(["Target", "Commit ID", "Sanitizer"])
     
     for json_file_path in json_files:
         with open(json_file_path) as f:
@@ -246,7 +240,7 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     else:
         return False
 
-def do_bug_test(target_path, bug_path, commit_id, writer, commit_trigger_count):
+def do_bug_test(target_path, bug_path, commit_id, writer):
     '''
     Run helper.py reproduce
     '''
@@ -309,7 +303,6 @@ def do_bug_test(target_path, bug_path, commit_id, writer, commit_trigger_count):
                         row.append('1|1')
                     else:
                         row.append('1|0')
-                    commit_trigger_count[commit_id] += 1
                 else:
                     # poc doesn't work
                     if bug_exist:
@@ -561,7 +554,6 @@ if __name__ == "__main__":
             do_bug_build(repo_path, bug_path, commit)
     
     if args.mode in ["test", "both"]:
-        commit_trigger_count = {commit: 0 for commit in commits}
         test_csv_file_path = os.path.join(log_path, target + '.csv')
         test_csv_file = open(test_csv_file_path, mode='w', newline='')
         test_writer = csv.writer(test_csv_file)
@@ -579,13 +571,5 @@ if __name__ == "__main__":
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            do_bug_test(repo_path, bug_path, commit, test_writer, commit_trigger_count)
+            do_bug_test(repo_path, bug_path, commit, test_writer)
         test_csv_file.close()
-        
-        # Save commit_trigger_count to a new CSV file
-        commit_trigger_csv_file_path = os.path.join(log_path, target + '_commit_trigger_count.csv')
-        with open(commit_trigger_csv_file_path, mode='w', newline='') as commit_trigger_csv_file:
-            commit_trigger_writer = csv.writer(commit_trigger_csv_file)
-            commit_trigger_writer.writerow(['commit id', 'trigger count', 'commit time'])  # Write the header
-            for commit_id, trigger_count in commit_trigger_count.items():
-                commit_trigger_writer.writerow([commit_id, trigger_count, get_commit_timestamp(repo_path, commit_id)])
