@@ -2035,30 +2035,30 @@ def collect_trace(args):
     
     docker_run(llvm_builder, architecture=args.architecture)
 
-  # # Prepare part. 
-  # # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
-  # run_args.extend([
-  #     '-v', f'{out_dir}:/out', 
-  #     '-v', f'{args.project.work}:/work', 
-  #     '-v', f'{script_folder}:/script', 
-  #     '-v', f'{Function_instrument}:/Function_instrument', 
-  #     '-v', f'{LLVM_PROEJCT}:/llvm',
-  #     '-v', f'{result_dir}:/data',
-  #     '-t', f'gcr.io/{image_project}/{args.project.name}', 
-  #     '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
-  # ])
-  # clean(args, out_dir)
-  # docker_run(run_args, architecture=args.architecture)
+  # Prepare part. 
+  # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
+  run_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
+      '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{result_dir}:/data',
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
+  ])
+  clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
 
-  # run_args.pop()
-  # run_args.extend([get_trace_log_bash(args.buggy_commit1, args)])
-  # clean(args, out_dir)
-  # docker_run(run_args, architecture=args.architecture)
+  run_args.pop()
+  run_args.extend([get_trace_log_bash(args.buggy_commit1, args)])
+  clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
   
-  # run_args.pop()
-  # run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
-  # clean(args, out_dir)
-  # docker_run(run_args, architecture=args.architecture)
+  run_args.pop()
+  run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
+  clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
 
   # Fuzzing part
   run_fuzzer_args.extend([
