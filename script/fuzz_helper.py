@@ -32,7 +32,6 @@ import tempfile
 
 import constants
 import templates
-from buildAndtest import checkout_latest_commit
 
 OSS_FUZZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
 BUILD_DIR = os.path.join(OSS_FUZZ_DIR, 'build')
@@ -1971,7 +1970,6 @@ def build_llvm_from_source():
 
 def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
   """Prepares the repository by checking out to the specific commit and modifying the Dockerfile."""
-  checkout_latest_commit(oss_fuzz_dir)
   os.chdir(oss_fuzz_dir)
   subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
   subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
