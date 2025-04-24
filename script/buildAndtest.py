@@ -262,13 +262,10 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     else:
         return False
 
-def do_bug_test(target_path, bug_path, commit_id, writer):
+def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
     '''
     Run helper.py reproduce
     '''
-    os.chdir(oss_fuzz_path)
-    json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
-
     commit_time = get_commit_timestamp(target_path, commit_id)
     
     row = [commit_id]
@@ -592,8 +589,9 @@ if __name__ == "__main__":
         test_writer = csv.writer(test_csv_file)
 
         json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
+        sorted_json_files = sorted(json_files)
         csv_header = ['commit id']
-        for json_file_path in json_files:
+        for json_file_path in sorted_json_files:
             dir_path = os.path.dirname(json_file_path)
             testcases_folder_path = os.path.join(dir_path, "testcases")
             with open(json_file_path) as f:
@@ -604,5 +602,5 @@ if __name__ == "__main__":
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            do_bug_test(repo_path, bug_path, commit, test_writer)
+            do_bug_test(repo_path, bug_path, commit, test_writer, sorted_json_files)
         test_csv_file.close()
