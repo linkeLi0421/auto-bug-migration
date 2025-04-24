@@ -178,7 +178,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     # Replace '--depth=1' in the Dockerfile
     if not os.path.exists(target_dockerfile_path):
         logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
-        return do_bug_build(target_path, bug_path, commit_id, month+1, build_writer)
+        return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
@@ -232,7 +232,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
             "failed with exit status"
         ]) or result.returncode != 0:
             logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}, will try newer oss-fuzz again.")
-            return do_bug_build(target_path, bug_path, commit_id, month+1, build_writer)
+            return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
         else:
             # Create directory for storing output files if it doesn't exist
             os.makedirs(target_storage_path, exist_ok=True)
