@@ -1880,8 +1880,8 @@ def get_trace_log_bash(commit:str, args):
     
     cd /Function_instrument/build && cmake .. && make clean && make && cd -;
     
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
+    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
