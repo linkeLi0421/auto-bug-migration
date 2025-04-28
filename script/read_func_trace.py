@@ -19,11 +19,7 @@ def read_func_trace(file_path):
             for line in f:
                 if "Entering function:" in line:
                     function_name = line.split("Entering function:")[1].strip()
-                    if "LLVMFuzzerTestOneInput" in function_name:
-                        seen_llvm_inputoutput = True
-                        continue
-                    if seen_llvm_inputoutput:
-                        function_names.add(function_name)
+                    function_names.add(function_name)
         
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found")
