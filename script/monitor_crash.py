@@ -24,7 +24,7 @@ def analyze_crash_file(crash_file, target_crashes_dir):
     try:
         # Run the fuzzer with the crash file as input (without -ignore_crashes)
         cmd = [
-            f"/data/{args.fuzzer}",
+            f"/out/{args.fuzzer}",
             "-runs=1",  # Run exactly once
             crash_file
         ]
@@ -125,7 +125,7 @@ def extract_function_stack(file_path):
 
     with open(file_path, 'r') as f:
         for line in f:
-            if 'LLVMFuzzerTestOneInput' in line:
+            if 'in LLVMFuzzerTestOneInput' in line:
                 break
             if re.search(r"#\d+", line):
                 function_name = ''.join(line.split(' ')[7:-1])
@@ -220,7 +220,6 @@ def main(timeout_hours=12):
             if time.time() - start_time > timeout_seconds:
                 print(f"\n[!] Timeout of {timeout_hours} hour reached. Stopping fuzzer...")
                 stop_event.set()
-                return 1
             time.sleep(0.5)
         
         # If stop_event is set but process is still running, terminate it
@@ -263,7 +262,6 @@ def main(timeout_hours=12):
                 print(f"  - Failed to move target crash {target_file.name}: {e}")
         print(f"[+] All target crashes moved to: {out_target_dir}")
         print("[*] Note: These directories were not deleted for your analysis.")
-        return 0
 
 if __name__ == "__main__":
     # Parse command-line arguments
@@ -290,10 +288,11 @@ if __name__ == "__main__":
     for i in range(runs):
         print(f"Run {i+1}/{runs}")
         start_time = time.time()
-        if main():
-            # if timeout, don't run it again
-            break
+        main()
         run_time = time.time() - start_time
+        if run_time > 43200:
+            print("Time limit reached. Stopping runs.")
+            break
         runtime_list.append(run_time)
         print(f"Run {i+1} completed in {run_time:.2f} seconds")
         # Clean up files in /tmpfolder/ except testcase files

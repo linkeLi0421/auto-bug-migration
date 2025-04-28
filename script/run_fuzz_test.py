@@ -72,7 +72,7 @@ def run_fuzz_test(args):
             print(f"Successfully retrieved dictionary for target: {target}")
         except subprocess.CalledProcessError as e:
             print(f"Failed to retrieve dictionary for target: {target} with exit code {e.returncode}")
-        return
+
         target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:

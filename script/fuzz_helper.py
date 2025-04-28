@@ -1865,7 +1865,6 @@ def get_crash_log_bash(commit:str, args):
     cd -;
     export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
-    /bin/bash;
     
     compile &> /dev/null;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit}-{args.test_input}.txt;
@@ -1931,7 +1930,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
     
     compile &> /dev/null;
-    python3 /script/monitor_crash.py /data/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/{args.test_input}-fuzzlog; 
+    python3 /script/monitor_crash.py /data/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/{args.test_input}-{allowlist_type}-fuzzlog; 
   '''
   return bash_runfuzzer
 
@@ -1973,6 +1972,7 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
   os.chdir(oss_fuzz_dir)
   subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
   subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
+  logger.info('Checked out OSS-FUZZ to commit %s', oss_fuzz_commit)
   target_dockerfile_path = f'{oss_fuzz_dir}/projects/{target}/Dockerfile'
   # Replace '--depth=1' in the Dockerfile
   with open(target_dockerfile_path, 'r') as dockerfile:
@@ -2120,14 +2120,24 @@ def collect_trace(args):
   ])
   clean(args, out_dir)
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
-  docker_run(run_fuzzer_args, architecture=args.architecture)
+  allowlist_path = f'{result_dir}/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt'
+  # Check if allowlist only contains "src:*"
+  with open(allowlist_path, 'r') as f:
+    content = f.read().strip()
+    if 'fun:' in content:
+      docker_run(run_fuzzer_args, architecture=args.architecture)
   
-  run_args.pop()
+  run_fuzzer_args.pop()
   run_fuzzer_args.extend([get_runfuzzer_bash(args, 'full')])
   clean(args, out_dir)
-  docker_run(run_fuzzer_args, architecture=args.architecture)
+  allowlist_path = f'{result_dir}/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt'
+  # Check if allowlist only contains "src:*"
+  with open(allowlist_path, 'r') as f:
+    content = f.read().strip()
+    if 'fun:' in content:
+      docker_run(run_fuzzer_args, architecture=args.architecture)
   
-  run_args.pop()
+  run_fuzzer_args.pop()
   run_fuzzer_args.extend([get_runfuzzer_bash(args, 'noselect')])
   clean(args, out_dir)
   docker_run(run_fuzzer_args, architecture=args.architecture)
