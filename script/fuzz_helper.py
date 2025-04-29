@@ -1897,10 +1897,23 @@ def get_trace_log_bash(commit:str, args):
 
 def get_allowlist_bash(args):
   if args.two_bug_mode:
-    bash_allowlist = f'''
-    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
-    '''
+    try:
+      with open(f"/data/target_trace-{args.buggy_commit1}-{args.test_input}.txt", 'r') as f:
+      trace1 = f.read()
+      with open(f"/data/target_trace-{args.buggy_commit2}-{args.test_input}.txt", 'r') as f:
+      trace2 = f.read()
+    except Exception as e:
+      logger.error(f"Error reading trace files: {str(e)}")
+    if trace1 == trace2:
+      bash_allowlist = f'''
+      python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+      python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.base_commit}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-{args.base_commit}-{args.test_input}.txt;
+      '''
+    else:
+      bash_allowlist = f'''
+      python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+      python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+      '''
   else:
     bash_allowlist = f'''
     python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
@@ -2102,6 +2115,13 @@ def collect_trace(args):
   clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   
+  if args.base_commit != args.buggy_commit2:
+    run_args.pop()
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
+    run_args.extend([get_trace_log_bash(args.base_commit, args)])
+    clean(args, out_dir)
+    docker_run(run_args, architecture=args.architecture)
+
   run_args.pop()
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name)
   run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
