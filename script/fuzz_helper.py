@@ -1899,9 +1899,9 @@ def get_allowlist_bash(args):
   if args.two_bug_mode:
     try:
       with open(f"/data/target_trace-{args.buggy_commit1}-{args.test_input}.txt", 'r') as f:
-      trace1 = f.read()
+        trace1 = f.read()
       with open(f"/data/target_trace-{args.buggy_commit2}-{args.test_input}.txt", 'r') as f:
-      trace2 = f.read()
+        trace2 = f.read()
     except Exception as e:
       logger.error(f"Error reading trace files: {str(e)}")
     if trace1 == trace2:
