@@ -84,6 +84,13 @@ def crash_analyzer_thread(target_crashes_dir, stop_event):
         try:
             # Get a crash file from the queue with timeout
             crash_file = crash_queue.get(timeout=1)
+            # Also copy the crash to /data for persistence
+            try:
+                data_crash_file = Path("/data/all_crashes") / os.path.basename(crash_file)
+                shutil.copy2(crash_file, data_crash_file)
+                print(f"[+] Crash also copied to: {data_crash_file}")
+            except Exception as e:
+                print(f"[-] Failed to copy crash to /data/all_crashes: {e}")
             
             # Analyze the crash
             if analyze_crash_file(crash_file, target_crashes_dir):
@@ -138,6 +145,9 @@ def check_stack_trace(log_file):
     
     # Check if the stack matches the reference stack
     print('current_stack: ', current_stack)
+    with open(log_file, 'r') as f:
+        for line in f:
+            print(line)
     if len(current_stack) >= len(REFERENCE_STACK):
         for i in range(len(current_stack) - len(REFERENCE_STACK) + 1):
             if current_stack[i:i+len(REFERENCE_STACK)] == REFERENCE_STACK:
