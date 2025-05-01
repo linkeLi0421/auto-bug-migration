@@ -125,11 +125,11 @@ def extract_function_stack(file_path):
 
     with open(file_path, 'r') as f:
         for line in f:
-            if 'in LLVMFuzzerTestOneInput' in line:
-                break
             if re.search(r"#\d+", line):
                 function_name = ''.join(line.split(' ')[7:-1])
                 stack.append(function_name)
+            if 'in LLVMFuzzerTestOneInput' in line:
+                break
     return stack
 
 def check_stack_trace(log_file):
