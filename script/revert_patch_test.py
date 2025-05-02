@@ -674,7 +674,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch , target
     ]
 
-    logger.debug(' '.join(cmd))
+    logger.info(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Check for build errors
@@ -1779,6 +1779,9 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
+        if bug_id != 'OSV-2021-997':
+            continue
+        next_commit['commit_id'] = '07a76d'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
         next_commit['commit_id'] = next_commit['commit_id'][:6]  # use short commit id for trace file name
         bug_info = bug_info_dataset[bug_id]
@@ -2094,6 +2097,7 @@ def revert_patch_test(args):
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys())
 
             for file_path in path_set:
+                logger.info(f'Processing file {file_path} for enum/macro/function declaration patch')
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
