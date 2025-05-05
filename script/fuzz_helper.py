@@ -1930,7 +1930,6 @@ def get_runfuzzer_bash(args, allowlist_type):
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
     
     compile &> /dev/null;
-    /bin/bash;
     python3 /script/monitor_crash.py /data/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/{args.test_input}-{allowlist_type}-fuzzlog; 
   '''
   return bash_runfuzzer

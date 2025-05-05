@@ -145,9 +145,6 @@ def check_stack_trace(log_file):
     
     # Check if the stack matches the reference stack
     print('current_stack: ', current_stack)
-    with open(log_file, 'r') as f:
-        for line in f:
-            print(line)
     if len(current_stack) >= len(REFERENCE_STACK):
         for i in range(len(current_stack) - len(REFERENCE_STACK) + 1):
             if current_stack[i:i+len(REFERENCE_STACK)] == REFERENCE_STACK:
