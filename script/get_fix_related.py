@@ -50,13 +50,22 @@ def main():
     parser = argparse.ArgumentParser(description="Compare traces from two files.")
     parser.add_argument("file1", help="Path to the first trace file")
     parser.add_argument("file2", help="Path to the second trace file")
+    parser.add_argument("--file3", help="Path to the optional third trace file", default=None)
     args = parser.parse_args()
     
     trace1 = extract_function_calls(args.file1)
     trace2 = extract_function_calls(args.file2)
+    if args.file3:
+        trace3 = extract_function_calls(args.file3)
 
     common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
-    common_funcs = {func for _, func in common_part}
+    common_funcs12 = {func for _, func in common_part}
+    
+    if args.file3:
+        common_part, remaining_trace1, remaining_trace3 = compare_traces(trace1, trace3)
+        common_funcs = {func for _, func in common_part if func in common_funcs12}
+    else:
+        common_funcs = common_funcs12
         
     for func in common_funcs:
         print_func_name(func)
