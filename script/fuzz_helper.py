@@ -248,6 +248,8 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = get_dict(args)
   elif args.command == 'build_version':
     result = build_version(args)
+  elif args.command == 'fuzz_one':
+    result = fuzz_one(args)
   elif args.command == 'collect_trace':
     result = collect_trace(args)
   elif args.command == 'pull_images':
@@ -529,6 +531,29 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_environment_args(get_dict_parser)
   _add_external_project_args(get_dict_parser)
 
+  collect_trace_parser = subparsers.add_parser(
+      'collect_trace', help='get trace file for a project at a commit')
+  collect_trace_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  collect_trace_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  collect_trace_parser.add_argument('fuzzer_name',
+                            help='name of the fuzzer')
+  collect_trace_parser.add_argument('--commit',
+                            help='commit hash to checkout in the builder')
+  collect_trace_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
+  collect_trace_parser.add_argument('--testcases',
+                            help='path to store testcases')
+  collect_trace_parser.add_argument('--test_input',
+                            help='test_input name')
+  _add_architecture_args(collect_trace_parser)
+  _add_engine_args(collect_trace_parser)
+  _add_sanitizer_args(collect_trace_parser)
+  _add_environment_args(collect_trace_parser)
+  _add_external_project_args(collect_trace_parser)
+
   build_version_parser = subparsers.add_parser(
       'build_version', help='Run /bin/bash within the builder container.')
   build_version_parser.add_argument('project',
@@ -544,35 +569,35 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_environment_args(build_version_parser)
   _add_external_project_args(build_version_parser)
 
-  collect_trace_parser = subparsers.add_parser(
-      'collect_trace', help='Collect trace for a specific version with a specific input.')
-  collect_trace_parser.add_argument('project',
+  fuzz_one_parser = subparsers.add_parser(
+      'fuzz_one', help='Collect trace for a specific version with a specific input.')
+  fuzz_one_parser.add_argument('project',
                             help='name of the project or path (external)')
-  collect_trace_parser.add_argument('source_path',
+  fuzz_one_parser.add_argument('source_path',
                             help='path of local source',
                             nargs='?')
-  collect_trace_parser.add_argument('fuzzer_name',
+  fuzz_one_parser.add_argument('fuzzer_name',
                             help='name of the fuzzer')
-  collect_trace_parser.add_argument('--buggy_commit1',
+  fuzz_one_parser.add_argument('--buggy_commit1',
                             help='commit hash 1 to collect bug trace')
-  collect_trace_parser.add_argument('--buggy_commit2',
+  fuzz_one_parser.add_argument('--buggy_commit2',
                             help='commit hash 2 to collect bug trace')
-  collect_trace_parser.add_argument('--base_commit',
+  fuzz_one_parser.add_argument('--base_commit',
                             help='commit hash to migrate bug')
-  collect_trace_parser.add_argument('--testcases',
+  fuzz_one_parser.add_argument('--testcases',
                             help='path to store testcases')
-  collect_trace_parser.add_argument('--test_input',
+  fuzz_one_parser.add_argument('--test_input',
                             help='test_input name')
-  collect_trace_parser.add_argument('--two_bug_mode',
+  fuzz_one_parser.add_argument('--two_bug_mode',
                             action='store_true',
                             help='Specify if there are two buggy commits to analyze. False means buggy_commit2==base_commit and is not buggy')
-  collect_trace_parser.add_argument('--build_csv',
+  fuzz_one_parser.add_argument('--build_csv',
                             help='this file contains a target project commit id and corresponding commit id')
-  _add_architecture_args(collect_trace_parser)
-  _add_engine_args(collect_trace_parser)
-  _add_sanitizer_args(collect_trace_parser)
-  _add_environment_args(collect_trace_parser)
-  _add_external_project_args(collect_trace_parser)
+  _add_architecture_args(fuzz_one_parser)
+  _add_engine_args(fuzz_one_parser)
+  _add_sanitizer_args(fuzz_one_parser)
+  _add_environment_args(fuzz_one_parser)
+  _add_external_project_args(fuzz_one_parser)
 
   run_clusterfuzzlite_parser = subparsers.add_parser(
       'run_clusterfuzzlite', help='Run ClusterFuzzLite on a project.')
@@ -1898,9 +1923,9 @@ def get_trace_log_bash(commit:str, args):
 def get_allowlist_bash(args):
   if args.two_bug_mode:
     bash_allowlist = f'''
-      python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-      python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
-      '''
+    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    '''
   else:
     bash_allowlist = f'''
     python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
@@ -1983,7 +2008,7 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
       dockerfile.write(updated_content)
 
 
-def collect_trace(args):
+def fuzz_one(args):
   """collect execution trace"""
   if not build_image_impl(args.project):
     return False
@@ -2223,6 +2248,81 @@ def get_dict(args):
       '/bin/bash', '-c', bash_getdict
   ])
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  docker_run(run_args, architecture=args.architecture)
+  return True
+
+
+def collect_trace(args):
+  """get traces about bug fix"""
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=' + args.engine,
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+                args.commit, oss_fuzz_commit)
+          oss_fuzz_commit = oss_fuzz_commit
+  else:
+    logger.error('Need a build_csv')
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+
+  result_dir = os.path.join(HOME_DIR, 'data')
+  if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
+
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  script_folder = os.path.join(HOME_DIR, 'script')
+  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
+  LLVM_PROEJCT = os.path.join(HOME_DIR, 'llvm-project')
+  result_dir = os.path.join(HOME_DIR, 'data')
+  
+  run_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
+      '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{result_dir}:/data',
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', get_trace_log_bash(args.commit, args)
+  ])
+  clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   return True
 

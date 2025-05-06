@@ -47,6 +47,7 @@ def print_func_name(func: str) -> None:
 
 
 def main():
+    # trace files => common funcs
     parser = argparse.ArgumentParser(description="Compare traces from two files.")
     parser.add_argument("file1", help="Path to the first trace file")
     parser.add_argument("file2", help="Path to the second trace file")
