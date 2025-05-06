@@ -2270,6 +2270,16 @@ def collect_trace(args):
   if args.e:
     env += args.e
 
+  testcases_path = _get_absolute_path(args.testcases)
+  if os.path.exists(testcases_path):
+    run_args.extend([
+        '-v',
+        '%s:/corpus' % testcases_path,
+    ])
+  else:
+    logger.error('Testcase path %s does not exist.', args.testcases)
+    return False
+
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
