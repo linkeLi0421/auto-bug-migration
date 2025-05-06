@@ -85,7 +85,7 @@ def run_fuzz_test(args):
             dockerfile.write(updated_content)
 
         # Build the command
-        cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace']
+        cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'fuzz_one']
     
         cmd.extend(['--sanitizer', sanitizer])
     
