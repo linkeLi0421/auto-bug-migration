@@ -121,7 +121,7 @@ def rever_patch_test(args):
             except subprocess.CalledProcessError as e:
                 print(f"Command failed with exit code {e.returncode}")
                 
-        if not os.path.exits(trace_path2):
+        if not os.path.exists(trace_path2):
             collect_trace_cmd[4] = next_commit['commit_id']
             # Print the command being executed
             print("Running command:", " ".join(collect_trace_cmd))
