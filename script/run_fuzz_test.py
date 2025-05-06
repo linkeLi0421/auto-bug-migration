@@ -3,7 +3,6 @@ import subprocess
 import sys
 import json
 import os
-import signal
 from buildAndtest import checkout_latest_commit
 
 py3 = "/home/user/pyenv/venv/bin/python3"
@@ -125,16 +124,8 @@ def run_fuzz_test(args):
         except subprocess.CalledProcessError as e:
             print(f"Command failed with exit code {e.returncode}")
         
-        # def restore_dockerfile(signal_received, frame):
-        #     with open(target_dockerfile_path, 'w') as dockerfile:
-        #         dockerfile.write(dockerfile_content)
-        #     print(f"Restored original Dockerfile for {target_dockerfile_path}")
-        #     sys.exit(0)
-
-        # Register signal handlers to restore Dockerfile on termination
-        # signal.signal(signal.SIGINT, restore_dockerfile)  # Handle Ctrl+C
-        # signal.signal(signal.SIGTERM, restore_dockerfile)  # Handle termination signals
 
 if __name__ == "__main__":
+    # python3 script/run_fuzz_test.py --target_bugs xx.json --bug_info merged_bugs.json --build_csv xx_builds.csv
     args = parse_arguments()
-    sys.exit(run_fuzz_test(args))
+    run_fuzz_test(args)
