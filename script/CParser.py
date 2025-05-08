@@ -1,0 +1,210 @@
+import os
+from tree_sitter import Language, Parser
+import tree_sitter_c as tsc
+import tree_sitter_cpp as tsp
+
+class CParser:
+    def __init__(self):
+        """Initialize the C/C++ parser with tree-sitter."""
+        # Create a parser
+        self.parser = Parser()
+        
+        self.C_LANGUAGE = Language(tsc.language())
+        self.CPP_LANGUAGE = Language(tsp.language())
+    
+    def parse_file(self, file_path, file_type='c'):
+        """
+        Parse a C/C++ file and return its syntax tree.
+        
+        Args:
+            file_path: Path to the source file
+            file_type: 'c' or 'cpp'
+            
+        Returns:
+            Tuple of (source_code, tree)
+        """
+        # Set appropriate language
+        if file_type.lower() in ('c', '.c', 'h', '.h'):
+            self.parser.language = self.C_LANGUAGE
+        else:  # cpp, cc, cxx, hpp, etc.
+            self.parser.language = self.CPP_LANGUAGE
+        
+        # Read and parse the file
+        with open(file_path, 'rb') as f:
+            source_code = f.read()
+        
+        tree = self.parser.parse(source_code)
+        return source_code, tree
+    
+    def find_context_at_position(self, source_code, tree, line, column):
+        """Find the context (function/class) at the specified position."""
+        # Find the specific node at the position
+        point = (line, column)
+        node = tree.root_node
+        
+        # Navigate to the most specific node containing the point
+        while True:
+            found_child = False
+            for child in node.children:
+                if (child.start_point[0] <= point[0] <= child.end_point[0] and
+                    ((child.start_point[0] < point[0]) or 
+                     (child.start_point[0] == point[0] and child.start_point[1] <= point[1])) and
+                    ((child.end_point[0] > point[0]) or 
+                     (child.end_point[0] == point[0] and child.end_point[1] >= point[1]))):
+                    node = child
+                    found_child = True
+                    break
+            if not found_child:
+                break
+                
+        # Find containing function or class/struct
+        return self._get_containing_context(node, source_code)
+    
+    def _get_containing_context(self, node, source_code):
+        """Get containing function or class/struct for a node."""
+        current = node
+        context = {
+            'function': None,
+            'class_or_struct': None
+        }
+        
+        # Walk up the tree to find containing contexts
+        while current:
+            # Check for function definition
+            if current.type == 'function_definition' and not context['function']:
+                context['function'] = self._extract_function_info(current, source_code)
+            
+            # Check for class/struct definition
+            if current.type in ('struct_specifier', 'class_specifier') and not context['class_or_struct']:
+                context['class_or_struct'] = self._extract_class_info(current, source_code)
+                
+            current = current.parent
+            
+        return context
+    
+    def _extract_function_info(self, node, source_code):
+        """Extract function signature and name from a function_definition node."""
+        # Get function body to determine where signature ends
+        body = node.child_by_field_name('body')
+        if not body:
+            return None
+            
+        # Extract the signature (everything before the body)
+        signature = source_code[node.start_byte:body.start_byte].decode('utf8').strip()
+        
+        # Find function name
+        declarator = node.child_by_field_name('declarator')
+        name = "unknown"
+        if declarator:
+            # Find identifier in declarator using recursive traversal
+            def find_identifier(node):
+                if node.type == 'identifier':
+                    return source_code[node.start_byte:node.end_byte].decode('utf8')
+                for child in node.children:
+                    found = find_identifier(child)
+                    if found:
+                        return found
+                return None
+                
+            found_name = find_identifier(declarator)
+            if found_name:
+                name = found_name
+        
+        return {
+            'name': name,
+            'signature': signature
+        }
+    
+    def _extract_class_info(self, node, source_code):
+        """Extract class/struct information from a class_specifier or struct_specifier node."""
+        type_name = 'class' if node.type == 'class_specifier' else 'struct'
+        
+        # Find name node
+        name = "anonymous"
+        for child in node.children:
+            if child.type == 'type_identifier':
+                name = source_code[child.start_byte:child.end_byte].decode('utf8')
+                break
+        
+        return {
+            'type': type_name,
+            'name': name
+        }
+
+    def iterate_code(self, file_path, file_type='c'):
+        """
+        Iterate through the code in a file and yield information about each context.
+        
+        Args:
+            file_path: Path to the file
+            file_type: 'c' or 'cpp'
+            
+        Yields:
+            Dict with context information for each significant node
+        """
+        source_code, tree = self.parse_file(file_path, file_type)
+        
+        # Query to find functions and struct/class definitions
+        query_str = """
+        (function_definition) @function
+        (struct_specifier) @struct
+        (class_specifier) @class
+        """
+        
+        language = self.C_LANGUAGE if file_type.lower() in ('c', '.c', 'h', '.h') else self.CPP_LANGUAGE
+        query = language.query(query_str)
+        captures = query.captures(tree.root_node)
+        for _, node_list in captures.items():
+            for node in node_list:
+                if node.type == 'function_definition':
+                    info = self._extract_function_info(node, source_code)
+                    yield {
+                        'type': 'function',
+                        'name': info['name'], 
+                        'signature': info['signature'],
+                        'code': source_code[node.start_byte:node.end_byte].decode('utf8'),
+                        'start_point': node.start_point,
+                        'end_point': node.end_point
+                    }
+                elif node.type in ('struct_specifier', 'class_specifier'):
+                    info = self._extract_class_info(node, source_code)
+                    yield {
+                        'type': info['type'],
+                        'name': info['name'],
+                        'code': source_code[node.start_byte:node.end_byte].decode('utf8'),
+                        'start_point': node.start_point,
+                        'end_point': node.end_point
+                    }
+
+
+def example_usage():
+    """Example demonstrating the usage of the CParser class."""
+    # Initialize the parser
+    parser = CParser()
+    
+    # Example 1: Parse a C file and get its syntax tree
+    file_path = "example.c"  # Replace with your C/C++ file path
+    source_code, tree = parser.parse_file(file_path, file_type='c')
+    print(f"Parsed {file_path}, tree has {len(tree.root_node.children)} top-level nodes")
+    
+    # Example 2: Find context at a specific position (line 10, column 5)
+    context = parser.find_context_at_position(source_code, tree, 10, 5)
+    if context['function']:
+        print(f"Position is in function: {context['function']['name']}")
+    if context['class_or_struct']:
+        print(f"Position is in {context['class_or_struct']['type']}: {context['class_or_struct']['name']}")
+    
+    # Example 3: Iterate through all functions and classes/structs
+    print("\nAll functions and classes/structs in the file:")
+    for item in parser.iterate_code(file_path, file_type='c'):
+        if item['type'] == 'function':
+            print(f"Function: {item['name']}")
+            print(f"Signature: {item['signature']}")
+        else:
+            print(f"{item['type'].capitalize()}: {item['name']}")
+        print(f"Location: Lines {item['start_point'][0]+1}-{item['end_point'][0]+1}")
+        print("---")
+
+# Example to run the parser
+if __name__ == "__main__":
+    example_usage()

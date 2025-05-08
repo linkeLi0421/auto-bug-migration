@@ -2333,6 +2333,7 @@ def collect_trace(args):
       '/bin/bash', '-c', get_trace_log_bash(args.commit, args)
   ])
   clean(args, out_dir)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   docker_run(run_args, architecture=args.architecture)
   return True
 

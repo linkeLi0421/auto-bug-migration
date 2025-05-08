@@ -197,14 +197,13 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
             sanitizers.add(sanitizer)
     os.chdir(target_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
-    subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8')
+    subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for sanitizer in sanitizers:
         if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer))) > 3:
             # build finish here
             logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer}")
             return
 
-        os.chdir(oss_fuzz_path)
         cmd = [
             "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
             target
@@ -502,7 +501,6 @@ def checkout_latest_commit(repo_path):
     # Checkout default branch and reset to latest
     repo.git.checkout(default_branch)
     repo.git.reset('--hard', f'origin/{default_branch}')
-    logger.info(f'Checked out latest commit of {repo.head.commit.hexsha} in {repo_path}')
     
     return repo.head.commit.hexsha
 
