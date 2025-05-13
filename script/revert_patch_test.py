@@ -30,46 +30,6 @@ current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
 
-def mangle_cpp_function(signature):
-    """
-    Mangles a C++ member function signature (Itanium ABI style).
-    Handles `void` return types and no parameters (simplified).
-    """
-    # Normalize whitespace and strip any leading/trailing spaces
-    signature = re.sub(r'\s+', ' ', signature).strip()
-    
-    parts = signature.split()
-    if len(parts) < 2 or "::" not in parts[1]:
-        return signature  # Not a valid member function
-    
-    return_type = parts[0]
-    class_func = parts[1].split("::")
-    class_name = class_func[0]
-    func_name = class_func[1].replace("()", "")  # Remove parentheses
-    
-    # Mangle class and function names (length-prefixed)
-    mangled_class = f"{len(class_name)}{class_name}"
-    mangled_func = f"{len(func_name)}{func_name}"
-    
-    # Mangled return type (simplified; only handles 'void')
-    return_code = "v" if return_type == "void" else ""
-    
-    # Full mangled name (e.g., _ZN7LibRaw10apply_tiffEv)
-    mangled = f"_ZN{mangled_class}{mangled_func}E{return_code}"
-    return mangled
-
-
-def mangle_string(input_str):
-    """Process a set of strings, mangling C++ function signatures."""
-    # Regex to match "void Class::Function()" as standalone strings
-    pattern = re.compile(r'^\s*\w+\s+\w+::\w+\(\)\s*$')
-    mangled_item = input_str
-    
-    if pattern.match(input_str.strip()):
-        mangled_item = mangle_cpp_function(input_str)
-    
-    return mangled_item
-
 
 def get_commit_patch_gitpython(repo_path, commit_id, parent_commit_id):
     repo = Repo(repo_path)
@@ -176,6 +136,9 @@ def analyze_diffindex(diff_index, target_repo_path: str, fix_commit: str):
             new_code = [line[1:] for line in body[0].splitlines() if line.startswith('+') and not line.startswith('+++')]
             parser = CParser()
             file_path = os.path.join(target_repo_path, path)
+            if not os.path.exists(file_path):
+                logger.info(f"File {file_path} does not exist, skipping parsing")
+                continue
             
             # checkout target repo to the fix commit, and parse the code from that
             os.chdir(target_repo_path)
@@ -187,6 +150,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, fix_commit: str):
                 # If all lines in new_code are in the function defination, save the function signature
                 if item['type'] == 'function' and all(code_line in item['code'] for code_line in new_code):
                     signature = item['signature']
+                    break
 
             header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
             header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
@@ -219,25 +183,13 @@ def revert_patch(repo_path: str, patch_text):
     os.remove(tmp_path)
 
 
-def build_and_test_fuzzer(target, commit_id, target_repo_path, sanitizer, bug_id, ossfuzz_path):
-    """
-    Build the fuzzer after patch reversion and test if it works
-    
-    Args:
-        target: The target project name
-        commit_id: The commit ID being tested
-        target_repo_path: Path to the target repo
-        sanitizer: The sanitizer to use (e.g., 'address', 'undefined')
-        bug_id: The bug ID being tested
-        ossfuzz_path: Path to the OSS-Fuzz directory
-    
-    Returns:
-        bool: True if the build succeeds, False otherwise
-    """
+def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer):
+    # build part
     cmd = [
-        "python3", f"{ossfuzz_path}/infra/helper.py", "build_fuzzers", '--clean',
-        target, target_repo_path, "--sanitizer", sanitizer
+        "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+        "--patch", patch_file_path, target
     ]
+
     logger.info(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     
@@ -262,7 +214,9 @@ def build_and_test_fuzzer(target, commit_id, target_repo_path, sanitizer, bug_id
         "failed with exit status"
     ]
     
-    if any(error_pattern in result.stderr or error_pattern in result.stdout 
+    # test part
+    fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
+    if not os.path.exists(fuzzer_path) and any(error_pattern in result.stderr or error_pattern in result.stdout 
             for error_pattern in build_error_patterns) or result.returncode != 0:
         logger.info(f"Build failed after patch reversion for bug {bug_id}")
         return False
@@ -289,6 +243,7 @@ def rever_patch_test(args):
         target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
+        bug_type = bug_info['reproduce']['crash_type']
         trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
         trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
         target_repo_path = os.path.join(repo_path, target)
@@ -347,15 +302,38 @@ def rever_patch_test(args):
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
         diffs = get_commit_patch_gitpython(target_repo_path, next_commit['commit_id'], commit['commit_id'])
         diff_results.extend(analyze_diffindex(diffs, target_repo_path, next_commit['commit_id']))
+
+        trace_func_set = set()
+        # checkout target repo to the bug commit, get function signature from source code using code location
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        trace_func_set = {func for _, func in common_part}
+        func_dict = dict()
+        for _, func in common_part: # may comsume a lot of time
+            if func in func_dict:
+                continue
+            func_loc = func.split(' ')[1]
+            file_path = os.path.join(target_repo_path, func_loc.split(':')[0])
+            line_num = func_loc.split(':')[1]
+            col_num = func_loc.split(':')[2]
+            parser = CParser()
+            if os.path.exists(file_path):
+                func_dict[func] = parser.function_signature(file_path, int(line_num), int(col_num), file_path.split('.')[-1])
+                trace_func_set.add(func_dict[func])
+            else:
+                trace_func_set.add(func.split(' ')[0])
+                
+        # checkout target repo to the bug commit, get function signature from source code using code location
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
         patch_to_apply = []
         for diff_result in diff_results:
-            if diff_result['file_type'] == 'cpp':
-                patch_func = mangle_string(diff_result['signature'])
-            else:
-                patch_func = diff_result['signature']
-            
+            patch_func = diff_result['signature']
+            logger.info(f'File Path: {diff_result["file_path"]}')
+            logger.info(f'Patch Function: {patch_func}')
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
@@ -363,19 +341,34 @@ def rever_patch_test(args):
                 logger.info(f'Function {demangle_cpp_symbol(patch_func)} in both bug and fix traces, revert patch related to it')
                 patch_to_apply.append(diff_result['patch_text'])
         
-        # patch reverting finish here, target repo has been set to fix commit in analyze_diffindex
-        for patch_text in patch_to_apply:
-            revert_patch(target_repo_path, patch_text)
+        patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+        
+        if not os.path.exists(patch_folder):
+            os.makedirs(patch_folder, exist_ok=True)
+        
+        # Save all patches to a single file
+        if patch_to_apply:
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_patches.diff")
+            with open(patch_file_path, 'w') as patch_file:
+                for patch in patch_to_apply:
+                    patch_file.write(patch)
+                    patch_file.write('\n\n')  # Add separator between patches
+        else:
+            logger.info(f"No relevant patches found to revert for bug {bug_id}")
         
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
-        build_success = build_and_test_fuzzer(target, next_commit['commit_id'], 
-                                                target_repo_path, sanitizer, bug_id, ossfuzz_path)
+        build_success = build_and_test_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer)
         if build_success:
             # Run the fuzzer to test if the bug is reproduced
             fuzzer_path = os.path.join(ossfuzz_path, "build/out", target, fuzzer)
             testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
-            test_result = subprocess.run([fuzzer_path, testcase_path], encoding='utf-8')
-            
+            test_result = subprocess.run([fuzzer_path, testcase_path], capture_output=True, text=True)
+            if bug_type.lower() in test_result.stdout or bug_type.lower() in test_result.stderr:
+                # trigger the bug
+                logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}")
+            else:
+                logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}")
+                logger.info(f"{test_result.stderr}")
         break
 
 

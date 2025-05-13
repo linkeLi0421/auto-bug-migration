@@ -145,19 +145,49 @@ class CParser:
         source_code, tree = self.parse_file(file_path, file_type)
         
         # Query to find functions and struct/class definitions
-        query_str = """
-        (function_definition) @function
-        (struct_specifier) @struct
-        (class_specifier) @class
-        """
+        # Determine appropriate query based on file content and extension
+        is_cpp = False
         
-        language = self.C_LANGUAGE if file_type.lower() in ('c', '.c', 'h', '.h') else self.CPP_LANGUAGE
-        query = language.query(query_str)
+        # If explicitly specified as cpp type, use cpp
+        if file_type.lower() not in ('c', '.c'):
+            is_cpp = True
+        # For header files, try to determine if it's C++ by looking for C++-specific keywords
+        elif file_type.lower() in ('h', '.h'):
+            # Check for C++ keywords in the file
+            cpp_indicators = [b'class ', b'namespace ', b'template', b'typename', b'::', b'std::']
+            for indicator in cpp_indicators:
+                if indicator in source_code:
+                    is_cpp = True
+                    break
+        
+        # Choose the appropriate query based on language determination
+        if is_cpp:
+            # C++ language query
+            query_str = """
+            (function_definition) @function
+            (struct_specifier) @struct
+            (class_specifier) @class
+            (namespace_definition) @namespace
+            (preproc_function_def) @macro
+            """
+            query = self.CPP_LANGUAGE.query(query_str)
+        else:
+            # C language query - no class_specifier or namespace_definition in C
+            query_str = """
+            (function_definition) @function
+            (struct_specifier) @struct
+            (preproc_function_def) @macro
+            """
+            query = self.C_LANGUAGE.query(query_str)
+            
         captures = query.captures(tree.root_node)
         for _, node_list in captures.items():
             for node in node_list:
                 if node.type == 'function_definition':
                     info = self._extract_function_info(node, source_code)
+                    if not info:
+                        # Sometimes tree-sitter parse wrong functions, Skip them
+                        continue
                     yield {
                         'type': 'function',
                         'name': info['name'], 
@@ -168,6 +198,9 @@ class CParser:
                     }
                 elif node.type in ('struct_specifier', 'class_specifier'):
                     info = self._extract_class_info(node, source_code)
+                    if not info:
+                        # Sometimes tree-sitter parse wrong classes, Skip them
+                        continue
                     yield {
                         'type': info['type'],
                         'name': info['name'],
@@ -175,6 +208,23 @@ class CParser:
                         'start_point': node.start_point,
                         'end_point': node.end_point
                     }
+
+
+    def function_signature(self, file_path, line_number, column_number, file_type):
+        """
+        Get the function signature at a specific line and column in a file.
+        
+        Args:
+            file_path: Path to the file
+            line_number: Line number (1-based)
+            column_number: Column number (0-based)
+            
+        Returns:
+            Function signature or None if not found
+        """
+        source_code, tree = self.parse_file(file_path, file_type)
+        context = self.find_context_at_position(source_code, tree, int(line_number) - 1, column_number)
+        return context['function']['signature'] if context['function'] else None
 
 
 def example_usage():

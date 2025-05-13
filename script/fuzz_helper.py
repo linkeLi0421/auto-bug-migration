@@ -563,6 +563,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             nargs='?')
   build_version_parser.add_argument('--commit',
                             help='commit hash to checkout in the builder')
+  build_version_parser.add_argument('--patch',
+                            help='patch file to apply in the builder')
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -1868,12 +1870,31 @@ def build_version(args):
         '%s:%s' % (_get_absolute_path(args.source_path), workdir),
     ])
 
+  build_bash = f'''
+  cd /src/{args.project.name};
+  git checkout -f {args.commit};
+  '''
+  
+  if args.patch:
+    build_bash += f'''
+    git apply --reverse /patch;
+    '''
+    run_args.extend([
+        '-v',
+        '%s:/patch' % args.patch,
+    ])
+  
+  build_bash += '''
+  cd -;
+  compile;
+  '''
+
   run_args.extend([
       '-v',
       '%s:/out' % out_dir, '-v',
       '%s:/work' % args.project.work, '-t',
       'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
-      '-c', 'cd /src/%s && git checkout -f %s && cd - && compile' %(args.project.name, args.commit)
+      '-c', build_bash
   ])
   clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
