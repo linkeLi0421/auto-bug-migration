@@ -376,9 +376,8 @@ def rever_patch_test(args):
                 revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             else:
-                revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
-                logger.info(f"{test_result.stderr}")
 
     logger.info(f"Revert and trigger set: {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {revert_and_trigger_fail_set}")
