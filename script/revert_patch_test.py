@@ -183,11 +183,11 @@ def revert_patch(repo_path: str, patch_text):
     os.remove(tmp_path)
 
 
-def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer):
+def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv):
     # build part
     cmd = [
         "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-        "--patch", patch_file_path, target
+        "--patch", patch_file_path, '--build_csv', build_csv, target
     ]
 
     logger.info(' '.join(cmd))
@@ -229,6 +229,8 @@ def rever_patch_test(args):
     csv_file_path = args.target_test_result
     bug_info_dataset = read_json_file(args.bug_info)
     checkout_latest_commit(ossfuzz_path)
+    revert_and_trigger_set = set()
+    revert_and_trigger_fail_set = set()
     # Get repo path from environment variable
     repo_path = os.getenv('REPO_PATH')
     if not repo_path:
@@ -281,7 +283,7 @@ def rever_patch_test(args):
             print("Running command:", " ".join(collect_trace_cmd))
             # Execute the command
             try:
-                result = subprocess.run(collect_trace_cmd, check=True, text=True)
+                result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print(f"Command completed with exit code {result.returncode}")
             except subprocess.CalledProcessError as e:
                 print(f"Command failed with exit code {e.returncode}")
@@ -292,7 +294,7 @@ def rever_patch_test(args):
             print("Running command:", " ".join(collect_trace_cmd))
             # Execute the command
             try:
-                result = subprocess.run(collect_trace_cmd, check=True, text=True)
+                result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print(f"Command completed with exit code {result.returncode}")
             except subprocess.CalledProcessError as e:
                 print(f"Command failed with exit code {e.returncode}")
@@ -324,6 +326,10 @@ def rever_patch_test(args):
             else:
                 trace_func_set.add(func.split(' ')[0])
                 
+        logger.info(f"Trace function set: {trace_func_set}")
+        if not trace_func_set:
+            logger.info(f'No function signatures found in trace for bug {bug_id}')
+            break
         # checkout target repo to the bug commit, get function signature from source code using code location
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -337,10 +343,12 @@ def rever_patch_test(args):
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
-            if patch_func in trace_func_set:
-                logger.info(f'Function {demangle_cpp_symbol(patch_func)} in both bug and fix traces, revert patch related to it')
-                patch_to_apply.append(diff_result['patch_text'])
-        
+            for trace_func in trace_func_set:
+                if trace_func in patch_func:
+                    logger.info(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
+                    patch_to_apply.append(diff_result['patch_text'])
+                    break
+
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -357,7 +365,7 @@ def rever_patch_test(args):
             logger.info(f"No relevant patches found to revert for bug {bug_id}")
         
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
-        build_success = build_and_test_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer)
+        build_success = build_and_test_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv)
         if build_success:
             # Run the fuzzer to test if the bug is reproduced
             fuzzer_path = os.path.join(ossfuzz_path, "build/out", target, fuzzer)
@@ -365,12 +373,15 @@ def rever_patch_test(args):
             test_result = subprocess.run([fuzzer_path, testcase_path], capture_output=True, text=True)
             if bug_type.lower() in test_result.stdout or bug_type.lower() in test_result.stderr:
                 # trigger the bug
-                logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}")
+                revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             else:
-                logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}")
+                revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
                 logger.info(f"{test_result.stderr}")
-        break
 
+    logger.info(f"Revert and trigger set: {revert_and_trigger_set}")
+    logger.info(f"Revert and trigger fail set: {revert_and_trigger_fail_set}")
 
 if __name__ == "__main__":
     args = parse_arguments()

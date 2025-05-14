@@ -565,6 +565,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='commit hash to checkout in the builder')
   build_version_parser.add_argument('--patch',
                             help='patch file to apply in the builder')
+  build_version_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -1839,6 +1841,22 @@ def clean(args, out_dir):
 
 def build_version(args):
   """Build in a specific commit."""
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+                args.commit, oss_fuzz_commit)
+          break
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   if not build_image_impl(args.project):
     return False
 
