@@ -408,7 +408,7 @@ def rever_patch_test(args):
             fuzzer_path = os.path.join(ossfuzz_path, "build/out", target, fuzzer)
             testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
             test_result = subprocess.run([fuzzer_path, testcase_path], capture_output=True, text=True)
-            if bug_type.lower() in test_result.stdout or bug_type.lower() in test_result.stderr:
+            if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
                 # trigger the bug
                 revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
