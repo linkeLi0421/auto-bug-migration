@@ -87,18 +87,53 @@ def parse_csv_data(csv_content):
     return data
 
 
-def find_transitions(data):
+def find_transitions(data, repo_path):
+    # Build commit graph for easy parent/child lookup
+    commit_graph = {}
+    repo = Repo(repo_path)
+    
+    # Initialize the graph with all commits
+    for entry in data:
+        commit_id = entry['commit_id']
+        commit_graph[commit_id] = {
+            'parents': [],
+            'children': [],
+            'data': entry
+        }
+    
+    # Fill in parent/child relationships
+    for i in range(len(data)):
+        current_commit = data[i]['commit_id']
+        commit = repo.commit(current_commit)
+        # Add parents
+        for parent in commit.parents:
+            parent_id = parent.hexsha
+            if parent_id in commit_graph:
+                commit_graph[current_commit]['parents'].append(parent_id)
+                commit_graph[parent_id]['children'].append(current_commit)
+            
     transitions = []
     
-    for i in range(len(data) - 1):
-        current = data[i]
-        next_commit = data[i + 1]
-        
-        # Check for transitions in each OSV
-        for bug_id, status in current['osv_statuses'].items():
-            if status and re.match(r'1\|.+', status) and bug_id in next_commit['osv_statuses']:
-                if next_commit['osv_statuses'][bug_id] == "0|0" or next_commit['osv_statuses'][bug_id] == "0|1":
-                    transitions.append((current, next_commit, bug_id))
+    # Find transitions using the commit graph
+    for commit_id, node in commit_graph.items():
+        # Skip if commit has no children
+        if not node['children']:
+            continue
+            
+        # Check all OSV statuses for this commit
+        for bug_id, status in node['data']['osv_statuses'].items():
+            # Check if this commit has a vulnerable status (1|0 or 1|1)
+            if status and re.match(r'1\|[01]', status):
+                # Check all children for this commit
+                for child_id in node['children']:
+                    # Skip if child doesn't have this bug_id in its status
+                    if bug_id not in commit_graph[child_id]['data']['osv_statuses']:
+                        continue
+                        
+                    child_status = commit_graph[child_id]['data']['osv_statuses'][bug_id]
+                    # Check if child has a fixed status (0|0 or 0|1)
+                    if child_status in ["0|0", "0|1"]:
+                        transitions.append((node['data'], commit_graph[child_id]['data'], bug_id))
     
     return transitions
 
@@ -190,7 +225,7 @@ def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path,
         "--patch", patch_file_path, '--build_csv', build_csv, target
     ]
 
-    logger.info(' '.join(cmd))
+    logger.debug(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     
     # Check for build errors
@@ -208,6 +243,7 @@ def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path,
         "error: 'struct",
         "error: conflicting types",
         "error: invalid conversion",
+        "error: patch failed:",
         "make: *** [Makefile:",
         "ninja: build stopped:",
         "Compilation failed",
@@ -218,7 +254,7 @@ def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path,
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
     if not os.path.exists(fuzzer_path) and any(error_pattern in result.stderr or error_pattern in result.stdout 
             for error_pattern in build_error_patterns) or result.returncode != 0:
-        logger.info(f"Build failed after patch reversion for bug {bug_id}")
+        logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
         return False
     
     logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
@@ -234,24 +270,26 @@ def rever_patch_test(args):
     # Get repo path from environment variable
     repo_path = os.getenv('REPO_PATH')
     if not repo_path:
-        print("REPO_PATH environment variable not set. Exiting.")
+        logger.info("REPO_PATH environment variable not set. Exiting.")
         exit(1)
 
     parsed_data = parse_csv_file(csv_file_path)
-    transitions = find_transitions(parsed_data)
+    target = csv_file_path.split('/')[-1].split('.')[0]
+    target_repo_path = os.path.join(repo_path, target)
+    target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
+    transitions = find_transitions(parsed_data, target_repo_path)
+    logger.info(f"Transitions found: {len(transitions)}")
     
     for commit, next_commit, bug_id in transitions:
+        logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
         bug_info = bug_info_dataset[bug_id]
-        target = bug_info['reproduce']['project']
         fuzzer = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         bug_type = bug_info['reproduce']['crash_type']
         trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
         trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
-        target_repo_path = os.path.join(repo_path, target)
         diff_results = []
     
-        target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
@@ -267,7 +305,7 @@ def rever_patch_test(args):
         if testcases_env:
             collect_trace_cmd.extend(['--testcases', testcases_env])
         else:
-            print("TESTCASES environment variable not set. Exiting.")
+            logger.info("TESTCASES environment variable not set. Exiting.")
             exit(1)
 
         collect_trace_cmd.extend(['--build_csv', args.build_csv])
@@ -279,25 +317,23 @@ def rever_patch_test(args):
         collect_trace_cmd.append(fuzzer)
     
         if not os.path.exists(trace_path1):
-            # Print the command being executed
-            print("Running command:", " ".join(collect_trace_cmd))
+            # logger.info the command being executed
+            logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
             # Execute the command
             try:
                 result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print(f"Command completed with exit code {result.returncode}")
             except subprocess.CalledProcessError as e:
-                print(f"Command failed with exit code {e.returncode}")
+                logger.info(f"Command failed with exit code {e.returncode}")
                 
         if not os.path.exists(trace_path2):
             collect_trace_cmd[4] = next_commit['commit_id']
-            # Print the command being executed
-            print("Running command:", " ".join(collect_trace_cmd))
+            # logger.info the command being executed
+            logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
             # Execute the command
             try:
                 result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print(f"Command completed with exit code {result.returncode}")
             except subprocess.CalledProcessError as e:
-                print(f"Command failed with exit code {e.returncode}")
+                logger.info(f"Command failed with exit code {e.returncode}")
         
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
@@ -312,7 +348,7 @@ def rever_patch_test(args):
         subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         func_dict = dict()
-        for _, func in common_part: # may comsume a lot of time
+        for _, func in common_part: # may consume a lot of time
             if func in func_dict:
                 continue
             func_loc = func.split(' ')[1]
@@ -326,7 +362,7 @@ def rever_patch_test(args):
             else:
                 trace_func_set.add(func.split(' ')[0])
                 
-        logger.info(f"Trace function set: {trace_func_set}")
+        logger.debug(f"Trace function set: {trace_func_set}")
         if not trace_func_set:
             logger.info(f'No function signatures found in trace for bug {bug_id}')
             break
@@ -338,14 +374,14 @@ def rever_patch_test(args):
         patch_to_apply = []
         for diff_result in diff_results:
             patch_func = diff_result['signature']
-            logger.info(f'File Path: {diff_result["file_path"]}')
-            logger.info(f'Patch Function: {patch_func}')
+            logger.debug(f'File Path: {diff_result["file_path"]}')
+            logger.debug(f'Patch Function: {patch_func}')
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
             for trace_func in trace_func_set:
                 if trace_func in patch_func:
-                    logger.info(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
+                    logger.debug(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
                     patch_to_apply.append(diff_result['patch_text'])
                     break
 
@@ -356,13 +392,14 @@ def rever_patch_test(args):
         
         # Save all patches to a single file
         if patch_to_apply:
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_patches.diff")
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches.diff")
             with open(patch_file_path, 'w') as patch_file:
                 for patch in patch_to_apply:
                     patch_file.write(patch)
                     patch_file.write('\n\n')  # Add separator between patches
         else:
-            logger.info(f"No relevant patches found to revert for bug {bug_id}")
+            logger.error(f"No relevant patches found to revert for bug {bug_id}")
+            continue
         
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
         build_success = build_and_test_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv)
@@ -379,8 +416,8 @@ def rever_patch_test(args):
                 revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
 
-    logger.info(f"Revert and trigger set: {revert_and_trigger_set}")
-    logger.info(f"Revert and trigger fail set: {revert_and_trigger_fail_set}")
+    logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
+    logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
 
 if __name__ == "__main__":
     args = parse_arguments()
