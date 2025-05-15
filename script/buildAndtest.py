@@ -188,6 +188,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     
     json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
     sanitizers = set()
+    archs = set()
     
     for json_file_path in json_files:
         with open(json_file_path) as f:
@@ -195,49 +196,63 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
         for bug_id, bug_info in data.items():
             sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
             sanitizers.add(sanitizer)
+            job_type = bug_info['reproduce']['job_type']
+            if len(job_type.split('-')) > 3:
+                arch = job_type.split('-')[2]
+            else:
+                arch = 'x86_64'
+            archs.add(arch)
+    
     os.chdir(target_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
     subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for sanitizer in sanitizers:
-        if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer))) > 3:
-            # build finish here
-            logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer}")
-            return
+    for arch in archs:
+        for sanitizer in sanitizers:
+            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer))) > 3:
+                # build finish here
+                logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
+                return
 
-        cmd = [
-            "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-            target
-        ]
+            cmd = [
+                "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
+                target
+            ]
 
-        logger.info(' '.join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if any(error_pattern in result.stderr or error_pattern in result.stdout for error_pattern in [
-            "Building fuzzers failed",
-            "Docker build failed",
-            "clang++: error:",
-            "g++: error:",
-            "cmake: error:",
-            "fatal error:",
-            "undefined reference to",
-            "cannot find -l",
-            "No such file or directory",
-            "error: command",
-            "error: 'struct",
-            "error: conflicting types",
-            "error: invalid conversion",
-            "make: *** [Makefile:",
-            "ninja: build stopped:",
-            "Compilation failed",
-            "failed with exit status"
-        ]) or result.returncode != 0:
-            logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer}, will try newer oss-fuzz again.")
-            return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
-        else:
-            # Create directory for storing output files if it doesn't exist
-            os.makedirs(target_storage_path, exist_ok=True)
-            move_result = subprocess.run(["mv", "-T", oss_fuzz_path + "/build/out/" + target, os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)], encoding='utf-8')
-            if move_result.returncode == 0:
-                build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
+            logger.info(' '.join(cmd))
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if any(error_pattern in result.stderr or error_pattern in result.stdout for error_pattern in [
+                "Building fuzzers failed",
+                "Docker build failed",
+                "clang++: error:",
+                "g++: error:",
+                "cmake: error:",
+                "fatal error:",
+                "undefined reference to",
+                "cannot find -l",
+                "No such file or directory",
+                "error: command",
+                "error: 'struct",
+                "error: conflicting types",
+                "error: invalid conversion",
+                "make: *** [Makefile:",
+                "ninja: build stopped:",
+                "Compilation failed",
+                "failed with exit status"
+            ]) or result.returncode != 0:
+                logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
+                return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
+            else:
+                # Create directory for storing output files if it doesn't exist
+                os.makedirs(target_storage_path, exist_ok=True)
+                arch_str = f"-{arch}" if arch != 'x86_64' else ''
+                # Create the destination directory if it doesn't exist
+                dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                
+                # Move with force option to overwrite if destination exists
+                move_result = subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
+                if move_result.returncode == 0:
+                    build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
     # Start of the second day (midnight of t1's date + 1 day)
@@ -283,31 +298,26 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
             fuzz_target = bug_info['reproduce']['fuzz_target']
             sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
             crash_type = bug_info['reproduce']['crash_type']
+            job_type = bug_info['reproduce']['job_type']
+            if len(job_type.split('-')) > 3:
+                arch = job_type.split('-')[2]
+            else:
+                arch = 'x86_64'
+            arch_str = f"-{arch}" if arch != 'x86_64' else ''
 
             bug_exist = is_ancestor(repo_path, commit_id, bug_info["introduced"])\
               and is_ancestor(repo_path, bug_info["fixed"], commit_id) and commit_id != bug_info["fixed"]  
             if bug_exist:
                 bug_exist_count += 1
 
-            source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)
+            source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
 
             if os.path.exists(source_dir):
                 pass
             else:
                 logger.error(f"Source directory or file does not exist: {source_dir}")
                 return
-            
-            # Too Slow 
-            # os.makedirs(os.path.join(oss_fuzz_path, "build/out"), exist_ok=True)
-            # target_path = os.path.join(oss_fuzz_path, "build/out", target)
-            # if os.path.exists(target_path) or os.path.islink(target_path):
-            #     os.remove(target_path)
-            # os.symlink(source_dir, target_path)
-            # cmd = [
-            #     "python3", "infra/helper.py", "reproduce",
-            #     target, fuzz_target, poc_path
-            # ]
-            
+
             # some bug not stable
             source_path = os.path.join(source_dir, fuzz_target)
             cmd = [
