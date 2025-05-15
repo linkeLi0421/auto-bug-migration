@@ -299,8 +299,8 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
             sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
             crash_type = bug_info['reproduce']['crash_type']
             job_type = bug_info['reproduce']['job_type']
-            if len(job_type.split('-')) > 3:
-                arch = job_type.split('-')[2]
+            if len(job_type.split('_')) > 3:
+                arch = job_type.split('_')[2]
             else:
                 arch = 'x86_64'
             arch_str = f"-{arch}" if arch != 'x86_64' else ''
