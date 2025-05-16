@@ -207,11 +207,13 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
     subprocess.run(["git", "checkout", '-f', commit_id], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for arch in archs:
+        arch_str = f"-{arch}" if arch != 'x86_64' else ''
         for sanitizer in sanitizers:
-            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer))) > 3:
-                # build finish here
-                logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
-                return
+            if sanitizer == 'memory' and arch == 'i386':
+                # msan do not support i386
+                continue
+            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str))) > 3:
+                continue
 
             cmd = [
                 "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
@@ -242,9 +244,10 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
                 logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
                 return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
             else:
+                # build finish here
+                logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
                 # Create directory for storing output files if it doesn't exist
                 os.makedirs(target_storage_path, exist_ok=True)
-                arch_str = f"-{arch}" if arch != 'x86_64' else ''
                 # Create the destination directory if it doesn't exist
                 dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
