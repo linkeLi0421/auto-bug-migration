@@ -1672,7 +1672,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       'gcr.io/oss-fuzz-base/%s' % image_name,
       'reproduce',
       fuzzer_name,
-      '-runs=10',
+      '-runs=1',
   ] + fuzzer_args
 
   return run_function(run_args, architecture=architecture)
@@ -1939,11 +1939,10 @@ def get_crash_log_bash(commit:str, args):
 def get_trace_log_bash(commit:str, args):
   bash_trace = f'''
     cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
-    [ -d "/Function_instrument/build" ] && rm -rf /Function_instrument/build
-    mkdir /Function_instrument/build
+    [ -d "/Function_instrument/build" ] && rm -rf /Function_instrument/build;
+    mkdir /Function_instrument/build;
     
-    cd /Function_instrument/build && cmake .. && make clean && make && cd -;
-    
+    cd /Function_instrument/build && cmake .. && make clean && make && mv CMakeFiles/PrintFunc.dir/print_func.c.o ./print_func.o && cd -;
     export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
     
