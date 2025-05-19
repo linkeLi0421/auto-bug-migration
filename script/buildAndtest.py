@@ -287,14 +287,14 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
     
     row = [commit_id]
     bug_exist_count = 0
+    testcases_env = os.getenv('TESTCASES', '')
     
     for json_file_path in json_files:
         dir_path = os.path.dirname(json_file_path)
-        testcases_folder_path = os.path.join(dir_path, "testcases")
         with open(json_file_path) as f:
             data = json.load(f)
         for bug_id, bug_info in data.items():
-            poc_path = os.path.join(testcases_folder_path, 'testcase-' + bug_id)
+            poc_path = os.path.join(testcases_env, 'testcase-' + bug_id)
             introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
             fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
             fuzzing_engine = bug_info['reproduce']['fuzzing_engine']
@@ -321,10 +321,8 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
                 logger.error(f"Source directory or file does not exist: {source_dir}")
                 return
 
-            # some bug not stable
-            source_path = os.path.join(source_dir, fuzz_target)
             cmd = [
-                source_path, poc_path
+                'python3', f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
             ]
             logger.info(' '.join(cmd))
             try:

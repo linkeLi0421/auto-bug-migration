@@ -497,6 +497,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   reproduce_parser.add_argument('fuzzer_args',
                                 help='arguments to pass to the fuzzer',
                                 nargs='*')
+  reproduce_parser.add_argument('--fuzzer_path',
+                                help='path to the fuzzer binary')
   _add_environment_args(reproduce_parser)
   _add_external_project_args(reproduce_parser)
   _add_architecture_args(reproduce_parser)
@@ -1629,7 +1631,7 @@ def fuzzbench_measure(args):
 def reproduce(args):
   """Reproduces a specific test case from a specific project."""
   return reproduce_impl(args.project, args.fuzzer_name, args.valgrind, args.e,
-                        args.fuzzer_args, args.testcase_path, args.architecture)
+                        args.fuzzer_args, args.testcase_path, args.architecture, fuzzer_path=args.fuzzer_path)
 
 
 def reproduce_impl(  # pylint: disable=too-many-arguments
@@ -1641,12 +1643,17 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
     testcase_path,
     architecture='x86_64',
     run_function=docker_run,
-    err_result=False):
+    fuzzer_path=None,
+    err_result=False,
+    ):
   """Reproduces a testcase in the container."""
   if not check_project_exists(project):
     return err_result
 
-  if not _check_fuzzer_exists(project, fuzzer_name, architecture):
+  if fuzzer_path:
+    if not os.path.exists(os.path.join(fuzzer_path, fuzzer_name)):
+      return err_result
+  elif not _check_fuzzer_exists(project, fuzzer_name, architecture):
     return err_result
 
   debugger = ''
@@ -1674,6 +1681,8 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       fuzzer_name,
       '-runs=1',
   ] + fuzzer_args
+  if fuzzer_path:
+    run_args[5] = f'{fuzzer_path}:/out'
 
   return run_function(run_args, architecture=architecture)
 
