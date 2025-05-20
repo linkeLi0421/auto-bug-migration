@@ -8,6 +8,8 @@
 *.swp
 .venv
 .gdb_history
+*/*.a
+*/*.so
 
 # IntelliJ IDEA
 /.idea
