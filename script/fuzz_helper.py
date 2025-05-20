@@ -1948,12 +1948,14 @@ def get_crash_log_bash(commit:str, args):
 def get_trace_log_bash(commit:str, args):
   bash_trace = f'''
     cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
-    [ -d "/Function_instrument/build" ] && rm -rf /Function_instrument/build;
-    mkdir /Function_instrument/build;
-    
-    cd /Function_instrument/build && cmake .. && make clean && make && mv CMakeFiles/PrintFunc.dir/print_func.c.o ./print_func.o && cd -;
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-unused-command-line-argument -fpass-plugin=/Function_instrument/build/libPrint_trace.so /Function_instrument/build/print_func.o";
+    [ -d "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
+    [ -d "/Function_instrument/libtrace.so" ] && rm /Function_instrument/libtrace.so;
+    cd /Function_instrument ; make ; cd -;
+
+    export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
+    export LD_LIBRARY_PATH=/Function_instrument/:$LD_LIBRARY_PATH
+    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
@@ -1961,8 +1963,9 @@ def get_trace_log_bash(commit:str, args):
     cd -;
     
     # Compile and collect trace
-    compile &> /dev/null;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_trace-{commit}-{args.test_input}.txt; 
+    compile;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> tmp.txt;
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit}-{args.test_input}.txt --source_path /src/{args.project.name} ./tmp.txt; 
   '''
   return bash_trace
 

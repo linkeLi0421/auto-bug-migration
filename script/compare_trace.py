@@ -16,7 +16,7 @@ def compare_traces(trace1, trace2):
     common_part = []
     min_length = min(len(trace1), len(trace2))
     for i in range(min_length):
-        if trace1[i][1].split(':')[0] != trace2[i][1].split(':')[0]:
+        if trace1[i][1].split(' ')[0] != trace2[i][1].split(' ')[0]:
             return common_part, trace1[i:], trace2[i:]
         common_part.append(trace1[i])
     # If no difference is found in the common length, return remaining functions
