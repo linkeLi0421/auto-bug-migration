@@ -161,26 +161,28 @@ class CParser:
                     break
         
         # Choose the appropriate query based on language determination
-        if is_cpp:
-            # C++ language query
-            query_str = """
-            (function_definition) @function
-            (struct_specifier) @struct
-            (class_specifier) @class
-            (namespace_definition) @namespace
-            (preproc_function_def) @macro
-            """
-            query = self.CPP_LANGUAGE.query(query_str)
-        else:
-            # C language query - no class_specifier or namespace_definition in C
-            query_str = """
-            (function_definition) @function
-            (struct_specifier) @struct
-            (preproc_function_def) @macro
-            """
-            query = self.C_LANGUAGE.query(query_str)
-            
-        captures = query.captures(tree.root_node)
+        # if is_cpp:
+        # C++ language query
+        query_str = """
+        (function_definition) @function
+        (struct_specifier) @struct
+        (class_specifier) @class
+        (namespace_definition) @namespace
+        (preproc_function_def) @macro
+        """
+        query_cpp = self.CPP_LANGUAGE.query(query_str)
+        # else:
+        # C language query - no class_specifier or namespace_definition in C
+        query_str = """
+        (function_definition) @function
+        (struct_specifier) @struct
+        (preproc_function_def) @macro
+        """
+        query_c= self.C_LANGUAGE.query(query_str)
+
+        captures = query_c.captures(tree.root_node)
+        if len(captures) == 0:
+            captures = query_cpp.captures(tree.root_node)
         for _, node_list in captures.items():
             for node in node_list:
                 if node.type == 'function_definition':
