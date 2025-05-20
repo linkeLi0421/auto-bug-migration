@@ -1953,9 +1953,9 @@ def get_trace_log_bash(commit:str, args):
     cd /Function_instrument ; make ; cd -;
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
-    export LD_LIBRARY_PATH=/Function_instrument/:$LD_LIBRARY_PATH
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
+    export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
+    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
