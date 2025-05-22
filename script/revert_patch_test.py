@@ -180,13 +180,190 @@ def find_transitions(data, repo_path):
     return transitions
 
 
-def analyze_diffindex(diff_index, target_repo_path: str, fix_commit: str):
+'''
+Function-Level Changes
+* **Function Signature Change**:
+    * `Function Rename`: Changing the name of a function.
+    * `Parameter Addition`: Adding one or more parameters to a function.
+    * `Parameter Removal`: Removing one or more parameters from a function.
+    * `Parameter Type Change`: Modifying the data type of one or more function parameters.
+    * `Parameter Order Change`: Reordering existing function parameters.
+    * `Return Type Change`: Modifying the data type of the function's return value.
+    * `Qualifier Change`: Adding/removing `const`, `static`, `inline`, `virtual`, `explicit`, `volatile` qualifiers to a function.
+* **Function Body Change**:
+    * `Logic Change`: Modifying the internal logic or algorithm within a function.
+    * `Statement Addition`: Adding new lines of executable code.
+    * `Statement Deletion`: Removing existing lines of executable code.
+    * `Statement Modification`: Changing existing lines of executable code.
+    * `Function Call Added`: Introducing a call to another function.
+    * `Function Call Removed`: Removing a call to another function.
+    * `Function Call Argument Change`: Modifying arguments passed to a function call.
+* **Function Definition/Declaration**:
+    * `Function Added`: A new function is defined.
+    * `Function Removed`: An existing function definition is removed.
+    * `Function Declaration Added/Removed/Modified`: Changes to forward declarations, typically in header files.
+
+Class/Struct-Level Changes (primarily C++)
+* **Class/Struct Definition**:
+    * `Class/Struct Added`: A new class or struct is defined.
+    * `Class/Struct Removed`: An existing class or struct definition is removed.
+    * `Class/Struct Rename`: Changing the name of a class or struct.
+* **Member Changes**:
+    * `Member Variable Added`: Adding a new data member.
+    * `Member Variable Removed`: Removing an existing data member.
+    * `Member Variable Type Change`: Changing the type of a data member.
+    * `Member Variable Rename`: Renaming a data member.
+    * `Member Function Added` (see Function-Level Changes for methods).
+    * `Member Function Removed` (see Function-Level Changes for methods).
+    * `Access Specifier Change`: Changing `public`, `protected`, or `private` status of members.
+* **Inheritance/Polymorphism**:
+    * `Base Class Added`: Adding a new base class (inheritance).
+    * `Base Class Removed`: Removing a base class.
+    * `Virtual Function Added/Removed/Modified`: Changes related to polymorphism.
+    * `Override Specifier Added/Removed`: Adding/removing `override`.
+    * `Final Specifier Added/Removed`: Adding/removing `final`.
+* **Constructor/Destructor Changes**:
+    * `Constructor Added/Removed/Modified`.
+    * `Destructor Added/Removed/Modified`.
+    * `Default Constructor/Destructor Added/Removed` (e.g., `= default`, `= delete`).
+
+Control Flow Changes
+* `Conditional Statement Added/Removed/Modified`: Changes to `if`, `else if`, `else`, `switch` statements.
+* `Loop Added/Removed/Modified`: Changes to `for`, `while`, `do-while` loops.
+* `Break/Continue Statement Added/Removed`.
+* `Return Statement Added/Removed/Modified`.
+* `Goto Statement Added/Removed/Modified` (less common, but possible).
+
+Data Type Changes
+* `Typedef Change`: Modifying a `typedef` definition.
+* `Using Alias Change` (C++): Modifying a `using` alias for a type.
+* `Enum Definition Added/Removed/Modified`: Changes to enumerations.
+* `Union Definition Added/Removed/Modified`: Changes to unions.
+
+Preprocessor Changes
+* `Macro Definition Added/Removed/Modified`: Changes to `#define`.
+* `Include Directive Added/Removed/Modified`: Changes to `#include`.
+* `Conditional Compilation Added/Removed/Modified`: Changes involving `#ifdef`, `#ifndef`, `#if`, `#else`, `#elif`, `#endif`.
+
+Variable/Attribute Changes
+* `Variable Declaration Added/Removed`: Adding or removing local or global variables.
+* `Variable Initialization Change`: Modifying how a variable is initialized.
+* `Variable Type Change`: Changing the data type of a variable.
+* `Static Variable Added/Removed/Modified`.
+* `Extern Variable Declaration Added/Removed/Modified`.
+* `Constant Definition Added/Removed/Modified`: Changes to `const` variables.
+
+Error Handling Changes
+* `Exception Handling Added/Removed/Modified` (C++): Changes to `try`, `catch`, `throw`.
+* `Error Code Check Added/Removed/Modified`: Changes in how function return values or error flags are checked.
+
+Memory Management Changes
+* `Dynamic Memory Allocation Added/Removed/Modified`: Changes involving `new`/`delete` (C++) or `malloc`/`calloc`/`realloc`/`free` (C).
+* `Smart Pointer Usage Added/Removed/Modified` (C++): e.g., `std::unique_ptr`, `std::shared_ptr`.
+
+Concurrency Changes (C++11 and later, or using pthreads, etc.)
+* `Thread Creation/Management Change`.
+* `Mutex/Lock/Semaphore Usage Added/Removed/Modified`.
+* `Atomic Operation Added/Removed/Modified`.
+* `Condition Variable Usage Added/Removed/Modified`.
+
+Style/Formatting Changes
+* `Whitespace Change`: Modifications to spaces, tabs, newlines that don't affect logic.
+* `Comment Added/Removed/Modified`.
+* `Code Reformatting`: Changes that only alter the layout of the code (e.g., brace style, indentation). *Often, these are filtered out or handled separately in semantic diff tools.*
+'''
+def get_diff_type(diff):
+    pass
+
+
+def extract_revert_patch(h, line_start, line_end, version):
+    """
+    Extract and create a partial revert patch from a given diff hunk.
+    
+    Args:
+        h: String containing the hunk content
+        line_start: Starting line number to extract
+        line_end: Ending line number to extract
+        version: Version of the code (old or new)
+    
+    Returns:
+        String containing the extracted patch
+    """
+    # Split the hunk content into lines
+    lines = h.split('\n')
+    logger.debug(f'line_start: {line_start}, line_end: {line_end} version: {version}')
+    
+    inside_hunk = True  # We're already inside a hunk
+    patch_lines = []
+    new_line_cursor = {"num": 0} # next line to be check
+    old_line_cursor = {"num": 0} # next line to be check
+    # line to be check
+    if version == 'old':
+        target_line_cursor = old_line_cursor
+    elif version == 'new':
+        target_line_cursor = new_line_cursor
+    else:
+        raise ValueError("Version must be 'old' or 'new'")
+    
+    # First line contains the hunk header
+    header_line = lines[0]
+    
+    # Parse header line like: " -1223,17 +1224,73 @@"
+    match = re.match(r'^.*-(\d+),?\d* \+(\d+),?(\d*) .*', header_line)
+    if match:
+        old_line_cursor['num'] = int(match.group(1))
+        new_line_cursor['num'] = int(match.group(2))
+        
+    get_sub_patch_start = False
+    old_line_start = 0
+    new_line_start = 0
+    
+    # Process the actual diff content
+    for line in lines[1:]:
+        if not line:
+            continue
+        
+        logger.debug(f'target_line_cursor: {target_line_cursor["num"]} old_line_cursor: {old_line_cursor["num"]} new_line_cursor: {new_line_cursor["num"]}')
+        
+        if target_line_cursor['num'] >= line_start and target_line_cursor['num'] <= line_end:
+            if not get_sub_patch_start:
+                if version == 'new' and line.startswith('+') or version == 'old' and line.startswith('-') or line.startswith(' '):
+                    get_sub_patch_start = True
+                    new_line_start = new_line_cursor['num']
+                    old_line_start = old_line_cursor['num']
+            if get_sub_patch_start:
+                patch_lines.append(line)
+                logger.debug(f'add line: {line}')
+            
+        if target_line_cursor['num'] > line_end:
+            # We've reached the end of the target lines
+            break
+        
+        # Check the first character of the line to determine the type of change
+        if line.startswith(' '):
+            # Context line, increment both cursors
+                new_line_cursor['num'] += 1
+                old_line_cursor['num'] += 1
+        elif line.startswith('+'):
+            # Added line, increment new line cursor
+            new_line_cursor['num'] += 1
+        elif line.startswith('-'):
+            # Removed line, increment old line cursor
+            old_line_cursor['num'] += 1
+                
+    new_header_line = f"@@ -{new_line_start},{old_line_cursor['num']-old_line_start} +{new_line_start},{new_line_cursor['num']-new_line_start} @@\n"
+    patch_lines.insert(0, new_header_line)
+    return '\n'.join(patch_lines), old_line_start, old_line_cursor['num'], new_line_start, new_line_cursor['num']
+
+
+def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_commit: str):
     """
     Analyze a GitPython DiffIndex and return metadata per hunk.
     Target repo checkout to fix commit here.
     """
-    results = []
+    results = dict()
     for diff in diff_index:
+        type_set = set()
         # Choose the post-change path if available, else pre-change:
         path = diff.b_path or diff.a_path
         # Derive file extension/type from path:
@@ -199,21 +376,26 @@ def analyze_diffindex(diff_index, target_repo_path: str, fix_commit: str):
         # Split into hunks on lines starting with '@@'
         hunks = re.split(r'(?m)^@@', patch_text)
         # The first element is the header before any hunk; skip it
+        
+        # checkout target repo to the new commit, and parse the code from that
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for h in hunks[1:]:
             # The hunk header is before the first newline
             header, *body = h.split('\n', 1)
-            fix_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
-            begin_num = int(fix_line_num.split(',')[0])
-            end_num = begin_num + int(fix_line_num.split(',')[1])
+            old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
+            old_begin_num = int(old_line_num.split(',')[0]) + 3
+            old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
+
+            new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
+            # diff codes have extra 3 lines
+            begin_num = int(new_line_num.split(',')[0]) + 3
+            end_num = begin_num + int(new_line_num.split(',')[1]) - 7
             # Extract section/function name (text after second '@@')
             section = header.split('@@')[-1].strip() or "<no-section>"
 
-            # Count added and removed lines in this hunk
-            added   = sum(1 for line in body[0].splitlines() if line.startswith('+') and not line.startswith('+++'))
-            removed = sum(1 for line in body[0].splitlines() if line.startswith('-') and not line.startswith('---'))
-            
             # parse to get function signature
-            new_code = [line[1:] for line in body[0].splitlines() if line.startswith('+') and not line.startswith('+++')]
             parser = CParser()
             file_path = os.path.join(target_repo_path, path)
             
@@ -228,24 +410,35 @@ def analyze_diffindex(diff_index, target_repo_path: str, fix_commit: str):
             
             signature = 'unknown'
             for item in parser.iterate_code(file_path, file_type=ext):
-                if item['type'] == 'function' and item['start_point'][0] - 3 <= begin_num and item['end_point'][0] + 4 >= end_num: # diff code may have extra 3 lines
+                header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
+                header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
+                # diff inside a function definition
+                if item['type'] == 'function' and item['start_point'][0]+1 <= old_begin_num and item['end_point'][0] >= old_end_num:
                     signature = item['signature']
                     break
-
-            header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
-            header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
-            patch_text = header + '@@' + h
-
-            results.append({
-                'file_path':   path,
-                'file_type':   ext,
-                'change_type': diff.change_type,
-                'hunk_header': section,
-                'added':       added,
-                'removed':     removed,
-                'patch_text':  patch_text,
-                'signature':   signature,
-            })
+                # part of function definitions inside the diff
+                if item['type'] == 'function' and item['end_point'][0] >= old_begin_num and item['start_point'][0]+1 <= old_end_num:
+                    signature = item['signature']
+                    diff_result_begin = max(item['start_point'][0], old_begin_num)
+                    diff_result_end = min(item['end_point'][0], old_end_num) + 1
+                    # not include context lines, because they may add some changes not related to the function
+                    sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'old')
+                    patch_text = header + sub_patch
+                    
+                    if f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}' in results:
+                        results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}']['old_signature'] = signature
+                    else:
+                        results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
+                            'file_path':   path,
+                            'file_type':   ext,
+                            'change_type': diff.change_type,
+                            'hunk_header': section,
+                            'patch_text':  patch_text,
+                            'old_signature':   signature,
+                            'patch_type': type_set,
+                        }
+                    
+    
     return results
 
 
@@ -336,7 +529,6 @@ def revert_patch_test(args):
             arch = 'x86_64'
         trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
         trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
-        diff_results = []
     
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
@@ -387,8 +579,8 @@ def revert_patch_test(args):
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
-        diffs = get_commit_patch_gitpython(target_repo_path, next_commit['commit_id'], commit['commit_id'])
-        diff_results.extend(analyze_diffindex(diffs, target_repo_path, next_commit['commit_id']))
+        diffs = get_commit_patch_gitpython(target_repo_path, next_commit['commit_id'], commit['commit_id']) # every file get a diff
+        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'])
 
         trace_func_set = set()
         # checkout target repo to the bug commit, get function signature from source code using code location
@@ -421,9 +613,14 @@ def revert_patch_test(args):
         subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         patch_to_apply = []
-        for diff_result in diff_results:
-            patch_func = diff_result['signature']
-            logger.debug(f'File Path: {diff_result["file_path"]}')
+        for key, diff_result in diff_results.items():
+            if 'new_signature' in diff_result:
+                logger.debug(f'newsignature{diff_result['new_signature']}')
+                patch_func = diff_result['new_signature']
+            if 'old_signature' in diff_result:
+                logger.debug(f'oldsignature{diff_result['old_signature']}')
+                patch_func = diff_result['old_signature']
+            logger.debug(f'Diff result: {key} \n{diff_result['patch_text']}')
             logger.debug(f'Patch Function: {patch_func}')
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
