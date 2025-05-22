@@ -363,7 +363,6 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
     """
     results = dict()
     for diff in diff_index:
-        type_set = set()
         # Choose the post-change path if available, else pre-change:
         path = diff.b_path or diff.a_path
         # Derive file extension/type from path:
@@ -411,16 +410,17 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                 if item['type'] == 'function' and item['start_point'][0]+1 <= begin_num and item['end_point'][0] >= end_num:
                     signature = item['signature']
                     patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
-
+                    type_set = {'Function body change'}
+                    dependent_func = set()
                     # use old patch location as key
                     results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
                         'file_path':   path,
                         'file_type':   ext,
-                        'change_type': diff.change_type,
                         'hunk_header': section,
                         'patch_text':  patch_text,
                         'new_signature':   signature,
                         'patch_type': type_set,
+                        'dependent_func': dependent_func,
                     }
                     break
                 # part or all of function definitions inside the diff
@@ -431,14 +431,16 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
                     patch_text = header + sub_patch
+                    type_set = {'Function body change'}
+                    dependent_func = set()
                     results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
                         'file_path':   path,
                         'file_type':   ext,
-                        'change_type': diff.change_type,
                         'hunk_header': section,
                         'patch_text':  patch_text,
                         'new_signature':   signature,
                         'patch_type': type_set,
+                        'dependent_func': dependent_func,
                     }
         
         # checkout target repo to the old commit, and parse the code from that
@@ -472,6 +474,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                 if item['type'] == 'function' and item['start_point'][0]+1 <= old_begin_num and item['end_point'][0] >= old_end_num:
                     signature = item['signature']
                     patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
+                    type_set = {'Function body change'}
+                    dependent_func = set()
 
                     if f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}' in results:
                         results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}']['old_signature'] = signature
@@ -479,11 +483,11 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                         results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
                             'file_path':   path,
                             'file_type':   ext,
-                            'change_type': diff.change_type,
                             'hunk_header': section,
                             'patch_text':  patch_text,
                             'old_signature':   signature,
                             'patch_type': type_set,
+                            'dependent_func': dependent_func,
                         }
                     break
                 # part of function definitions inside the diff
@@ -494,6 +498,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'old')
                     patch_text = header + sub_patch
+                    type_set = {'Function body change'}
+                    dependent_func = set()
                     
                     if f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}' in results:
                         results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}']['old_signature'] = signature
@@ -501,11 +507,11 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                         results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
                             'file_path':   path,
                             'file_type':   ext,
-                            'change_type': diff.change_type,
                             'hunk_header': section,
                             'patch_text':  patch_text,
                             'old_signature':   signature,
                             'patch_type': type_set,
+                            'dependent_func': dependent_func,
                         }
                     
     
