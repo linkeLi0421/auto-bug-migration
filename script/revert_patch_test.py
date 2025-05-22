@@ -383,7 +383,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
         subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for h in hunks[1:]:
             # The hunk header is before the first newline
-            header, *body = h.split('\n', 1)
+            header, body = h.split('\n', 1)
             old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
             old_begin_num = int(old_line_num.split(',')[0]) + 3
             old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
@@ -398,23 +398,93 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             # parse to get function signature
             parser = CParser()
             file_path = os.path.join(target_repo_path, path)
-            
-            # checkout target repo to the fix commit, and parse the code from that
-            os.chdir(target_repo_path)
-            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "checkout", '-f', fix_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
+
             if not os.path.exists(file_path):
                 logger.info(f"File {file_path} does not exist, skipping parsing")
                 continue
             
             signature = 'unknown'
             for item in parser.iterate_code(file_path, file_type=ext):
-                header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
-                header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
+                patch_header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
+                patch_header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
+                # diff inside a function definition
+                if item['type'] == 'function' and item['start_point'][0]+1 <= begin_num and item['end_point'][0] >= end_num:
+                    signature = item['signature']
+                    patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
+
+                    # use old patch location as key
+                    results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
+                        'file_path':   path,
+                        'file_type':   ext,
+                        'change_type': diff.change_type,
+                        'hunk_header': section,
+                        'patch_text':  patch_text,
+                        'new_signature':   signature,
+                        'patch_type': type_set,
+                    }
+                    break
+                # part or all of function definitions inside the diff
+                if item['type'] == 'function' and item['end_point'][0] >= begin_num and item['start_point'][0]+1 <= end_num:
+                    signature = item['signature']
+                    diff_result_begin = max(item['start_point'][0], begin_num)
+                    diff_result_end = min(item['end_point'][0], end_num) + 1
+                    # not include context lines, because they may add some changes not related to the function
+                    sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
+                    patch_text = header + sub_patch
+                    results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
+                        'file_path':   path,
+                        'file_type':   ext,
+                        'change_type': diff.change_type,
+                        'hunk_header': section,
+                        'patch_text':  patch_text,
+                        'new_signature':   signature,
+                        'patch_type': type_set,
+                    }
+        
+        # checkout target repo to the old commit, and parse the code from that
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for h in hunks[1:]:
+            # The hunk header is before the first newline
+            header, body = h.split('\n', 1)
+            old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
+            old_begin_num = int(old_line_num.split(',')[0]) + 3
+            old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
+
+            new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
+            # Extract section/function name (text after second '@@')
+            section = header.split('@@')[-1].strip() or "<no-section>"
+
+            # parse to get function signature
+            parser = CParser()
+            file_path = os.path.join(target_repo_path, path)
+
+            if not os.path.exists(file_path):
+                logger.info(f"File {file_path} does not exist, skipping parsing")
+                continue
+            
+            signature = 'unknown'
+            for item in parser.iterate_code(file_path, file_type=ext):
+                patch_header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
+                patch_header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
                 # diff inside a function definition
                 if item['type'] == 'function' and item['start_point'][0]+1 <= old_begin_num and item['end_point'][0] >= old_end_num:
                     signature = item['signature']
+                    patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
+
+                    if f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}' in results:
+                        results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}']['old_signature'] = signature
+                    else:
+                        results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
+                            'file_path':   path,
+                            'file_type':   ext,
+                            'change_type': diff.change_type,
+                            'hunk_header': section,
+                            'patch_text':  patch_text,
+                            'old_signature':   signature,
+                            'patch_type': type_set,
+                        }
                     break
                 # part of function definitions inside the diff
                 if item['type'] == 'function' and item['end_point'][0] >= old_begin_num and item['start_point'][0]+1 <= old_end_num:
