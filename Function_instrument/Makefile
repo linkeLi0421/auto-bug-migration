@@ -29,6 +29,6 @@ $(STATIC_LIB): trace.c
 	rm -f trace.o
 
 clean:
-	rm -f $(SHARED_LIB) $(STATIC_LIB) trace.o trace.c
+	rm -f $(SHARED_LIB) $(STATIC_LIB)
 
 .PHONY: all clean
