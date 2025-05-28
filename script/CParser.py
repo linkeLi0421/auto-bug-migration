@@ -83,7 +83,7 @@ class CParser:
         return context
     
     def _extract_function_info(self, node, source_code):
-        """Extract function signature and name from a function_definition node."""
+        """Extract function signature, name, code and line information from a function_definition node."""
         # Get function body to determine where signature ends
         body = node.child_by_field_name('body')
         if not body:
@@ -91,6 +91,13 @@ class CParser:
             
         # Extract the signature (everything before the body)
         signature = source_code[node.start_byte:body.start_byte].decode('utf8').strip()
+        
+        # Extract the full code for the function
+        function_code = source_code[node.start_byte:node.end_byte].decode('utf8')
+        
+        # Get line information
+        start_line = node.start_point[0] + 1  # Convert to 1-based indexing
+        end_line = node.end_point[0] + 1
         
         # Find function name
         declarator = node.child_by_field_name('declarator')
@@ -112,7 +119,10 @@ class CParser:
         
         return {
             'name': name,
-            'signature': signature
+            'signature': signature,
+            'code': function_code,
+            'start_point': start_line,
+            'end_point': end_line
         }
     
     def _extract_class_info(self, node, source_code):
@@ -216,6 +226,51 @@ class CParser:
         source_code, tree = self.parse_file(file_path, file_type)
         context = self.find_context_at_position(source_code, tree, int(line_number) - 1, column_number)
         return context['function']['signature'] if context['function'] else None
+
+
+    def get_code_context(self, file_path, line_number, column_number, file_type):
+        """
+        Get the function/class context at a specific line and column in a file.
+        
+        Args:
+            file_path: Path to the file
+            line_number: Line number (1-based)
+            column_number: Column number (0-based)
+            
+        Returns:
+            Function signature or None if not found
+        """
+        source_code, tree = self.parse_file(file_path, file_type)
+        context = self.find_context_at_position(source_code, tree, int(line_number) - 1, column_number)
+        return context if context['function'] else None
+
+
+    def find_function_calls(self, file_path, file_type='c'):
+        source_code, tree = self.parse_file(file_path, file_type)
+        root = tree.root_node
+        calls = []
+
+        def traverse(node):
+            if node.type == 'call_expression':
+                # Function being called
+                function_node = node.child_by_field_name('function')
+                if function_node:
+                    func_name = source_code[function_node.start_byte:function_node.end_byte].decode('utf8')
+                else:
+                    func_name = "unknown"
+
+                calls.append({
+                    'name': func_name,
+                    'start_point': node.start_point,
+                    'end_point': node.end_point,
+                    'code': source_code[node.start_byte:node.end_byte].decode('utf8')
+                })
+
+            for child in node.children:
+                traverse(child)
+
+        traverse(root)
+        return calls
 
 
 def example_usage():
