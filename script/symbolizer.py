@@ -14,52 +14,69 @@ caller offset information, and uses llvm-symbolizer to convert offsets to
 symbol names and source locations.
 """
 
-def symbolize(offsets, binary_path):
+def symbolize_funcs(all_offsets, binary_path):
     # Prepare input for llvm-symbolizer
-    output_data = []
+    offset_to_symbol = {}
     
-    for offset in offsets:
-        cmd = f"{binary_path} {offset}"
-        proc = subprocess.Popen(['/out/llvm-symbolizer', cmd], 
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                universal_newlines=True)
-        output, error = proc.communicate(timeout=30)
-        if error:
-            print(f"Symbolizer error: {error}", file=sys.stderr)
+    # Batch process all offsets in a single call
+    cmd_input = '\n'.join([f"{binary_path} {offset}" for offset in all_offsets])
     
-        # Process output
-        lines = output.strip().split('\n')
-        symbol = lines[0]
-        location = lines[1]
-        output_data.append((symbol, location))
-    return output_data
+    proc = subprocess.Popen(['/out/llvm-symbolizer'], 
+                          stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,
+                          universal_newlines=True)
+    output, error = proc.communicate(input=cmd_input, timeout=30)
+    
+    if error:
+        print(f"Symbolizer error: {error}", file=sys.stderr)
+    
+    # Process output - each symbol/location pair takes two lines
+    output_lines = output.strip().split('\n\n')
+    for i in range(len(output_lines)):
+        output_line = output_lines[i]
+        offset = all_offsets[i]
+        lines = output_line.split('\n')
+        if len(lines) < 2:
+            continue
+        symbol = lines[0].strip()
+        location = lines[1].strip()
+        offset_to_symbol[offset] = (symbol, location)
+    
+    return offset_to_symbol
 
 
-def parse_trace_file(file_path: str) -> List[Tuple[str, str]]:
+def parse_trace_file(file_path: str) -> List[str]:
     """
-    Parse the trace file and extract offset and caller offset pairs.
+    Parse the trace file and extract offset information.
     
     Args:
         file_path: Path to the trace file
         
     Returns:
-        List of (offset, caller_offset) tuples
+        List of offsets found in the file
     """
-    offset_pattern = re.compile(r'offset: ([0-9a-f]+)')
-    func_offset_list = []
+    offset_pattern = re.compile(r'offset: ([0-9a-f]+) called by: ([0-9a-f]+)')
+    trace_offset_list = []
+    caller_to_callees = defaultdict(list)
+    all_offsets = set()
     
     try:
         with open(file_path, 'r') as f:
             content = f.read()
-            matches = offset_pattern.findall(content)
-            func_offset_list = [offset for offset in matches]
+            for match in offset_pattern.finditer(content):
+                offset = match.group(1)
+                caller_offset = match.group(2)
+                trace_offset_list.append(offset)
+                caller_to_callees[caller_offset].append(offset)
+                all_offsets.add(offset)
+                all_offsets.add(caller_offset)
     except FileNotFoundError:
         print(f"Error: File '{file_path}' not found.")
     except Exception as e:
         print(f"Error processing file: {e}")
         
-    return func_offset_list
+    return list(all_offsets), trace_offset_list, caller_to_callees
 
 
 def main():
@@ -74,21 +91,33 @@ def main():
     
     # If no trace file is provided, read from stdin
     if args.trace_file:
-        func_offset_list = parse_trace_file(args.trace_file)
+        all_offsets, trace_offset_list, caller_to_callees = parse_trace_file(args.trace_file)
     
-    if not func_offset_list:
+    if not trace_offset_list:
         print("No offset information found in the input.")
         return
     
     # Analyze the trace data
-    symbols = {}
-    symbols = symbolize(list(func_offset_list), args.binary)
+    offset_to_symbol = symbolize_funcs(all_offsets, args.binary)
+    
+    # Process caller relationships
+    for caller_offset, callee_offsets in caller_to_callees.items():
+        print(f"Caller: {offset_to_symbol[caller_offset]} {caller_offset}")
+        for callee_offset in callee_offsets:
+            if callee_offset in offset_to_symbol:
+                print(f"  -> Callee: {offset_to_symbol[callee_offset]} {callee_offset}")
+                
+    for trace_offset in trace_offset_list:
+        if trace_offset in offset_to_symbol:
+            symbol, location = offset_to_symbol[trace_offset]
+            print(f"Trace Offset: {trace_offset} Symbol: {symbol} Location: {location}")
 
     # Prepare output
     output_lines = [f"Trace Analysis Summary:", f"-----------------------", ""]
-    output_lines.append(f"Found {len(symbols)} function entries.")
+    output_lines.append(f"Found {len(trace_offset_list)} function entries.")
     output_lines.append("")
-    for symbol, location in symbols:
+    for trace_offset in trace_offset_list:
+        symbol, location = offset_to_symbol[trace_offset]
         if args.source_path:
             # Get relative path
             location = location.replace(args.source_path, "")
