@@ -284,7 +284,7 @@ def extract_revert_patch(h, line_start, line_end, version):
         h: String containing the hunk content
         line_start: Starting line number to extract
         line_end: Ending line number to extract
-        version: Version of the code (old or new)
+        version: Version of the code (old or new or both)
     
     Returns:
         String containing the extracted patch
@@ -302,6 +302,8 @@ def extract_revert_patch(h, line_start, line_end, version):
         target_line_cursor = old_line_cursor
     elif version == 'new':
         target_line_cursor = new_line_cursor
+    elif version == 'both':
+        target_line_cursor = None
     else:
         raise ValueError("Version must be 'old' or 'new'")
     
@@ -323,11 +325,11 @@ def extract_revert_patch(h, line_start, line_end, version):
         if not line:
             continue
         
-        logger.debug(f'target_line_cursor: {target_line_cursor["num"]} old_line_cursor: {old_line_cursor["num"]} new_line_cursor: {new_line_cursor["num"]}')
+        logger.debug(f'version: {version} old_line_cursor: {old_line_cursor["num"]} new_line_cursor: {new_line_cursor["num"]}')
         
-        if target_line_cursor['num'] >= line_start and target_line_cursor['num'] <= line_end:
+        if (not target_line_cursor and old_line_cursor['num'] >= line_start and new_line_cursor['num'] <= line_end) or (target_line_cursor and target_line_cursor['num'] >= line_start and target_line_cursor['num'] <= line_end):
             if not get_sub_patch_start:
-                if version == 'new' and line.startswith('+') or version == 'old' and line.startswith('-') or line.startswith(' '):
+                if not target_line_cursor or version == 'new' and line.startswith('+') or version == 'old' and line.startswith('-') or line.startswith(' '):
                     get_sub_patch_start = True
                     new_line_start = new_line_cursor['num']
                     old_line_start = old_line_cursor['num']
@@ -335,7 +337,7 @@ def extract_revert_patch(h, line_start, line_end, version):
                 patch_lines.append(line)
                 logger.debug(f'add line: {line}')
             
-        if target_line_cursor['num'] > line_end:
+        if target_line_cursor and target_line_cursor['num'] > line_end or not target_line_cursor and new_line_cursor['num'] > line_end:
             # We've reached the end of the target lines
             break
         
@@ -421,7 +423,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             file_path = os.path.join(target_repo_path, path)
 
             if not os.path.exists(file_path):
-                logger.info(f"File {file_path} does not exist, skipping parsing")
+                logger.debug(f"File {file_path} does not exist, skipping parsing")
                 continue
             
             signature = 'unknown'
@@ -453,8 +455,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                 # part or all of function definitions inside the diff
                 if item['type'] == 'function' and item['end_point'][0] >= begin_num and item['start_point'][0]+1 <= end_num:
                     signature = item['signature']
-                    diff_result_begin = max(item['start_point'][0], begin_num)
-                    diff_result_end = min(item['end_point'][0], end_num) + 1
+                    diff_result_begin = max(item['start_point'][0]+1, begin_num)
+                    diff_result_end = min(item['end_point'][0]+1, end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
                     patch_text = patch_header + sub_patch
@@ -500,7 +502,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             file_path = os.path.join(target_repo_path, path)
 
             if not os.path.exists(file_path):
-                logger.info(f"File {file_path} does not exist, skipping parsing")
+                logger.debug(f"File {file_path} does not exist, skipping parsing")
                 continue
             
             signature = 'unknown'
@@ -535,10 +537,31 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                 # part of function definitions inside the diff
                 if item['type'] == 'function' and item['end_point'][0] >= old_begin_num and item['start_point'][0]+1 <= old_end_num:
                     signature = item['signature']
-                    diff_result_begin = max(item['start_point'][0], old_begin_num)
-                    diff_result_end = min(item['end_point'][0], old_end_num) + 1
+                    diff_result_begin = max(item['start_point'][0]+1, old_begin_num)
+                    diff_result_end = min(item['end_point'][0]+1, old_end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'old')
+                    k_old = f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
+                    # check if there is a patch that has overlapped with the current patch
+                    key_merged = dict()
+                    for k, v in results.items():
+                        old_start_i, old_end_i, new_start_i, new_end_i = v['old_start_line'], v['old_end_line'], v['new_start_line'], v['new_end_line']
+                        if new_start_i == new_end_i:
+                            # this situation is handled in add_context()
+                            continue
+                        if (max(old_start_i, old_line_start) < min(old_end_i, old_line_cursor) and
+                            max(new_start_i, new_line_start) < min(new_end_i, new_line_cursor)):
+                            logger.debug(f'Overlapped patch found: {sub_patch}\n{v["patch_text"]}')
+                            # update the boundaries: take min start and max end for both old and new
+                            old_start = min(old_start_i, old_line_start)
+                            old_end = max(old_end_i, old_line_cursor)
+                            new_start = min(new_start_i, new_line_start)
+                            new_end = max(new_end_i, new_line_cursor)
+                            sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, old_start, new_end, 'both')
+                            k_old = f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
+                            key_merged[k] = k_old
+                            break
+                        
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
                     if old_line_cursor == old_line_start:
@@ -548,10 +571,10 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     
                     dependent_func = set()
                     
-                    if f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}' in results:
-                        results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}']['old_signature'] = signature
+                    if k_old in results:
+                        results[k_old]['old_signature'] = signature
                     else:
-                        results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
+                        results[k_old] = {
                             'file_path_old':   diff.a_path,
                             'file_path_new':   diff.b_path,
                             'file_type':   ext,
@@ -566,6 +589,9 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                             'old_end_line': int(old_line_cursor),
                         }
                     
+                    for k_new, k_old in key_merged.items():
+                        results[k_old]['new_signature'] = results[k_new]['new_signature']
+                        del results[k_new]
     
     return results
 
@@ -612,10 +638,9 @@ def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path,
 
 
 def rename_func(patch_text, fname):
-    logger.debug(f'Renaming function {fname} in {patch_text}')
-    # add prefix to function being deleted
+    logger.debug(f'Renaming function {fname}')
     modified_lines = []
-    regex = r'\b' + re.escape(fname) + r'\b'
+    regex = r'(?<!\w)' + re.escape(fname) + r'(?!\w)'
     replacement_string = f"__revert_{fname}"
 
     for line in patch_text.splitlines():
@@ -629,15 +654,27 @@ def rename_func(patch_text, fname):
 
 
 def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit, next_commit, target_repo_path):
+    # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
     handle_func_signature_change = set()
+    
+    removed_old_signatures = set()
+    removed_new_signatures = set()
+    reserved_keys = set()
+    
     for key in patch_to_apply:
         patch = diff_results[key]
+        patch_text = patch['patch_text']
+        lines = patch_text.split('\n')
+        if 'old_signature' not in patch:
+            # skip for a added function
+            new_patch_to_apply.append(key)
+            continue
         fname = patch['old_signature'].split('(')[0].split(' ')[-1]
-        old_line_info = key.split('-')[1].split('+')[0]
+        old_line_info = key.split('-')[-1].split('+')[0]
         old_line_begin = int(old_line_info.split(',')[0])
         old_line_end = int(old_line_info.split(',')[1]) + old_line_begin
-        new_line_info = key.split('+')[1]
+        new_line_info = key.split('+')[-1]
         new_line_begin = int(new_line_info.split(',')[0])
         new_line_end = int(new_line_info.split(',')[1]) + new_line_begin
         parser = CParser()
@@ -656,6 +693,10 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             elif 'Function signature change' in patch['patch_type'] and key in dependence_graph:
                 if patch['old_signature'] in handle_func_signature_change:
                     continue
+                # Delete all other patches that have the same signature
+                removed_old_signatures.add(patch['old_signature'])
+                removed_new_signatures.add(patch['new_signature'])
+                
                 handle_func_signature_change.add(patch['old_signature'])
                 logger.debug(f'key {key} is a function signature change, and has dependent functions')
                 # Need a Artificial patch, to create the old function
@@ -703,12 +744,23 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(new_key)
+                reserved_keys.add(new_key)
             else:
                 new_patch_to_apply.append(key)
         else:
             new_patch_to_apply.append(key)
             logger.debug(f"Skipping non-function body change for {key}")
             
+    # Remove patches that are not needed anymore
+    for key in new_patch_to_apply:
+        if key in reserved_keys:
+            continue
+        patch = diff_results[key]
+        if 'old_signature' in patch and patch['old_signature'] in removed_old_signatures:
+            new_patch_to_apply.remove(key)
+            continue
+        if 'new_signature' in patch and patch['new_signature'] in removed_new_signatures:
+            new_patch_to_apply.remove(key)
     return new_patch_to_apply
 
 
@@ -716,14 +768,14 @@ def build_dependency_graph(diff_results, patch_to_apply):
     dependence_graph = dict()
     parser = CParser()
     patch_list = list(patch_to_apply)
-    new_patch_to_patch = []
+    new_patch_to_patch = set()
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
     # the callee definition patch to this patch(caller). specifically, do this for the patches remove
     # the function definition or change the function def.
     while patch_list:
         key = patch_list.pop()
-        new_patch_to_patch.append(key)
+        new_patch_to_patch.add(key)
         logger.debug(f'Analyzing patch {diff_results[key]['patch_text']}')
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type']:
@@ -739,7 +791,7 @@ def build_dependency_graph(diff_results, patch_to_apply):
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
                             
-    return dependence_graph, new_patch_to_patch
+    return dependence_graph, list(new_patch_to_patch)
 
 
 def add_context(diff_results, final_patches, new_commit, target_repo_path):
@@ -748,7 +800,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     old_patch_key = None
     removed_patches = set()
     
-    # 1. Merge the patches that have overlap
+    # 1. Merge the patches that have overlap, note that the overlap here is just the simple ones
     for key in final_patches:
         patch = diff_results[key]
         patch_text = patch['patch_text']
