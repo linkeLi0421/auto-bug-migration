@@ -596,7 +596,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
     return results
 
 
-def build_and_test_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch):
+def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch):
     cmd = [
         "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
         "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch , target
@@ -874,6 +874,8 @@ def revert_patch_test(args):
     transitions = find_transitions(parsed_data, target_repo_path)
     logger.info(f"Transitions found: {len(transitions)}")
     
+    get_patched_traces = dict()
+    
     for commit, next_commit, bug_id in transitions:
         logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
         bug_info = bug_info_dataset[bug_id]
@@ -887,7 +889,9 @@ def revert_patch_test(args):
             arch = 'x86_64'
         trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
         trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
-    
+        if bug_id in get_patched_traces:
+            patch_path_list = get_patched_traces[bug_id]
+            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
@@ -898,8 +902,12 @@ def revert_patch_test(args):
         with open(target_dockerfile_path, 'w') as dockerfile:
             dockerfile.write(updated_content)
     
-        collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
-                            '--build_csv', args.build_csv, '--architecture', arch]
+        if bug_id in get_patched_traces:
+            collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
+                                '--build_csv', args.build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
+        else:
+            collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
+                                '--build_csv', args.build_csv, '--architecture', arch]
         testcases_env = os.getenv('TESTCASES', '')
         if testcases_env:
             collect_trace_cmd.extend(['--testcases', testcases_env])
@@ -1003,7 +1011,7 @@ def revert_patch_test(args):
         # Save all patches to a single file
         if patch_to_apply:
             patch_to_apply = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches.diff")
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
                 if key not in final_patches:
@@ -1022,7 +1030,7 @@ def revert_patch_test(args):
                 patch_file.write('\n\n')  # Add separator between patches
         
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
-        build_success = build_and_test_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        build_success = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             # Run the fuzzer to test if the bug is reproduced
             testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
@@ -1036,6 +1044,8 @@ def revert_patch_test(args):
                 logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             else:
                 revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
+                transitions.append((commit, next_commit, bug_id))
                 logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")

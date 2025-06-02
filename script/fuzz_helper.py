@@ -550,6 +550,8 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='path to store testcases')
   collect_trace_parser.add_argument('--test_input',
                             help='test_input name')
+  collect_trace_parser.add_argument('--patch',
+                            help='patch file to apply in the builder')
   _add_architecture_args(collect_trace_parser)
   _add_engine_args(collect_trace_parser)
   _add_sanitizer_args(collect_trace_parser)
@@ -2320,24 +2322,6 @@ def collect_trace(args):
   if args.e:
     env += args.e
 
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-      
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
-                args.commit, oss_fuzz_commit)
-          oss_fuzz_commit = oss_fuzz_commit
-  else:
-    logger.error('Need a build_csv')
-
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
     out_dir = _get_out_dir()
@@ -2366,6 +2350,13 @@ def collect_trace(args):
   else:
     logger.error('Testcase path %s does not exist.', args.testcases)
     return False
+
+  bash = ''
+  if args.patch:
+    run_args.extend([
+        '-v',
+        '%s:/patch' % args.patch,
+    ])
 
   script_folder = os.path.join(HOME_DIR, 'script')
   Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
