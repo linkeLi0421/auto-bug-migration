@@ -46,6 +46,37 @@ def get_commit_patch_gitpython(repo_path, commit_id, parent_commit_id):
     return diffs
 
 
+def get_diff_unified(repo_path, commit1, commit2, context_lines=3):
+    """
+    Get unified diff format between two commits.
+    
+    Args:
+        repo_path (str): Path to the git repository
+        commit1 (str): First commit hash/reference
+        commit2 (str): Second commit hash/reference
+        context_lines (int): Number of context lines around changes
+    
+    Returns:
+        str: Unified diff content without a/ and b/ prefixes.
+    """
+    try:
+        repo = Repo(repo_path)
+        
+        # Use git diff with --minimal, --no-prefix and context lines options
+        diff_output = repo.git.diff(
+            '--minimal',
+            '--no-prefix',
+            commit1, 
+            commit2, 
+            unified=context_lines
+        )
+        
+        return diff_output
+        
+    except Exception as e:
+        raise RuntimeError(f"Error generating unified diff: {e}")
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run fuzzing tests with trace collection')
     parser.add_argument('target_test_result',
@@ -366,9 +397,10 @@ def update_type_set(patch):
         patch: The patch text to analyze.
     
     Returns:
-        A set of change types.
+        a list of signature changed function pairs
     """
     type_set = patch.get('patch_type', set())
+    sig_change_list = []
     old_signature = patch.get('old_signature', '')
     new_signature = patch.get('new_signature', '')
     logger.debug(f'\nold_signature: {old_signature}\nnew_signature: {new_signature}')
@@ -377,24 +409,41 @@ def update_type_set(patch):
         type_set.add('Function added')
         type_set.add('Function removed')
         type_set.add('Function signature change')
+        sig_change_list.append((old_signature, new_signature))
     patch['patch_type'] = type_set
 
+    return sig_change_list
 
-def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_commit: str):
+
+def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str):
     """
     Analyze a GitPython DiffIndex and return metadata per hunk.
     Target repo checkout to fix commit here.
     """
     results = dict()
-    for diff in diff_index:
+    for diff in diff_text.split('diff --git')[1:]:
         # Choose the post-change path if available, else pre-change:
-        path = diff.b_path or diff.a_path
+        diff_lines = diff.splitlines()
+        if len(diff_lines) < 5:
+            # Skip if the diff is too short to contain valid information, like binary files or empty diffs
+            continue
+        path_a = None
+        path_b = None
+        for diff_line in diff_lines:
+            if diff_line.startswith('---'):
+                path_a = diff_line.split(' ')[-1]
+            elif diff_line.startswith('+++'):
+                path_b = diff_line.split(' ')[-1]
+            if path_a and path_b:
+                break
+        path = path_b if 'dev/null' not in path_b else path_a
         # Derive file extension/type from path:
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
+        if ext not in ['c', 'cpp', 'h', 'hpp', 'cxx', 'cc']:
+            # Skip non-C/C++ files
+            continue
 
-        # Decode patch text; skip diffs without patch bodies
-        patch_bytes = diff.diff or b''
-        patch_text = patch_bytes.decode('utf-8', errors='ignore')
+        patch_text = diff
 
         # Split into hunks on lines starting with '@@'
         hunks = re.split(r'(?m)^@@', patch_text)
@@ -405,22 +454,27 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for h in hunks[1:]:
-            # The hunk header is before the first newline
-            header, body = h.split('\n', 1)
-            old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
-            old_begin_num = int(old_line_num.split(',')[0]) + 3
-            old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
-
-            new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
             # diff codes have extra 3 lines
-            begin_num = int(new_line_num.split(',')[0]) + 3
-            end_num = begin_num + int(new_line_num.split(',')[1]) - 7
-            # Extract section/function name (text after second '@@')
-            section = header.split('@@')[-1].strip() or "<no-section>"
+            if len(h.split('\n')) >= 8:
+                # The hunk header is before the first newline
+                header, body = h.split('\n', 1)
+                old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
+                old_begin_num = int(old_line_num.split(',')[0]) + 3
+                old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
 
+                new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
+                begin_num = int(new_line_num.split(',')[0]) + 3
+                end_num = begin_num + int(new_line_num.split(',')[1]) - 7
+                # Extract section/function name (text after second '@@')
+                section = header.split('@@')[-1].strip() or "<no-section>"
+            else:
+                # If the hunk is too short, skip it TODO: maybe find a better way to handle this
+                logger.debug(f'Skipping short hunk: {h}')
+                continue
+                
             # parse to get function signature
             parser = CParser()
-            file_path = os.path.join(target_repo_path, path)
+            file_path = os.path.join(target_repo_path, path_b)
 
             if not os.path.exists(file_path):
                 logger.debug(f"File {file_path} does not exist, skipping parsing")
@@ -428,8 +482,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             
             signature = 'unknown'
             for item in parser.iterate_code(file_path, file_type=ext):
-                patch_header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
-                patch_header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
+                patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
+                patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
                 # diff inside a function definition
                 if item['type'] == 'function' and item['start_point'][0]+1 <= begin_num and item['end_point'][0] >= end_num:
                     signature = item['signature']
@@ -437,9 +491,9 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     type_set = {'Function body change'}
                     dependent_func = set()
                     # use old patch location as key
-                    results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
-                        'file_path_old':   diff.a_path,
-                        'file_path_new':   diff.b_path,
+                    results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}'] = {
+                        'file_path_old':   path_a,
+                        'file_path_new':   path_b,
                         'file_type':   ext,
                         'hunk_header': section,
                         'patch_text':  patch_text,
@@ -459,6 +513,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     diff_result_end = min(item['end_point'][0]+1, end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
+                    key_new = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
                     if old_line_cursor == old_line_start:
@@ -467,9 +522,9 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                         type_set.add('Function removed')
                     
                     dependent_func = set()
-                    results[f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
-                        'file_path_old':   diff.a_path,
-                        'file_path_new':   diff.b_path,
+                    results[f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
+                        'file_path_old':   path_a,
+                        'file_path_new':   path_b,
                         'file_type':   ext,
                         'hunk_header': section,
                         'patch_text':  patch_text,
@@ -490,6 +545,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             # The hunk header is before the first newline
             header, body = h.split('\n', 1)
             old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
+            old_line_num = old_line_num if old_line_num.count(',') else '0,' + old_line_num
             old_begin_num = int(old_line_num.split(',')[0]) + 3
             old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
 
@@ -499,7 +555,7 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
 
             # parse to get function signature
             parser = CParser()
-            file_path = os.path.join(target_repo_path, path)
+            file_path = os.path.join(target_repo_path, path_a)
 
             if not os.path.exists(file_path):
                 logger.debug(f"File {file_path} does not exist, skipping parsing")
@@ -507,8 +563,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
             
             signature = 'unknown'
             for item in parser.iterate_code(file_path, file_type=ext):
-                patch_header = f"diff --git a/{diff.a_path} b/{diff.b_path}\n"
-                patch_header += f"--- a/{diff.a_path}\n+++ b/{diff.b_path}\n"
+                patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
+                patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
                 # diff inside a function definition
                 if item['type'] == 'function' and item['start_point'][0]+1 <= old_begin_num and item['end_point'][0] >= old_end_num:
                     signature = item['signature']
@@ -516,12 +572,12 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     type_set = {'Function body change'}
                     dependent_func = set()
 
-                    if f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}' in results:
-                        results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}']['old_signature'] = signature
+                    if f'{path_a}{path_b}-{old_line_num}+{new_line_num}' in results:
+                        results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}']['old_signature'] = signature
                     else:
-                        results[f'{diff.a_path}{diff.b_path}-{old_line_num}+{new_line_num}'] = {
-                            'file_path_old':   diff.a_path,
-                            'file_path_new':   diff.b_path,
+                        results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}'] = {
+                            'file_path_old':   path_a,
+                            'file_path_new':   path_b,
                             'file_type':   ext,
                             'hunk_header': section,
                             'patch_text':  patch_text,
@@ -541,26 +597,30 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                     diff_result_end = min(item['end_point'][0]+1, old_end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'old')
-                    k_old = f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
+                    k_old = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
                     # check if there is a patch that has overlapped with the current patch
                     key_merged = dict()
-                    for k, v in results.items():
-                        old_start_i, old_end_i, new_start_i, new_end_i = v['old_start_line'], v['old_end_line'], v['new_start_line'], v['new_end_line']
-                        if new_start_i == new_end_i:
-                            # this situation is handled in add_context()
-                            continue
-                        if (max(old_start_i, old_line_start) < min(old_end_i, old_line_cursor) and
-                            max(new_start_i, new_line_start) < min(new_end_i, new_line_cursor)):
-                            logger.debug(f'Overlapped patch found: {sub_patch}\n{v["patch_text"]}')
-                            # update the boundaries: take min start and max end for both old and new
-                            old_start = min(old_start_i, old_line_start)
-                            old_end = max(old_end_i, old_line_cursor)
-                            new_start = min(new_start_i, new_line_start)
-                            new_end = max(new_end_i, new_line_cursor)
-                            sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, old_start, new_end, 'both')
-                            k_old = f'{diff.a_path}{diff.b_path}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
-                            key_merged[k] = k_old
-                            break
+                    if k_old not in results:
+                        for k, v in results.items():
+                            if f'{path_a}{path_b}' not in k:
+                                # not same file, skip
+                                continue
+                            old_start_i, old_end_i, new_start_i, new_end_i = v['old_start_line'], v['old_end_line'], v['new_start_line'], v['new_end_line']
+                            if new_start_i == new_end_i:
+                                # this situation is handled in add_context()
+                                continue
+                            if (max(old_start_i, old_line_start) < min(old_end_i, old_line_cursor) and
+                                max(new_start_i, new_line_start) < min(new_end_i, new_line_cursor)):
+                                logger.debug(f'Overlapped patch found: {sub_patch}\n{v["patch_text"]}')
+                                # update the boundaries: take min start and max end for both old and new
+                                old_start = min(old_start_i, old_line_start)
+                                old_end = max(old_end_i, old_line_cursor)
+                                new_start = min(new_start_i, new_line_start)
+                                new_end = max(new_end_i, new_line_cursor)
+                                sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, old_start, new_end, 'both')
+                                k_old = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
+                                key_merged[k] = k_old
+                                break
                         
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
@@ -575,8 +635,8 @@ def analyze_diffindex(diff_index, target_repo_path: str, new_commit: str, old_co
                         results[k_old]['old_signature'] = signature
                     else:
                         results[k_old] = {
-                            'file_path_old':   diff.a_path,
-                            'file_path_new':   diff.b_path,
+                            'file_path_old':   path_a,
+                            'file_path_new':   path_b,
                             'file_type':   ext,
                             'hunk_header': section,
                             'patch_text':  patch_text,
@@ -737,10 +797,20 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     'old_start_line': artificial_patch_insert_point,
                     'old_end_line': artificial_patch_insert_point + func_length
                 }
-                # Add this new artificial patch key to patch_to_apply
+                # 4. Add this new artificial patch key to patch_to_apply
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
+                # 5. Rename the function by dependency graph
+                for callee_key, caller_key_set in dependence_graph.items():
+                    # rename functions in the Artificial patch
+                    for caller in caller_key_set:
+                        if key == caller:
+                            callee_fname = diff_results[callee_key]['old_signature'].split('(')[0].split(' ')[-1]
+                            modified_lines = rename_func(diff_results[new_key]['patch_text'], callee_fname)
+                            diff_results[new_key]['patch_text'] = '\n'.join(modified_lines)
+                    
                 for dep_key in dependence_graph.get(key, []):
+                    # rename functions in patches that depend on (call) this function
                     modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(new_key)
@@ -764,7 +834,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     return new_patch_to_apply
 
 
-def build_dependency_graph(diff_results, patch_to_apply):
+def build_dependency_graph(diff_results, patch_to_apply, target_repo_path):
     dependence_graph = dict()
     parser = CParser()
     patch_list = list(patch_to_apply)
@@ -778,14 +848,14 @@ def build_dependency_graph(diff_results, patch_to_apply):
         new_patch_to_patch.add(key)
         logger.debug(f'Analyzing patch {diff_results[key]['patch_text']}')
         patch = diff_results[key]
-        if 'Function body change' in patch['patch_type']:
+        if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
             patch_text = patch['patch_text']
-            calls = parser.find_function_calls(patch['file_path_old'], patch['file_type'])
+            calls = parser.find_function_calls(os.path.join(target_repo_path, patch['file_path_old']), patch['file_type'])
             for call in calls:
                 if patch['old_start_line'] <= call['start_point'][0] <= patch['old_end_line']:
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
-                        if diff_result['file_path_old'] == patch['file_path_old'] and 'old_signature' in diff_result and \
+                        if 'old_signature' in diff_result and \
                             call['name'] == diff_result['old_signature'].split('(')[0].split(' ')[-1] and \
                             len(call['code'].split(',')) == len(diff_result['old_signature'].split(',')):
                             patch_list.append(key1)
@@ -806,7 +876,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         patch_text = patch['patch_text']
         lines = patch_text.split('\n')
         if lines[4][0] == '-': # meaning this patch is only a remove patch, and has no context
-            if old_patch_key and new_start_line <= patch['new_start_line'] <= new_end_line:
+            if old_patch_key and old_patch_key.split('-')[0] in key and new_start_line-3 <= patch['new_end_line'] <= new_end_line+3:
                 # merge the patches that have overlap
                 old_patch = diff_results[old_patch_key]
                 old_patch['patch_text'] += '\n' + '\n'.join(lines[4:])
@@ -830,28 +900,51 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         final_patches.remove(key)
         
     # 2. Add context lines to the patches
-    os.chdir(target_repo_path)
-    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
     for key in final_patches:
         patch = diff_results[key]
         patch_text = patch['patch_text']
         lines = patch_text.split('\n')
+        if not patch['file_path_new']:
+            # a patch delete a file, skip now
+            continue
         if lines[4][0] in {'-', '+'}:
             # no context lines.
-            old_line_begin = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0]) - 3
-            old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1]) + 6
-            new_line_begin = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0]) - 3
-            new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1]) + 6
+            os.chdir(target_repo_path)
+            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             file_path = os.path.join(target_repo_path, patch['file_path_new'])
             with open(file_path, 'r') as f:
                 content = [line.rstrip('\n') for line in f.readlines()]
+            
+            old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
+            old_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
+            new_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
+            new_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(',')[-1])
+            
+            new_line_begin = max(new_line_begin_nocontext - 3, 0)
+            new_offset = new_offset_nocontext + (new_line_begin_nocontext - new_line_begin) + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext))
+            old_line_begin = max(old_line_begin_nocontext - 3, 0)
+            old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
+                
             # 1 based index and 0 based index
-            context_lines1 = [f' {line}' for line in content[new_line_begin-1: new_line_begin+2]]
-            context_lines2 = [f' {line}' for line in content[new_line_begin+new_offset-4: new_line_begin + new_offset-1]]
+            context_lines1 = [f' {line}' for line in content[new_line_begin-1: new_line_begin_nocontext-1]]
+            context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
             lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
                 + context_lines1 + lines[4:] + context_lines2
+            patch['patch_text'] = '\n'.join(lines)
+
+
+def handle_file_change(diff_results, patch_to_apply):
+    for key in diff_results:
+        patch = diff_results[key]
+        # Delete and add file
+        if patch['file_path_new'] == '/dev/null':
+            lines = patch['patch_text'].split('\n')
+            lines.insert(2, 'deleted file mode 100644')
+            patch['patch_text'] = '\n'.join(lines)
+        if patch['file_path_old'] == '/dev/null':
+            lines = patch['patch_text'].split('\n')
+            lines.insert(1, 'new file mode 100644')
             patch['patch_text'] = '\n'.join(lines)
 
 
@@ -932,7 +1025,7 @@ def revert_patch_test(args):
             except subprocess.CalledProcessError as e:
                 logger.info(f"Command failed with exit code {e.returncode}")
                 
-        if not os.path.exists(trace_path2)  or os.path.exists(trace_path2) and 'No such file or directory' in open(trace_path2).read():
+        if not os.path.exists(trace_path2):
             collect_trace_cmd[4] = next_commit['commit_id']
             # logger.info the command being executed
             logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
@@ -942,10 +1035,15 @@ def revert_patch_test(args):
             except subprocess.CalledProcessError as e:
                 logger.info(f"Command failed with exit code {e.returncode}")
         
+        # may cannot get trace, in new commit
+        if not os.path.exists(trace_path2):
+            logger.info(f"Trace file {trace_path2} does not exist, skipping bug {bug_id}")
+            continue
+        
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
-        common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
-        diffs = get_commit_patch_gitpython(target_repo_path, next_commit['commit_id'], commit['commit_id']) # every file get a diff
+        common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
+        diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id']) # every file get a diff
         diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'])
 
         trace_func_set = set()
@@ -965,36 +1063,47 @@ def revert_patch_test(args):
             parser = CParser()
             if os.path.exists(file_path):
                 func_dict[func] = parser.function_signature(file_path, int(line_num), int(col_num), file_path.split('.')[-1])
-                trace_func_set.add(func_dict[func])
+                trace_func_set.add((func_dict[func], func_loc))
             else:
-                trace_func_set.add(func.split(' ')[0])
+                trace_func_set.add((func.split(' ')[0], func_loc))
                 
         logger.debug(f"Trace function set: {trace_func_set}")
         if not trace_func_set:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
-        # checkout target repo to the bug commit, get function signature from source code using code location
+
+        if previous_bug == bug_id and previous_trace_func_set == trace_func_set:
+            # Try to add trace funcs for this bug fail
+            logger.info(f"Skipping bug {bug_id} as it has the same trace functions as the previous bug")
+            continue
+        previous_trace_func_set = trace_func_set
+        previous_bug = bug_id
+
+        # checkout target repo to the new commit, get function signature from source code using code location
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         patch_to_apply = []
+        patch_func_new = ''
+        patch_func_old = ''
+        patch_file_path = ''
         for key, diff_result in diff_results.items():
             if 'new_signature' in diff_result:
                 logger.debug(f'newsignature{diff_result['new_signature']}')
-                patch_func = diff_result['new_signature']
+                patch_func_new = diff_result['new_signature']
             if 'old_signature' in diff_result:
                 logger.debug(f'oldsignature{diff_result['old_signature']}')
-                patch_func = diff_result['old_signature']
-            logger.debug(f'Diff result: {key} \n{diff_result['patch_text']}')
-            logger.debug(f'Patch Function: {patch_func}')
+                patch_func_old = diff_result['old_signature']
+            if 'file_path_old' in diff_result:
+                patch_file_path = diff_result['file_path_old']
             update_type_set(diff_result)
             
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
-            for trace_func in trace_func_set:
-                if trace_func in patch_func:
+            for trace_func, func_loc in trace_func_set:
+                if patch_file_path in func_loc and trace_func in patch_func_old:
                     logger.debug(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
                     patch_to_apply.append(key)
                     break
@@ -1002,7 +1111,7 @@ def revert_patch_test(args):
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply)
+        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path)
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -1023,6 +1132,7 @@ def revert_patch_test(args):
         # Sort final_patches by new_start_line
         final_patches = sorted(final_patches, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
         add_context(diff_results, final_patches, next_commit['commit_id'], target_repo_path)
+        handle_file_change(diff_results, final_patches)
         with open(patch_file_path, 'w') as patch_file:
             for key in final_patches:
                 patch = diff_results[key]   
