@@ -11,14 +11,17 @@ def extract_function_calls(file_path):
         return filtered_lines
 
 
-def compare_traces(trace1, trace2):
+def compare_traces(trace1, trace2, signature_change_list=None):
     """Find the first difference and return the common part and all functions after it."""
     common_part = []
     min_length = min(len(trace1), len(trace2))
     for i in range(min_length):
-        if trace1[i][1].split(' ')[0] != trace2[i][1].split(' ')[0]:
+        func1 = trace1[i][1].split(' ')[0]
+        func2 = trace2[i][1].split(' ')[0]
+        if func1 != func2 and not (signature_change_list and any((func1, func2) == sig_pair or (func2, func1) == sig_pair for sig_pair in signature_change_list)):
             return common_part, trace1[i:], trace2[i:]
         common_part.append(trace1[i])
+        common_part.append(trace2[i])
     # If no difference is found in the common length, return remaining functions
     return common_part, trace1[min_length:], trace2[min_length:]
 

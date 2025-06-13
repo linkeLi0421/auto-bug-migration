@@ -571,6 +571,18 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='patch file to apply in the builder')
   build_version_parser.add_argument('--build_csv',
                             help='this file contains a target project commit id and corresponding commit id')
+  build_version_parser.add_argument(
+      '--preprocess',
+      action='store_true',
+      default=False,
+      help='get preprocessed files based on compile_commands.json.'
+  )
+  build_version_parser.add_argument(
+      '--compile_commands',
+      action='store_true',
+      default=False,
+      help='Run builder in “cmdjson” mode (boolean flag).'
+  )
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -1913,16 +1925,45 @@ def build_version(args):
         '%s:/patch' % args.patch,
     ])
   
-  build_bash += '''
-  cd -;
-  compile;
-  '''
+  if args.preprocess:
+    build_bash += f'''
+    cd -;
+    apt-get update && apt-get install -y bear;
+    apt install libclang-18-dev -y;
+    pip install libclang==18.*;
+    bear compile;
+    python3 /script/preprocessor.py compile_commands.json;
+    mkdir /data/{args.project.name}-{args.commit[:6]};
+    python3 /script/mv.py ./ /data/{args.project.name}-{args.commit[:6]};
+    '''
+  elif args.compile_commands:
+    build_bash += f'''
+    cd -;
+    apt-get update && apt-get install -y bear;
+    apt install libclang-18-dev -y;
+    pip install libclang==18.*;
+    bear compile;
+    python3 /script/libclang.py;
+    # Remove existing output directory if it already exists
+    if [ -d "/data/{args.project.name}-{args.commit[:6]}" ]; then
+        rm -rf "/data/{args.project.name}-{args.commit[:6]}"
+    fi
+    mv /data/{args.project.name} /data/{args.project.name}-{args.commit[:6]};
+    '''
+  else:
+    build_bash += '''
+    cd -;
+    compile;
+    '''
 
+  result_dir = os.path.join(HOME_DIR, 'data')
+  script_dir = os.path.join(HOME_DIR, 'script')
   run_args.extend([
-      '-v',
-      '%s:/out' % out_dir, '-v',
-      '%s:/work' % args.project.work, '-t',
-      'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
+      '-v', '%s:/out' % out_dir,
+      '-v', '%s:/work' % args.project.work,
+      '-v', f'{result_dir}:/data',
+      '-v', f'{script_dir}:/script',
+      '-t', 'gcr.io/%s/%s' % (image_project, args.project.name), '/bin/bash',
       '-c', build_bash
   ])
   clean(args, out_dir)

@@ -16,7 +16,6 @@ from run_fuzz_test import read_json_file
 from run_fuzz_test import py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
-from CParser import CParser
 from get_fix_related import demangle_cpp_symbol
 from collections import OrderedDict
 
@@ -415,16 +414,18 @@ def update_type_set(patch):
     return sig_change_list
 
 
-def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str):
+def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str, target: str):
     """
     Analyze a GitPython DiffIndex and return metadata per hunk.
     Target repo checkout to fix commit here.
     """
     results = dict()
+    func_kinds = {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
     for diff in diff_text.split('diff --git')[1:]:
         # Choose the post-change path if available, else pre-change:
         diff_lines = diff.splitlines()
         if len(diff_lines) < 5:
+            logger.info(f'diff is too short, skipping: {diff}')
             # Skip if the diff is too short to contain valid information, like binary files or empty diffs
             continue
         path_a = None
@@ -441,6 +442,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
         if ext not in ['c', 'cpp', 'h', 'hpp', 'cxx', 'cc']:
             # Skip non-C/C++ files
+            logger.info(f'Skipping non-C/C++ file: {path}')
             continue
 
         patch_text = diff
@@ -465,28 +467,31 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
                 begin_num = int(new_line_num.split(',')[0]) + 3
                 end_num = begin_num + int(new_line_num.split(',')[1]) - 7
-                # Extract section/function name (text after second '@@')
-                section = header.split('@@')[-1].strip() or "<no-section>"
             else:
                 # If the hunk is too short, skip it TODO: maybe find a better way to handle this
                 logger.debug(f'Skipping short hunk: {h}')
                 continue
                 
-            # parse to get function signature
-            parser = CParser()
             file_path = os.path.join(target_repo_path, path_b)
-
-            if not os.path.exists(file_path):
-                logger.debug(f"File {file_path} does not exist, skipping parsing")
+            parsing_path = os.path.join(data_path, f'{target}-{new_commit[:6]}', f'{path_b}_analysis.json')
+            if not os.path.exists(file_path) or not os.path.exists(parsing_path):
+                logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
                 continue
             
+            # read data for function signature mapping
+            with open(parsing_path, 'r') as f:
+                ast_nodes = json.load(f)
+
+            patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
+            patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
             signature = 'unknown'
-            for item in parser.iterate_code(file_path, file_type=ext):
-                patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
-                patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
+            # filter for function‐like nodes (clang cursors for functions, methods, etc.)
+            for node in ast_nodes:
+                if node.get('kind') not in func_kinds:
+                    continue
                 # diff inside a function definition
-                if item['type'] == 'function' and item['start_point'][0]+1 <= begin_num and item['end_point'][0] >= end_num:
-                    signature = item['signature']
+                if node['extent']['start']['line'] <= begin_num and node['extent']['end']['line'] >= end_num:
+                    signature = node['signature']
                     patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
                     type_set = {'Function body change'}
                     dependent_func = set()
@@ -495,7 +500,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         'file_path_old':   path_a,
                         'file_path_new':   path_b,
                         'file_type':   ext,
-                        'hunk_header': section,
                         'patch_text':  patch_text,
                         'new_signature':   signature,
                         'patch_type': type_set,
@@ -507,10 +511,10 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                     }
                     break
                 # part or all of function definitions inside the diff
-                if item['type'] == 'function' and item['end_point'][0] >= begin_num and item['start_point'][0]+1 <= end_num:
-                    signature = item['signature']
-                    diff_result_begin = max(item['start_point'][0]+1, begin_num)
-                    diff_result_end = min(item['end_point'][0]+1, end_num)
+                if node['extent']['end']['line'] >= begin_num and node['extent']['start']['line'] <= end_num:
+                    signature = node['signature']
+                    diff_result_begin = max(node['extent']['start']['line'], begin_num)
+                    diff_result_end = min(node['extent']['end']['line'], end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
                     key_new = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
@@ -526,7 +530,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         'file_path_old':   path_a,
                         'file_path_new':   path_b,
                         'file_type':   ext,
-                        'hunk_header': section,
                         'patch_text':  patch_text,
                         'new_signature':   signature,
                         'patch_type': type_set,
@@ -537,10 +540,11 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         'old_end_line': int(old_line_cursor),
                     }
         
-        # checkout target repo to the old commit, and parse the code from that
+        # checkout target repo to the new commit, and parse the code from that
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
         for h in hunks[1:]:
             # The hunk header is before the first newline
             header, body = h.split('\n', 1)
@@ -550,24 +554,29 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
 
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
-            # Extract section/function name (text after second '@@')
-            section = header.split('@@')[-1].strip() or "<no-section>"
 
-            # parse to get function signature
-            parser = CParser()
             file_path = os.path.join(target_repo_path, path_a)
+            parsing_path = os.path.join(data_path, f'{target}-{old_commit[:6]}', f'{path_b}_analysis.json')
 
-            if not os.path.exists(file_path):
-                logger.debug(f"File {file_path} does not exist, skipping parsing")
+            if not os.path.exists(file_path) or not os.path.exists(parsing_path):
+                logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
                 continue
             
+            # read data for function signature mapping
+            with open(parsing_path, 'r') as f:
+                ast_nodes = json.load(f)
+            
+            patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
+            patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
             signature = 'unknown'
-            for item in parser.iterate_code(file_path, file_type=ext):
-                patch_header = f"diff --git a/{path_a if path_a != '/dev/null' else path_b} b/{path_b if path_b != '/dev/null' else path_a}\n"
-                patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
+            # filter for function‐like nodes (clang cursors for functions, methods, etc.)
+            func_kinds = {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
+            for node in ast_nodes:
+                if node.get('kind') not in func_kinds:
+                    continue
                 # diff inside a function definition
-                if item['type'] == 'function' and item['start_point'][0]+1 <= old_begin_num and item['end_point'][0] >= old_end_num:
-                    signature = item['signature']
+                if node['extent']['start']['line'] <= old_begin_num and node['extent']['end']['line'] >= old_end_num:
+                    signature = node['signature']
                     patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
                     type_set = {'Function body change'}
                     dependent_func = set()
@@ -579,7 +588,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             'file_path_old':   path_a,
                             'file_path_new':   path_b,
                             'file_type':   ext,
-                            'hunk_header': section,
                             'patch_text':  patch_text,
                             'old_signature':   signature,
                             'patch_type': type_set,
@@ -591,10 +599,10 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         }
                     break
                 # part of function definitions inside the diff
-                if item['type'] == 'function' and item['end_point'][0] >= old_begin_num and item['start_point'][0]+1 <= old_end_num:
-                    signature = item['signature']
-                    diff_result_begin = max(item['start_point'][0]+1, old_begin_num)
-                    diff_result_end = min(item['end_point'][0]+1, old_end_num)
+                if node['extent']['end']['line'] >= old_begin_num and node['extent']['start']['line'] <= old_end_num:
+                    signature = node['signature']
+                    diff_result_begin = max(node['extent']['start']['line'], old_begin_num)
+                    diff_result_end = min(node['extent']['end']['line'], old_end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'old')
                     k_old = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
@@ -638,7 +646,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             'file_path_old':   path_a,
                             'file_path_new':   path_b,
                             'file_type':   ext,
-                            'hunk_header': section,
                             'patch_text':  patch_text,
                             'old_signature':   signature,
                             'patch_type': type_set,
@@ -737,7 +744,6 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         new_line_info = key.split('+')[-1]
         new_line_begin = int(new_line_info.split(',')[0])
         new_line_end = int(new_line_info.split(',')[1]) + new_line_begin
-        parser = CParser()
         
         if 'Function body change' in patch['patch_type']:
             if 'Function removed' in patch['patch_type'] and not 'Function added' in patch['patch_type']:
@@ -765,19 +771,33 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                func_context = parser.get_code_context(os.path.join(target_repo_path, patch['file_path_old']), (old_line_begin + old_line_end) // 2, 0, patch['file_type'])
-                func_code = func_context['function']['code']
-                func_code = '\n'.join(f'-{line}' for line in func_code.split('\n'))
-                func_length = func_code.count('\n') + 1
+                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit[:6]}', f'{patch['file_path_old']}_analysis.json')
+                with open(parsing_path, 'r') as f:
+                    ast_nodes = json.load(f)
+                for ast_node in ast_nodes:
+                    if ast_node.get('kind') not in {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                        continue
+                    if ast_node['extent']['start']['file'] == patch['file_path_old'] and ast_node['signature'] == patch['old_signature']:
+                        with open(os.path.join(target_repo_path, patch['file_path_old']), 'r') as f:
+                            file_content = f.readlines()
+                            func_code = ''.join('-' + line for line in file_content[ast_node['extent']['start']['line']-1:ast_node['extent']['end']['line']])
+                            func_length = func_code.count('\n')
+                            break
                 
                 # 2. get patch insert line number from new commit for the Artificial patch
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
-                func_context = parser.get_code_context(os.path.join(target_repo_path, patch['file_path_new']), (new_line_begin + new_line_end) // 2, 0, patch['file_type'])
-                old_func_end_line = func_context['function']['end_point']
-                artificial_patch_insert_point = old_func_end_line + 1
+                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit[:6]}', f'{patch['file_path_new']}_analysis.json')
+                with open(parsing_path, 'r') as f:
+                    ast_nodes = json.load(f)
+                for ast_node in ast_nodes:
+                    if ast_node.get('kind') not in {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                        continue
+                    if ast_node['extent']['start']['file'] == patch['file_path_new'] and ast_node['signature'] == patch['new_signature']:
+                        artificial_patch_insert_point = ast_node['extent']['end']['line'] + 1
+                        break
                 
                 # 3. create the Artificial patch
                 patch_lines = patch['patch_text'].split('\n')
@@ -787,7 +807,6 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     'file_path_old': patch['file_path_old'],
                     'file_path_new': patch['file_path_new'],
                     'file_type': patch['file_type'],
-                    'hunk_header': patch['hunk_header'],
                     'patch_text': '\n'.join(rename_func(patch_header + func_code, fname)),
                     'old_signature': patch['old_signature'], # __revert_{fname} is not added here
                     'patch_type': {'Function removed', 'Function body change'},
@@ -834,30 +853,46 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     return new_patch_to_apply
 
 
-def build_dependency_graph(diff_results, patch_to_apply, target_repo_path):
+def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
+    os.chdir(target_repo_path)
+    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     dependence_graph = dict()
-    parser = CParser()
     patch_list = list(patch_to_apply)
     new_patch_to_patch = set()
+    visited_patches = set()
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
     # the callee definition patch to this patch(caller). specifically, do this for the patches remove
     # the function definition or change the function def.
     while patch_list:
         key = patch_list.pop()
+        if key in visited_patches:
+            # skip if this patch has been visited
+            continue
+        visited_patches.add(key)
         new_patch_to_patch.add(key)
         logger.debug(f'Analyzing patch {diff_results[key]['patch_text']}')
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
             patch_text = patch['patch_text']
-            calls = parser.find_function_calls(os.path.join(target_repo_path, patch['file_path_old']), patch['file_type'])
-            for call in calls:
-                if patch['old_start_line'] <= call['start_point'][0] <= patch['old_end_line']:
+            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit[:6]}', f'{patch['file_path_old']}_analysis.json')
+            with open(parsing_path, 'r') as f:
+                ast_nodes = json.load(f)
+            # filter for call expressions (clang cursors for function calls)
+            call_kinds = {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}
+            for node in ast_nodes:
+                if node.get('kind') not in call_kinds:
+                    continue
+                # check if the call is within the patch range
+                if node['extent']['end']['line'] <= patch['old_end_line'] and node['extent']['start']['line'] >= patch['old_start_line']:
+                    if 'callee' not in node:
+                        # indirect call, can get the callee. skip now
+                        continue
+                    # logger.info(f'Found call expression in patch {key}: {node["callee"]["signature"]}')
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
-                        if 'old_signature' in diff_result and \
-                            call['name'] == diff_result['old_signature'].split('(')[0].split(' ')[-1] and \
-                            len(call['code'].split(',')) == len(diff_result['old_signature'].split(',')):
+                        if 'old_signature' in diff_result and node['callee']['signature'] == diff_result['old_signature']:
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
                             
@@ -907,31 +942,49 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         if not patch['file_path_new']:
             # a patch delete a file, skip now
             continue
-        if lines[4][0] in {'-', '+'}:
-            # no context lines.
-            os.chdir(target_repo_path)
-            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            file_path = os.path.join(target_repo_path, patch['file_path_new'])
-            with open(file_path, 'r') as f:
-                content = [line.rstrip('\n') for line in f.readlines()]
-            
-            old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
-            old_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
-            new_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
-            new_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(',')[-1])
-            
+        context_lines1 = []
+        context_lines2 = []
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        file_path = os.path.join(target_repo_path, patch['file_path_new'])
+        with open(file_path, 'r') as f:
+            content = [line.rstrip('\n') for line in f.readlines()]
+        old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
+        old_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
+        new_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
+        new_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(',')[-1])
+        new_line_begin = new_line_begin_nocontext
+        new_offset = new_offset_nocontext
+        old_line_begin = old_line_begin_nocontext
+        old_offset = old_offset_nocontext
+
+        # logger.info(f'{key}\npathc_text: {patch_text}')
+
+        if lines[4] and lines[4][0] in {'-', '+'}:
+            # No context lines before the patch: add context_lines1.
             new_line_begin = max(new_line_begin_nocontext - 3, 0)
-            new_offset = new_offset_nocontext + (new_line_begin_nocontext - new_line_begin) + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext))
+            new_offset = new_offset_nocontext + (new_line_begin_nocontext - new_line_begin)
             old_line_begin = max(old_line_begin_nocontext - 3, 0)
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
-                
-            # 1 based index and 0 based index
             context_lines1 = [f' {line}' for line in content[new_line_begin-1: new_line_begin_nocontext-1]]
+            # Used for context_lines2
+            new_line_begin_nocontext = new_line_begin
+            new_offset_nocontext = new_offset
+            old_line_begin_nocontext = old_line_begin
+            old_offset_nocontext = old_offset
+            
+        if lines[-1] and lines[-1][0] in {'-', '+'}:
+            # No context lines after the patch: add context_lines2.
+            new_line_begin = new_line_begin_nocontext
+            new_offset = new_offset_nocontext + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext))
+            old_line_begin = old_line_begin_nocontext
+            old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
-            lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
-                + context_lines1 + lines[4:] + context_lines2
-            patch['patch_text'] = '\n'.join(lines)
+        
+        lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
+            + context_lines1 + lines[4:] + context_lines2
+        patch['patch_text'] = '\n'.join(lines)
 
 
 def handle_file_change(diff_results, patch_to_apply):
@@ -968,6 +1021,9 @@ def revert_patch_test(args):
     logger.info(f"Transitions found: {len(transitions)}")
     
     get_patched_traces = dict()
+    previous_bug = ''
+    previous_trace_func_set = set()
+    signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
         logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
@@ -1044,7 +1100,9 @@ def revert_patch_test(args):
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id']) # every file get a diff
-        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'])
+        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
+        get_compile_commands(target, commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
+        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target)
 
         trace_func_set = set()
         # checkout target repo to the bug commit, get function signature from source code using code location
@@ -1060,9 +1118,15 @@ def revert_patch_test(args):
             file_path = os.path.join(target_repo_path, func_loc.split(':')[0])
             line_num = func_loc.split(':')[1]
             col_num = func_loc.split(':')[2]
-            parser = CParser()
+            relative_path = func_loc.split(':')[0]
+            parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{relative_path}_analysis.json')
             if os.path.exists(file_path):
-                func_dict[func] = parser.function_signature(file_path, int(line_num), int(col_num), file_path.split('.')[-1])
+                with open(parsing_path, 'r') as f:
+                    ast_nodes = json.load(f)
+                for node in ast_nodes:
+                    if node['extent']['start']['line']+1 <= int(line_num) <= node['extent']['end']['line']:
+                        func_dict[func] = node['signature']
+                        break
                 trace_func_set.add((func_dict[func], func_loc))
             else:
                 trace_func_set.add((func.split(' ')[0], func_loc))
@@ -1108,10 +1172,7 @@ def revert_patch_test(args):
                     patch_to_apply.append(key)
                     break
 
-        os.chdir(target_repo_path)
-        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path)
+        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'])
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -1161,6 +1222,18 @@ def revert_patch_test(args):
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
 
+
+def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch):
+    cmd = [
+        py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+        '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
+    ]
+    
+    logger.info(' '.join(cmd))
+    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id[:6]}')):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+    
 if __name__ == "__main__":
     args = parse_arguments()
     revert_patch_test(args)
