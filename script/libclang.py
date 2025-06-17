@@ -25,7 +25,10 @@ def analyze_file(directory, src_file, args):
                                                                    CursorKind.STRUCT_DECL,
                                                                    CursorKind.UNION_DECL,
                                                                    CursorKind.ENUM_DECL,
-                                                                   CursorKind.CALL_EXPR}:
+                                                                   CursorKind.ENUM_CONSTANT_DECL,
+                                                                   CursorKind.CALL_EXPR,
+                                                                   CursorKind.DECL_REF_EXPR
+                                                                   }:
             continue
         info = {
             "kind": cursor.kind.name,
@@ -38,6 +41,8 @@ def analyze_file(directory, src_file, args):
         }
         if cursor.kind == CursorKind.FUNCTION_DECL:
             # Build a precise function signature
+            if cursor.is_definition():
+                info['kind'] = 'FUNCTION_DEFI'
             arg_list = []
             for arg in cursor.get_arguments():
                 arg_list.append(f"{arg.type.spelling} {arg.spelling}")
@@ -115,7 +120,6 @@ def main():
             if idx + 1 < len(args):
                 args[idx + 1] = "/dev/null"
         out_path_set.update(analyze_file(directory, src_file, args))
-    print(out_path_set)
     for out_path in out_path_set:
         with open(out_path, "r+") as f:
             data = f.read().rstrip(",\n")
