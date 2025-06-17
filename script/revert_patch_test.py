@@ -420,7 +420,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
     Target repo checkout to fix commit here.
     """
     results = dict()
-    func_kinds = {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
+    func_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
     for diff in diff_text.split('diff --git')[1:]:
         # Choose the post-change path if available, else pre-change:
         diff_lines = diff.splitlines()
@@ -570,7 +570,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             patch_header += f"--- {'a/' if path_a != '/dev/null' else ''}{path_a}\n+++ {'b/' if path_b != '/dev/null' else ''}{path_b}\n"
             signature = 'unknown'
             # filter for function‐like nodes (clang cursors for functions, methods, etc.)
-            func_kinds = {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
+            func_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
             for node in ast_nodes:
                 if node.get('kind') not in func_kinds:
                     continue
@@ -707,7 +707,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
 def rename_func(patch_text, fname):
     logger.debug(f'Renaming function {fname}')
     modified_lines = []
-    regex = r'(?<!\w)' + re.escape(fname) + r'(?!\w)'
+    regex = r'(?<![\w.])' + re.escape(fname) + r'(?!\w)'
     replacement_string = f"__revert_{fname}"
 
     for line in patch_text.splitlines():
@@ -728,6 +728,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     removed_old_signatures = set()
     removed_new_signatures = set()
     reserved_keys = set()
+    renamed_functions = dict()
     
     for key in patch_to_apply:
         patch = diff_results[key]
@@ -755,8 +756,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
+                renamed_functions[patch['old_signature']] = key
             
-            elif 'Function signature change' in patch['patch_type'] and key in dependence_graph:
+            elif 'old_signature' in patch and 'new_signature' in patch:
                 if patch['old_signature'] in handle_func_signature_change:
                     continue
                 # Delete all other patches that have the same signature
@@ -775,7 +777,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 for ast_node in ast_nodes:
-                    if ast_node.get('kind') not in {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                    if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                         continue
                     if ast_node['extent']['start']['file'] == patch['file_path_old'] and ast_node['signature'] == patch['old_signature']:
                         with open(os.path.join(target_repo_path, patch['file_path_old']), 'r') as f:
@@ -793,7 +795,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 for ast_node in ast_nodes:
-                    if ast_node.get('kind') not in {'FUNCTION_DECL', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                    if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                         continue
                     if ast_node['extent']['start']['file'] == patch['file_path_new'] and ast_node['signature'] == patch['new_signature']:
                         artificial_patch_insert_point = ast_node['extent']['end']['line'] + 1
@@ -819,6 +821,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 # 4. Add this new artificial patch key to patch_to_apply
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
+                renamed_functions[artificial_patch['old_signature']] = new_key
                 # 5. Rename the function by dependency graph
                 for callee_key, caller_key_set in dependence_graph.items():
                     # rename functions in the Artificial patch
@@ -828,14 +831,13 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                             modified_lines = rename_func(diff_results[new_key]['patch_text'], callee_fname)
                             diff_results[new_key]['patch_text'] = '\n'.join(modified_lines)
                     
-                for dep_key in dependence_graph.get(key, []):
+                for caller_key in dependence_graph.get(key, []):
                     # rename functions in patches that depend on (call) this function
-                    modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
-                    diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
+                    caller_key = renamed_functions.get(diff_results[caller_key]['old_signature'], caller_key)
+                    modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname)
+                    diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(new_key)
                 reserved_keys.add(new_key)
-            else:
-                new_patch_to_apply.append(key)
         else:
             new_patch_to_apply.append(key)
             logger.debug(f"Skipping non-function body change for {key}")
@@ -859,7 +861,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     dependence_graph = dict()
     patch_list = list(patch_to_apply)
-    new_patch_to_patch = set()
+    new_patch_to_patch = []
     visited_patches = set()
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
@@ -871,8 +873,8 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
             # skip if this patch has been visited
             continue
         visited_patches.add(key)
-        new_patch_to_patch.add(key)
-        logger.debug(f'Analyzing patch {diff_results[key]['patch_text']}')
+        new_patch_to_patch.append(key)
+        logger.debug(f'Analyzing patch {key}\n{diff_results[key]['patch_text']}')
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
             patch_text = patch['patch_text']
@@ -889,14 +891,14 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                     if 'callee' not in node:
                         # indirect call, can get the callee. skip now
                         continue
-                    # logger.info(f'Found call expression in patch {key}: {node["callee"]["signature"]}')
+                    logger.debug(f'Found call expression in patch {key}: {node["callee"]["signature"]}')
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
                         if 'old_signature' in diff_result and node['callee']['signature'] == diff_result['old_signature']:
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
                             
-    return dependence_graph, list(new_patch_to_patch)
+    return dependence_graph, new_patch_to_patch
 
 
 def add_context(diff_results, final_patches, new_commit, target_repo_path):
