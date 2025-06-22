@@ -1,18 +1,46 @@
 import os
 import json
 from clang.cindex import Index, CursorKind, Config
+from clang.cindex import TranslationUnit
+import subprocess
 
 Config.set_library_file('/usr/lib/llvm-18/lib/libclang.so')  # adjust for your system
 index = Index.create()
 
 
+def extract_include_paths() -> list[str]:
+    # Run the Clang command and capture stderr
+    result = subprocess.run(
+        ['clang', '-E', '-x', 'c', '-', '-v'],
+        input='',  # empty input to simulate /dev/null
+        capture_output=True,
+        text=True
+    )
+
+    clang_output = result.stderr  # `-v` output goes to stderr
+    include_paths = []
+    inside_include_block = False
+
+    for line in clang_output.splitlines():
+        if "#include <...> search starts here:" in line:
+            inside_include_block = True
+            continue
+        if inside_include_block:
+            if line.strip() == "End of search list.":
+                break
+            include_paths.append(line.strip())
+
+    return include_paths
+
+
 def analyze_file(directory, src_file, args):
     path = os.path.join(directory, src_file)
+    include_paths = extract_include_paths()
     
     if not os.path.exists(path):
         print(f"File does not exist: {path}")
         return set()
-    tu = index.parse(path, args=args[:-1])
+    tu = index.parse(path, args=args[:-1], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
     results = []
     dir_path, file_name = os.path.split(path)
     dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /out/
@@ -20,21 +48,26 @@ def analyze_file(directory, src_file, args):
     
     for cursor in tu.cursor.walk_preorder():
         file_path = str(cursor.location.file) if cursor.location.file else ""
-        # Skip targets not in '/src'
-        if not file_path.startswith('/src') or cursor.kind not in {CursorKind.FUNCTION_DECL,
-                                                                   CursorKind.STRUCT_DECL,
-                                                                   CursorKind.UNION_DECL,
-                                                                   CursorKind.ENUM_DECL,
-                                                                   CursorKind.ENUM_CONSTANT_DECL,
-                                                                   CursorKind.CALL_EXPR,
-                                                                   CursorKind.DECL_REF_EXPR
-                                                                   }:
+        file = file_path
+        if file.startswith('/src'):
+            file = file.split('/', 3)[-1]
+        elif any(path in str(cursor.extent.start.file) for path in include_paths):
+            file = '#include <' + file.split('/')[-1] + '>'
+        if cursor.kind not in {CursorKind.FUNCTION_DECL,
+                               CursorKind.STRUCT_DECL,
+                               CursorKind.UNION_DECL,
+                               CursorKind.ENUM_DECL,
+                               CursorKind.ENUM_CONSTANT_DECL,
+                               CursorKind.CALL_EXPR,
+                               CursorKind.DECL_REF_EXPR,
+                               CursorKind.MACRO_DEFINITION,
+                               }:
             continue
         info = {
             "kind": cursor.kind.name,
             "spelling": cursor.spelling,
             "location": {
-            "file": file_path.split('/', 3)[-1] if file_path.startswith('/src') else file_path,
+            "file": file,
             "line": cursor.location.line,
             "column": cursor.location.column,
             },
@@ -71,28 +104,54 @@ def analyze_file(directory, src_file, args):
             
         # record extent for declarations/definitions
         if cursor.extent and cursor.extent.start and cursor.extent.end:
+            file = str(cursor.extent.start.file)
+            if file.startswith('/src'):
+                file = file.split('/', 3)[-1]
+            elif any(path in str(cursor.extent.start.file) for path in include_paths):
+                # header file from system include paths
+                file = '#include <' + file.split('/')[-1] + '>'
             info["extent"] = {
                 "start": {
-                    "file": str(cursor.extent.start.file).split('/', 3)[-1] if str(cursor.extent.start.file).startswith('/src') else str(cursor.extent.start.file),
+                    "file": file,
                     "line": cursor.extent.start.line,
                     "column": cursor.extent.start.column,
                 },
                 "end": {
-                    "file": str(cursor.extent.end.file).split('/', 3)[-1] if str(cursor.extent.end.file).startswith('/src') else str(cursor.extent.end.file),
+                    "file": file,
                     "line": cursor.extent.end.line,
                     "column": cursor.extent.end.column,
                 },
             }
 
-        file_path = file_path.split('/', 3)[-1] if file_path.startswith('/src') else file_path
-        file_name = file_path.split('/')[-1] + "_analysis.json"
-        out_path = os.path.realpath(os.path.join(dir_path, file_name))
-        if not os.path.exists(dir_path):
-            os.makedirs(dir_path)
-        with open(out_path, "a") as out:
-            json.dump(info, out, indent=2)
-            out.write(",\n")
-        out_path_set.add(out_path)
+        if file_path:
+            # Sometimes, macro do not come from a file. So when the file_path is empty, we just keep the info
+            # in where it use.
+            file_relative_path = file_path.split('/', 3)[-1] if file_path.startswith('/src') else file_path
+            file_relative_folder = os.path.dirname(file_relative_path)
+            file_name = file_relative_path.split('/')[-1] + "_analysis.json"
+            out_path = os.path.realpath(os.path.join(file_relative_folder, file_name))
+            if not os.path.exists(file_relative_folder):
+                os.makedirs(file_relative_folder)
+            with open(out_path, "a") as out:
+                json.dump(info, out, indent=2)
+                out.write(",\n")
+            out_path_set.add(out_path)
+        
+        src_path = os.path.realpath(path)
+        file_path = os.path.realpath(file_path)
+        src_relative_path = src_path.split('/', 3)[-1] if src_path.startswith('src/') else src_path
+        src_file_name = src_relative_path.split('/')[-1] + "_analysis.json"
+        if file_path != src_path:
+            # perhaps file_path is a .h file
+            out_path = os.path.join(dir_path, src_file_name)
+            out_path = os.path.realpath(out_path)
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+            with open(out_path, "a") as out:
+                json.dump(info, out, indent=2)
+                out.write(",\n")
+            out_path_set.add(os.path.realpath(out_path))
+        
     return out_path_set
     
 
