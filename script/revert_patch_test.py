@@ -461,12 +461,24 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 # The hunk header is before the first newline
                 header, body = h.split('\n', 1)
                 old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
-                old_begin_num = int(old_line_num.split(',')[0]) + 3
-                old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
+                lines_body = body.split('\n')
+                first_index = None
+                last_index = None
+                for idx, line in enumerate(lines_body):
+                    if line.startswith('-') or line.startswith('+'):
+                        first_index = idx
+                        break
+                
+                for idx, line in enumerate(lines_body[::-1]):
+                    if line.startswith('-') or line.startswith('+'):
+                        last_index = idx-1
+                        break
+                old_begin_num = int(old_line_num.split(',')[0]) + first_index
+                old_end_num = max(old_begin_num, old_begin_num + int(old_line_num.split(',')[1]) - first_index - last_index - 1)
 
                 new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
-                begin_num = int(new_line_num.split(',')[0]) + 3
-                end_num = begin_num + int(new_line_num.split(',')[1]) - 7
+                begin_num = int(new_line_num.split(',')[0]) + first_index
+                end_num = max(begin_num, begin_num + int(new_line_num.split(',')[1]) - first_index - last_index - 1)
             else:
                 # If the hunk is too short, skip it TODO: maybe find a better way to handle this
                 logger.debug(f'Skipping short hunk: {h}')
@@ -489,29 +501,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             for node in ast_nodes:
                 if node.get('kind') not in func_kinds:
                     continue
-                # diff inside a function definition
-                if node['extent']['start']['line'] <= begin_num and node['extent']['end']['line'] >= end_num:
-                    signature = node['signature']
-                    patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
-                    type_set = {'Function body change'}
-                    dependent_func = set()
-                    # use old patch location as key
-                    results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}'] = {
-                        'file_path_old':   path_a,
-                        'file_path_new':   path_b,
-                        'file_type':   ext,
-                        'patch_text':  patch_text,
-                        'new_signature':   signature,
-                        'patch_type': type_set,
-                        'dependent_func': dependent_func,
-                        'new_start_line': int(new_line_num.split(',')[0]),
-                        'new_end_line': int(new_line_num.split(',')[0]) + int(new_line_num.split(',')[1]),
-                        'old_start_line': int(old_line_num.split(',')[0]),
-                        'old_end_line': int(old_line_num.split(',')[0]) + int(old_line_num.split(',')[1]),
-                    }
-                    break
-                # part or all of function definitions inside the diff
-                if node['extent']['end']['line'] >= begin_num and node['extent']['start']['line'] <= end_num:
+                if node['location']['file'] == path_b and node['extent']['end']['line'] >= begin_num and node['extent']['start']['line'] <= end_num:
                     signature = node['signature']
                     diff_result_begin = max(node['extent']['start']['line'], begin_num)
                     diff_result_end = min(node['extent']['end']['line'], end_num)
@@ -550,8 +540,22 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             header, body = h.split('\n', 1)
             old_line_num = header.split('@@')[-2].strip().split(' ')[0][1:]
             old_line_num = old_line_num if old_line_num.count(',') else '0,' + old_line_num
-            old_begin_num = int(old_line_num.split(',')[0]) + 3
-            old_end_num = old_begin_num + int(old_line_num.split(',')[1]) - 7
+
+            lines_body = body.split('\n')
+            first_index = 0
+            last_index = 0
+            for idx, line in enumerate(lines_body):
+                if line.startswith('-') or line.startswith('+'):
+                    first_index = idx
+                    break
+            
+            for idx, line in enumerate(lines_body[::-1]):
+                if line.startswith('-') or line.startswith('+'):
+                    last_index = idx-1
+                    break
+            
+            old_begin_num = int(old_line_num.split(',')[0]) + first_index
+            old_end_num = max(old_begin_num, old_begin_num + int(old_line_num.split(',')[1]) - first_index - last_index - 1)
 
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
 
@@ -574,32 +578,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             for node in ast_nodes:
                 if node.get('kind') not in func_kinds:
                     continue
-                # diff inside a function definition
-                if node['extent']['start']['line'] <= old_begin_num and node['extent']['end']['line'] >= old_end_num:
-                    signature = node['signature']
-                    patch_text = patch_header + f'@@ -{new_line_num.split(',')[0]},{old_line_num.split(',')[1]} +{new_line_num.split(',')[0]},{new_line_num.split(',')[1]} @@\n' + body
-                    type_set = {'Function body change'}
-                    dependent_func = set()
-
-                    if f'{path_a}{path_b}-{old_line_num}+{new_line_num}' in results:
-                        results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}']['old_signature'] = signature
-                    else:
-                        results[f'{path_a}{path_b}-{old_line_num}+{new_line_num}'] = {
-                            'file_path_old':   path_a,
-                            'file_path_new':   path_b,
-                            'file_type':   ext,
-                            'patch_text':  patch_text,
-                            'old_signature':   signature,
-                            'patch_type': type_set,
-                            'dependent_func': dependent_func,
-                            'new_start_line': int(new_line_num.split(',')[0]),
-                            'new_end_line': int(new_line_num.split(',')[0]) + int(new_line_num.split(',')[1]),
-                            'old_start_line': int(old_line_num.split(',')[0]),
-                            'old_end_line': int(old_line_num.split(',')[0]) + int(old_line_num.split(',')[1]),
-                        }
-                    break
-                # part of function definitions inside the diff
-                if node['extent']['end']['line'] >= old_begin_num and node['extent']['start']['line'] <= old_end_num:
+                if node['location']['file'] == path_a and node['extent']['end']['line'] >= old_begin_num and node['extent']['start']['line'] <= old_end_num:
                     signature = node['signature']
                     diff_result_begin = max(node['extent']['start']['line'], old_begin_num)
                     diff_result_end = min(node['extent']['end']['line'], old_end_num)
@@ -698,10 +677,10 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     if not os.path.exists(fuzzer_path) and any(error_pattern in result.stderr or error_pattern in result.stdout 
             for error_pattern in build_error_patterns) or result.returncode != 0:
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
-        return False
+        return False, result.stderr+result.stdout
     
     logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
-    return True
+    return True, ''
 
 
 def rename_func(patch_text, fname):
@@ -794,6 +773,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit[:6]}', f'{patch['file_path_new']}_analysis.json')
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
+                artificial_patch_insert_point = -1
                 for ast_node in ast_nodes:
                     if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                         continue
@@ -891,7 +871,10 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                     if 'callee' not in node:
                         # indirect call, can get the callee. skip now
                         continue
-                    logger.debug(f'Found call expression in patch {key}: {node["callee"]["signature"]}')
+                    if 'signature' not in node['callee']:
+                        # function like zalloc
+                        continue
+                    logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
                         if 'old_signature' in diff_result and node['callee']['signature'] == diff_result['old_signature']:
@@ -1001,6 +984,74 @@ def handle_file_change(diff_results, patch_to_apply):
             lines = patch['patch_text'].split('\n')
             lines.insert(1, 'new file mode 100644')
             patch['patch_text'] = '\n'.join(lines)
+
+
+def handle_build_error(error_log):
+    pattern = r"(/src.+?):(\d+):(\d+):.*use of undeclared identifier '(\w+)'"
+    matches = re.findall(pattern, error_log)
+    undeclared_identifiers = {(identifier, f"{filepath}:{line}:{column}") for filepath, line, column, identifier in matches}
+    return undeclared_identifiers
+
+
+def find_first_code_line(file_path):
+    """
+    Returns the 1-based line number where actual C code starts.
+    Skips blank lines, comments (both single and multi-line), and preprocessor directives.
+    """
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    in_multiline_comment = False
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+
+        # Track multi-line comment blocks
+        if in_multiline_comment:
+            if "*/" in stripped:
+                in_multiline_comment = False
+            continue
+
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_multiline_comment = True
+            continue
+
+        # Skip single-line comment or blank
+        if not stripped or stripped.startswith("//"):
+            continue
+
+        # Skip preprocessor directives
+        if stripped.startswith("#"):
+            continue
+
+        # Found real code
+        return idx + 1
+
+    return len(lines) + 1
+
+
+def get_line_context(file_path, line_number, context=3):
+    """
+    Returns a list of lines around the given line_number in the file.
+    Includes up to `context` lines before and after, if they exist.
+    
+    :param file_path: Path to the C source file
+    :param line_number: 1-based line number
+    :param context: Number of lines before and after to include
+    :return: two strings:
+        - Lines before the given line_number (up to `context` lines)
+        - Lines from the given line_number to the end of the context (up to `context` lines)
+        - 1-based start and end indices of the context lines
+    """
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+
+    total_lines = len(lines)
+    start = max(0, line_number - context - 1)  # zero-based index
+    end = min(total_lines, line_number - 1 + context)  # one-based index
+
+    return ''.join([f' {lines[i]}' for i in range(start, line_number-1)]), ''.join([f' {lines[i]}' for i in range(line_number-1, end)]), start+1, end
 
 
 def revert_patch_test(args):
@@ -1202,8 +1253,76 @@ def revert_patch_test(args):
                 patch_file.write(patch['patch_text'])
                 patch_file.write('\n\n')  # Add separator between patches
         
+        with open(patch_file_path, 'r') as patch_file:
+            original_patch = patch_file.read()
+        con_to_add = dict() # key: file path, value: list of enum/macro locations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
-        build_success = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        error_log = 'undeclared identifier'
+        while 'undeclared identifier' in error_log:
+            build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+            undeclared_identifier = handle_build_error(error_log)
+            logger.info(f'undeclared_identifier: {undeclared_identifier}')
+            for identifier, location in undeclared_identifier:
+                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id'][:6]}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
+                if os.path.exists(parsing_path):
+                    with open(parsing_path, 'r') as f:
+                        ast_nodes = json.load(f)
+                    for ast_node in ast_nodes:
+                        if ast_node['kind'] in {'ENUM_CONSTANT_DECL'} and ast_node['spelling'] == identifier:
+                            con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                            break
+                        if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
+                            if '#include' in ast_node['extent']['start']['file']:
+                                # macro defined in header file from system include paths
+                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                            else:
+                                # macro defined in .h file in the target repo
+                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                            break
+            
+            os.chdir(target_repo_path)
+            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            extra_patches = dict() # key: file path, value: patch text
+            for file_path in con_to_add:
+                patch_header = f'diff --git a/{file_path} b/{file_path}\n--- a/{file_path}\n+++ b/{file_path}\n'
+                locs = con_to_add[file_path]
+                enum_len = 2
+                enum_text = '-enum {\n'
+                include_text = ''
+                include_len = 0
+                
+                for log in reversed(locs):
+                    path = log.split(':')[0]
+                    if path.startswith('#include'):
+                        # header file from system include paths
+                        include_file = path.split(' ')[1]
+                        include_text += f'-{path}\n'
+                        include_len += 1
+                        continue
+                    start_line = int(log.split(':')[1])
+                    end_line = int(log.split(':')[2])
+                    enum_len += end_line - start_line + 1
+                    with open(os.path.join(target_repo_path, path), 'r') as f:
+                        file_content = f.readlines()
+                        enum_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
+                # no check here because I think a file at least should have 3 lines
+                os.chdir(target_repo_path)
+                subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                insert_point = find_first_code_line(os.path.join(target_repo_path, file_path))
+                context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
+                patch_header += f'@@ -{start},{enum_len+include_len+end-start+1} +{start},{end-start+1} @@\n'
+                enum_text += '-};\n'
+                extra_patches[file_path] = (patch_header + context1 + include_text + enum_text + context2)
+                
+            with open(patch_file_path, 'w') as patch_file:
+                patch_file.write(original_patch)
+                for patch in extra_patches.values():    
+                    patch_file.write(patch)
+                    patch_file.write('\n\n')
+            
         if build_success:
             # Run the fuzzer to test if the bug is reproduced
             testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
@@ -1220,6 +1339,8 @@ def revert_patch_test(args):
                 get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
                 transitions.append((commit, next_commit, bug_id))
                 logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
+        else:
+            logger.info(f"Build failed for bug {bug_id} on commit {next_commit['commit_id']}\n")
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
