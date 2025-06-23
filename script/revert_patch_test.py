@@ -703,6 +703,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
     handle_func_signature_change = set()
+    function_declarations = dict() # file path: a set of function declarations
     
     removed_old_signatures = set()
     removed_new_signatures = set()
@@ -729,6 +730,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             if 'Function removed' in patch['patch_type'] and not 'Function added' in patch['patch_type']:
                 # add prefix to function being deleted
                 modified_lines = rename_func(patch['patch_text'], fname)
+                function_declarations.setdefault(patch['file_path_old'], set()).add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 patch['patch_text'] = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
                 for dep_key in dependence_graph.get(key, []):
@@ -801,6 +803,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 # 4. Add this new artificial patch key to patch_to_apply
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
+                function_declarations.setdefault(patch['file_path_old'], set()).add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 renamed_functions[artificial_patch['old_signature']] = new_key
                 # 5. Rename the function by dependency graph
                 for callee_key, caller_key_set in dependence_graph.items():
@@ -832,7 +835,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             continue
         if 'new_signature' in patch and patch['new_signature'] in removed_new_signatures:
             new_patch_to_apply.remove(key)
-    return new_patch_to_apply
+    return new_patch_to_apply, function_declarations
 
 
 def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
@@ -1233,7 +1236,7 @@ def revert_patch_test(args):
         
         # Save all patches to a single file
         if patch_to_apply:
-            patch_to_apply = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
+            patch_to_apply, function_declarations = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
@@ -1279,43 +1282,58 @@ def revert_patch_test(args):
                                 # macro defined in .h file in the target repo
                                 con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
                             break
-            
-            os.chdir(target_repo_path)
-            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             extra_patches = dict() # key: file path, value: patch text
-            for file_path in con_to_add:
+            path_set = set(con_to_add.keys()) | set(function_declarations.keys())
+
+            for file_path in path_set:
+                os.chdir(target_repo_path)
+                subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 patch_header = f'diff --git a/{file_path} b/{file_path}\n--- a/{file_path}\n+++ b/{file_path}\n'
-                locs = con_to_add[file_path]
-                enum_len = 2
-                enum_text = '-enum {\n'
                 include_text = ''
                 include_len = 0
+                func_decl_text = ''
+                func_decl_len = 0
                 
-                for log in reversed(locs):
-                    path = log.split(':')[0]
-                    if path.startswith('#include'):
-                        # header file from system include paths
-                        include_file = path.split(' ')[1]
-                        include_text += f'-{path}\n'
-                        include_len += 1
-                        continue
-                    start_line = int(log.split(':')[1])
-                    end_line = int(log.split(':')[2])
-                    enum_len += end_line - start_line + 1
-                    with open(os.path.join(target_repo_path, path), 'r') as f:
-                        file_content = f.readlines()
-                        enum_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
-                # no check here because I think a file at least should have 3 lines
+                if file_path in function_declarations:
+                    # function declaration patch
+                    func_decls = function_declarations[file_path]
+                    for func_decl in func_decls:
+                        func_decl_text += f'-{func_decl};\n'
+                        func_decl_len += 1
+                    
+                if file_path in con_to_add:
+                    # enum or macro patch
+                    locs = con_to_add[file_path]
+                    enum_len = 2
+                    enum_text = '-enum {\n'
+                    for log in reversed(locs):
+                        path = log.split(':')[0]
+                        if path.startswith('#include'):
+                            # header file from system include paths
+                            include_file = path.split(' ')[1]
+                            include_text += f'-{path}\n'
+                            include_len += 1
+                            continue
+                        start_line = int(log.split(':')[1])
+                        end_line = int(log.split(':')[2])
+                        enum_len += end_line - start_line + 1
+                        with open(os.path.join(target_repo_path, path), 'r') as f:
+                            file_content = f.readlines()
+                            enum_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
+                    enum_text += '-};\n'
+                else:
+                    enum_text = ''
+                    enum_len = 0
+                # need new version to get the context lines
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 insert_point = find_first_code_line(os.path.join(target_repo_path, file_path))
                 context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
-                patch_header += f'@@ -{start},{enum_len+include_len+end-start+1} +{start},{end-start+1} @@\n'
-                enum_text += '-};\n'
-                extra_patches[file_path] = (patch_header + context1 + include_text + enum_text + context2)
+                patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+end-start+1} +{start},{end-start+1} @@\n'
+                extra_patches[file_path] = (patch_header + context1 + include_text + enum_text + func_decl_text + context2)
                 
             with open(patch_file_path, 'w') as patch_file:
                 patch_file.write(original_patch)
