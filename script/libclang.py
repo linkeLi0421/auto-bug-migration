@@ -43,7 +43,7 @@ def analyze_file(directory, src_file, args):
     tu = index.parse(path, args=args[:-1], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
     results = []
     dir_path, file_name = os.path.split(path)
-    dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /out/
+    dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
     out_path_set = set()
     
     for cursor in tu.cursor.walk_preorder():
@@ -123,15 +123,16 @@ def analyze_file(directory, src_file, args):
                 },
             }
 
-        if file_path:
+        if file_path and file_path.startswith('/src'):
             # Sometimes, macro do not come from a file. So when the file_path is empty, we just keep the info
             # in where it use.
-            file_relative_path = file_path.split('/', 3)[-1] if file_path.startswith('/src') else file_path
-            file_relative_folder = os.path.dirname(file_relative_path)
+            file_relative_path = file_path.split('/', 2)[-1]
             file_name = file_relative_path.split('/')[-1] + "_analysis.json"
-            out_path = os.path.realpath(os.path.join(file_relative_folder, file_name))
-            if not os.path.exists(file_relative_folder):
-                os.makedirs(file_relative_folder)
+            folder = os.path.join('/data/', '/'.join(file_relative_path.split('/')[:-1]))
+            out_path = os.path.realpath(os.path.join(folder, file_name))
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+            print(f"Processing {file_relative_path} at {cursor.location.line}:{cursor.location.column} - {cursor.kind.name} {cursor.spelling} {out_path}")
             with open(out_path, "a") as out:
                 json.dump(info, out, indent=2)
                 out.write(",\n")
