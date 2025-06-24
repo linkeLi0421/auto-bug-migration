@@ -385,6 +385,11 @@ def extract_revert_patch(h, line_start, line_end, version):
                 
     new_header_line = f"@@ -{new_line_start},{old_line_cursor['num']-old_line_start} +{new_line_start},{new_line_cursor['num']-new_line_start} @@"
     patch_lines.insert(0, new_header_line)
+    
+    if not get_sub_patch_start:
+        # get nothing
+        return '\n'.join(patch_lines), old_line_cursor['num']-1, old_line_cursor['num']-1, new_line_cursor['num']-1, new_line_cursor['num']-1
+    
     return '\n'.join(patch_lines), old_line_start, old_line_cursor['num'], new_line_start, new_line_cursor['num']
 
 
@@ -592,13 +597,14 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             if f'{path_a}{path_b}' not in k:
                                 # not same file, skip
                                 continue
+                            if 'new_signature' not in v:
+                                continue
                             old_start_i, old_end_i, new_start_i, new_end_i = v['old_start_line'], v['old_end_line'], v['new_start_line'], v['new_end_line']
                             if new_start_i == new_end_i:
                                 # this situation is handled in add_context()
                                 continue
-                            if (max(old_start_i, old_line_start) < min(old_end_i, old_line_cursor) and
-                                max(new_start_i, new_line_start) < min(new_end_i, new_line_cursor)):
-                                logger.debug(f'Overlapped patch found: {sub_patch}\n{v["patch_text"]}')
+                            if (max(old_start_i, old_line_start) <= min(old_end_i, old_line_cursor) and
+                                max(new_start_i, new_line_start) <= min(new_end_i, new_line_cursor)):
                                 # update the boundaries: take min start and max end for both old and new
                                 old_start = min(old_start_i, old_line_start)
                                 old_end = max(old_end_i, old_line_cursor)
@@ -838,6 +844,43 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     return new_patch_to_apply, function_declarations
 
 
+def normalize_signature(signature):
+    """
+    Parse and normalize a C-style function signature.
+    Returns a tuple: (return_type, function_name, list of param types)
+    """
+    # Remove extra spaces
+    signature = re.sub(r'\s+', ' ', signature.strip())
+
+    # Match return type, function name, and argument list
+    match = re.match(r'(.+?)\s+(\w+)\s*\((.*?)\)', signature)
+    if not match:
+        raise ValueError(f"Invalid function signature: {signature}")
+
+    ret_type, func_name, args = match.groups()
+    ret_type = ret_type.strip()
+    func_name = func_name.strip()
+
+    # Normalize arguments: keep only types, ignore parameter names
+    arg_types = []
+    args = args.strip()
+    if args and args != 'void':
+        for arg in args.split(','):
+            # Remove default values and extract type
+            parts = arg.strip().split()
+            if len(parts) >= 1:
+                # Keep all parts except the last (parameter name)
+                arg_type = ' '.join(parts[:-1]) if len(parts) > 1 else parts[0]
+                arg_types.append(arg_type.strip())
+
+    return ret_type, func_name, tuple(arg_types)
+
+
+def compare_function_signatures(sig1, sig2):
+    """Returns True if two C function signatures are the same (ignoring parameter names)."""
+    return normalize_signature(sig1) == normalize_signature(sig2)
+
+
 def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -880,7 +923,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
-                        if 'old_signature' in diff_result and node['callee']['signature'] == diff_result['old_signature']:
+                        if 'old_signature' in diff_result and compare_function_signatures(node['callee']['signature'], diff_result['old_signature']):
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
                             
@@ -1326,7 +1369,11 @@ def revert_patch_test(args):
                 else:
                     enum_text = ''
                     enum_len = 0
+                
                 # need new version to get the context lines
+                if enum_len+include_len+func_decl_len == 0:
+                    # no enum or macro patch, skip this file
+                    continue
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
