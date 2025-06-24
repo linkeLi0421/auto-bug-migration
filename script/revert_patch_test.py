@@ -709,7 +709,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
     handle_func_signature_change = set()
-    function_declarations = dict() # file path: a set of function declarations
+    function_declarations = set() # a set of function declarations
     
     removed_old_signatures = set()
     removed_new_signatures = set()
@@ -732,11 +732,15 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         new_line_begin = int(new_line_info.split(',')[0])
         new_line_end = int(new_line_info.split(',')[1]) + new_line_begin
         
+        if fname == 'LLVMFuzzerTestOneInput':
+            # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
+            new_patch_to_apply.append(key)
+            continue
         if 'Function body change' in patch['patch_type']:
             if 'Function removed' in patch['patch_type'] and not 'Function added' in patch['patch_type']:
                 # add prefix to function being deleted
                 modified_lines = rename_func(patch['patch_text'], fname)
-                function_declarations.setdefault(patch['file_path_old'], set()).add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
+                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 patch['patch_text'] = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
                 for dep_key in dependence_graph.get(key, []):
@@ -809,7 +813,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 # 4. Add this new artificial patch key to patch_to_apply
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
-                function_declarations.setdefault(patch['file_path_old'], set()).add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
+                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 renamed_functions[artificial_patch['old_signature']] = new_key
                 # 5. Rename the function by dependency graph
                 for callee_key, caller_key_set in dependence_graph.items():
@@ -881,7 +885,7 @@ def compare_function_signatures(sig1, sig2):
     return normalize_signature(sig1) == normalize_signature(sig2)
 
 
-def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
+def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit, trace1):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -889,6 +893,9 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     patch_list = list(patch_to_apply)
     new_patch_to_patch = []
     visited_patches = set()
+    trace_function_signatures = set()
+    for index, func in trace1:
+        trace_function_signatures.add(func.split(' ')[0])
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
     # the callee definition patch to this patch(caller). specifically, do this for the patches remove
@@ -919,6 +926,10 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                         continue
                     if 'signature' not in node['callee']:
                         # function like zalloc
+                        continue
+                    if node['callee']['name'] not in trace_function_signatures:
+                        # skip if the function signature is not in the trace_function_signatures,
+                        # now we only check the name, signature or line number level need more code.
                         continue
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
@@ -1036,7 +1047,11 @@ def handle_build_error(error_log):
     pattern = r"(/src.+?):(\d+):(\d+):.*use of undeclared identifier '(\w+)'"
     matches = re.findall(pattern, error_log)
     undeclared_identifiers = {(identifier, f"{filepath}:{line}:{column}") for filepath, line, column, identifier in matches}
-    return undeclared_identifiers
+    
+    pattern = r"(/src.+?):(\d+):(\d+):.*undeclared function '(\w+)'"
+    matches = re.findall(pattern, error_log)
+    undeclared_functions = {(identifier, f"{filepath}:{line}:{column}") for filepath, line, column, identifier in matches}
+    return undeclared_identifiers, undeclared_functions
 
 
 def find_first_code_line(file_path):
@@ -1271,7 +1286,7 @@ def revert_patch_test(args):
                     patch_to_apply.append(key)
                     break
 
-        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'])
+        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -1302,11 +1317,12 @@ def revert_patch_test(args):
         with open(patch_file_path, 'r') as patch_file:
             original_patch = patch_file.read()
         con_to_add = dict() # key: file path, value: list of enum/macro locations
+        func_decl_to_add = dict() # key: file path, value: list of function declarations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
         error_log = 'undeclared identifier'
         while 'undeclared identifier' in error_log:
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
-            undeclared_identifier = handle_build_error(error_log)
+            undeclared_identifier, undeclared_functions = handle_build_error(error_log)
             logger.info(f'undeclared_identifier: {undeclared_identifier}')
             for identifier, location in undeclared_identifier:
                 parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id'][:6]}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
@@ -1326,8 +1342,13 @@ def revert_patch_test(args):
                                 con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
                             break
 
+            for func_name, location in undeclared_functions:
+                for func_decl in function_declarations:
+                    if func_name in func_decl:
+                        func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{func_decl}')
+
             extra_patches = dict() # key: file path, value: patch text
-            path_set = set(con_to_add.keys()) | set(function_declarations.keys())
+            path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys())
 
             for file_path in path_set:
                 os.chdir(target_repo_path)
@@ -1339,9 +1360,9 @@ def revert_patch_test(args):
                 func_decl_text = ''
                 func_decl_len = 0
                 
-                if file_path in function_declarations:
+                if file_path in func_decl_to_add:
                     # function declaration patch
-                    func_decls = function_declarations[file_path]
+                    func_decls = func_decl_to_add[file_path]
                     for func_decl in func_decls:
                         func_decl_text += f'-{func_decl};\n'
                         func_decl_len += 1
