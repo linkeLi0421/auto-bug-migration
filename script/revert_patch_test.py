@@ -689,11 +689,12 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     return True, ''
 
 
-def rename_func(patch_text, fname):
+def rename_func(patch_text, fname, replacement_string=None):
     logger.debug(f'Renaming function {fname}')
     modified_lines = []
     regex = r'(?<![\w.])' + re.escape(fname) + r'(?!\w)'
-    replacement_string = f"__revert_{fname}"
+    if not replacement_string:
+        replacement_string = f"__revert_{fname}"
 
     for line in patch_text.splitlines():
         if line.startswith('-'):
@@ -704,6 +705,45 @@ def rename_func(patch_text, fname):
             modified_lines.append(line)
     return modified_lines
 
+
+def remove_unnecessary_lines(diff_results, patch_to_apply, dependence_graph, trace1):
+    # 1. Remove unnecessary lines from the diff results based on the trace1
+    # If callee do not exist in the trace1, in caller's patch, delete the lines like 
+    # " -  callee();" Because it is not used when bug is triggered.
+    # 2. Also update dependence_graph to remove the callee from the graph.
+    
+    # Not do this in patpch_patcher, becuase it has been too complicated;
+    
+    trace_function_names = set()
+    new_patch_to_apply = []
+    for index, func in trace1:
+        trace_function_names.add(func.split(' ')[0])
+    
+    for key in patch_to_apply:
+        patch = diff_results[key]
+        if 'old_signature' in patch and patch['old_signature'].split(' ')[1].split('(')[0] in trace_function_names:
+            # If the function is in the trace, do not remove any lines
+            new_patch_to_apply.append(key)
+            continue
+        for caller_key in dependence_graph.get(key, set()):
+            caller_patch = diff_results[caller_key]
+            patch_text = caller_patch['patch_text']
+            lines = patch_text.split('\n')
+            modified_lines = []
+            for line in lines:
+                if line.startswith('-') and patch['old_signature'].split(' ')[1].split('(')[0] in line:
+                    # If the line is a call to the removed function, remove it
+                    logger.info(f'Removing line: {line} from {caller_key} because {patch["old_signature"]} is not in the trace')
+                    modified_lines.append('-')
+                else:
+                    # Keep all other lines (added or unchanged)
+                    modified_lines.append(line)
+            caller_patch['patch_text'] = '\n'.join(modified_lines)
+        if key in dependence_graph:
+            del dependence_graph[key]
+
+    return new_patch_to_apply
+    
 
 def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit, next_commit, target_repo_path):
     # Create artificial patch for function signature change or function removed
@@ -831,6 +871,14 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(new_key)
                 reserved_keys.add(new_key)
+                
+                # 6. Update the dependence graph to reflect the new key
+                dependence_graph[new_key] = dependence_graph.get(key, set())
+                del dependence_graph[key]
+                for caller_key_set in dependence_graph.values():
+                    if key in caller_key_set:
+                        caller_key_set.remove(key)
+                        caller_key_set.add(new_key)
         else:
             new_patch_to_apply.append(key)
             logger.debug(f"Skipping non-function body change for {key}")
@@ -885,7 +933,7 @@ def compare_function_signatures(sig1, sig2):
     return normalize_signature(sig1) == normalize_signature(sig2)
 
 
-def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit, trace1):
+def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -893,9 +941,6 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     patch_list = list(patch_to_apply)
     new_patch_to_patch = []
     visited_patches = set()
-    trace_function_signatures = set()
-    for index, func in trace1:
-        trace_function_signatures.add(func.split(' ')[0])
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
     # the callee definition patch to this patch(caller). specifically, do this for the patches remove
@@ -926,10 +971,6 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                         continue
                     if 'signature' not in node['callee']:
                         # function like zalloc
-                        continue
-                    if node['callee']['name'] not in trace_function_signatures:
-                        # skip if the function signature is not in the trace_function_signatures,
-                        # now we only check the name, signature or line number level need more code.
                         continue
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
@@ -1286,7 +1327,7 @@ def revert_patch_test(args):
                     patch_to_apply.append(key)
                     break
 
-        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
+        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'])
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -1295,6 +1336,7 @@ def revert_patch_test(args):
         # Save all patches to a single file
         if patch_to_apply:
             patch_to_apply, function_declarations = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
+            patch_to_apply = remove_unnecessary_lines(diff_results, patch_to_apply, depen_graph, trace1)
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
@@ -1320,10 +1362,9 @@ def revert_patch_test(args):
         func_decl_to_add = dict() # key: file path, value: list of function declarations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
         error_log = 'undeclared identifier'
-        while 'undeclared identifier' in error_log:
+        while 'undeclared identifier' in error_log or 'undeclared function' in error_log:
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
             undeclared_identifier, undeclared_functions = handle_build_error(error_log)
-            logger.info(f'undeclared_identifier: {undeclared_identifier}')
             for identifier, location in undeclared_identifier:
                 parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id'][:6]}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
                 if os.path.exists(parsing_path):
