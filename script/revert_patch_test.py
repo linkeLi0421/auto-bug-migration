@@ -567,7 +567,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
 
             file_path = os.path.join(target_repo_path, path_a)
-            parsing_path = os.path.join(data_path, f'{target}-{old_commit[:6]}', f'{path_b}_analysis.json')
+            parsing_path = os.path.join(data_path, f'{target}-{old_commit[:6]}', f'{path_a}_analysis.json')
 
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
