@@ -48,7 +48,7 @@ def analyze_file(directory, src_file, args):
     
     for cursor in tu.cursor.walk_preorder():
         file_path = str(cursor.location.file) if cursor.location.file else ""
-        file = file_path
+        file = os.path.realpath(file_path)
         if file.startswith('/src'):
             file = file.split('/', 3)[-1]
         elif any(path in str(cursor.extent.start.file) for path in include_paths):
@@ -104,7 +104,7 @@ def analyze_file(directory, src_file, args):
             
         # record extent for declarations/definitions
         if cursor.extent and cursor.extent.start and cursor.extent.end:
-            file = str(cursor.extent.start.file)
+            file = os.path.realpath(str(cursor.extent.start.file))
             if file.startswith('/src'):
                 file = file.split('/', 3)[-1]
             elif any(path in str(cursor.extent.start.file) for path in include_paths):
