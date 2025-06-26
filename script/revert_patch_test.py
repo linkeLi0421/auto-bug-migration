@@ -533,6 +533,8 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         'new_end_line': int(new_line_cursor),
                         'old_start_line': int(old_line_start),
                         'old_end_line': int(old_line_cursor),
+                        'new_function_start_line': int(node['extent']['start']['line']),
+                        'new_function_end_line': int(node['extent']['end']['line']),
                     }
         
         # checkout target repo to the new commit, and parse the code from that
@@ -639,10 +641,14 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             'new_end_line': int(new_line_cursor),
                             'old_start_line': int(old_line_start),
                             'old_end_line': int(old_line_cursor),
+                            'old_function_start_line': int(node['extent']['start']['line']),
+                            'old_function_end_line': int(node['extent']['end']['line']),
                         }
                     
                     for k_new, k_old in key_merged.items():
                         results[k_old]['new_signature'] = results[k_new]['new_signature']
+                        results[k_old]['new_start_line'] = results[k_new]['new_start_line']
+                        results[k_old]['new_end_line'] = results[k_new]['new_end_line']
                         del results[k_new]
     
     return results
@@ -848,7 +854,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     'new_start_line': artificial_patch_insert_point,
                     'new_end_line': artificial_patch_insert_point,
                     'old_start_line': artificial_patch_insert_point,
-                    'old_end_line': artificial_patch_insert_point + func_length
+                    'old_end_line': artificial_patch_insert_point + func_length,
+                    'old_function_start_line': artificial_patch_insert_point,
+                    'old_function_end_line': artificial_patch_insert_point + func_length,
                 }
                 # 4. Add this new artificial patch key to patch_to_apply
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
@@ -965,7 +973,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                 if node.get('kind') not in call_kinds:
                     continue
                 # check if the call is within the patch range
-                if node['extent']['end']['line'] <= patch['old_end_line'] and node['extent']['start']['line'] >= patch['old_start_line']:
+                if node['extent']['end']['line'] <= patch['old_function_end_line'] and node['extent']['start']['line'] >= patch['old_function_start_line']:
                     if 'callee' not in node:
                         # indirect call, can get the callee. skip now
                         continue
