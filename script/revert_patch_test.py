@@ -727,7 +727,7 @@ def remove_unnecessary_lines(diff_results, patch_to_apply, dependence_graph, tra
     
     for key in patch_to_apply:
         patch = diff_results[key]
-        if 'old_signature' in patch and patch['old_signature'].split(' ')[1].split('(')[0] in trace_function_names:
+        if 'old_signature' in patch and patch['old_signature'].split('(')[0].split(' ')[-1] in trace_function_names:
             # If the function is in the trace, do not remove any lines
             new_patch_to_apply.append(key)
             continue
@@ -737,7 +737,7 @@ def remove_unnecessary_lines(diff_results, patch_to_apply, dependence_graph, tra
             lines = patch_text.split('\n')
             modified_lines = []
             for line in lines:
-                if line.startswith('-') and patch['old_signature'].split(' ')[1].split('(')[0] in line:
+                if line.startswith('-') and patch['old_signature'].split('(')[0].split(' ')[-1] in line:
                     # If the line is a call to the removed function, remove it
                     logger.info(f'Removing line: {line} from {caller_key} because {patch["old_signature"]} is not in the trace')
                     modified_lines.append('-')
