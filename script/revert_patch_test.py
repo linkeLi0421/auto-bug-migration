@@ -864,13 +864,13 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 renamed_functions[artificial_patch['old_signature']] = new_key
                 # 5. Rename the function by dependency graph
-                for callee_key, caller_key_set in dependence_graph.items():
-                    # rename functions in the Artificial patch
-                    for caller in caller_key_set:
-                        if key == caller:
-                            callee_fname = diff_results[callee_key]['old_signature'].split('(')[0].split(' ')[-1]
-                            modified_lines = rename_func(diff_results[new_key]['patch_text'], callee_fname)
-                            diff_results[new_key]['patch_text'] = '\n'.join(modified_lines)
+                # for callee_key, caller_key_set in dependence_graph.items():
+                #     # rename functions in the Artificial patch
+                #     for caller in caller_key_set:
+                #         if key == caller:
+                #             callee_fname = diff_results[callee_key]['old_signature'].split('(')[0].split(' ')[-1]
+                #             modified_lines = rename_func(diff_results[new_key]['patch_text'], callee_fname)
+                #             diff_results[new_key]['patch_text'] = '\n'.join(modified_lines)
                     
                 for caller_key in dependence_graph.get(key, []):
                     # rename functions in patches that depend on (call) this function
