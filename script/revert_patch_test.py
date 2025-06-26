@@ -1366,8 +1366,8 @@ def revert_patch_test(args):
         
         with open(patch_file_path, 'r') as patch_file:
             original_patch = patch_file.read()
-        con_to_add = dict() # key: file path, value: list of enum/macro locations
-        func_decl_to_add = dict() # key: file path, value: list of function declarations
+        con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
+        func_decl_to_add = dict() # key: file path, value: set of function declarations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
         error_log = 'undeclared identifier'
         while 'undeclared identifier' in error_log or 'undeclared function' in error_log:
@@ -1380,21 +1380,21 @@ def revert_patch_test(args):
                         ast_nodes = json.load(f)
                     for ast_node in ast_nodes:
                         if ast_node['kind'] in {'ENUM_CONSTANT_DECL'} and ast_node['spelling'] == identifier:
-                            con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                            con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
                             break
                         if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
                             if '#include' in ast_node['extent']['start']['file']:
                                 # macro defined in header file from system include paths
-                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
                             else:
                                 # macro defined in .h file in the target repo
-                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}')
+                                con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
                             break
 
             for func_name, location in undeclared_functions:
                 for func_decl in function_declarations:
                     if func_name in func_decl:
-                        func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], []).append(f'{func_decl}')
+                        func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], set()).add(f'{func_decl}')
 
             extra_patches = dict() # key: file path, value: patch text
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys())
@@ -1418,10 +1418,10 @@ def revert_patch_test(args):
                     
                 if file_path in con_to_add:
                     # enum or macro patch
-                    locs = con_to_add[file_path]
+                    locs = list(con_to_add[file_path])
                     enum_len = 2
                     enum_text = '-enum {\n'
-                    for log in reversed(locs):
+                    for log in locs:
                         path = log.split(':')[0]
                         if path.startswith('#include'):
                             # header file from system include paths
