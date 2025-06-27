@@ -17,7 +17,6 @@ from run_fuzz_test import py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from get_fix_related import demangle_cpp_symbol
-from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -120,7 +119,7 @@ def parse_csv_data(csv_content):
 
 def find_transitions(data, repo_path):
     # Build commit graph for easy parent/child lookup, and commits stored ordered by time
-    commit_graph = OrderedDict()
+    commit_graph = Dict()
     repo = Repo(repo_path)
     know_bug_ids = set() # a set of bugs that already have a fix
     
