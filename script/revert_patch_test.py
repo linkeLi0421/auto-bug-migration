@@ -119,7 +119,7 @@ def parse_csv_data(csv_content):
 
 def find_transitions(data, repo_path):
     # Build commit graph for easy parent/child lookup, and commits stored ordered by time
-    commit_graph = Dict()
+    commit_graph = dict()
     repo = Repo(repo_path)
     know_bug_ids = set() # a set of bugs that already have a fix
     
