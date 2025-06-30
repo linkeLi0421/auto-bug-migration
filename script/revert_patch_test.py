@@ -685,7 +685,8 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "ninja: build stopped:",
         "Compilation failed",
         "failed with exit status"
-        'CMake Error'
+        'CMake Error',
+        'error: patch failed:'
     ]
     
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
