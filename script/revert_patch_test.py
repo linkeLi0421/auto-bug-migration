@@ -413,6 +413,9 @@ def update_type_set(patch):
         type_set.add('Function removed')
         type_set.add('Function signature change')
         sig_change_list.append((old_signature, new_signature))
+    if patch['file_path_new'] == '/dev/null':
+        type_set.add('Function removed')
+        type_set.add('File removed')
     patch['patch_type'] = type_set
 
     return sig_change_list
