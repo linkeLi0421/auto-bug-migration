@@ -689,7 +689,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     ]
     
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
-    if not os.path.exists(fuzzer_path) and any(error_pattern in result.stderr or error_pattern in result.stdout 
+    if not os.path.exists(fuzzer_path) or any(error_pattern in result.stderr or error_pattern in result.stdout 
             for error_pattern in build_error_patterns) or result.returncode != 0:
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
         return False, result.stderr+result.stdout
@@ -827,6 +827,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                             file_content = f.readlines()
                             func_code = ''.join('-' + line for line in file_content[ast_node['extent']['start']['line']-1:ast_node['extent']['end']['line']])
                             func_length = func_code.count('\n')
+                            if func_code[-1] != '\n':
+                                # This function is in the last line of the file, without a \n will cause the patch to fail
+                                func_length += 1
                             break
                 
                 # 2. get patch insert line number from new commit for the Artificial patch
@@ -870,14 +873,6 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
                 renamed_functions[artificial_patch['old_signature']] = new_key
                 # 5. Rename the function by dependency graph
-                # for callee_key, caller_key_set in dependence_graph.items():
-                #     # rename functions in the Artificial patch
-                #     for caller in caller_key_set:
-                #         if key == caller:
-                #             callee_fname = diff_results[callee_key]['old_signature'].split('(')[0].split(' ')[-1]
-                #             modified_lines = rename_func(diff_results[new_key]['patch_text'], callee_fname)
-                #             diff_results[new_key]['patch_text'] = '\n'.join(modified_lines)
-                    
                 for caller_key in dependence_graph.get(key, []):
                     # rename functions in patches that depend on (call) this function
                     caller_key = renamed_functions.get(diff_results[caller_key]['old_signature'], caller_key)
@@ -1188,7 +1183,7 @@ def get_line_context(file_path, line_number, context=3):
 
 def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit, next_commit, target):
     # For function do not change but appear in trace, add a patch if they should call recreated functions
-    new_patch_to_apply = []
+    new_patch_to_apply = set()
     for index, func in trace1:
         fname = func.split(' ')[0]
         location = func.split(' ')[1]
@@ -1257,9 +1252,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         new_key = f'{file_path}{file_path}-{start_line},{1}+{start_line},{1}'
                         
                         diff_results[new_key] = patch
-                        new_patch_to_apply.append(new_key)
-            
-    final_patches.extend(new_patch_to_apply)
+                        new_patch_to_apply.add(new_key)
+
+    final_patches.extend(list(new_patch_to_apply))
 
 
 def revert_patch_test(args):
@@ -1520,7 +1515,7 @@ def revert_patch_test(args):
                     locs = list(con_to_add[file_path])
                     enum_len = 2
                     enum_text = '-enum {\n'
-                    for log in locs:
+                    for log in reversed(locs):
                         path = log.split(':')[0]
                         if path.startswith('#include'):
                             # header file from system include paths
