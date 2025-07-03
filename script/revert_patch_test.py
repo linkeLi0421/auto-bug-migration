@@ -1257,6 +1257,13 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     final_patches.extend(list(new_patch_to_apply))
 
 
+def update_function_mappings(recreated_functions, signature_change_list):
+    # add mapping for recreated functions
+    for func_sig in recreated_functions:
+        func_name = func_sig.split('(')[0].split(' ')[-1]
+        signature_change_list.append((func_name, f'__revert_{func_name}'))
+
+
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
     bug_info_dataset = read_json_file(args.bug_info)
@@ -1292,11 +1299,11 @@ def revert_patch_test(args):
             arch = job_type.split('_')[2]
         else:
             arch = 'x86_64'
-        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
-        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
+        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id'][:6]}-testcase-{bug_id}.txt')
+        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id'][:6]}-testcase-{bug_id}.txt')
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
-            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
+            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id'][:6]}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
@@ -1567,6 +1574,7 @@ def revert_patch_test(args):
                 revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
                 transitions.append((commit, next_commit, bug_id))
+                update_function_mappings(recreated_functions, signature_change_list)
                 logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
         else:
             logger.info(f"Build failed for bug {bug_id} on commit {next_commit['commit_id']}\n")
