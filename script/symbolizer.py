@@ -101,11 +101,13 @@ def main():
     offset_to_symbol = symbolize_funcs(all_offsets, args.binary)
     
     # Process caller relationships
+    call_relation_lines = [f'Call Relation Summary:', f'-----------------------', '']
     for caller_offset, callee_offsets in caller_to_callees.items():
-        print(f"Caller: {offset_to_symbol[caller_offset]} {caller_offset}")
+        call_relation_lines.append(f"Caller: {offset_to_symbol[caller_offset]} {caller_offset}")
         for callee_offset in callee_offsets:
             if callee_offset in offset_to_symbol:
-                print(f"  -> Callee: {offset_to_symbol[callee_offset]} {callee_offset}")
+                call_relation_lines.append(f"  -> Callee: {offset_to_symbol[callee_offset]} {callee_offset}")
+
                 
     for trace_offset in trace_offset_list:
         if trace_offset in offset_to_symbol:
@@ -113,7 +115,7 @@ def main():
             print(f"Trace Offset: {trace_offset} Symbol: {symbol} Location: {location}")
 
     # Prepare output
-    output_lines = [f"Trace Analysis Summary:", f"-----------------------", ""]
+    output_lines = call_relation_lines + [f"Trace Analysis Summary:", f"-----------------------", ""]
     output_lines.append(f"Found {len(trace_offset_list)} function entries.")
     output_lines.append("")
     for trace_offset in trace_offset_list:

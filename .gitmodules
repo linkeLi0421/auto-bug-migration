@@ -1,3 +1,6 @@
 [submodule "oss-fuzz"]
 	path = oss-fuzz
 	url = https://github.com/google/oss-fuzz.git
+[submodule "cfg-clang"]
+	path = cfg-clang
+	url = git@github.com:linkeLi0421/cfg-clang.git
