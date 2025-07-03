@@ -252,6 +252,8 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = fuzz_one(args)
   elif args.command == 'collect_trace':
     result = collect_trace(args)
+  elif args.command == 'get_cfg':
+    result = get_cfg(args)
   elif args.command == 'pull_images':
     result = pull_images()
   elif args.command == 'run_clusterfuzzlite':
@@ -557,6 +559,27 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_sanitizer_args(collect_trace_parser)
   _add_environment_args(collect_trace_parser)
   _add_external_project_args(collect_trace_parser)
+
+  get_cfg_parser = subparsers.add_parser(
+      'get_cfg', help='get cfg for a project at a commit')
+  get_cfg_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  get_cfg_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  get_cfg_parser.add_argument('--commit',
+                            help='commit hash to checkout in the builder')
+  get_cfg_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
+  get_cfg_parser.add_argument('--patch',
+                            help='patch file to apply in the builder')
+  get_cfg_parser.add_argument('--target_file',
+                            help='target file to get cfg for')
+  _add_architecture_args(get_cfg_parser)
+  _add_engine_args(get_cfg_parser)
+  _add_sanitizer_args(get_cfg_parser)
+  _add_environment_args(get_cfg_parser)
+  _add_external_project_args(get_cfg_parser)
 
   build_version_parser = subparsers.add_parser(
       'build_version', help='Run /bin/bash within the builder container.')
@@ -2053,6 +2076,32 @@ def get_runfuzzer_bash(args, allowlist_type):
   return bash_runfuzzer
 
 
+def get_cfg_bash(args):
+  """Returns the bash commands to generate CFG."""
+  bash_cfg = f'''
+    apt-get update && apt-get install -y bear;
+    cd /llvm/build ; make install -j$(nproc) &> /dev/null ; cd -;
+    cd /src/{args.project.name};
+    git checkout -f {args.commit}; 
+    cd -;
+    
+    rm /cfg-clang/build -rf;
+    mkdir /cfg-clang/build;
+    cd /cfg-clang/build;
+    cmake -DCMAKE_PREFIX_PATH=/llvm/build  ..;
+    make -j$(nproc);
+    cd -;
+    
+    {'git apply --reverse /patch;' if args.patch else ''}
+    
+    bear compile;
+    /cfg-clang/build/cfg-clang -p ./compile_commands.json \
+      {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}.txt;
+
+  '''
+  return bash_cfg
+
+
 def build_llvm_from_source():
   """Builds LLVM from source."""
   llvm_source_dir = os.path.join('/', "llvm")
@@ -2148,10 +2197,23 @@ def fuzz_one(args):
 
   script_folder = os.path.join(HOME_DIR, 'script')
   Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
-  LLVM_PROEJCT = os.path.join(HOME_DIR, 'llvm-project')
+  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
   result_dir = os.path.join(HOME_DIR, 'data')
-  run_fuzzer_args = run_args.copy()
-  
+  run_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
+      '-v', f'{LLVM_PROJECT}:/llvm',
+      '-v', f'{result_dir}:/data',
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', last_argument
+  ])
+  clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
+
+
+def fuzz_one(args):
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
@@ -2181,8 +2243,8 @@ def fuzz_one(args):
   if not os.path.exists(result_dir):
     os.makedirs(result_dir)
   
-  if not os.path.exists(LLVM_PROEJCT):
-    os.makedirs(LLVM_PROEJCT)
+  if not os.path.exists(LLVM_PROJECT):
+    os.makedirs(LLVM_PROJECT)
     
     llvm_builder = run_args.copy()
     # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
@@ -2191,7 +2253,7 @@ def fuzz_one(args):
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
       '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{LLVM_PROJECT}:/llvm',
       '-v', f'{result_dir}:/data',
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', build_llvm_from_source()
@@ -2401,7 +2463,7 @@ def collect_trace(args):
 
   script_folder = os.path.join(HOME_DIR, 'script')
   Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
-  LLVM_PROEJCT = os.path.join(HOME_DIR, 'llvm-project')
+  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
   result_dir = os.path.join(HOME_DIR, 'data')
   
   run_args.extend([
@@ -2409,13 +2471,95 @@ def collect_trace(args):
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
       '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{LLVM_PROJECT}:/llvm',
       '-v', f'{result_dir}:/data',
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', get_trace_log_bash(args.commit, args)
   ])
   clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
+  return True
+
+
+def get_cfg(args):
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+                args.commit, oss_fuzz_commit)
+          break
+  else:
+    logger.error('Need a build_csv')
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=' + args.engine,
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+
+  result_dir = os.path.join(HOME_DIR, 'data')
+  if not os.path.exists(result_dir):
+    os.makedirs(result_dir)
+
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  bash = ''
+  if args.patch:
+    run_args.extend([
+        '-v',
+        '%s:/patch' % args.patch,
+    ])
+
+  script_folder = os.path.join(HOME_DIR, 'script')
+  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
+  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
+  result_dir = os.path.join(HOME_DIR, 'data')
+  cfg_clang = os.path.join(HOME_DIR, 'cfg-clang')
+  
+  run_args.extend([
+      '-v', f'{out_dir}:/out', 
+      '-v', f'{args.project.work}:/work', 
+      '-v', f'{script_folder}:/script', 
+      '-v', f'{Function_instrument}:/Function_instrument', 
+      '-v', f'{LLVM_PROJECT}:/llvm',
+      '-v', f'{result_dir}:/data',
+      '-v', f'{cfg_clang}:/cfg-clang',
+      '-t', f'gcr.io/{image_project}/{args.project.name}', 
+      '/bin/bash', '-c', get_cfg_bash(args)
+  ])
+  clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   return True
 
