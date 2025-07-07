@@ -2096,8 +2096,7 @@ def get_cfg_bash(args):
     
     bear compile;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
-      {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}.txt;
-
+      {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
   '''
   return bash_cfg
 
@@ -2128,6 +2127,8 @@ def build_llvm_from_source():
       -DLLDB_INCLUDE_TESTS=OFF \
       -DCLANG_ENABLE_ARCMT=OFF \
       -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+      -DLLVM_BUILD_LLVM_DYLIB=ON \
+      -DLLVM_ENABLE_RTTI=ON\
       {llvm_source_dir}/llvm;
     make -j$(nproc);
   """
