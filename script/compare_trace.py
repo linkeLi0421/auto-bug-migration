@@ -38,8 +38,8 @@ def main():
 
     common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
 
-    remaining_funcs1 = {func for _, func.split(' ')[0] in remaining_trace1}
-    remaining_funcs2 = {func for _, func.split(' ')[0] in remaining_trace2}
+    remaining_funcs1 = {func.split(' ')[0] for _, func in remaining_trace1}
+    remaining_funcs2 = {func.split(' ')[0] for _, func in remaining_trace2}
     common_funcs = remaining_funcs1.intersection(remaining_funcs2)
 
     if args.two_bug_mode:
