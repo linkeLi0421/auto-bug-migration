@@ -1380,11 +1380,15 @@ def keep_bb_in_path(bbstart, bbend, key, diff_results):
     
     ptr1 = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0]) - 1
     ptr2 = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0]) - 1
+    removed = 0
+    added = 0
     for line in lines:
         if line.startswith('-'):
+            removed += 1
             ptr1 += 1
 
         elif line.startswith('+'):
+            added += 1
             ptr2 += 1
         else:
             ptr1 += 1
@@ -1392,11 +1396,16 @@ def keep_bb_in_path(bbstart, bbend, key, diff_results):
         # remove '-' lines, and keep the '+' lines
         if bb1_start <= ptr1 <= bb1_end or bbstart <= ptr2 <= bbend:
             if line.startswith('+') or line.startswith(' '):
+                if line.startswith('+'):
+                    added -= 1
                 new_lines.append(' ' + line[1:])
         else:
             new_lines.append(line)
         
-
+    if removed == 0 and added == 0:
+        del diff_results[key]
+        return
+    
     patch['patch_text'] = '\n'.join(patch['patch_text'].split('\n')[:4] + new_lines)
 
 
