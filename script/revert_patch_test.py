@@ -17,6 +17,7 @@ from run_fuzz_test import py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from get_fix_related import demangle_cpp_symbol
+from cfg_parser import parse_cfg_text, find_block_by_line
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -758,7 +759,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
     handle_func_signature_change = set()
-    function_declarations = set() # a set of function declarations
+    function_declarations = set() # a set of 'recreated' function declarations
     
     removed_old_signatures = set()
     removed_new_signatures = set()
@@ -938,12 +939,21 @@ def normalize_signature(signature):
     return ret_type, func_name, tuple(arg_types)
 
 
-def compare_function_signatures(sig1, sig2):
+def compare_function_signatures(sig1, sig2, ignore_arg_types=False):
     """Returns True if two C function signatures are the same (ignoring parameter names)."""
-    return normalize_signature(sig1) == normalize_signature(sig2)
+    s1 = normalize_signature(sig1)
+    s2 = normalize_signature(sig2)
+    if ignore_arg_types:
+        ret_type1, func_name1, args_types1 = s1
+        ret_type2, func_name2, args_types2 = s2
+        ret = (ret_type1 == ret_type2 and func_name1 == func_name2 and
+               len(args_types1) == len(args_types2))
+        return ret
+    else:    
+        return s1 == s2
 
 
-def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit):
+def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit, trace1):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -951,6 +961,9 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     patch_list = list(patch_to_apply)
     new_patch_to_patch = []
     visited_patches = set()
+    trace_function_names = set()
+    for index, func in trace1:
+        trace_function_names.add(func.split(' ')[0])
     # 1. Function Call Relationship;
     # in old version of this patch, if there is a call to a fucntion, create an edge from
     # the callee definition patch to this patch(caller). specifically, do this for the patches remove
@@ -984,6 +997,9 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                         continue
                     if 'signature' not in node['callee']:
                         # function like zalloc
+                        continue
+                    if node['callee']['signature'].split('(')[0].split(' ')[-1] not in trace_function_names:
+                        # if the function is not in the trace, skip it
                         continue
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
@@ -1232,7 +1248,6 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         end_line = start_line + 1
                         patch_text = rename_func(f'-{line}', recreated_fname)[0] + '\n+' + line[:-1]
                         patch_text = patch_header + f"@@ -{start_line},{1} +{start_line},{1} @@\n" + patch_text
-                        logger.info(f'patch_text: {patch_text}')
                         patch = {
                             'file_path_old': file_path,
                             'file_path_new': file_path,
@@ -1262,6 +1277,127 @@ def update_function_mappings(recreated_functions, signature_change_list):
     for func_sig in recreated_functions:
         func_name = func_sig.split('(')[0].split(' ')[-1]
         signature_change_list.append((func_name, f'__revert_{func_name}'))
+
+
+def get_correct_line_num(file_path, line_num, patch_key_list, diff_results):
+    # transforom the line number after reverting patches, to the line number before reverting patches (in new commit)
+    add_num = 0 # the number of lines added by patches
+    for key in reversed(patch_key_list):
+        patch = diff_results[key]
+        if 'file_path_new' in patch and patch['file_path_new'] == file_path:
+            if patch['new_start_line'] <= line_num <= patch['new_end_line']:
+                break
+            patch_lines = patch['patch_text'].split('\n')
+            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+            add_num += new_offset - old_offset
+    return line_num + add_num
+
+
+def corresponding_bb(cfgs1, cfgs2, bb2, patch_key, diff_results):
+    # return the corresponding basic blocks in cfgs1 for bb2, based on their relationship in a patch
+    bbs = []
+    # 1. compare function name
+    patch = diff_results[patch_key]
+    old_signature = patch['old_signature']
+    new_signature = patch['new_signature']
+    cfg1 = None
+    cfg2 = None
+    for cfg in cfgs1:
+        logger.info(f'Comparing {cfg.function_signature} with {old_signature}')
+        if compare_function_signatures(cfg.function_signature, old_signature, ignore_arg_types=True):
+            # Because two signature come from libclang and clangtools, they may have different formats,
+            # like int and size_t, so we ignore the argument types for now. Same for cfg2.
+            cfg1 = cfg
+            break
+    for cfg in cfgs2:
+        if compare_function_signatures(cfg.function_signature, new_signature, ignore_arg_types=True):
+            cfg2 = cfg
+            break
+    if not cfg1 or not cfg2:
+        logger.error(f'Cannot find corresponding cfg for {old_signature} and {new_signature}')
+        return bbs
+
+    # 2. iterate patch to align the basic blocks:
+    #    if bb in two cfg have common lines in patch, then they are corresponding
+    old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
+    old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+    new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+    new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+    ptr1 = old_start-1 # line number in old commit
+    ptr2 = new_start-1 # line number in new commit
+    common_unchanged_lines = []
+    for line in patch['patch_text'].split('\n')[4:]:
+        if line.startswith('-'):
+            ptr1 += 1
+        elif line.startswith('+'):
+            ptr2 += 1
+        else:
+            ptr1 += 1
+            ptr2 += 1
+            if ptr2 >= bb2.start_line and ptr2 <= bb2.end_line:
+                common_unchanged_lines.append((ptr1, ptr2))
+
+        if ptr2 == bb2.start_line:
+            bb1_start = ptr1
+        if ptr2 == bb2.end_line:
+            bb1_end = ptr1
+            break
+    
+    for bid in cfg1.blocks:
+        bb = cfg1.blocks[bid]
+        if bb.start_line and bb.end_line and bb.start_line <= bb1_end and bb.end_line >= bb1_start:
+            # there is overlap, so probably they are corresponding, do not check the unchanged lines for now
+            bbs.append(bb)
+    return bbs
+
+
+def keep_bb_in_path(bbstart, bbend, key, diff_results):
+    # A patch will be used to revert (git apply --reverse); but we 
+    # want to keep a specific basic block from new version in the path
+    patch = diff_results[key]
+    ptr1 = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0]) - 1  # line number in old commit
+    ptr2 = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0]) - 1  # line number in new commit
+    bb1_start = None
+    bb1_end = None
+    lines = patch['patch_text'].split('\n')[4:]
+    new_lines = []
+    for line in lines:
+        if line.startswith('-'):
+            ptr1 += 1
+        elif line.startswith('+'):
+            ptr2 += 1
+        else:
+            ptr1 += 1
+            ptr2 += 1
+
+        if ptr2 == bbstart:
+            bb1_start = ptr1
+        if ptr2 == bbend + 1:
+            bb1_end = ptr1
+    if not bb1_end:
+        bb1_end = ptr1
+    
+    ptr1 = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0]) - 1
+    ptr2 = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0]) - 1
+    for line in lines:
+        if line.startswith('-'):
+            ptr1 += 1
+
+        elif line.startswith('+'):
+            ptr2 += 1
+        else:
+            ptr1 += 1
+            ptr2 += 1
+        # remove '-' lines, and keep the '+' lines
+        if bb1_start <= ptr1 <= bb1_end or bbstart <= ptr2 <= bbend:
+            if line.startswith('+') or line.startswith(' '):
+                new_lines.append(' ' + line[1:])
+        else:
+            new_lines.append(line)
+        
+
+    patch['patch_text'] = '\n'.join(patch['patch_text'].split('\n')[:4] + new_lines)
 
 
 def revert_patch_test(args):
@@ -1435,7 +1571,7 @@ def revert_patch_test(args):
                     patch_to_apply.append(key)
                     break
 
-        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'])
+        depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         
         if not os.path.exists(patch_folder):
@@ -1493,9 +1629,48 @@ def revert_patch_test(args):
                             break
 
             for func_name, location in undeclared_functions:
-                for func_decl in function_declarations:
-                    if func_name in func_decl:
-                        func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], set()).add(f'{func_decl}')
+                if not func_name.startswith('__revert_'):
+                    # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
+                    # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
+                    file_path = location.split(':')[0]
+                    line_num = int(location.split(':')[1])
+                    relative_file_path = file_path.split('/', 3)[-1]
+                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt')):
+                        get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
+                                    '--architecture', arch, '--target_file', relative_file_path, target]
+                        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+                        result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt')):
+                        get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit['commit_id'], '--build_csv', args.build_csv,
+                                    '--architecture', arch, '--target_file', relative_file_path, target]
+                        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+                        result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    
+                    # line_num after patch -> line number before patch -> 
+                    # find block start and end line in bug version -> get the part in patch need to be removed
+                    line_num = get_correct_line_num(relative_file_path, line_num, final_patches, diff_results)
+                    with open(os.path.join(data_path, f'cfg-{target}-{commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+                        cfgs1 = parse_cfg_text(cfg_file.read())
+                    with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+                        cfgs2 = parse_cfg_text(cfg_file.read())
+                    _, bb2 = find_block_by_line(cfgs2, file_path.split('/')[-1], line_num)
+                    if not bb2:
+                        logger.info(f'No basic block found for {file_path}:{line_num} in {next_commit['commit_id'][:6]}')
+                        continue
+                    
+                    for key in final_patches:
+                        patch = diff_results[key]
+                        new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+                        new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+                        if patch['file_path_new'] == relative_file_path and new_start <= bb2.end_line and bb2.start_line < new_start + new_offset:
+                            keep_bb_in_path(bb2.start_line, bb2.end_line, key, diff_results)
+
+                else:
+                    # Add declaration for the "__revert_*" function
+                    for func_decl in function_declarations:
+                        if func_name == func_decl.split('(')[0].split(' ')[-1]:
+                            func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], set()).add(f'{func_decl}')
+                            break
 
             extra_patches = dict() # key: file path, value: patch text
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys())
@@ -1554,7 +1729,10 @@ def revert_patch_test(args):
                 extra_patches[file_path] = (patch_header + context1 + include_text + enum_text + func_decl_text + context2)
                 
             with open(patch_file_path, 'w') as patch_file:
-                patch_file.write(original_patch)
+                for key in final_patches:
+                    patch = diff_results[key]
+                    patch_file.write(patch['patch_text'])
+                    patch_file.write('\n\n')
                 for patch in extra_patches.values():    
                     patch_file.write(patch)
                     patch_file.write('\n\n')
