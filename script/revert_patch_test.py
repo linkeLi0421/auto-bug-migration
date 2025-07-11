@@ -1359,7 +1359,7 @@ def corresponding_bb(cfgs1, cfgs2, bb2, patch_key, diff_results):
     return bbs
 
 
-def keep_bb_in_path(bbstart, bbend, key, final_patches, diff_results):
+def keep_bb_in_patch(bbstart, bbend, key, final_patches, diff_results):
     # A patch will be used to revert (git apply --reverse); but we 
     # want to keep a specific basic block from new version in the path
     patch = diff_results[key]
@@ -1684,7 +1684,7 @@ def revert_patch_test(args):
                         new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
                         new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
                         if patch['file_path_new'] == relative_file_path and new_start <= bb2.end_line and bb2.start_line < new_start + new_offset:
-                            keep_bb_in_path(bb2.start_line, bb2.end_line, key, final_patches, diff_results)
+                            keep_bb_in_patch(bb2.start_line, bb2.end_line, key, final_patches, diff_results)
 
                 else:
                     # Add declaration for the "__revert_*" function
