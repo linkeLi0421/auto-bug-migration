@@ -45,35 +45,37 @@ def get_commit_patch_gitpython(repo_path, commit_id, parent_commit_id):
     return diffs
 
 
-def get_diff_unified(repo_path, commit1, commit2, context_lines=3):
-    """
-    Get unified diff format between two commits.
-    
-    Args:
-        repo_path (str): Path to the git repository
-        commit1 (str): First commit hash/reference
-        commit2 (str): Second commit hash/reference
-        context_lines (int): Number of context lines around changes
-    
-    Returns:
-        str: Unified diff content without a/ and b/ prefixes.
-    """
+def get_diff_unified(repo_path, commit1, commit2, patch_path, context_lines=3):
+    from git import Repo
+    import os
+
+    repo = Repo(repo_path)
+
+    # Determine what to restore to: branch or commit
     try:
-        repo = Repo(repo_path)
-        
-        # Use git diff with --minimal, --no-prefix and context lines options
+        orig_ref = repo.active_branch.name
+    except TypeError:
+        # Detached HEAD; fallback to current commit hash
+        orig_ref = repo.head.commit.hexsha
+
+    tmp_branch = f"tmp_patch_{os.getpid()}"
+
+    if patch_path:
+        # Create temp branch from commit2
+        repo.git.checkout(commit2, b=tmp_branch)
+        # Apply patch in reverse
+        repo.git.apply(patch_path, reverse=True)
+        # Diff with commit1
         diff_output = repo.git.diff(
-            '--minimal',
-            '--no-prefix',
-            commit1, 
-            commit2, 
-            unified=context_lines
+            '--minimal', '--no-prefix', f'{commit1}', '.', unified=context_lines
         )
-        
-        return diff_output
-        
-    except Exception as e:
-        raise RuntimeError(f"Error generating unified diff: {e}")
+        # Clean up
+        repo.git.checkout(orig_ref)
+        repo.git.branch('-D', tmp_branch)
+    else:
+        diff_output = repo.git.diff('--minimal', '--no-prefix', commit1, commit2, unified=context_lines)
+
+    return diff_output
 
 
 def parse_arguments():
@@ -422,7 +424,7 @@ def update_type_set(patch):
     return sig_change_list
 
 
-def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str, target: str):
+def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str, target: str, signature_change_list: list):
     """
     Analyze a GitPython DiffIndex and return metadata per hunk.
     Target repo checkout to fix commit here.
@@ -649,6 +651,10 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         }
                     
                     for k_new, k_old in key_merged.items():
+                        old_func_name = results[k_old]['old_signature'].split('(')[0].split(' ')[-1]
+                        new_func_name = results[k_new]['new_signature'].split('(')[0].split(' ')[-1]
+                        if old_func_name != new_func_name:
+                            signature_change_list.append((old_func_name, new_func_name))
                         results[k_old]['new_signature'] = results[k_new]['new_signature']
                         results[k_old]['new_start_line'] = results[k_new]['new_start_line']
                         results[k_old]['new_end_line'] = results[k_new]['new_end_line']
@@ -682,6 +688,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "error: conflicting types",
         "error: invalid conversion",
         "error: patch failed:",
+        "error: corrupt patch",
         "make: *** [Makefile:",
         "ninja: build stopped:",
         "Compilation failed",
@@ -765,7 +772,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     removed_new_signatures = set()
     reserved_keys = set()
     renamed_functions = dict()
-    recreated_functions = set() # a set of functions that are recreated by the artificial patch, and caller may do not change
+    recreated_functions = set() # a set of functions that are recreated by the artificial patch, and may be called by other functions
     
     for key in patch_to_apply:
         patch = diff_results[key]
@@ -1352,7 +1359,7 @@ def corresponding_bb(cfgs1, cfgs2, bb2, patch_key, diff_results):
     return bbs
 
 
-def keep_bb_in_path(bbstart, bbend, key, diff_results):
+def keep_bb_in_path(bbstart, bbend, key, final_patches, diff_results):
     # A patch will be used to revert (git apply --reverse); but we 
     # want to keep a specific basic block from new version in the path
     patch = diff_results[key]
@@ -1399,11 +1406,14 @@ def keep_bb_in_path(bbstart, bbend, key, diff_results):
                 if line.startswith('+'):
                     added -= 1
                 new_lines.append(' ' + line[1:])
+            else:
+                removed -= 1
         else:
             new_lines.append(line)
         
     if removed == 0 and added == 0:
         del diff_results[key]
+        final_patches.remove(key)
         return
     
     patch['patch_text'] = '\n'.join(patch['patch_text'].split('\n')[:4] + new_lines)
@@ -1440,6 +1450,7 @@ def revert_patch_test(args):
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         bug_type = bug_info['reproduce']['crash_type']
         job_type = bug_info['reproduce']['job_type']
+        patch_path_list = []
         if len(job_type.split('_')) > 3:
             arch = job_type.split('_')[2]
         else:
@@ -1449,6 +1460,9 @@ def revert_patch_test(args):
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
             trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id'][:6]}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
+            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id'][:6]} to {next_commit['commit_id'][:6]} with patch {patch_path_list[-1]}")
+        else:
+            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id'][:6]} to {next_commit['commit_id'][:6]}")
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
@@ -1507,10 +1521,10 @@ def revert_patch_test(args):
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
-        diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id']) # every file get a diff
-        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
+        diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
+        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch, get_patched_traces.get(bug_id, []))
         get_compile_commands(target, commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
-        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target)
+        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
 
         trace_func_set = set()
         # checkout target repo to the bug commit, get function signature from source code using code location
@@ -1610,8 +1624,6 @@ def revert_patch_test(args):
                 patch_file.write(patch['patch_text'])
                 patch_file.write('\n\n')  # Add separator between patches
         
-        with open(patch_file_path, 'r') as patch_file:
-            original_patch = patch_file.read()
         con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
         func_decl_to_add = dict() # key: file path, value: set of function declarations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
@@ -1626,7 +1638,7 @@ def revert_patch_test(args):
                         ast_nodes = json.load(f)
                     for ast_node in ast_nodes:
                         if ast_node['kind'] in {'ENUM_CONSTANT_DECL'} and ast_node['spelling'] == identifier:
-                            con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
+                            con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
                             break
                         if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
                             if '#include' in ast_node['extent']['start']['file']:
@@ -1672,7 +1684,7 @@ def revert_patch_test(args):
                         new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
                         new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
                         if patch['file_path_new'] == relative_file_path and new_start <= bb2.end_line and bb2.start_line < new_start + new_offset:
-                            keep_bb_in_path(bb2.start_line, bb2.end_line, key, diff_results)
+                            keep_bb_in_path(bb2.start_line, bb2.end_line, key, final_patches, diff_results)
 
                 else:
                     # Add declaration for the "__revert_*" function
@@ -1770,14 +1782,20 @@ def revert_patch_test(args):
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
 
 
-def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch):
-    cmd = [
-        py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-        '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
-    ]
+def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch, patch_path_list=None):
+    if not patch_path_list:
+        cmd = [
+            py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+            '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
+        ]
+    else:
+        cmd = [
+            py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+            '--build_csv', build_csv, '--compile_commands', '--architecture', arch, '--patch', patch_path_list[-1], target
+        ]
     
     logger.info(' '.join(cmd))
-    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id[:6]}')):
+    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id[:6]}{'-'+patch_path_list[-1].split('/')[-1].split('.diff')[0] if patch_path_list else ''}')):
         result = subprocess.run(cmd, capture_output=True, text=True)
 
     
