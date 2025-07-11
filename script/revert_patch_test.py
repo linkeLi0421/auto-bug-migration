@@ -1577,10 +1577,10 @@ def revert_patch_test(args):
         for key, diff_result in diff_results.items():
             if 'new_signature' in diff_result:
                 logger.debug(f'newsignature{diff_result['new_signature']}')
-                patch_func_new = diff_result['new_signature']
+                patch_func_new = diff_result['new_signature'].split('(')[0].split(' ')[-1]
             if 'old_signature' in diff_result:
                 logger.debug(f'oldsignature{diff_result['old_signature']}')
-                patch_func_old = diff_result['old_signature']
+                patch_func_old = diff_result['old_signature'].split('(')[0].split(' ')[-1]
             if 'file_path_old' in diff_result:
                 patch_file_path = diff_result['file_path_old']
             update_type_set(diff_result)
@@ -1589,7 +1589,7 @@ def revert_patch_test(args):
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
             for trace_func, func_loc in trace_func_set:
-                if patch_file_path in func_loc and trace_func in patch_func_old:
+                if patch_file_path in func_loc and trace_func == patch_func_old:
                     logger.debug(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
                     patch_to_apply.append(key)
                     break
@@ -1604,7 +1604,7 @@ def revert_patch_test(args):
         if patch_to_apply:
             patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
             # patch_to_apply = remove_unnecessary_lines(diff_results, patch_to_apply, depen_graph, trace1)
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id'][:6]}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
                 if key not in final_patches:
