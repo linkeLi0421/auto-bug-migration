@@ -11,6 +11,7 @@ from unidiff import PatchSet
 from io import StringIO
 import logging
 from typing import Tuple, Set
+from collections import defaultdict
 
 from buildAndtest import checkout_latest_commit
 from run_fuzz_test import read_json_file
@@ -19,6 +20,7 @@ from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from get_fix_related import demangle_cpp_symbol
 from cfg_parser import parse_cfg_text, find_block_by_line
+from gumtree import get_corresponding_lines
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -436,7 +438,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
         # Choose the post-change path if available, else pre-change:
         diff_lines = diff.splitlines()
         if len(diff_lines) < 5:
-            logger.info(f'diff is too short, skipping: {diff}')
+            logger.debug(f'diff is too short, skipping: {diff}')
             # Skip if the diff is too short to contain valid information, like binary files or empty diffs
             continue
         path_a = None
@@ -453,7 +455,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
         if ext not in ['c', 'cpp', 'h', 'hpp', 'cxx', 'cc']:
             # Skip non-C/C++ files
-            logger.info(f'Skipping non-C/C++ file: {path}')
+            logger.debug(f'Skipping non-C/C++ file: {path}')
             continue
 
         patch_text = diff
@@ -1372,27 +1374,19 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     return 0
 
 
-def corresponding_bb(cfgs1, cfgs2, bb1, patch_key, diff_results):
+def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
     # return the corresponding basic blocks of bb1 from cfgs1 in cfgs2, based on their relationship in a patch
     bbs = []
     # 1. compare function name
     patch = diff_results[patch_key]
     old_signature = patch['old_signature']
     new_signature = patch['new_signature']
-    cfg1 = None
     cfg2 = None
-    for cfg in cfgs1:
-        logger.info(f'Comparing {cfg.function_signature} with {old_signature}')
-        if compare_function_signatures(cfg.function_signature, old_signature, ignore_arg_types=True):
-            # Because two signature come from libclang and clangtools, they may have different formats,
-            # like int and size_t, so we ignore the argument types for now. Same for cfg2.
-            cfg1 = cfg
-            break
     for cfg in cfgs2:
         if compare_function_signatures(cfg.function_signature, new_signature, ignore_arg_types=True):
             cfg2 = cfg
             break
-    if not cfg1 or not cfg2:
+    if not cfg2:
         logger.error(f'Cannot find corresponding cfg for {old_signature} and {new_signature}')
         return bbs
 
@@ -1511,7 +1505,53 @@ def get_code_from_file(target_repo_path, file_path, commit, start_line, end_line
     return code_lines, code_length
 
 
-def keep_bb_in_patch(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
+def blocks_overlap(bb_list_a, bb_list_b):
+    for a in bb_list_a:
+        for b in bb_list_b:
+            if not (a.end_line < b.start_line or a.start_line > b.end_line):
+                return True
+    return False
+
+
+def deduplicate_bb_blocks(bb_list):
+    seen = set()
+    unique = []
+    for bb in bb_list:
+        key = (bb.start_line, bb.end_line)
+        if key not in seen:
+            seen.add(key)
+            unique.append(bb)
+    return unique
+
+
+def filter_and_dedup_bb_change_pairs(bb_change_pair):
+    filtered = defaultdict(list)
+
+    for file_path, change_list in bb_change_pair.items():
+        kept = []
+
+        for bb1s_i, bb2s_i, cfg_i in change_list:
+            bb2s_i = deduplicate_bb_blocks(bb2s_i)
+
+            overlap_found = False
+            for idx, (bb1s_j, bb2s_j, cfg_j) in enumerate(kept):
+                if blocks_overlap(bb1s_i, bb1s_j):
+                    # Conflict: keep the one with more unique bb2s
+                    if len(bb2s_i) > len(bb2s_j):
+                        kept[idx] = (bb1s_i, bb2s_i, cfg_i)
+                    # else: discard current i
+                    overlap_found = True
+                    break
+
+            if not overlap_found:
+                kept.append((bb1s_i, bb2s_i, cfg_i))
+
+        filtered[file_path] = kept
+
+    return filtered
+
+
+def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
     line_num_after_patch = line_num
     relative_file_path = file_path.split('/', 3)[-1]
     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
@@ -1531,47 +1571,63 @@ def keep_bb_in_patch(file_path, line_num, final_patches, diff_results, extra_pat
         cfgs1 = parse_cfg_text(cfg_file.read())
     with open(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
         cfgs2 = parse_cfg_text(cfg_file.read())
-    cfg1, bb1 = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit)
-    if not bb1:
+    cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], [line_num_in_old_commit])
+    if not bb1s:
         logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit}')
         return False
-    
-    bb2s = []
+
     for key, patch in diff_results.items():
-        old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-        old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-        if patch['file_path_new'] == relative_file_path and old_start <= bb1.end_line and bb1.start_line < old_start + old_offset:
-            bb2s.extend(corresponding_bb(cfgs1, cfgs2, bb1, key, diff_results))
+        if patch['file_path_new'] == relative_file_path:
+            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_old'], next_commit, bb1s)
+            break
+    
+    cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
     # Now we get basic blocks in new commit that correspond to bb1
     if not bb2s:
         logger.error(f'Cannot find corresponding basic blocks for {cfg1.function_signature} in {relative_file_path} at line {line_num_in_old_commit}')
         return False
     
+    return bb1s, bb2s, cfg1, relative_file_path
+    
+    
+def keep_bb_in_patch(bb1s, bb2s, cfg1, diff_results, final_patches, target_repo_path, next_commit, relative_file_path):
+    bb1_start_line = float('inf')
+    bb1_end_line = float('-inf')
+    bb2_start_line = float('inf')
+    bb2_end_line = float('-inf')
+    for bb1 in bb1s:
+        bb1_start_line = min(bb1_start_line, bb1.start_line)
+        bb1_end_line = max(bb1_end_line, bb1.end_line)
+    for bb2 in bb2s:
+        bb2_start_line = min(bb2_start_line, bb2.start_line)
+        bb2_end_line = max(bb2_end_line, bb2.end_line)
+
     for key in final_patches:
         patch = diff_results[key]
         if patch['file_path_new'] == relative_file_path and 'Recreated function' in patch['patch_type'] and compare_function_signatures(patch['old_signature'], cfg1.function_signature, ignore_arg_types=True):
-            for bb2 in bb2s:
-                old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-                old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-                new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-                new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-                if patch['patch_text'].find('\n-') != -1:
-                    # find the real patch start line, usually is 3
-                    lines = patch['patch_text'].split('\n')
-                    for line in lines:
-                        if line.startswith('-') and not line.startswith('---'):
-                            real_patch_start_line = lines.index(line)
-                            break
-                else:
-                    raise ValueError(f'Cannot find real patch start line in {patch["patch_text"]}')
-                # will change code from bb_start to bb_end in the patch, to bb2 in new commit; 4 is patch header lines
-                bb_start = real_patch_start_line + bb1.start_line - cfg1.signature_line
-                bb_end = real_patch_start_line + bb1.end_line - cfg1.signature_line
-                bb2_code_lines, bb2_code_length = get_code_from_file(target_repo_path, relative_file_path, next_commit, bb2.start_line, bb2.end_line)
-                patch_lines = patch['patch_text'].split('\n')
-                patch_lines[bb_start:bb_end+1] = [f'-{line}' for line in bb2_code_lines]
-                patch_lines[3] = f'@@ -{old_start},{old_offset-(bb_end-bb_start+1)+bb2_code_length} +{new_start},{new_offset} @@'
-                diff_results[key]['patch_text'] = '\n'.join(patch_lines)
+            logger.debug(f'bb1 {bb1_start_line} - {bb1_end_line} in patch {key}')
+            logger.debug(f'bb2 {bb2_start_line} - {bb2_end_line} in new commit {next_commit}')
+            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
+            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+            if patch['patch_text'].find('\n-') != -1:
+                # find the real patch start line, usually is 3
+                lines = patch['patch_text'].split('\n')
+                for line in lines:
+                    if line.startswith('-') and not line.startswith('---'):
+                        real_patch_start_line = lines.index(line)
+                        break
+            else:
+                raise ValueError(f'Cannot find real patch start line in {patch["patch_text"]}')
+            # will change code from bb_start to bb_end in the patch, to bb2 in new commit; 4 is patch header lines
+            bb_start = real_patch_start_line + bb1_start_line - cfg1.signature_line
+            bb_end = real_patch_start_line + bb1_end_line - cfg1.signature_line
+            bb2_code_lines, bb2_code_length = get_code_from_file(target_repo_path, relative_file_path, next_commit, bb2_start_line, bb2_end_line)
+            patch_lines = patch['patch_text'].split('\n')
+            patch_lines[bb_start:bb_end+1] = [f'-{line}' for line in bb2_code_lines]
+            patch_lines[3] = f'@@ -{old_start},{old_offset-(bb_end-bb_start+1)+bb2_code_length} +{new_start},{new_offset} @@'
+            diff_results[key]['patch_text'] = '\n'.join(patch_lines)
             break
     return True
 
@@ -1788,6 +1844,8 @@ def revert_patch_test(args):
         error_log = 'undeclared identifier'
         while 'undeclared identifier' in error_log or 'undeclared function' in error_log:
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+            if build_success:
+                break
             undeclared_identifier, undeclared_functions, miss_member_structs = handle_build_error(error_log)
             logger.info(f'undeclared_identifier: {undeclared_identifier}')
             logger.info(f'undeclared_functions: {undeclared_functions}')
@@ -1810,8 +1868,20 @@ def revert_patch_test(args):
                                 con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
                             break
 
+            bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
             for field_name, struct_name, file_path, line_num in miss_member_structs:
-                keep_bb_in_patch(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'][:6], commit['commit_id'][:6], arch, args.build_csv, target_repo_path)
+                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'][:6], commit['commit_id'][:6], arch, args.build_csv, target_repo_path)
+                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
+
+            bb_change_pair = filter_and_dedup_bb_change_pairs(bb_change_pair)
+            for relative_file_path, bb_change_list in bb_change_pair.items():
+                if not bb_change_list:
+                    continue
+                # bb_change_list is a list of (bb1s, bb2s, cfg1)
+                for bb1s, bb2s, cfg1 in bb_change_list:
+                    if not keep_bb_in_patch(bb1s, bb2s, cfg1, diff_results, final_patches, target_repo_path, next_commit['commit_id'][:6], relative_file_path):
+                        logger.error(f'Failed to keep basic block in patch for {relative_file_path}')
+                        continue
 
             for func_name, location in undeclared_functions:
                 if not func_name.startswith('__revert_'):
@@ -1838,8 +1908,8 @@ def revert_patch_test(args):
                         cfgs1 = parse_cfg_text(cfg_file.read())
                     with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
                         cfgs2 = parse_cfg_text(cfg_file.read())
-                    _, bb2 = find_block_by_line(cfgs2, file_path.split('/')[-1], line_num)
-                    if not bb2:
+                    _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
+                    if not bb2s:
                         logger.info(f'No basic block found for {file_path}:{line_num} in {next_commit['commit_id'][:6]}')
                         continue
                     
@@ -1847,8 +1917,8 @@ def revert_patch_test(args):
                         patch = diff_results[key]
                         new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
                         new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-                        if patch['file_path_new'] == relative_file_path and new_start <= bb2.end_line and bb2.start_line < new_start + new_offset:
-                            __keep_bb_in_patch(bb2.start_line, bb2.end_line, key, final_patches, diff_results)
+                        if patch['file_path_new'] == relative_file_path and new_start <= bb2s[0].end_line and bb2s[0].start_line < new_start + new_offset:
+                            __keep_bb_in_patch(bb2s[0].start_line, bb2s[0].end_line, key, final_patches, diff_results)
 
                 else:
                     # Add declaration for the "__revert_*" function

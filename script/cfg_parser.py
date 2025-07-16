@@ -95,12 +95,26 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
 
             pred_match = preds_re.match(line)
             if pred_match:
-                current_block.preds = list(map(lambda s: int(s[1:]), pred_match.group(2).split()))
+                tokens = pred_match.group(2).split()
+                current_block.preds = []
+                for token in tokens:
+                    # Assuming the first character is some prefix (like 'B' for block)
+                    if len(token) > 1:
+                        numeric_part = token[1:]
+                        if numeric_part.isdigit():
+                            current_block.preds.append(int(numeric_part))
                 continue
 
             succ_match = succs_re.match(line)
             if succ_match:
-                current_block.succs = list(map(lambda s: int(s[1:]), succ_match.group(2).split()))
+                tokens = succ_match.group(2).split()
+                current_block.succs = []
+                for token in tokens:
+                    # Assuming the first character is some prefix (like 'B' for block)
+                    if len(token) > 1:
+                        numeric_part = token[1:]
+                        if numeric_part.isdigit():
+                            current_block.succs.append(int(numeric_part))
                 continue
 
             range_match = from_line_re.match(line)
@@ -115,15 +129,20 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
     return cfgs
 
 
-def find_block_by_line(cfgs, file_name, line_number):
+def find_block_by_line(cfgs, file_name, line_number_list):
+    cfg1 = None
+    blocks = []
     for cfg in cfgs:
-        if not (cfg.file_path in file_name or file_name in cfg.file_path):
+        if not (cfg.file_path == file_name):
             continue
         for block in cfg.blocks.values():
             if block.start_line is not None and block.end_line is not None:
-                if block.start_line <= line_number <= block.end_line:
-                    return cfg.function_signature, block
-    return None, None
+                for line_number in line_number_list:
+                    if block.start_line <= line_number <= block.end_line:
+                        if not cfg1:
+                            cfg1 = cfg
+                        blocks.append(block)
+    return cfg1, blocks
 
 
 if __name__ == "__main__":
@@ -220,4 +239,4 @@ if __name__ == "__main__":
     cfgs = parse_cfg_text(text)
     for cfg in cfgs:
         cfg.print_summary()
-    _, block = find_block_by_line(cfgs, "fuzz_decompress_chunk.c", 23)
+    _, blocks = find_block_by_line(cfgs, "fuzz_decompress_chunk.c", [23])
