@@ -1097,9 +1097,9 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
 
         if lines[4] and lines[4][0] in {'-', '+'}:
             # No context lines before the patch: add context_lines1.
-            new_line_begin = max(new_line_begin_nocontext - 3, 0)
+            new_line_begin = max(new_line_begin_nocontext - 3, 1)
             new_offset = new_offset_nocontext + (new_line_begin_nocontext - new_line_begin)
-            old_line_begin = max(old_line_begin_nocontext - 3, 0)
+            old_line_begin = max(old_line_begin_nocontext - 3, 1)
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             context_lines1 = [f' {line}' for line in content[new_line_begin-1: new_line_begin_nocontext-1]]
             # Used for context_lines2
@@ -1111,11 +1111,13 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         if lines[-1] and lines[-1][0] in {'-', '+'}:
             # No context lines after the patch: add context_lines2.
             new_line_begin = new_line_begin_nocontext
-            new_offset = new_offset_nocontext + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext))
+            new_offset = new_offset_nocontext + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext+1))
             old_line_begin = old_line_begin_nocontext
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
-        
+            if new_offset - new_offset_nocontext < 3:
+                context_lines2.append('\ No newline at end of file')
+
         lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
             + context_lines1 + lines[4:] + context_lines2
         patch['patch_text'] = '\n'.join(lines)
