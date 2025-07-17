@@ -1116,7 +1116,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
             if new_offset - new_offset_nocontext < 3:
-                context_lines2.append('\ No newline at end of file')
+                context_lines2.append('\\ No newline at end of file')
 
         lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
             + context_lines1 + lines[4:] + context_lines2
