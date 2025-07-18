@@ -2061,6 +2061,8 @@ def revert_patch_test(args):
             if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
                 # trigger the bug
                 revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                if ((bug_id, next_commit['commit_id'], fuzzer) in revert_and_trigger_fail_set):
+                    revert_and_trigger_fail_set.remove((bug_id, next_commit['commit_id'], fuzzer))
                 logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             else:
                 revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
