@@ -247,5 +247,8 @@ def main():
             f.write(data)
             f.write("\n]\n")
 
+    deduplicate_json_files(out_path_set)
+
+
 if __name__ == "__main__":
     main()
