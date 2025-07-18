@@ -364,7 +364,7 @@ def extract_revert_patch(h, line_start, line_end, version):
         
         if (not target_line_cursor and old_line_cursor['num'] >= line_start and new_line_cursor['num'] <= line_end) or (target_line_cursor and target_line_cursor['num'] >= line_start and target_line_cursor['num'] <= line_end):
             if not get_sub_patch_start:
-                if not target_line_cursor or version == 'new' and line.startswith('+') or version == 'old' and line.startswith('-') or line.startswith(' '):
+                if not target_line_cursor or version == 'new' and line.startswith('+') or version == 'old' and line.startswith('-'):
                     get_sub_patch_start = True
                     new_line_start = new_line_cursor['num']
                     old_line_start = old_line_cursor['num']
@@ -387,13 +387,16 @@ def extract_revert_patch(h, line_start, line_end, version):
         elif line.startswith('-'):
             # Removed line, increment old line cursor
             old_line_cursor['num'] += 1
-                
+    
+    # handle a case where subpatch ends with '-...\n+...'.  
+    if old_line_start == old_line_cursor['num']:
+        old_line_start = old_line_cursor['num'] = old_line_cursor['num'] - 1
     new_header_line = f"@@ -{old_line_start},{old_line_cursor['num']-old_line_start} +{new_line_start},{new_line_cursor['num']-new_line_start} @@"
     patch_lines.insert(0, new_header_line)
     
     if not get_sub_patch_start:
         # get nothing
-        return '\n'.join(patch_lines), old_line_cursor['num']-1, old_line_cursor['num']-1, new_line_cursor['num']-1, new_line_cursor['num']-1
+        return '', 0, 0, 0, 0
     
     return '\n'.join(patch_lines), old_line_start, old_line_cursor['num'], new_line_start, new_line_cursor['num']
 
@@ -520,13 +523,12 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                     diff_result_end = min(node['extent']['end']['line'], end_num)
                     # not include context lines, because they may add some changes not related to the function
                     sub_patch, old_line_start, old_line_cursor, new_line_start, new_line_cursor = extract_revert_patch(h, diff_result_begin, diff_result_end, 'new')
+                    if not sub_patch:
+                        # no changes in this function, skip
+                        continue
                     key_new = f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
-                    if old_line_cursor == old_line_start:
-                        type_set.add('Function added')
-                    if new_line_cursor == new_line_start:
-                        type_set.add('Function removed')
                     
                     dependent_func = set()
                     results[f'{path_a}{path_b}-{old_line_start},{old_line_cursor-old_line_start}+{new_line_start},{new_line_cursor-new_line_start}'] = {
@@ -613,6 +615,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             if new_start_i == new_end_i:
                                 # this situation is handled in add_context()
                                 continue
+                            # <= because line_start and line_cursor may be the same then subpatch only contains '+' or only '-'
                             if (max(old_start_i, old_line_start) <= min(old_end_i, old_line_cursor) and
                                 max(new_start_i, new_line_start) <= min(new_end_i, new_line_cursor)):
                                 # update the boundaries: take min start and max end for both old and new
@@ -625,6 +628,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                                 key_merged[k] = k_old
                                 break
                         
+                    if not sub_patch:
+                        # no changes in this function, skip
+                        continue
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
                     if old_line_cursor == old_line_start:
@@ -1274,7 +1280,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                             'patch_text': patch_text,
                             'old_signature': fname,
                             'new_signature': fname,
-                            'patch_type': {'Function body change', 'Function removed'},
+                            'patch_type': {'Function body change'},
                             'dependent_func': set(),
                             'new_start_line': start_line,
                             'new_end_line': end_line,
