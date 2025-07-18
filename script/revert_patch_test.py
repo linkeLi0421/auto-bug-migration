@@ -1162,36 +1162,55 @@ def handle_build_error(error_log):
 def find_first_code_line(file_path):
     """
     Returns the 1-based line number where actual C code starts.
-    Skips blank lines, comments (both single and multi-line), and preprocessor directives.
+    Skips:
+      - blank lines
+      - single-line and multi-line comments
+      - preprocessor directives
+      - code inside conditional preprocessor blocks like #ifdef/#ifndef/#if ... #endif
     """
     with open(file_path, 'r') as f:
         lines = f.readlines()
 
     in_multiline_comment = False
+    conditional_depth = 0
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
 
-        # Track multi-line comment blocks
+        # Handle multi-line comments
         if in_multiline_comment:
             if "*/" in stripped:
                 in_multiline_comment = False
             continue
-
         if stripped.startswith("/*"):
             if "*/" not in stripped:
                 in_multiline_comment = True
             continue
 
-        # Skip single-line comment or blank
+        # Skip blank or single-line comment
         if not stripped or stripped.startswith("//"):
             continue
 
-        # Skip preprocessor directives
+        # Track preprocessor conditional depth
+        if stripped.startswith("#if"):
+            conditional_depth += 1
+            continue
+        if stripped.startswith("#endif"):
+            if conditional_depth > 0:
+                conditional_depth -= 1
+            continue
+        if stripped.startswith("#else") or stripped.startswith("#elif"):
+            continue
+
+        # Skip all preprocessor lines
         if stripped.startswith("#"):
             continue
 
-        # Found real code
+        # Skip code inside #if / #ifdef blocks
+        if conditional_depth > 0:
+            continue
+
+        # Found actual code outside conditionals
         return idx + 1
 
     return len(lines) + 1
