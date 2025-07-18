@@ -633,10 +633,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         continue
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
-                    if old_line_cursor == old_line_start:
-                        type_set.add('Function added')
-                    if new_line_cursor == new_line_start:
-                        type_set.add('Function removed')
                     
                     dependent_func = set()
                     
@@ -815,6 +811,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
+                recreated_functions.add(patch['old_signature'])
                 renamed_functions[patch['old_signature']] = key
             
             elif 'old_signature' in patch and 'new_signature' in patch:
@@ -1641,6 +1638,21 @@ def keep_bb_in_patch(bb1s, bb2s, cfg1, diff_results, final_patches, target_repo_
     return True
 
 
+def get_full_funsig(patch, target, commit, version:str):
+    # version is either 'old' or 'new'
+    patch_file_path = patch[f'file_path_{version}']
+    patch_start_line = patch[f'{version}_start_line']
+    parsing_path = os.path.join(data_path, f'{target}-{commit[:6]}', f'{patch_file_path}_analysis.json')
+    with open(parsing_path, 'r') as f:
+        ast_nodes = json.load(f)
+    for node in ast_nodes:
+        if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+            continue
+        if node['extent']['start']['file'] == patch_file_path and node['extent']['start']['line'] <= patch_start_line <= node['extent']['end']['line']:
+            # Found the function definition
+            return node['signature'], node['extent']['start']['line'], node['extent']['end']['line']
+    return None, 0, 0
+
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
     bug_info_dataset = read_json_file(args.bug_info)
@@ -1805,14 +1817,20 @@ def revert_patch_test(args):
                 patch_func_old = diff_result['old_signature'].split('(')[0].split(' ')[-1]
             if 'file_path_old' in diff_result:
                 patch_file_path = diff_result['file_path_old']
+            else:
+                patch_file_path = diff_result['file_path_new']
             update_type_set(diff_result)
             
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
             # revert it. 
             for trace_func, func_loc in trace_func_set:
-                if patch_file_path in func_loc and trace_func == patch_func_old:
-                    logger.debug(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
+                if patch_file_path in func_loc and (trace_func == patch_func_old or trace_func == patch_func_new):
+                    logger.info(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
+                    if 'old_signature' not in diff_result:
+                        diff_result['old_signature'], diff_result['old_function_start_line'], diff_result['old_function_end_line'] = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
+                    if 'new_signature' not in diff_result:
+                        diff_result['new_signature'], _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
                     patch_to_apply.append(key)
                     break
 
