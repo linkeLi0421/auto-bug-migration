@@ -156,6 +156,64 @@ def analyze_file(directory, src_file, args):
     return out_path_set
     
 
+def deduplicate_json_files(json_files):
+    """
+    Remove duplicate entries from JSON files based on kind, spelling, and location.
+    """
+    for json_file in json_files:
+        print(f"Deduplicating {json_file}")
+        
+        # Read the JSON file
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"Error reading {json_file}: {e}")
+            continue
+        
+        if not isinstance(data, list):
+            print(f"Skipping {json_file}: not a list")
+            continue
+        
+        # Create a set to track unique entries
+        seen = set()
+        unique_entries = []
+        
+        for entry in data:
+            # Create a unique key based on kind, spelling, and location
+            if not isinstance(entry, dict):
+                continue
+                
+            kind = entry.get('kind', '')
+            spelling = entry.get('spelling', '')
+            location = entry.get('location', {})
+            
+            # Create a hashable key for the location
+            location_key = (
+                location.get('file', ''),
+                location.get('line', 0),
+                location.get('column', 0)
+            )
+            
+            # Create the unique key
+            unique_key = (kind, spelling, location_key)
+            
+            # Only add if we haven't seen this combination before
+            if unique_key not in seen:
+                seen.add(unique_key)
+                unique_entries.append(entry)
+            else:
+                print(f"  Removing duplicate: {kind} {spelling} at {location_key}")
+        
+        # Write the deduplicated data back to the file
+        if len(unique_entries) < len(data):
+            print(f"  Removed {len(data) - len(unique_entries)} duplicates from {json_file}")
+            with open(json_file, 'w') as f:
+                json.dump(unique_entries, f, indent=2)
+        else:
+            print(f"  No duplicates found in {json_file}")
+
+
 def load_compile_commands(path="compile_commands.json"):
     with open(path) as f:
         data = json.load(f)
