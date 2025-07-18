@@ -2035,7 +2035,7 @@ def revert_patch_test(args):
             # Run the fuzzer to test if the bug is reproduced
             testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
             reproduce_cmd = [
-                py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', target, fuzzer, testcase_path
+                py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', target, fuzzer, testcase_path, '-e', 'ASAN_OPTIONS=detect_leaks=0'
             ]
             logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
             test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
