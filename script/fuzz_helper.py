@@ -2014,8 +2014,8 @@ def get_crash_log_bash(commit:str, args):
 def get_trace_log_bash(commit:str, args):
   bash_trace = f'''
     cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
-    [ -d "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
-    [ -d "/Function_instrument/libtrace.so" ] && rm /Function_instrument/libtrace.so;
+    [ -f "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
+    [ -f "/Function_instrument/libtrace.so" ] && rm /Function_instrument/libtrace.so;
     cd /Function_instrument ; make ; cd -;
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
@@ -2025,13 +2025,14 @@ def get_trace_log_bash(commit:str, args):
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
-    git checkout -f {commit}; 
+    git checkout -f {commit};
+    {'git apply --reverse /patch;' if args.patch else ''} 
     cd -;
     
     # Compile and collect trace
     compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> tmp.txt;
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}.txt --source_path /src/{args.project.name} ./tmp.txt; 
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} ./tmp.txt; 
   '''
   return bash_trace
 
