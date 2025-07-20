@@ -1237,6 +1237,7 @@ def get_line_context(file_path, line_number, context=3):
 
 def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit, next_commit, target):
     # For function do not change but appear in trace, add a patch if they should call recreated functions
+    # Assume target_repo in new commit
     new_patch_to_apply = set()
     for index, func in trace1:
         fname = func.split(' ')[0]
@@ -1308,6 +1309,91 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         new_patch_to_apply.add(new_key)
 
     final_patches.extend(list(new_patch_to_apply))
+
+
+def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recreated_functions, target_repo_path, commit, next_commit, target):
+    # Assume target_repo in new commit
+    fuzzer_keys = set()
+    for key in patch_to_apply:
+        patch = diff_results[key]
+        if not ('old_signature' in patch and 'new_signature' in patch):
+            # This patch is not a function body change, skip it
+            continue
+        if 'LLVMFuzzerTestOneInput' in patch['old_signature'] or 'LLVMFuzzerTestOneInput' in patch['new_signature']:
+            # This is a patch for LLVMFuzzerTestOneInput, we need to update the function calls
+            fuzzer_keys.add(key)
+            fuzzer_file_path = patch['file_path_new']
+            fuzzer_new_signature = patch['new_signature']
+            fuzzer_old_signature = patch['old_signature']
+
+    parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{fuzzer_file_path}_analysis.json')
+    with open(parsing_path, 'r') as f:
+        ast_nodes = json.load(f)
+    for node in ast_nodes:
+        if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+            continue
+        if node['extent']['start']['file'] == fuzzer_file_path and node['signature'].split('(')[0].split(' ')[-1] == 'LLVMFuzzerTestOneInput':
+            # Found the function definition
+            fuzzer_start_line = node['extent']['start']['line']
+            fuzzer_end_line = node['extent']['end']['line']
+            break
+    for node in ast_nodes:
+        if node.get('kind') not in {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}:
+            continue
+        if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_sig.split('(')[0].split(' ')[-1] for func_sig in recreated_functions):
+            # This call is within the LLVMFuzzerTestOneInput function
+            Inpatch_flag = False
+            for key in fuzzer_keys:
+                patch = diff_results[key]
+                lines = patch['patch_text'].split('\n')
+                new_lines = []
+                new_start_line = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
+                new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
+                if new_start_line <= node['location']['line'] < new_start_line + new_offset:
+                    # This call in within a patch, we need to update the patch
+                    Inpatch_flag = True
+                    for i, line in enumerate(lines):
+                        if re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
+                            # If the function is called in this patch, we need to update the call
+                            rm_line = rename_func(f'-{line[1:]}', node['spelling'])[0]
+                            add_line = f'+{line[1:]}'
+                            new_lines.append(rm_line)
+                            new_lines.append(add_line)
+                        else:
+                            new_lines.append(line)
+                    patch['patch_text'] = '\n'.join(new_lines)
+            
+            if not Inpatch_flag:
+                # This call is not in any patch, we need to create a new patch
+                new_start_line = node['location']['line']
+                new_offset = 1
+                with open(os.path.join(target_repo_path, fuzzer_file_path), 'r') as f:
+                    content = f.readlines()
+                    function_line = content[node['location']['line']-1]
+                    assert(node['extent']['start']['line'] == node['extent']['end']['line']), f'Function call should be in one line, but got {node["extent"]["start"]["line"]} - {node["extent"]["end"]["line"]}'
+
+                rm_line = rename_func(f'-{function_line}', node['spelling'])[0]
+                add_line = f'+{function_line}'
+                patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- {fuzzer_file_path}\n+++ {fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
+                patch = {
+                    'file_path_old': fuzzer_file_path,
+                    'file_path_new': fuzzer_file_path,
+                    'file_type': 'c',
+                    'patch_text': patch_text,
+                    'old_signature': fuzzer_old_signature,
+                    'new_signature': fuzzer_new_signature,
+                    'patch_type': {'Function body change'},
+                    'dependent_func': set(),
+                    'new_start_line': new_start_line,
+                    'new_end_line': new_start_line + new_offset,
+                    'old_start_line': new_start_line,
+                    'old_end_line': new_start_line + new_offset,
+                    'old_function_start_line': fuzzer_start_line,
+                    'old_function_end_line': fuzzer_end_line,
+                }
+                new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{new_start_line},{new_offset}+{new_start_line},{new_offset}'
+                diff_results[new_key] = patch
+                patch_to_apply.append(new_key)
 
 
 def update_function_mappings(recreated_functions, signature_change_list):
@@ -1870,6 +1956,7 @@ def revert_patch_test(args):
             continue
 
         add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
+        llvm_fuzzer_test_one_input_patch_update(diff_results, final_patches, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
         # Sort final_patches by new_start_line
         final_patches = sorted(final_patches, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
         add_context(diff_results, final_patches, next_commit['commit_id'], target_repo_path)
