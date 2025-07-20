@@ -501,7 +501,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 continue
                 
             file_path = os.path.join(target_repo_path, path_b)
-            parsing_path = os.path.join(data_path, f'{target}-{new_commit[:6]}', f'{path_b}_analysis.json')
+            parsing_path = os.path.join(data_path, f'{target}-{new_commit}', f'{path_b}_analysis.json')
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
                 continue
@@ -577,7 +577,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
 
             file_path = os.path.join(target_repo_path, path_a)
-            parsing_path = os.path.join(data_path, f'{target}-{old_commit[:6]}', f'{path_a}_analysis.json')
+            parsing_path = os.path.join(data_path, f'{target}-{old_commit}', f'{path_a}_analysis.json')
 
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
@@ -831,7 +831,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit[:6]}', f'{patch['file_path_old']}_analysis.json')
+                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{patch['file_path_old']}_analysis.json')
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 for ast_node in ast_nodes:
@@ -852,7 +852,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
-                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit[:6]}', f'{patch['file_path_new']}_analysis.json')
+                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit}', f'{patch['file_path_new']}_analysis.json')
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 artificial_patch_insert_point = -1
@@ -989,7 +989,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
             patch_text = patch['patch_text']
-            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit[:6]}', f'{patch['file_path_old']}_analysis.json')
+            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch['file_path_old']}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
             # filter for call expressions (clang cursors for function calls)
@@ -1251,7 +1251,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 break
         if flag:
             continue
-        parsing_path = os.path.join(data_path, f'{target}-{next_commit[:6]}', f'{file_path}_analysis.json')
+        parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{file_path}_analysis.json')
         if os.path.exists(parsing_path):
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
@@ -1657,7 +1657,7 @@ def get_full_funsig(patch, target, commit, version:str):
     # version is either 'old' or 'new'
     patch_file_path = patch[f'file_path_{version}']
     patch_start_line = patch[f'{version}_start_line']
-    parsing_path = os.path.join(data_path, f'{target}-{commit[:6]}', f'{patch_file_path}_analysis.json')
+    parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
@@ -1693,7 +1693,8 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
+        commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
+        next_commit['commit_id'] = next_commit['commit_id'][:6]  # use short commit id for trace file name
         bug_info = bug_info_dataset[bug_id]
         fuzzer = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
@@ -1704,14 +1705,14 @@ def revert_patch_test(args):
             arch = job_type.split('_')[2]
         else:
             arch = 'x86_64'
-        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id'][:6]}-testcase-{bug_id}.txt')
-        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id'][:6]}-testcase-{bug_id}.txt')
+        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
+        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
-            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id'][:6]}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
-            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id'][:6]} to {next_commit['commit_id'][:6]} with patch {patch_path_list[-1]}")
+            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
+            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
-            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id'][:6]} to {next_commit['commit_id'][:6]}")
+            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
         # Replace '--depth=1' in the Dockerfile
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
@@ -1859,7 +1860,7 @@ def revert_patch_test(args):
         if patch_to_apply:
             patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
             # patch_to_apply = remove_unnecessary_lines(diff_results, patch_to_apply, depen_graph, trace1)
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id'][:6]}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
                 if key not in final_patches:
@@ -1893,7 +1894,7 @@ def revert_patch_test(args):
             logger.info(f'undeclared_functions: {undeclared_functions}')
             logger.info(f'miss_member_structs: {miss_member_structs}')
             for identifier, location in undeclared_identifier:
-                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id'][:6]}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
+                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
                 if os.path.exists(parsing_path):
                     with open(parsing_path, 'r') as f:
                         ast_nodes = json.load(f)
@@ -1912,7 +1913,7 @@ def revert_patch_test(args):
 
             bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
             for field_name, struct_name, file_path, line_num in miss_member_structs:
-                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'][:6], commit['commit_id'][:6], arch, args.build_csv, target_repo_path)
+                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
                 bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
 
             bb_change_pair = filter_and_dedup_bb_change_pairs(bb_change_pair)
@@ -1921,7 +1922,7 @@ def revert_patch_test(args):
                     continue
                 # bb_change_list is a list of (bb1s, bb2s, cfg1)
                 for bb1s, bb2s, cfg1 in bb_change_list:
-                    if not keep_bb_in_patch(bb1s, bb2s, cfg1, diff_results, final_patches, target_repo_path, next_commit['commit_id'][:6], relative_file_path):
+                    if not keep_bb_in_patch(bb1s, bb2s, cfg1, diff_results, final_patches, target_repo_path, next_commit['commit_id'], relative_file_path):
                         logger.error(f'Failed to keep basic block in patch for {relative_file_path}')
                         continue
 
@@ -1932,12 +1933,12 @@ def revert_patch_test(args):
                     file_path = location.split(':')[0]
                     line_num = int(location.split(':')[1])
                     relative_file_path = file_path.split('/', 3)[-1]
-                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt')):
+                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
                         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
                                     '--architecture', arch, '--target_file', relative_file_path, target]
                         logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
                         result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt')):
+                    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
                         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit['commit_id'], '--build_csv', args.build_csv,
                                     '--architecture', arch, '--target_file', relative_file_path, target]
                         logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
@@ -1946,13 +1947,13 @@ def revert_patch_test(args):
                     # line_num after patch -> line number before patch -> 
                     # find block start and end line in bug version -> get the part in patch need to be removed
                     line_num = get_correct_line_num(relative_file_path, line_num, final_patches, diff_results)
-                    with open(os.path.join(data_path, f'cfg-{target}-{commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+                    with open(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
                         cfgs1 = parse_cfg_text(cfg_file.read())
-                    with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id'][:6]}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+                    with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
                         cfgs2 = parse_cfg_text(cfg_file.read())
                     _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
                     if not bb2s:
-                        logger.info(f'No basic block found for {file_path}:{line_num} in {next_commit['commit_id'][:6]}')
+                        logger.info(f'No basic block found for {file_path}:{line_num} in {next_commit['commit_id']}')
                         continue
                     
                     for key in final_patches:
@@ -2086,7 +2087,7 @@ def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv
         ]
     
     logger.info(' '.join(cmd))
-    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id[:6]}{'-'+patch_path_list[-1].split('/')[-1].split('.diff')[0] if patch_path_list else ''}')):
+    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}{'-'+patch_path_list[-1].split('/')[-1].split('.diff')[0] if patch_path_list else ''}')):
         result = subprocess.run(cmd, capture_output=True, text=True)
 
     
