@@ -777,8 +777,8 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     removed_old_signatures = set()
     removed_new_signatures = set()
     reserved_keys = set()
-    renamed_functions = dict()
     recreated_functions = set() # a set of functions that are recreated by the artificial patch, and may be called by other functions
+    key_to_newkey = dict() # a mapping from old key to new key for recreated functions, used to update function name in caller patches
     
     for key in patch_to_apply:
         patch = diff_results[key]
@@ -812,7 +812,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
                 recreated_functions.add(patch['old_signature'])
-                renamed_functions[patch['old_signature']] = key
+                key_to_newkey[key] = key
             
             elif 'old_signature' in patch and 'new_signature' in patch:
                 if patch['old_signature'] in handle_func_signature_change:
@@ -886,28 +886,24 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
                 function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
-                renamed_functions[artificial_patch['old_signature']] = new_key
-                # 5. Rename the function by dependency graph
-                for caller_key in dependence_graph.get(key, []):
-                    # rename functions in patches that depend on (call) this function
-                    caller_key = renamed_functions.get(diff_results[caller_key]['old_signature'], caller_key)
-                    modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname)
-                    diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(new_key)
                 reserved_keys.add(new_key)
+                key_to_newkey[key] = new_key
                 
-                # 6. Update the dependence graph to reflect the new key
-                dependence_graph[new_key] = dependence_graph.get(key, set())
-                if key in dependence_graph:
-                    del dependence_graph[key]
-                for caller_key_set in dependence_graph.values():
-                    if key in caller_key_set:
-                        caller_key_set.remove(key)
-                        caller_key_set.add(new_key)
         else:
             new_patch_to_apply.append(key)
             logger.debug(f"Skipping non-function body change for {key}")
             
+    # 5. Rename the function by dependency graph, find the caller of the recreated function
+    for key in key_to_newkey:
+        patch = diff_results[key]
+        fname = patch['old_signature'].split('(')[0].split(' ')[-1]
+        for caller_key in dependence_graph.get(key, []):
+            # rename functions in patches that depend on (call) this function
+            caller_key = key_to_newkey.get(caller_key, caller_key)
+            modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname)
+            diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
+    
     # Remove patches that are not needed anymore
     for key in new_patch_to_apply:
         if key in reserved_keys:
