@@ -2006,7 +2006,7 @@ def get_crash_log_bash(commit:str, args):
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
     
     compile &> /dev/null;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit}-{args.test_input}.txt;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit[:6]}-{args.test_input}.txt;
   '''
   return bash_crash
 
@@ -2031,7 +2031,7 @@ def get_trace_log_bash(commit:str, args):
     # Compile and collect trace
     compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> tmp.txt;
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit}-{args.test_input}.txt --source_path /src/{args.project.name} ./tmp.txt; 
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}.txt --source_path /src/{args.project.name} ./tmp.txt; 
   '''
   return bash_trace
 
