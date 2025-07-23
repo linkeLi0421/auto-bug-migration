@@ -1660,22 +1660,24 @@ def filter_and_dedup_bb_change_pairs(bb_change_pair):
     return filtered
 
 
-def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
-    line_num_after_patch = line_num
+def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path, line_num_in_old_commit=-1):
     relative_file_path = file_path.split('/', 3)[-1]
-    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
-        get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit, '--build_csv', build_csv,
-                    '--architecture', arch, '--target_file', relative_file_path, target]
-        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
-        result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt')):
-        get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit, '--build_csv', build_csv,
-                    '--architecture', arch, '--target_file', relative_file_path, target]
-        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
-        result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if line_num_in_old_commit == -1:
+        line_num_after_patch = line_num
+        if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
+            get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit, '--build_csv', build_csv,
+                        '--architecture', arch, '--target_file', relative_file_path, target]
+            logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+            result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt')):
+            get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit, '--build_csv', build_csv,
+                        '--architecture', arch, '--target_file', relative_file_path, target]
+            logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+            result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    # line_num after patch -> line number in old commit
-    line_num_in_old_commit = get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit)
+        # line_num after patch -> line number in old commit
+        line_num_in_old_commit = get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit)
+    
     with open(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
         cfgs1 = parse_cfg_text(cfg_file.read())
     with open(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
@@ -1690,11 +1692,8 @@ def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_p
             bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_old'], next_commit, bb1s)
             break
     
-    cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
     # Now we get basic blocks in new commit that correspond to bb1
-    if not bb2s:
-        logger.error(f'Cannot find corresponding basic blocks for {cfg1.function_signature} in {relative_file_path} at line {line_num_in_old_commit}')
-        return False
+    cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
     
     return bb1s, bb2s, cfg1, relative_file_path
     
