@@ -1600,6 +1600,8 @@ def __keep_bb_in_patch(bbstart, bbend, key, final_patches, diff_results):
 
 
 def get_code_from_file(target_repo_path, file_path, commit, start_line, end_line):
+    if start_line > end_line:
+        return [], 0
     # Get code from a file in a specific commit
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
