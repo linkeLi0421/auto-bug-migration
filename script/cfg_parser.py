@@ -133,7 +133,7 @@ def find_block_by_line(cfgs, file_name, line_number_list):
     cfg1 = None
     blocks = []
     for cfg in cfgs:
-        if not (cfg.file_path == file_name):
+        if not (cfg.file_path == file_name or cfg.file_path.endswith(file_name)):
             continue
         for block in cfg.blocks.values():
             if block.start_line is not None and block.end_line is not None:
