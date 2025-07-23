@@ -1860,7 +1860,7 @@ def revert_patch_test(args):
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
-        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch, get_patched_traces.get(bug_id, []))
+        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
         get_compile_commands(target, commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
         diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
 
@@ -1982,6 +1982,7 @@ def revert_patch_test(args):
             logger.info(f'undeclared_identifier: {undeclared_identifier}')
             logger.info(f'undeclared_functions: {undeclared_functions}')
             logger.info(f'miss_member_structs: {miss_member_structs}')
+            miss_function_decls = []
             for identifier, location in undeclared_identifier:
                 parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
                 if os.path.exists(parsing_path):
@@ -1999,10 +2000,17 @@ def revert_patch_test(args):
                                 # macro defined in .h file in the target repo
                                 con_to_add.setdefault(location.split('/',3)[-1].split(':')[0], dict())[f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
                             break
+                        if ast_node['kind'] in {'DECL_REF_EXPR'} and ast_node['spelling'] == identifier:
+                            miss_function_decls.append((ast_node['spelling'], '/src/c-blosc2/' + ast_node['location']['file'], ast_node['location']['line']))
+                            break
 
             bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
             for field_name, struct_name, file_path, line_num in miss_member_structs:
                 bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
+                
+            for identifier, file_path, line_num in miss_function_decls:
+                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, -1, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path, line_num)
                 bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
 
             bb_change_pair = filter_and_dedup_bb_change_pairs(bb_change_pair)
@@ -2163,20 +2171,14 @@ def revert_patch_test(args):
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
 
 
-def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch, patch_path_list=None):
-    if not patch_path_list:
-        cmd = [
-            py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-            '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
-        ]
-    else:
-        cmd = [
-            py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-            '--build_csv', build_csv, '--compile_commands', '--architecture', arch, '--patch', patch_path_list[-1], target
-        ]
+def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch):
+    cmd = [
+        py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+        '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
+    ]
     
     logger.info(' '.join(cmd))
-    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}{'-'+patch_path_list[-1].split('/')[-1].split('.diff')[0] if patch_path_list else ''}')):
+    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}')):
         result = subprocess.run(cmd, capture_output=True, text=True)
 
     
