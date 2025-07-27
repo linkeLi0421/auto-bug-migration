@@ -1731,7 +1731,6 @@ def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line,
             bb_start = real_patch_start_line + bb1_start_line - cfg1.signature_line
             bb_end = real_patch_start_line + bb1_end_line - cfg1.signature_line
             bb2_code_lines, bb2_code_length = get_code_from_file(target_repo_path, relative_file_path, next_commit, bb2_start_line, bb2_end_line)
-            logger.info(f'bb1 {bb1_start_line} {bb1_end_line}; start {bb2_start_line} - {bb2_end_line}; bb2 code length {bb2_code_length}, bb2 code lines {bb2_code_lines}')
             patch_lines = patch['patch_text'].split('\n')
             patch_lines[bb_start:bb_end+1] = [f'-{line}' for line in bb2_code_lines]
             patch_lines[3] = f'@@ -{old_start},{old_offset-(bb_end-bb_start+1)+bb2_code_length} +{new_start},{new_offset} @@'
