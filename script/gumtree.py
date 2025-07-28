@@ -68,6 +68,7 @@ class GumTreeTextDiffParser:
                     continue
                 label1, start1, end1 = m1
                 label2, start2, end2 = m2
+                start1, end1, start2, end2 = int(start1), int(end1), int(start2), int(end2)
                 if label1 != label2:
                     continue
                 line1 = offset_to_line(self.offsets1, start1)
@@ -76,8 +77,15 @@ class GumTreeTextDiffParser:
                     DiffOperation(label1, (start1, end1), (start2, end2), line1, line2)
                 )
             elif lines[0] == "delete-node" or lines[0] == "delete-tree":
-                m = self._parse_line(lines[2])
-                label, start, end = m
+                for line in lines[2:]:
+                    m = self._parse_line(line)
+                    label, start, end = m
+                    try:
+                        start = int(start)
+                        end = int(end)
+                        break
+                    except:
+                        continue
                 line_start = offset_to_line(self.offsets1, start)
                 line_end = offset_to_line(self.offsets1, end)
                 self.deletes.append(
@@ -87,8 +95,8 @@ class GumTreeTextDiffParser:
     def _parse_line(self, line: str) -> Optional[Tuple[str, int, int]]:
         # Example line: "identifier: j [28021,28022]"
         label = line.split('[')[0].strip()
-        start = int(line.split('[')[-1].split(',')[0])
-        end = int(line.split(',')[-1].split(']')[0])
+        start = line.split('[')[-1].split(',')[0]
+        end = line.split(',')[-1].split(']')[0]
         return label, start, end
 
     def get_matches(self) -> List[DiffOperation]:
