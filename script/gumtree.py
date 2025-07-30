@@ -107,6 +107,23 @@ class GumTreeTextDiffParser:
 
 
 def get_corresponding_lines(target_repo_path, file_path1, commit1, file_path2, commit2, blocks):
+    """
+    Find corresponding lines between two versions of a file using GumTree text diff.
+    
+    This function uses GumTree to analyze the differences between two file versions
+    and returns the line numbers in the second version that correspond to the given blocks.
+    
+    Args:
+        target_repo_path: Path to the git repository
+        file_path1: Relative path to the file in commit1
+        commit1: First commit hash
+        file_path2: Relative path to the file in commit2  
+        commit2: Second commit hash
+        blocks: List of basic blocks from the first version to find corresponding lines for
+    
+    Returns:
+        List of line numbers in the second version that correspond to the input blocks
+    """
     file_path1 = os.path.join(target_repo_path, file_path1)
     file_path2 = os.path.join(target_repo_path, file_path2)
     os.chdir(target_repo_path)
