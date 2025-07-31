@@ -19,7 +19,7 @@ from run_fuzz_test import py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from get_fix_related import demangle_cpp_symbol
-from cfg_parser import parse_cfg_text, find_block_by_line
+from cfg_parser import parse_cfg_text, find_block_by_line, compute_data_dependencies
 from gumtree import get_corresponding_lines, get_delete_lines
 
 logger = logging.getLogger(__name__)
@@ -1641,36 +1641,42 @@ def filter_and_dedup_bb_change_pairs(bb_change_pair):
         kept = []
 
         new_change_list = []
-        for bb1s_i, bb2s_i, cfg_i in change_list:
+        for bb1s_i, bb2s_i, cfg1, cfg2 in change_list:
             bb1_start_line = min(bb.start_line for bb in bb1s_i)
             bb1_end_line = max(bb.end_line for bb in bb1s_i)
             if (bb1_start_line, bb1_end_line) in seen:
                 # Skip if this bb1 range has been seen before
                 continue
             seen.add((bb1_start_line, bb1_end_line))
-            new_change_list.append((bb1s_i, bb2s_i, cfg_i))
-        for bb1s_i, bb2s_i, cfg_i in new_change_list:
+            new_change_list.append((bb1s_i, bb2s_i, cfg1, cfg2))
+        for bb1s_i, bb2s_i, cfg1_i, cfg2_i in new_change_list:
             bb2s_i = deduplicate_bb_blocks(bb2s_i)
 
             overlap_found = False
-            for idx, (bb1s_j, bb2s_j, cfg_j) in enumerate(kept):
+            for idx, (bb1s_j, bb2s_j, cfg1_j, cfg2_j) in enumerate(kept):
                 if blocks_overlap(bb1s_i, bb1s_j):
                     # Conflict: keep the one with more unique bb2s
                     if len(bb2s_i) > len(bb2s_j):
-                        kept[idx] = (bb1s_i, bb2s_i, cfg_i)
+                        kept[idx] = (bb1s_i, bb2s_i, cfg1_i, cfg2_i)
                     # else: discard current i
                     overlap_found = True
                     break
 
             if not overlap_found:
-                kept.append((bb1s_i, bb2s_i, cfg_i))
+                kept.append((bb1s_i, bb2s_i, cfg1_i, cfg2_i))
 
         filtered[file_path] = kept
 
     return filtered
 
 
-def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
+def get_corresponding_bb(target_repo_path, bb1s, file_path, commit, next_commit, cfgs2):
+    bb2_line_num_list = get_corresponding_lines(target_repo_path, file_path, commit, file_path, next_commit, bb1s)
+    cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
+    return bb2s
+
+
+def get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
     relative_file_path = file_path.split('/', 3)[-1]
     line_num_after_patch = line_num
     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
@@ -1698,13 +1704,13 @@ def get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_p
 
     for key, patch in diff_results.items():
         if patch['file_path_new'] == relative_file_path:
-            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_old'], next_commit, bb1s)
+            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, bb1s)
             break
     
     # Now we get basic blocks in new commit that correspond to bb1
     cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
     
-    return bb1s, bb2s, cfg1, relative_file_path
+    return bb1s, bb2s, cfg1, cfg2
     
     
 def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line, cfg1, diff_results, final_patches, target_repo_path, next_commit, relative_file_path):
@@ -1726,7 +1732,7 @@ def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line,
                         real_patch_start_line = lines.index(line)
                         break
             if not real_patch_start_line:
-                raise ValueError(f'Cannot find real patch start line in {patch["patch_text"]}')
+                raise ValueError(f'Cannot find real patch start line in {key}\n{patch["patch_text"]}')
             # will change code from bb_start to bb_end in the patch, to bb2 in new commit; 4 is patch header lines
             bb_start = real_patch_start_line + bb1_start_line - cfg1.signature_line
             bb_end = real_patch_start_line + bb1_end_line - cfg1.signature_line
@@ -1753,6 +1759,49 @@ def get_full_funsig(patch, target, commit, version:str):
             # Found the function definition
             return node['signature'], node['extent']['start']['line'], node['extent']['end']['line']
     return None, 0, 0
+
+
+def analyze_def_use_chain(bb1s, bb2s, cfg1, cfg2):
+    compute_data_dependencies(cfg1)
+    if cfg2:
+        # Sometimes corresponding block does not exist
+        compute_data_dependencies(cfg2)
+    # Get all defs and uses variables in bb1s and bb2s
+    bb1_defs = set()
+    bb1_uses = set()
+    for bb in bb1s:
+        bb1_defs.update(getattr(bb, "defs", set()))
+        bb1_uses.update(getattr(bb, "uses", set()))
+    bb2_defs = set()
+    bb2_uses = set()
+    for bb in bb2s:
+        bb2_defs.update(getattr(bb, "defs", set()))
+        bb2_uses.update(getattr(bb, "uses", set()))
+    # Now bb1_defs, bb1_uses, bb2_defs, bb2_uses contain all defs/uses in the respective block lists
+
+    # Compare bb1_defs and bb2_defs, for variable in bb1_defs but not in bb2_defs, get the blocks that use it in cfg1
+    unique_bb1_defs = bb1_defs - bb2_defs
+    var_to_use_blocks_cfg1 = {}
+    for var in unique_bb1_defs:
+        blocks_using = []
+        for block in cfg1.blocks.values():
+            if var in getattr(block, "uses", set()):
+                blocks_using.append(block)
+        var_to_use_blocks_cfg1[var] = blocks_using
+    # var_to_use_blocks_cfg1 now maps each unique variable to the list of blocks in cfg1 that use it
+
+    # Compare bb1_uses and bb2_uses, for variable in bb2_uses but not in bb1_uses, find the definition block in cfg2
+    unique_bb2_uses = bb2_uses - bb1_uses
+    var_to_def_blocks_cfg2 = {}
+    for var in unique_bb2_uses:
+        def_blocks = []
+        for block in cfg2.blocks.values():
+            if var in getattr(block, "defs", set()):
+                def_blocks.append(block)
+        var_to_def_blocks_cfg2[var] = def_blocks
+    # var_to_def_blocks_cfg2 now maps each unique variable to the list of blocks in cfg2 that define it
+    return var_to_use_blocks_cfg1, var_to_def_blocks_cfg2
+
 
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
@@ -2008,20 +2057,38 @@ def revert_patch_test(args):
 
             bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
             for field_name, struct_name, file_path, line_num in miss_member_structs:
-                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
-                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
+                bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+                relative_file_path = file_path.split('/', 3)[-1]
+                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
                 
             for identifier, file_path, line_num in miss_decls:
-                bb1s, bb2s, cfg1, relative_file_path = get_bb_change_pair(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
-                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1))
+                bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+                relative_file_path = file_path.split('/', 3)[-1]
+                bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
 
             bb_change_pair = filter_and_dedup_bb_change_pairs(bb_change_pair)
             for relative_file_path, bb_change_list in bb_change_pair.items():
                 if not bb_change_list:
                     continue
                 seen = set()
-                # bb_change_list is a list of (bb1s, bb2s, cfg1)
-                for bb1s, bb2s, cfg1 in bb_change_list:
+                # Def-use chain to solve data dependency in blocks
+                bb_change_list_update = []
+                for bb1s, bb2s, cfg1, cfg2 in bb_change_list:
+                    var_to_use_blocks_cfg1, var_to_def_blocks_cfg2 = analyze_def_use_chain(bb1s, bb2s, cfg1, cfg2)
+                    for var, bb_to_update_incfg1 in var_to_use_blocks_cfg1.items():
+                        if bb_to_update_incfg1 == []:
+                            continue
+                        bb_to_update_incfg2 = get_corresponding_bb(target_repo_path, bb_to_update_incfg1, relative_file_path, commit['commit_id'], next_commit['commit_id'], [cfg2])
+                        bb_change_list_update.append((bb_to_update_incfg1, bb_to_update_incfg2, cfg1, cfg2))
+                    for var, bb_to_update_incfg2 in var_to_def_blocks_cfg2.items():
+                        if bb_to_update_incfg2 == []:
+                            continue
+                        bb_to_update_incfg1 = get_corresponding_bb(target_repo_path, bb_to_update_incfg2, relative_file_path, next_commit['commit_id'], commit['commit_id'], [cfg1])
+                        bb_change_list_update.append((bb_to_update_incfg1, bb_to_update_incfg2, cfg1, cfg2))
+                
+                bb_change_list.extend(bb_change_list_update)
+                # Rewrite the patches
+                for bb1s, bb2s, cfg1, cfg2 in bb_change_list:
                     bb1_start_line = float('inf')
                     bb1_end_line = float('-inf')
                     bb2_start_line = float('inf')
