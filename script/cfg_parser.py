@@ -13,9 +13,12 @@ class CFGBlock:
         self.succs = []
         self.start_line: Optional[int] = None
         self.end_line: Optional[int] = None
+        self.defs = set()  # Variables defined in this block
+        self.uses = set()  # Variables used in this block
+        self.data_dependencies = defaultdict(set)  # variable -> set of block_ids (defs this block depends on)
 
     def __repr__(self):
-        return f"B{self.block_id} ({self.start_line}-{self.end_line})"
+        return f"B{self.block_id} ({self.start_line}-{self.end_line}) defs:{list(self.defs)} uses:{list(self.uses)}"
 
 
 class SourceCFG:
@@ -24,6 +27,8 @@ class SourceCFG:
         self.file_path: Optional[str] = None
         self.signature_line: Optional[int] = None
         self.blocks: Dict[int, CFGBlock] = {}
+        self.variable_defs = defaultdict(set)  # variable -> set of block_ids where defined
+        self.variable_uses = defaultdict(set)  # variable -> set of block_ids where used
 
     def add_block(self, block: CFGBlock):
         self.blocks[block.block_id] = block
@@ -58,6 +63,10 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
     from_line_re = re.compile(r'from line (\d+) to line (\d+)')
     func_sig_re = re.compile(r'^Function signature: (.+)$')
     file_line_re = re.compile(r'^Defined in file: (.+) at line (\d+)$')
+    defuse_chain_re = re.compile(r'Def-Use Chain:')
+    defuse_entry_re = re.compile(r'\s*(USE|DEF) ([^ ]+) (?:used|defined|at line) (\d+) \(([^)]+)\)')
+
+    in_defuse_chain = False
 
     for line in lines:
         line = line.strip()
@@ -87,6 +96,7 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
             current_block = CFGBlock(block_id, is_entry, is_exit)
             if current_cfg:
                 current_cfg.add_block(current_block)
+            in_defuse_chain = False
             continue
 
         if current_block:
@@ -98,7 +108,6 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
                 tokens = pred_match.group(2).split()
                 current_block.preds = []
                 for token in tokens:
-                    # Assuming the first character is some prefix (like 'B' for block)
                     if len(token) > 1:
                         numeric_part = token[1:]
                         if numeric_part.isdigit():
@@ -110,7 +119,6 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
                 tokens = succ_match.group(2).split()
                 current_block.succs = []
                 for token in tokens:
-                    # Assuming the first character is some prefix (like 'B' for block)
                     if len(token) > 1:
                         numeric_part = token[1:]
                         if numeric_part.isdigit():
@@ -122,6 +130,25 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
                 current_block.start_line = int(range_match.group(1))
                 current_block.end_line = int(range_match.group(2))
                 continue
+
+            if defuse_chain_re.match(line):
+                in_defuse_chain = True
+                continue
+
+            if in_defuse_chain:
+                m = defuse_entry_re.match(line)
+                if m:
+                    kind, var, line_num, event_type = m.groups()
+                    if event_type in ("assignment", "variable_use"):
+                        current_block.uses.add(var)
+                        if current_cfg:
+                            current_cfg.variable_uses[var].add(current_block.block_id)
+                    if event_type == "variable_declaration":
+                        current_block.defs.add(var)
+                        if current_cfg:
+                            current_cfg.variable_defs[var].add(current_block.block_id)
+                else:
+                    in_defuse_chain = False
 
     if current_cfg:
         cfgs.append(current_cfg)
@@ -145,98 +172,171 @@ def find_block_by_line(cfgs, file_name, line_number_list):
     return cfg1, blocks
 
 
+def compute_data_dependencies(cfg: SourceCFG):
+    # For each variable, for each use, find all defs in other blocks in the same function
+    for var in cfg.variable_defs:
+        def_blocks = cfg.variable_defs[var]
+        use_blocks = cfg.variable_uses.get(var, set())
+        for use_block_id in use_blocks:
+            for def_block_id in def_blocks:
+                if use_block_id != def_block_id:
+                    block = cfg.get_block(use_block_id)
+                    if block:
+                        block.data_dependencies[var].add(def_block_id)
+
+
 if __name__ == "__main__":
     text = """
-    Function signature: int LLVMFuzzerTestOneInput(const uint8_t * data, int size)
-    Defined in file: fuzz_decompress_chunk.c at line 10
-
-    [B0 (EXIT)]
-    Preds (4): B1 B4 B6 B8
-
+    Function signature: int blosc2_register_io_cb(const blosc2_io_cb * io)
+    Defined in file: blosc2.c at line 4633
+    [B0]
+    Preds (4): B1 B2 B9 B17
+    from line 21960 to line 1
 
     [B1]
-    1: blosc_destroy()
-    2: 0
-    3: return [B1.2];
-    Preds (2): B2 B3
+    Preds (1): B8
     Succs (1): B0
-
-    from line 38 to line 39
+    Def-Use Chain:
+        USE io used at line 4645 (variable_use)
+    from line 4645 to line 4645
 
     [B2]
-    1: free(output)
-    Preds (1): B3
-    Succs (1): B1
-
-    from line 35 to line 35
+    Preds (2): B5 B3
+    Succs (1): B0
+    from line 4642 to line 4642
 
     [B3]
-    1: <recovery-expr>()
-    T: if [B3.1]
-    Preds (1): B5
-    Succs (2): B2 B1
-
-    from line 33 to line 33
+    Preds (1): B4
+    Succs (1): B2
+    from line 4641 to line 4641
 
     [B4]
-    1: blosc_destroy()
-    2: 0
-    3: return [B4.2];
-    Preds (1): B5
-    Succs (1): B0
-
-    from line 28 to line 29
+    Preds (1): B6
+    Succs (1): B3
+    Def-Use Chain:
+        USE stderr used at line 4641 (variable_use)
+    from line 4641 to line 4641
 
     [B5]
-    1: <recovery-expr>()
-    T: if [B5.1]
-    Preds (1): B7
-    Succs (2): B4 B3
-
-    from line 26 to line 26
+    Preds (1): B6
+    Succs (1): B2
+    from line 4641 to line 4641
 
     [B6]
-    1: blosc_destroy()
-    2: 0
-    3: return [B6.2];
-    Preds (1): B7
-    Succs (1): B0
-
-    from line 23 to line 24
+    Preds (2): B7 B8
+    Succs (2): B5 B4
+    Def-Use Chain:
+        DEF __e at line 4641 (variable_declaration)
+        USE __e used at line 4641 (variable_use)
+    from line 4641 to line 4641
 
     [B7]
-    1: blosc_init()
-    2: blosc_set_nthreads(1)
-    3: <recovery-expr>()
-    T: if [B7.3]
-    Preds (1): B9
-    Succs (2): B6 B5
-
-    from line 18 to line 22
+    Succs (1): B6
+    from line 4641 to line 4641
 
     [B8]
-    1: 0
-    2: return [B8.1];
-    Preds (1): B9
-    Succs (1): B0
-
-    from line 15 to line 15
+    Preds (1): B15
+    Succs (2): B6 B1
+    Def-Use Chain:
+        USE io used at line 4640 (variable_use)
+    from line 4640 to line 4640
 
     [B9]
-    1: void *output;
-    2: <recovery-expr>() < BLOSC_MIN_HEADER_LENGTH
-    T: if [B9.2]
-    Preds (1): B10
-    Succs (2): B8 B7
+    Preds (2): B12 B10
+    Succs (1): B0
+    from line 4637 to line 4637
 
-    from line 12 to line 14
-
-    [B10 (ENTRY)]
+    [B10]
+    Preds (1): B11
     Succs (1): B9
+    from line 4636 to line 4636
 
+    [B11]
+    Preds (1): B13
+    Succs (1): B10
+    Def-Use Chain:
+        USE stderr used at line 4636 (variable_use)
+    from line 4636 to line 4636
+
+    [B12]
+    Preds (1): B13
+    Succs (1): B9
+    from line 4636 to line 4636
+
+    [B13]
+    Preds (2): B14 B15
+    Succs (2): B12 B11
+    Def-Use Chain:
+        DEF __e at line 4636 (variable_declaration)
+        USE __e used at line 4636 (variable_use)
+    from line 4636 to line 4636
+
+    [B14]
+    Succs (1): B13
+    from line 4636 to line 4636
+
+    [B15]
+    Preds (1): B16
+    Succs (2): B13 B8
+    Def-Use Chain:
+        USE g_nio used at line 4635 (variable_use)
+    from line 4635 to line 4635
+
+    [B16]
+    Preds (1): B23
+    Succs (1): B15
+    from line 4634 to line 4634
+
+    [B17]
+    Preds (2): B20 B18
+    Succs (1): B0
+    from line 4634 to line 4634
+
+    [B18]
+    Preds (1): B19
+    Succs (1): B17
+    from line 4634 to line 4634
+
+    [B19]
+    Preds (1): B21
+    Succs (1): B18
+    Def-Use Chain:
+        USE stderr used at line 4634 (variable_use)
+    from line 4634 to line 4634
+
+    [B20]
+    Preds (1): B21
+    Succs (1): B17
+    from line 4634 to line 4634
+
+    [B21]
+    Preds (2): B22 B23
+    Succs (2): B20 B19
+    Def-Use Chain:
+        DEF __e at line 4634 (variable_declaration)
+        USE __e used at line 4634 (variable_use)
+    from line 4634 to line 4634
+
+    [B22]
+    Succs (1): B21
+    from line 4634 to line 4634
+
+    [B23]
+    Preds (2): B24 B25
+    Succs (2): B21 B16
+    from line 4634 to line 4634
+
+    [B24]
+    Succs (1): B23
+    from line 4634 to line 4634
+
+    [B25]
+    Succs (1): B23
+    from line 4634 to line 4634
     """
 
     cfgs = parse_cfg_text(text)
     for cfg in cfgs:
+        compute_data_dependencies(cfg)
         cfg.print_summary()
     _, blocks = find_block_by_line(cfgs, "fuzz_decompress_chunk.c", [23])
