@@ -2086,7 +2086,21 @@ def revert_patch_test(args):
                         bb_to_update_incfg1 = get_corresponding_bb(target_repo_path, bb_to_update_incfg2, relative_file_path, next_commit['commit_id'], commit['commit_id'], [cfg1])
                         bb_change_list_update.append((bb_to_update_incfg1, bb_to_update_incfg2, cfg1, cfg2))
                 
-                bb_change_list.extend(bb_change_list_update)
+                # Deduplicate bb_change_list_update based on bb1s and bb2s
+                seen_pairs = set()
+                deduplicated_bb_change_list_update = []
+                for bb1s, bb2s, cfg1, cfg2 in bb_change_list_update:
+                    # Create a hashable representation of bb1s and bb2s
+                    bb1s_key = tuple((bb.start_line, bb.end_line) for bb in bb1s) if bb1s else ()
+                    bb2s_key = tuple((bb.start_line, bb.end_line) for bb in bb2s) if bb2s else ()
+                    pair_key = (bb1s_key, bb2s_key)
+                    
+                    if pair_key not in seen_pairs:
+                        seen_pairs.add(pair_key)
+                        deduplicated_bb_change_list_update.append((bb1s, bb2s, cfg1, cfg2))
+                
+                bb_change_list.extend(deduplicated_bb_change_list_update)
+                
                 # Rewrite the patches
                 for bb1s, bb2s, cfg1, cfg2 in bb_change_list:
                     bb1_start_line = float('inf')
