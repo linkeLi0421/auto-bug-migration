@@ -1373,7 +1373,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     assert(node['extent']['start']['line'] == node['extent']['end']['line']), f'Function call should be in one line, but got {node["extent"]["start"]["line"]} - {node["extent"]["end"]["line"]}'
 
                 rm_line = rename_func(f'-{function_line}', node['spelling'])[0]
-                add_line = f'+{function_line}'
+                add_line = f'+{function_line.replace('\n', '')}'
                 patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
                 patch = {
                     'file_path_old': fuzzer_file_path,
