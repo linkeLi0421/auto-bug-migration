@@ -1268,7 +1268,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
         if old_line_begin and old_line_end:
             # Create a patch to add the function call
             patch_header = f"diff --git a/{file_path} b/{file_path}\n"
-            patch_header += f"--- {'a/'}{file_path}\n+++ {'b/'}{file_path}\n"
+            patch_header += f"--- a/{file_path}\n+++ b/{file_path}\n"
             with open(os.path.join(target_repo_path, file_path), 'r') as f:
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
