@@ -1941,7 +1941,7 @@ def revert_patch_test(args):
             else:
                 trace_func_set.add((func.split(' ')[0], func_loc))
                 
-        logger.debug(f"Trace function set: {trace_func_set}")
+        logger.info(f"Trace function set: {trace_func_set}")
         if not trace_func_set:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
@@ -1980,7 +1980,6 @@ def revert_patch_test(args):
             # revert it. 
             for trace_func, func_loc in trace_func_set:
                 if patch_file_path in func_loc and (trace_func == patch_func_old or trace_func == patch_func_new):
-                    logger.info(f'Function {demangle_cpp_symbol(trace_func)} in both bug and fix traces, revert patch related to it')
                     if 'old_signature' not in diff_result:
                         diff_result['old_signature'], diff_result['old_function_start_line'], diff_result['old_function_end_line'] = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
                     if 'new_signature' not in diff_result:
@@ -2025,7 +2024,9 @@ def revert_patch_test(args):
         var_del_to_add = dict() # key: file path, value: set of variable declarations
         # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
         error_log = 'undeclared identifier'
-        while 'undeclared identifier' in error_log or 'undeclared function' in error_log:
+        count = 0
+        while ('undeclared identifier' in error_log or 'undeclared function' in error_log) and count < 10:
+            count += 1
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
             if build_success:
                 break
@@ -2035,6 +2036,10 @@ def revert_patch_test(args):
             logger.info(f'miss_member_structs: {miss_member_structs}')
             miss_decls = []
             for identifier, location in undeclared_identifier:
+                if identifier.startswith('__revert_'):
+                    # Assign a recreated function to a function pointer
+                    undeclared_functions.append((identifier, location))
+                    continue
                 parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{location.split('/',3)[-1].split(':')[0]}_analysis.json')
                 if os.path.exists(parsing_path):
                     with open(parsing_path, 'r') as f:
@@ -2178,7 +2183,6 @@ def revert_patch_test(args):
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys())
 
             for file_path in path_set:
-                logger.info(f'Processing file {file_path} for enum/macro/function declaration patch')
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
