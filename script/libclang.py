@@ -40,7 +40,7 @@ def analyze_file(directory, src_file, args):
     if not os.path.exists(path):
         print(f"File does not exist: {path}")
         return set()
-    tu = index.parse(path, args=args[:-1], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+    tu = index.parse(path, args=args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
     results = []
     dir_path, file_name = os.path.split(path)
     dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
@@ -101,7 +101,23 @@ def analyze_file(directory, src_file, args):
                     for arg in callee.get_arguments():
                         callee_args.append(f"{arg.type.spelling} {arg.spelling}")
                     info["callee"]["signature"] = f"{callee.result_type.spelling} {callee.spelling}({', '.join(callee_args)})"
-            
+        elif cursor.kind == CursorKind.DECL_REF_EXPR:
+            target = cursor.referenced
+            if target is not None:
+                if target.kind == CursorKind.FUNCTION_DECL:
+                    info['kind'] = 'CALL_EXPR'
+                    num_args = len(list(target.get_arguments()))
+                    info["num_arguments"] = num_args
+                    info["callee"] = {
+                        "name": target.spelling,
+                        "type": target.type.spelling if hasattr(target, "type") else "",
+                        "result_type": target.result_type.spelling if hasattr(target, "result_type") else "",
+                    }
+                    callee_args = []
+                    for arg in target.get_arguments():
+                        callee_args.append(f"{arg.type.spelling} {arg.spelling}")
+                    info["callee"]["signature"] = f"{target.result_type.spelling} {target.spelling}({', '.join(callee_args)})"
+        
         # record extent for declarations/definitions
         if cursor.extent and cursor.extent.start and cursor.extent.end:
             file = os.path.realpath(str(cursor.extent.start.file))
