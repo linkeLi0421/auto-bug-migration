@@ -61,6 +61,7 @@ def analyze_file(directory, src_file, args):
                                CursorKind.CALL_EXPR,
                                CursorKind.DECL_REF_EXPR,
                                CursorKind.MACRO_DEFINITION,
+                               CursorKind.TYPEDEF_DECL,
                                }:
             continue
         info = {
@@ -117,6 +118,10 @@ def analyze_file(directory, src_file, args):
                     for arg in target.get_arguments():
                         callee_args.append(f"{arg.type.spelling} {arg.spelling}")
                     info["callee"]["signature"] = f"{target.result_type.spelling} {target.spelling}({', '.join(callee_args)})"
+        elif cursor.kind == CursorKind.ENUM_CONSTANT_DECL:
+            info['enum_value'] = cursor.enum_value
+        elif cursor.kind == CursorKind.TYPEDEF_DECL:
+            info['typedef'] = cursor.underlying_typedef_type.spelling
         
         # record extent for declarations/definitions
         if cursor.extent and cursor.extent.start and cursor.extent.end:
