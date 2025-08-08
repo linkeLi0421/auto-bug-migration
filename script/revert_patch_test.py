@@ -7,10 +7,7 @@ import sys
 import json
 import os
 from git import Repo
-from unidiff import PatchSet
-from io import StringIO
 import logging
-from typing import Tuple, Set
 from collections import defaultdict
 
 from buildAndtest import checkout_latest_commit
@@ -1141,8 +1138,6 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
 
 
 def add_context(diff_results, final_patches, new_commit, target_repo_path):
-    new_start_line = -3
-    new_end_line = -3
     patch_prev_key = None
     removed_patches = set()
     
@@ -1227,8 +1222,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
             old_line_begin_nocontext = old_line_begin
             old_offset_nocontext = old_offset
             
-        if lines[-1] and lines[-1][0] in {'-', '+'}:
-            # No context lines after the patch: add context_lines2.
+        if lines[-1] and (lines[-1][0] in {'-', '+'} or lines[-2][0] in {'-', '+'} or lines[-3][0] in {'-', '+'}):
+            # No context lines or context less than 3 lines after the patch: add context_lines2.
             new_line_begin = new_line_begin_nocontext
             new_offset = new_offset_nocontext + max(0, min(3, len(content) - new_line_begin_nocontext - new_offset_nocontext+1))
             old_line_begin = old_line_begin_nocontext
@@ -1442,8 +1437,26 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
 
 
 def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recreated_functions, target_repo_path, commit, next_commit, target):
+    """
+    Updates patches within LLVMFuzzerTestOneInput function to handle function call replacements when reverting patches.
+    
+    This function ensures that function calls within the fuzzer are properly mapped from their __revert_ prefixed 
+    versions back to their original names when patches are being reverted. It handles both existing patches that 
+    need updating and creates new patches for function calls that aren't covered by existing patches.
+    
+    Args:
+        diff_results: Dictionary containing all patch information
+        patch_to_apply: List of patch keys to be applied
+        recreated_functions: List of function signatures that have been recreated with __revert_ prefix
+        target_repo_path: Path to the target repository
+        commit: Current commit hash
+        next_commit: Next commit hash
+        target: Target project name
+    """
     # Assume target_repo in new commit
     fuzzer_keys = set()
+    
+    # Step 1: Identify all patches that affect LLVMFuzzerTestOneInput function
     for key in patch_to_apply:
         patch = diff_results[key]
         if not ('old_signature' in patch and 'new_signature' in patch):
@@ -1456,6 +1469,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_new_signature = patch['new_signature']
             fuzzer_old_signature = patch['old_signature']
 
+    # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
     parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{fuzzer_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -1467,12 +1481,19 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_start_line = node['extent']['start']['line']
             fuzzer_end_line = node['extent']['end']['line']
             break
+    
+    # Step 3: Process all function calls within LLVMFuzzerTestOneInput that reference recreated functions
     for node in ast_nodes:
         if node.get('kind') not in {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}:
             continue
+        
+        # Check if this call is within the LLVMFuzzerTestOneInput function and references a recreated function
         if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_sig.split('(')[0].split(' ')[-1] for func_sig in recreated_functions):
-            # This call is within the LLVMFuzzerTestOneInput function
+            
+            # Track whether this call is already covered by an existing patch
             Inpatch_flag = False
+            
+            # Step 3a: Check if this call is within any existing patch
             for key in fuzzer_keys:
                 patch = diff_results[key]
                 lines = patch['patch_text'].split('\n')
@@ -1483,7 +1504,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     # This call in within a patch, we need to update the patch
                     Inpatch_flag = True
                     for i, line in enumerate(lines):
-                        if re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
+                        if line[0] not in {'-', '+'} and re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
                             # If the function is called in this patch, we need to update the call
                             rm_line = rename_func(f'-{line[1:]}', node['spelling'])[0]
                             add_line = f'+{line[1:]}'
@@ -1493,18 +1514,26 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                             new_lines.append(line)
                     patch['patch_text'] = '\n'.join(new_lines)
             
+            # Step 3b: Create new patch for calls not covered by existing patches
             if not Inpatch_flag:
                 # This call is not in any patch, we need to create a new patch
                 new_start_line = node['location']['line']
                 new_offset = 1
+                
+                # Read the actual function call line from source file
                 with open(os.path.join(target_repo_path, fuzzer_file_path), 'r') as f:
                     content = f.readlines()
                     function_line = content[node['location']['line']-1]
                     assert(node['extent']['start']['line'] == node['extent']['end']['line']), f'Function call should be in one line, but got {node["extent"]["start"]["line"]} - {node["extent"]["end"]["line"]}'
 
+                # Create patch lines for reverting __revert_ functions back to original names
                 rm_line = rename_func(f'-{function_line}', node['spelling'])[0]
                 add_line = f'+{function_line.replace('\n', '')}'
+                
+                # Construct complete patch text
                 patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
+                
+                # Create new patch entry
                 patch = {
                     'file_path_old': fuzzer_file_path,
                     'file_path_new': fuzzer_file_path,
@@ -1521,6 +1550,8 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     'old_function_start_line': fuzzer_start_line,
                     'old_function_end_line': fuzzer_end_line,
                 }
+                
+                # Add new patch to diff_results and patch_to_apply list
                 new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{new_start_line},{new_offset}+{new_start_line},{new_offset}'
                 diff_results[new_key] = patch
                 patch_to_apply.append(new_key)
@@ -1772,6 +1803,9 @@ def filter_and_dedup_bb_change_pairs(bb_change_pair):
 
         new_change_list = []
         for bb1s_i, bb2s_i, cfg1, cfg2 in change_list:
+            if not cfg1 or not cfg2:
+                # Find nothing from get_bb_change_pair_from_line, ignore it.
+                continue
             bb1_start_line = min(bb.start_line for bb in bb1s_i)
             bb1_end_line = max(bb.end_line for bb in bb1s_i)
             if (bb1_start_line, bb1_end_line) in seen:
@@ -1830,7 +1864,7 @@ def get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_result
     cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], [line_num_in_old_commit])
     if not bb1s:
         logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit} line after patch {line_num_after_patch}')
-        return False
+        return None, None, None, None
 
     for key, patch in diff_results.items():
         if patch['file_path_new'] == relative_file_path:
@@ -2096,10 +2130,10 @@ def revert_patch_test(args):
         subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         patch_to_apply = []
-        patch_func_new = ''
-        patch_func_old = ''
-        patch_file_path = ''
         for key, diff_result in diff_results.items():
+            patch_func_new = ''
+            patch_func_old = ''
+            patch_file_path = ''
             if 'new_signature' in diff_result:
                 logger.debug(f'newsignature{diff_result['new_signature']}')
                 patch_func_new = diff_result['new_signature'].split('(')[0].split(' ')[-1]
@@ -2173,6 +2207,8 @@ def revert_patch_test(args):
                'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
                in error_log):
             count += 1
+            if count > 10:
+                break
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
             if build_success:
                 break
