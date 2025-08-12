@@ -1038,6 +1038,10 @@ def normalize_signature(signature):
     Parse and normalize a C-style function signature.
     Returns a tuple: (return_type, function_name, list of param types)
     """
+    # Skip error messages from AST analysis
+    if not signature or 'error generated' in signature:
+        raise ValueError(f"Invalid function signature: {signature}")
+    
     # Remove extra spaces
     signature = re.sub(r'\s+', ' ', signature.strip())
 
@@ -1146,6 +1150,9 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     subprocess.run(["git", "checkout", '-f', new_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
     # 1. Merge the patches that have overlap, note that the overlap here is just the simple ones
+    prev_new_start_line = dict()
+    prev_new_end_line = dict()
+    patch_prev_key = dict()
     for key in final_patches:
         patch = diff_results[key]
         patch_text = patch['patch_text']
@@ -1153,9 +1160,9 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
         if lines[4][0] == '-': # meaning this patch has no context
-            if patch_prev_key and patch_prev_key.split('-')[0] in key and prev_new_start_line-3 <= patch['new_end_line']-1 < prev_new_end_line+3:
+            if patch['file_path_new'] in patch_prev_key and prev_new_start_line[patch['file_path_new']]-3 <= patch['new_end_line']-1 < prev_new_end_line[patch['file_path_new']]+3:
                 # merge the patches that have overlap
-                patch_prev = diff_results[patch_prev_key]
+                patch_prev = diff_results[patch_prev_key[patch['file_path_new']]]
                 patch_prev_lines = patch_prev['patch_text'].split('\n')
                 connect_lines_begin = patch['new_end_line']
                 connect_lines_end = patch_prev['new_start_line']
@@ -1178,9 +1185,9 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 patch_prev['old_end_line'] = patch_prev['old_start_line'] + patch_new_offset+patch_prev_new_offset+connect_lines_end-connect_lines_begin
                 removed_patches.add(key)
                 continue
-        prev_new_start_line = patch['new_start_line']
-        prev_new_end_line = patch['new_end_line']
-        patch_prev_key = key
+        prev_new_start_line[patch['file_path_new']] = patch['new_start_line']
+        prev_new_end_line[patch['file_path_new']] = patch['new_end_line']
+        patch_prev_key[patch['file_path_new']] = key
 
     for key in removed_patches:
         final_patches.remove(key)
@@ -1564,19 +1571,43 @@ def update_function_mappings(recreated_functions, signature_change_list):
         signature_change_list.append((func_name, f'__revert_{func_name}'))
 
 
-def get_correct_line_num(file_path, line_num, patch_key_list, diff_results):
+def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
     # This is only used for LLVMFuzzerTestOneInput, to get the correct line number in the new commit
     # transform the line number after reverting patches, to the line number before reverting patches (in new commit)
     add_num = 0 # the number of lines added by patches
+    patch = None
     for key in reversed(patch_key_list):
         patch = diff_results[key]
         if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
-            if patch['new_start_line'] <= line_num <= patch['new_end_line']:
-                break
-            patch_lines = patch['patch_text'].split('\n')
+            new_start_line = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
             old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
             new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+            if new_start_line <= line_num < new_start_line + new_offset:
+                # logger.info(f'here:\n{new_start_line} {new_start_line + new_offset}\n {patch['patch_text']}')
+                break
             add_num += new_offset - old_offset
+        
+    if patch:
+        lines = patch['patch_text'].split('\n')
+    elif file_path in extra_patches:
+        lines = extra_patches[file_path]['patch_text'].split('\n')
+    else:
+        logger.error(f'Cannot find patch of the line. file_path: {file_path}, line_num: {line_num}')
+        
+    start_line = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
+    for i, line in enumerate(lines):
+        if i < 4:
+            continue
+        if start_line == line_num:
+            break
+        if line.startswith('+'):
+            add_num += 1
+        elif line.startswith('-'):
+            add_num -= 1
+            start_line += 1
+        else:
+            start_line += 1
+    
     return line_num + add_num
 
 
@@ -1588,7 +1619,8 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     if file_path in extra_patches:
         patch = extra_patches[file_path]
         add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
-    
+    # logger.info(f'file_path: {file_path}; line_num: {line_num}')
+    # logger.info(f'add_num1: {add_num}')
     for key in reversed(patch_key_list):
         patch = diff_results[key]
         if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
@@ -1601,6 +1633,8 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
                 key_of_line_num = key
                 add_num -= new_offset - old_offset
                 break
+            # logger.info(f'add_num2: {add_num} {patch['patch_text'].split('@@')[1]}')
+    # logger.info(f'add_num3: {add_num} {patch['patch_text'].split('@@')[1]}')
 
     index_old_infun = 0
     front_context_num = 0 # should be less than 3
@@ -1624,6 +1658,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
                 # this is the line we are looking for, we can get this line's index in the function
                 break
         index_old_infun -= front_context_num # I want the index inside the function, not the context lines
+        # logger.info(f'index_old_infun: {index_old_infun}')
         old_function_signature = diff_results[key_of_line_num]['old_signature']
         parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{diff_results[key_of_line_num]["file_path_old"]}_analysis.json')
         with open(parsing_path, 'r') as f:
@@ -1642,6 +1677,24 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     return 0
 
 
+def check_if_in_fuzzer(line_num, cfgs):
+    """
+    Check if the given line number falls within the scope of LLVMFuzzerTestOneInput function.
+    
+    Args:
+        line_num: The line number to check
+        cfgs: List of CFG objects parsed from cfg files
+    
+    Returns:
+        bool: True if line_num is within LLVMFuzzerTestOneInput, False otherwise
+    """
+    for cfg in cfgs:
+        start_line, end_line = cfg.get_line_range()
+        if cfg.function_signature.split('(')[0].split(' ')[-1] == 'LLVMFuzzerTestOneInput' and start_line <= line_num <= end_line:
+            return True
+    return False
+
+
 def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
     # return the corresponding basic blocks of bb1 from cfgs1 in cfgs2, based on their relationship in a patch
     bbs = []
@@ -1651,9 +1704,13 @@ def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
     new_signature = patch['new_signature']
     cfg2 = None
     for cfg in cfgs2:
-        if compare_function_signatures(cfg.function_signature, new_signature, ignore_arg_types=True):
-            cfg2 = cfg
-            break
+        try:
+            if compare_function_signatures(cfg.function_signature, new_signature, ignore_arg_types=True):
+                cfg2 = cfg
+                break
+        except (ValueError, AttributeError):
+            # Skip invalid signatures or missing attributes
+            continue
     if not cfg2:
         logger.error(f'Cannot find corresponding cfg for {old_signature} and {new_signature}')
         return bbs
@@ -1873,6 +1930,9 @@ def get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_result
     
     # Now we get basic blocks in new commit that correspond to bb1
     cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
+    # logger.info(f'line {line_num_in_old_commit} in old commit corresponds to line {bb2_line_num_list} in new commit')
+    # logger.info(f'bb1s: {bb1s}')
+    # logger.info(f'bb2s: {bb2s}')
     
     return bb1s, bb2s, cfg1, cfg2
     
@@ -1881,7 +1941,11 @@ def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line,
     for key in final_patches:
         patch = diff_results[key]
         real_patch_start_line = 0
-        if patch['file_path_new'] == relative_file_path and 'Recreated function' in patch['patch_type'] and compare_function_signatures(patch['old_signature'], cfg1.function_signature, ignore_arg_types=True):
+        try:
+            signature_match = compare_function_signatures(patch['old_signature'], cfg1.function_signature, ignore_arg_types=True)
+        except (ValueError, AttributeError):
+            signature_match = False
+        if patch['file_path_new'] == relative_file_path and 'Recreated function' in patch['patch_type'] and signature_match:
             logger.debug(f'bb1 {bb1_start_line} - {bb1_end_line} in patch {key}')
             logger.debug(f'bb2 {bb2_start_line} - {bb2_end_line} in new commit {next_commit}')
             old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
@@ -2112,7 +2176,7 @@ def revert_patch_test(args):
             else:
                 trace_func_list.append((func.split(' ')[0], func_loc))
                 
-        logger.debug(f"Trace function set: {trace_func_list}")
+        logger.info(f"Trace function set: {trace_func_list}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
@@ -2265,18 +2329,12 @@ def revert_patch_test(args):
                 else:
                     logger.error(f'Cannot find {identifier} in parsing_path: {parsing_path}!')
 
-            if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
-                # Solve other declarations and definitions first; Because they may lead to miss_decls here
-                # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-                bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, 
-                                                         extra_patches, target, next_commit, commit, arch, args, target_repo_path)
-
             for func_name, location in undeclared_functions:
                 if not func_name.startswith('__revert_'):
                     # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
                     # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
                     file_path = location.split(':')[0]
-                    line_num = int(location.split(':')[1])
+                    line_num_after_patch = int(location.split(':')[1])
                     relative_file_path = file_path.split('/', 3)[-1]
                     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
                         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
@@ -2289,16 +2347,20 @@ def revert_patch_test(args):
                         logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
                         result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     
-                    # line_num after patch -> line number before patch -> 
-                    # find block start and end line in bug version -> get the part in patch need to be removed
-                    line_num = get_correct_line_num(relative_file_path, line_num, final_patches, diff_results)
                     with open(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
                         cfgs1 = parse_cfg_text(cfg_file.read())
                     with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
                         cfgs2 = parse_cfg_text(cfg_file.read())
+                    # line_num after patch -> line number before patch -> 
+                    # find block start and end line in bug version -> get the part in patch need to be removed
+                    line_num = get_correct_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches)
+                    if not check_if_in_fuzzer(line_num, cfgs2):
+                        # Not LLVMFuzzerTestOneInput, handle it in process_undeclared_identifiers
+                        miss_decls.append((func_name, file_path, line_num_after_patch))
+                        continue
                     _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
                     if not bb2s:
-                        logger.info(f'No basic block found for {file_path}:{line_num} in {next_commit['commit_id']}')
+                        logger.info(f'No basic block2 found for {file_path}:{line_num} in {next_commit['commit_id']}')
                         continue
                     
                     for key in final_patches:
@@ -2315,8 +2377,15 @@ def revert_patch_test(args):
                             func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], set()).add(f'{func_decl}')
                             break
 
+            if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
+                # Solve other declarations and definitions first; Because they may lead to miss_decls here
+                # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
+                bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, 
+                                                         extra_patches, target, next_commit, commit, arch, args, target_repo_path)
+
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys())
 
+            not_write_patches = set()
             for file_path in path_set:
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2407,23 +2476,61 @@ def revert_patch_test(args):
                 subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 insert_point = find_first_code_line(os.path.join(target_repo_path, file_path))
                 context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
-                patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
-                patch = {
-                    'file_path_old': file_path,
-                    'file_path_new': file_path,
-                    'patch_text': patch_header + context1 + include_text + var_text + enum_text + func_decl_text + union_text + context2,
-                    'new_start_line': start,
-                    'new_end_line': end,
-                    'old_start_line': start,
-                    'old_end_line': enum_len+include_len+func_decl_len+var_len+union_len+end,
-                    'old_signature': '',
-                    'new_signature': '',
-                    'patch_type': {'Enum or macro change', 'Function declaration change'},
-                }
+                merge_flag = 0
+                
+                for key_f in final_patches:
+                    patch_f = diff_results[key_f]
+                    if patch_f['file_path_new'] != file_path:
+                        continue
+                    lines = patch_f['patch_text'].split('\n')
+                    new_start_f = int(lines[3].strip().split('@@')[-2].strip().split('+')[1].split(',')[0])
+                    new_offset_f = int(lines[3].strip().split('@@')[-2].strip().split('+')[1].split(',')[1])
+                    old_start_f = int(lines[3].strip().split('@@')[-2].strip().split(',')[-1])
+                    old_offset_f = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
+                    if end >= new_start_f:
+                        # There is overlap, merge them
+                        merge_flag = 1
+                        gap_len = (new_start_f + 3) - (end - 3) - 1
+                        _, gap_text, _, _ = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=gap_len)
+                        f_text = patch_f['patch_text'].split('\n', 7)[-1] # Remove the patch header and the front context
+                        patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+insert_point-start+gap_len+old_offset_f-3} +{start},{insert_point-start+gap_len+new_offset_f-3} @@\n'
+                        patch = {
+                            'file_path_old': file_path,
+                            'file_path_new': file_path,
+                            'patch_text': patch_header + context1 + include_text + var_text + enum_text + func_decl_text + union_text + gap_text + f_text,
+                            'new_start_line': start,
+                            'new_end_line': patch_f['new_end_line'],
+                            'old_start_line': start,
+                            'old_end_line': start+enum_len+include_len+func_decl_len+var_len+union_len+insert_point-start+1+gap_len+old_offset_f-3-1,
+                            'old_signature': '__merged__',
+                            'new_signature': '__merged__',
+                            'patch_type': {'Enum or macro change', 'Function declaration change'},
+                            'extra_length': enum_len+include_len+func_decl_len+var_len+union_len,
+                        }
+                        not_write_patches.add(key_f)
+                        break
+                    
+                if not merge_flag:
+                    patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
+                    patch = {
+                        'file_path_old': file_path,
+                        'file_path_new': file_path,
+                        'patch_text': patch_header + context1 + include_text + var_text + enum_text + func_decl_text + union_text + context2,
+                        'new_start_line': start,
+                        'new_end_line': end,
+                        'old_start_line': start,
+                        'old_end_line': enum_len+include_len+func_decl_len+var_len+union_len+end,
+                        'old_signature': '',
+                        'new_signature': '',
+                        'patch_type': {'Enum or macro change', 'Function declaration change'},
+                        'extra_length': enum_len+include_len+func_decl_len+var_len+union_len,
+                    }
                 extra_patches[file_path] = patch
                 
             with open(patch_file_path, 'w') as patch_file:
                 for key in final_patches:
+                    if key in not_write_patches:
+                        continue
                     patch = diff_results[key]
                     patch_file.write(patch['patch_text'])
                     patch_file.write('\n\n')
