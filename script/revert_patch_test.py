@@ -155,6 +155,8 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
         bb_change_list.extend(deduplicated_bb_change_list_update)
         
         # Rewrite the patches
+        # Store all block data in a list and sort by bb1_start_line (biggest to smallest)
+        block_data_list = []
         for bb1s, bb2s, cfg1, cfg2 in bb_change_list:
             bb1_start_line = float('inf')
             bb1_end_line = float('-inf')
@@ -174,6 +176,13 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
                     bb1_start_line = min(bb1_start_line, line1)
                     bb1_end_line = max(bb1_end_line, line2)
 
+            block_data_list.append((bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line, bb1s, bb2s, cfg1, cfg2))
+
+        # Sort by bb1_start_line in descending order (biggest to smallest)
+        block_data_list.sort(key=lambda x: x[0], reverse=True)
+
+        # Process blocks from biggest bb1_start_line to smallest
+        for bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line, bb1s, bb2s, cfg1, cfg2 in block_data_list:
             if (bb1_start_line, bb1_end_line) in seen:
                 # Skip if this bb1 range has been seen before
                 continue
@@ -2023,7 +2032,7 @@ def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line,
             new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
             new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
             if patch['patch_text'].find('\n-') != -1:
-                # find the real patch start line, usually is 3
+                # find the real patch start line, usually is 7
                 lines = patch['patch_text'].split('\n')
                 for line in lines:
                     if line.startswith('-') and not line.startswith('---'):
@@ -2134,6 +2143,8 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
+        if bug_id != 'OSV-2021-639':
+            continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
         next_commit['commit_id'] = next_commit['commit_id'][:6]  # use short commit id for trace file name
