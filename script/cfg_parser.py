@@ -41,10 +41,34 @@ class SourceCFG:
                 f"defined at {self.file_path}:{self.signature_line} "
                 f"with {len(self.blocks)} blocks>")
 
+
+    def get_line_range(self) -> tuple[int, int]:
+        """Get the start and end line numbers for this CFG.
+        
+        Returns:
+            tuple[int, int]: (start_line, end_line) representing the range
+                           of lines covered by all blocks in this CFG
+        """
+        if not self.blocks:
+            return (0, 0)
+        
+        all_lines = []
+        for block in self.blocks.values():
+            if block.start_line is not None and block.end_line is not None:
+                all_lines.extend([block.start_line, block.end_line])
+        
+        if not all_lines:
+            return (0, 0)
+            
+        return (min(all_lines), max(all_lines))
+
+
     def print_summary(self):
         print(f"Function: {self.function_signature}")
         if self.file_path:
             print(f"  File: {self.file_path}:{self.signature_line}")
+        start_line, end_line = self.get_line_range()
+        print(f"  Line range: {start_line}-{end_line}")
         for block_id in sorted(self.blocks):
             blk = self.blocks[block_id]
             print(f"  Block {blk.block_id} | Lines: {blk.start_line}-{blk.end_line} | "
