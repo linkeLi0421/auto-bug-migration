@@ -1,9 +1,6 @@
-import csv
 import re
-import sys
 import argparse
 import subprocess
-import sys
 import json
 import os
 from git import Repo
@@ -15,7 +12,6 @@ from run_fuzz_test import read_json_file
 from run_fuzz_test import py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
-from get_fix_related import demangle_cpp_symbol
 from cfg_parser import parse_cfg_text, find_block_by_line, compute_data_dependencies
 from gumtree import get_corresponding_lines, get_delete_lines
 
@@ -31,8 +27,63 @@ ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz')
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
 
 
-def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, 
-                                  extra_patches, target, next_commit, commit, arch, args, target_repo_path):
+def process_function_signature_changes(function_sig_changes, trace1, final_patches, diff_results, extra_patches):
+    """
+    For each function in function_sig_changes, check if its name exists in trace1.
+    """
+    trace_function_names = set()
+    for index, func in trace1:
+        trace_function_names.add(func.split(' ')[0])
+    for func_name, error_type, file_path, line_num_after_patch in function_sig_changes:
+        file_path = file_path.split('/', 3)[-1]
+        if func_name in trace_function_names:
+            raise RuntimeError(f"Function '{func_name}' is present in trace and cannot be deleted.")
+        else:
+            add_num = 0 # the number of lines added by patches
+            extra_patch = extra_patches.get(file_path, None)
+            key_of_line_num = None
+            if extra_patch:
+                old_offset = int(extra_patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+                new_offset = int(extra_patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+                add_num += new_offset - old_offset
+                
+            for key in reversed(final_patches):
+                patch = diff_results[key]
+                if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
+                    new_start_line = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+                    old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+                    new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+                    add_num += new_offset - old_offset
+                    if line_num_after_patch + add_num <= new_start_line:
+                        key_of_line_num = key
+                        add_num -= new_offset - old_offset
+                        break
+            if key_of_line_num:
+                patch_text = diff_results[key_of_line_num]['patch_text']
+            elif file_path in extra_patches:
+                patch_text = extra_patches[file_path]['patch_text']
+            else:
+                logger.error(f'No patch found for file {file_path}:{line_num_after_patch}')
+                return
+            
+            new_start_line = int(patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
+            lines = patch_text.split('\n')
+            for index, line in enumerate(lines):
+                if index < 4:
+                    # skip patch header
+                    continue
+                if line_num_after_patch + add_num == new_start_line:
+                    lines[index] = '-;' if line.startswith('-') else ';'
+                    break
+                if line.startswith('+'):
+                    new_start_line -= 1
+                else:
+                    new_start_line += 1
+
+            diff_results[key_of_line_num]['patch_text'] = '\n'.join(lines)
+
+
+def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
     """
     Process undeclared identifiers by analyzing and extracting basic block change pairs.
     
@@ -52,7 +103,6 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
         next_commit: The next commit information
         commit: The current commit information
         arch: Architecture to build for
-        args: Command-line arguments
         target_repo_path: Path to the target repository
         
     Returns:
@@ -1275,16 +1325,34 @@ def handle_build_error(error_log):
     # New pattern for too few arguments to function call
     pattern = r"(/src.+?):(\d+):(\d+):.*too few arguments to function call.*"
     matches = re.findall(pattern, error_log)
-    for filepath, line, column in matches:
-        missing_struct_members.append(("", "too_few_arguments_fun_call", filepath, int(line)))
-    missing_struct_members.sort(key=lambda x: x[3], reverse=True)
+    function_sig_changes = []
+    error_lines = error_log.splitlines()
+    for match in matches:
+        filepath, line, column = match
+        line_num = int(line)
+        func_name = ""
+        
+        # Find the matching error line and get the next line in error_log
+        for i, error_line in enumerate(error_lines):
+            if re.search(rf"{re.escape(filepath)}:{line}:{column}:.*too few arguments to function call", error_line):
+                # Check if there's a next line in the error log
+                if i + 1 < len(error_lines):
+                    next_error_line = error_lines[i + 1].strip()
+                    # Extract function name from the next line
+                    func_match = re.search(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)', next_error_line)
+                    if func_match:
+                        func_name = func_match.group(1)
+                break
+        
+        function_sig_changes.append((func_name, "too_few_arguments_fun_call", filepath, line_num))
+    function_sig_changes.sort(key=lambda x: x[3], reverse=True)
     
     # New pattern for unknown type name
     pattern = r"(/src.+?):(\d+):(\d+):.*unknown type name '([^']+)'"
     matches = re.findall(pattern, error_log)
     undeclared_identifiers.extend([(type_name, f"{filepath}:{line}:{column}") for filepath, line, column, type_name in matches])
     
-    return undeclared_identifiers, undeclared_functions, missing_struct_members
+    return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes
 
 
 def find_first_code_line(file_path):
@@ -1574,6 +1642,7 @@ def update_function_mappings(recreated_functions, signature_change_list):
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
     # This is only used for LLVMFuzzerTestOneInput, to get the correct line number in the new commit
     # transform the line number after reverting patches, to the line number before reverting patches (in new commit)
+    # extra_patches is not considered directly because it is not applied yet
     add_num = 0 # the number of lines added by patches
     patch = None
     for key in reversed(patch_key_list):
@@ -1583,6 +1652,7 @@ def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extr
             old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
             new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
             if new_start_line <= line_num < new_start_line + new_offset:
+                # TODO: check again
                 # logger.info(f'here:\n{new_start_line} {new_start_line + new_offset}\n {patch['patch_text']}')
                 break
             add_num += new_offset - old_offset
@@ -2176,7 +2246,7 @@ def revert_patch_test(args):
             else:
                 trace_func_list.append((func.split(' ')[0], func_loc))
                 
-        logger.info(f"Trace function set: {trace_func_list}")
+        logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
@@ -2276,10 +2346,11 @@ def revert_patch_test(args):
             build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
             if build_success:
                 break
-            undeclared_identifier, undeclared_functions, miss_member_structs = handle_build_error(error_log)
+            undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes = handle_build_error(error_log)
             logger.info(f'undeclared_identifier: {undeclared_identifier}')
             logger.info(f'undeclared_functions: {undeclared_functions}')
             logger.info(f'miss_member_structs: {miss_member_structs}')
+            logger.info(f'function_sig_changes: {function_sig_changes}')
             miss_decls = []
             for identifier, location in undeclared_identifier:
                 file_path_new = location.split('/',3)[-1].split(':')[0]
@@ -2380,8 +2451,10 @@ def revert_patch_test(args):
             if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
                 # Solve other declarations and definitions first; Because they may lead to miss_decls here
                 # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-                bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, 
-                                                         extra_patches, target, next_commit, commit, arch, args, target_repo_path)
+                bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
+
+            # Process function signature changes
+            process_function_signature_changes(function_sig_changes, trace1, final_patches, diff_results, extra_patches)
 
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys())
 
@@ -2454,7 +2527,6 @@ def revert_patch_test(args):
                         with open(os.path.join(target_repo_path, path), 'r') as f:
                             file_content = f.readlines()
                             var_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
-                    logger.info(f'var_text: {file_path}\n{var_text}')
                 
                 if file_path in type_def_to_add:
                     locs = list(type_def_to_add[file_path])
