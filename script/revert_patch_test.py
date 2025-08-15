@@ -8,8 +8,7 @@ import logging
 from collections import defaultdict
 
 from buildAndtest import checkout_latest_commit
-from run_fuzz_test import read_json_file
-from run_fuzz_test import py3
+from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from cfg_parser import parse_cfg_text, find_block_by_line, compute_data_dependencies
@@ -34,8 +33,15 @@ def process_function_signature_changes(function_sig_changes, trace1, final_patch
     trace_function_names = set()
     for index, func in trace1:
         trace_function_names.add(func.split(' ')[0])
-    for func_name, error_type, file_path, line_num_after_patch in function_sig_changes:
+    for func_name, error_type, file_path, line_range in function_sig_changes:
         file_path = file_path.split('/', 3)[-1]
+        # Extract start and end line numbers from the line_range tuple
+        if isinstance(line_range, tuple) and len(line_range) == 2:
+            start_line, end_line = line_range
+        else:
+            # For backward compatibility, if line_range is not a tuple, treat it as a single line number
+            start_line = end_line = line_range
+            
         if func_name in trace_function_names:
             raise RuntimeError(f"Function '{func_name}' is present in trace and cannot be deleted.")
         else:
@@ -54,7 +60,8 @@ def process_function_signature_changes(function_sig_changes, trace1, final_patch
                     old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
                     new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
                     add_num += new_offset - old_offset
-                    if line_num_after_patch + add_num <= new_start_line:
+                    # Use start_line instead of line_num_after_patch
+                    if start_line + add_num <= new_start_line:
                         key_of_line_num = key
                         add_num -= new_offset - old_offset
                         break
@@ -63,18 +70,21 @@ def process_function_signature_changes(function_sig_changes, trace1, final_patch
             elif file_path in extra_patches:
                 patch_text = extra_patches[file_path]['patch_text']
             else:
-                logger.error(f'No patch found for file {file_path}:{line_num_after_patch}')
+                logger.error(f'No patch found for file {file_path}:{start_line}-{end_line}')
                 return
             
             new_start_line = int(patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
             lines = patch_text.split('\n')
+            
+            # Handle the range of lines for the function call
+            # For now, we'll just use the start_line as the reference point
+            # This could be enhanced to handle the entire range if needed
             for index, line in enumerate(lines):
                 if index < 4:
                     # skip patch header
                     continue
-                if line_num_after_patch + add_num == new_start_line:
+                if start_line + add_num <= new_start_line <= end_line + add_num:
                     lines[index] = '-;' if line.startswith('-') else ';'
-                    break
                 if line.startswith('+'):
                     new_start_line -= 1
                 else:
@@ -1333,28 +1343,29 @@ def handle_build_error(error_log):
     
     # New pattern for too few arguments to function call
     pattern = r"(/src.+?):(\d+):(\d+):.*too few arguments to function call.*"
-    matches = re.findall(pattern, error_log)
+    next_error = {'note:', 'warning:', 'error:'}
+    line_num_pattern = r"^\s*(\d+)\s*\|\s*(.*)"
     function_sig_changes = []
     error_lines = error_log.splitlines()
-    for match in matches:
-        filepath, line, column = match
-        line_num = int(line)
-        func_name = ""
-        
-        # Find the matching error line and get the next line in error_log
-        for i, error_line in enumerate(error_lines):
-            if re.search(rf"{re.escape(filepath)}:{line}:{column}:.*too few arguments to function call", error_line):
-                # Check if there's a next line in the error log
-                if i + 1 < len(error_lines):
-                    next_error_line = error_lines[i + 1].strip()
-                    # Extract function name from the next line
-                    func_match = re.search(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)', next_error_line)
-                    if func_match:
-                        func_name = func_match.group(1)
-                break
-        
-        function_sig_changes.append((func_name, "too_few_arguments_fun_call", filepath, line_num))
-    function_sig_changes.sort(key=lambda x: x[3], reverse=True)
+    # Find the matching error line and extract function name from surrounding context
+    for i, error_line in enumerate(error_lines):
+        line_num_set = set()
+        fun_call_code = ''
+        match = re.search(pattern, error_line)
+        if match:
+            filepath, line_num, col_num = match.groups()
+            line_num_set.add(int(line_num))
+            for j in range(i+1, len(error_lines)):
+                if any(sign in error_lines[j] for sign in next_error):
+                    break
+                line_num_match = re.search(line_num_pattern, error_lines[j])
+                if line_num_match:
+                    line_num, code = line_num_match.groups()
+                    line_num_set.add(int(line_num))
+                    fun_call_code += code
+            function_sig_changes.append((fun_call_code, "too_few_arguments_fun_call", filepath, (min(line_num_set), max(line_num_set))))
+    # Sort by filepath and then by the first line number in the range (if it's a tuple)
+    function_sig_changes.sort(key=lambda x: (x[2], x[3][0] if isinstance(x[3], tuple) else x[3]), reverse=True)
     
     # New pattern for unknown type name
     pattern = r"(/src.+?):(\d+):(\d+):.*unknown type name '([^']+)'"
@@ -2143,8 +2154,6 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id != 'OSV-2021-639':
-            continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
         next_commit['commit_id'] = next_commit['commit_id'][:6]  # use short commit id for trace file name
