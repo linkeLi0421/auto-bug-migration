@@ -9,7 +9,6 @@ current_file_path = os.path.dirname(os.path.abspath(__file__))
 
 
 test_data = {
-    # TODO: arch and fuzzer need change
     'OSV-2021-496': {
         "commit_id": "83d00f",
         "sanitizer": "address",
