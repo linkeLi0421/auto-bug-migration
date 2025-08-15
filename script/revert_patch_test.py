@@ -93,7 +93,7 @@ def process_function_signature_changes(function_sig_changes, trace1, final_patch
             diff_results[key_of_line_num]['patch_text'] = '\n'.join(lines)
 
 
-def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
+def process_undeclared_identifiers(function_sig_changes, miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
     """
     Process undeclared identifiers by analyzing and extracting basic block change pairs.
     
@@ -119,13 +119,25 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
         Dictionary of basic block change pairs by file path
     """
     bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
+    
+    for func_name, error_type, file_path, line_range in function_sig_changes:
+        # Extract start and end line numbers from the line_range tuple
+        if isinstance(line_range, tuple) and len(line_range) == 2:
+            line_num_list = list(line_range)
+        else:
+            # For backward compatibility, if line_range is not a tuple, treat it as a single line number
+            line_num_list = [line_range]
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        relative_file_path = file_path.split('/', 3)[-1]
+        bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
+    
     for field_name, struct_name, file_path, line_num in miss_member_structs:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
         
     for identifier, file_path, line_num in miss_decls:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
 
@@ -1987,9 +1999,9 @@ def get_corresponding_bb(target_repo_path, bb1s, file_path, commit, next_commit,
     return bb2s
 
 
-def get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
+def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
     relative_file_path = file_path.split('/', 3)[-1]
-    line_num_after_patch = line_num
+    line_num_after_patch_list = line_num_list
     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit, '--build_csv', build_csv,
                     '--architecture', arch, '--target_file', relative_file_path, target]
@@ -2002,15 +2014,17 @@ def get_bb_change_pair_from_line(file_path, line_num, final_patches, diff_result
         result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # line_num after patch -> line number in old commit
-    line_num_in_old_commit = get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit)
+    line_num_in_old_commit_list = []
+    for line_num_after_patch in line_num_after_patch_list:
+        line_num_in_old_commit_list.append(get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit))
     
     with open(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
         cfgs1 = parse_cfg_text(cfg_file.read())
     with open(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
         cfgs2 = parse_cfg_text(cfg_file.read())
-    cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], [line_num_in_old_commit])
+    cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit_list)
     if not bb1s:
-        logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit} line after patch {line_num_after_patch}')
+        logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
         return None, None, None, None
 
     for key, patch in diff_results.items():
@@ -2471,10 +2485,7 @@ def revert_patch_test(args):
             if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
                 # Solve other declarations and definitions first; Because they may lead to miss_decls here
                 # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-                bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
-
-            # Process function signature changes
-            process_function_signature_changes(function_sig_changes, trace1, final_patches, diff_results, extra_patches)
+                bb_change_pair = process_undeclared_identifiers(function_sig_changes, miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
 
             path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys())
 
