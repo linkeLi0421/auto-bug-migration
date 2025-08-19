@@ -176,7 +176,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
     
         new_patch_key_list.add(new_key)
     
-    return list(new_patch_key_list), function_declarations
+    return new_patch_key_list, function_declarations
 
 
 def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
@@ -970,8 +970,6 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     if not os.path.exists(fuzzer_path) or any(error_pattern in result.stderr or error_pattern in result.stdout 
             for error_pattern in build_error_patterns) or result.returncode != 0:
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
-        # logger.error(f'result.stderr: {result.stderr}')
-        # logger.error(f'result.stdout: {result.stdout}')
         return False, result.stderr+result.stdout
     
     logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
@@ -2441,7 +2439,9 @@ def revert_patch_test(args):
                     logger.error(f'Cannot find {identifier} in parsing_path: {parsing_path}!')
 
             new_patch_key_list, function_declarations = process_function_signature_changes(function_sig_changes, final_patches, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs)
-            final_patches.extend(new_patch_key_list)
+            for key in new_patch_key_list:
+                if key not in final_patches:
+                    final_patches.append(key)
             final_patches = sorted(final_patches, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
             add_context(diff_results, final_patches, next_commit['commit_id'], target_repo_path)
             handle_file_change(diff_results, final_patches)
