@@ -189,6 +189,7 @@ def test_fuzzer(project: str, fuzz_target: str, max_time: int = 30) -> None:
 
     total_runtime = 0
     print(f"[*] Starting fuzz test for {max_time} seconds...")
+    print(f'{cmd}')
     for i in range(10):
         start_time = time.time()
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
