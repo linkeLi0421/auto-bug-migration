@@ -71,8 +71,8 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
                 if func_code[-1] != '\n':
                     # This function is in the last line of the file, without a \n will cause the patch to fail
                     func_length += 1
-                return func_code, func_length
-    return None, 0
+                return func_code, func_length, ast_node['extent']['start']['line']
+    return None, 0, 0
 
 
 def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_path, func_sig):
@@ -105,7 +105,7 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     return None
 
 
-def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs):
+def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict):
     # From the error_log like "too few arguments in function call" get the caller and callee info;
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
@@ -136,6 +136,8 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
             if not caller_sig and node.get('kind') in def_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
                 and max(old_line_list) <= int(node['extent']['end']['line']):
                 caller_sig = node['signature']
+        if not callee_sig:
+            logger.info(f'No callee sig found for {parsing_path}: {line_range}')
         fname = callee_sig.split('(')[0].split(' ')[-1]
         for node in ast_nodes:
             if (node.get('kind') in decl_kinds or node.get('kind') in def_kinds) and node['spelling'] == fname:
@@ -147,7 +149,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 def_file_path_new = file_path_new
 
         if callee_sig and caller_sig:
-            func_code, func_length = get_function_code_from_old_commit(target_repo_path, commit, data_path, def_file_path_old, callee_sig)
+            func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, def_file_path_old, callee_sig)
             callee_sig_new = get_new_funcsig(fname, next_commit, def_file_path_new, target_repo_path)
             if not callee_sig_new:
                 # Function change name, so insert at an abbitray point
@@ -157,6 +159,16 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 with open(os.path.join(target_repo_path, def_file_path_new), 'r') as f:
                     lines = f.readlines()
                 artificial_patch_insert_point = len(lines)+1
+                # Find call in this function, check if we need to replace them with recreated functions
+                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{def_file_path_old}_analysis.json')
+                with open(parsing_path, 'r') as f:
+                    ast_nodes = json.load(f)
+                for node in ast_nodes:
+                    if node['kind'] == 'CALL_EXPR':
+                        if start_line <= node['location']['line'] <= start_line + func_length and any('__revert_' + node['spelling'] + '(' in function_declaration for function_declaration in function_declarations):
+                            # Replace the call with the recreated function
+                            func_code = '\n'.join(rename_func(func_code, node['spelling']))
+                            
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, def_file_path_new))
             else:
                 artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
@@ -179,15 +191,15 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                 diff_results[new_key] = artificial_patch
                 new_patch_key_list.add(new_key)
+                # change the callsite, update depen_graph
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                        depen_graph.setdefault(new_key, set()).add(key)
+                        patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname))
             function_declarations.add(callee_sig.replace(fname, f'__revert_{fname}'))
         else:
             logger.error(f"{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
-            
-        # change the callsite
-        for key in patch_key_list:
-            patch = diff_results[key]
-            if 'old_signature' in patch and patch['old_signature'] == caller_sig:
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname))
             
     if len(tail_fun_info_list) > 0:
         tail_code = dict() 
@@ -220,8 +232,14 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 'old_end_line': insert_point + tail_code_len[def_file_path_old],
             }
             new_patch_key_list.add(tail_key)
+            # change the callsite, update depen_graph
+            for key in patch_key_list:
+                patch = diff_results[key]
+                if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                    depen_graph.setdefault(tail_key, set()).add(key)
+                    patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname))
             
-    return new_patch_key_list, function_declarations
+    return new_patch_key_list, function_declarations, depen_graph
 
 
 def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
@@ -1102,7 +1120,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 logger.debug(f'key {key} is a function signature change, and has dependent functions')
                 # Need a Artificial patch, to create the old function
 
-                func_code, func_length = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch['file_path_old'], patch['old_signature'])
+                func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch['file_path_old'], patch['old_signature'])
 
                 artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, patch['file_path_new'], patch['new_signature'])
 
@@ -2256,7 +2274,7 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id != 'OSV-2021-487':
+        if bug_id not in {'OSV-2021-404', 'OSV-2021-428', 'OSV-2021-439'}:
             continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
@@ -2426,7 +2444,6 @@ def revert_patch_test(args):
         if patch_to_apply:
             patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
             update_function_mappings(recreated_functions, signature_change_list)
-            # patch_to_apply = remove_unnecessary_lines(diff_results, patch_to_apply, depen_graph, trace1)
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
@@ -2524,12 +2541,12 @@ def revert_patch_test(args):
                     logger.error(f'Cannot find {identifier} in parsing_path: {parsing_path}!')
 
             for func_name, location in undeclared_functions:
+                file_path = location.split(':')[0]
+                line_num_after_patch = int(location.split(':')[1])
+                relative_file_path = file_path.split('/', 3)[-1]
                 if not func_name.startswith('__revert_'):
                     # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
                     # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
-                    file_path = location.split(':')[0]
-                    line_num_after_patch = int(location.split(':')[1])
-                    relative_file_path = file_path.split('/', 3)[-1]
                     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
                         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
                                     '--architecture', arch, '--target_file', relative_file_path, target]
@@ -2550,12 +2567,7 @@ def revert_patch_test(args):
                     line_num = get_correct_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches)
                     if not check_if_in_fuzzer(line_num, cfgs2):
                         # Treat as a signature/name change at call site; feed into process_function_signature_changes
-                        file_path, line_str, _ = location.split(':', 2)
-                        parts = location.split(':')
-                        file_path = parts[0].strip()
-                        line_str = parts[1]
-                        line_num = int(line_str)
-                        function_sig_changes.append(("", "undeclared_function", file_path, (line_num, line_num)))
+                        function_sig_changes.append(("", "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
                         continue
                     _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
                     if not bb2s:
@@ -2571,12 +2583,17 @@ def revert_patch_test(args):
 
                 else:
                     # Add declaration for the "__revert_*" function
+                    func_decl_line = dict()
                     for func_decl in function_declarations:
                         if func_name == func_decl.split('(')[0].split(' ')[-1]:
-                            func_decl_to_add.setdefault(location.split('/',3)[-1].split(':')[0], set()).add(f'{func_decl}')
+                            old_line_num = get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit['commit_id'])
+                            func_decl_to_add.setdefault(relative_file_path, set()).add(f'{func_decl}')
+                            if relative_file_path in func_decl_line:
+                                func_decl_line[relative_file_path] = min(old_line_num, func_decl_line[relative_file_path])
+                            else:
+                                func_decl_line[relative_file_path] = old_line_num
                             break
-            logger.info(f'function_sig_changes: {function_sig_changes}')
-            new_patch_key_list, function_declarations = process_function_signature_changes(function_sig_changes, final_patches, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs)
+            new_patch_key_list, function_declarations, depen_graph = process_function_signature_changes(function_sig_changes, final_patches, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
             for key in new_patch_key_list:
                 if key not in final_patches:
                     final_patches.append(key)
