@@ -606,6 +606,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
       default=False,
       help='Run builder in “cmdjson” mode (boolean flag).'
   )
+  build_version_parser.add_argument('--no_corpus',
+                            action='store_true',
+                            help='do not download corpus backup from OSS-Fuzz; use empty corpus')
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -1978,6 +1981,9 @@ def build_version(args):
     cd -;
     compile;
     '''
+
+  if args.no_corpus:
+    build_bash += 'rm /out/*.zip;'
 
   result_dir = os.path.join(HOME_DIR, 'data')
   script_dir = os.path.join(HOME_DIR, 'script')
