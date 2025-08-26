@@ -2274,7 +2274,7 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id not in {'OSV-2021-485'}:
+        if bug_id not in {'OSV-2021-404', 'OSV-2021-428', 'OSV-2021-439'}:
             continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
