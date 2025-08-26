@@ -33,12 +33,12 @@ def _sanitize_tool_output(text: str) -> str:
     return ansi_escape.sub('', text).replace('\r\n', '\n').replace('\r', '\n')
 
 
-def rename_func(patch_text, fname, replacement_string=None):
+def rename_func(patch_text, fname, commit, replacement_string=None):
     logger.debug(f'Renaming function {fname}')
     modified_lines = []
     regex = r'(?<![\w.])' + re.escape(fname) + r'(?!\w)'
     if not replacement_string:
-        replacement_string = f"__revert_{fname}"
+        replacement_string = f"__revert_{commit}_{fname}"
 
     for line in patch_text.splitlines():
         if line.startswith('-'):
@@ -165,9 +165,9 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     ast_nodes = json.load(f)
                 for node in ast_nodes:
                     if node['kind'] == 'CALL_EXPR':
-                        if start_line <= node['location']['line'] <= start_line + func_length and any('__revert_' + node['spelling'] + '(' in function_declaration for function_declaration in function_declarations):
+                        if start_line <= node['location']['line'] <= start_line + func_length and any(f'__revert_{commit}_{node['spelling']}(' in function_declaration for function_declaration in function_declarations):
                             # Replace the call with the recreated function
-                            func_code = '\n'.join(rename_func(func_code, node['spelling']))
+                            func_code = '\n'.join(rename_func(func_code, node['spelling'], commit))
                             
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, def_file_path_new))
             else:
@@ -179,8 +179,8 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     'file_path_old': def_file_path_old,
                     'file_path_new': def_file_path_new,
                     'file_type': 'c',
-                    'patch_text': '\n'.join(rename_func(patch_header + func_code, fname)),
-                    'old_signature': callee_sig, # __revert_{fname} is not added here
+                    'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                    'old_signature': callee_sig, # __revert_{commit}_{fname} is not added here
                     'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
                     'dependent_func': set(),
                     'new_start_line': artificial_patch_insert_point,
@@ -196,8 +196,8 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     patch = diff_results[key]
                     if 'old_signature' in patch and patch['old_signature'] == caller_sig:
                         depen_graph.setdefault(new_key, set()).add(key)
-                        patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname))
-            function_declarations.add(callee_sig.replace(fname, f'__revert_{fname}'))
+                        patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname, commit))
+            function_declarations.add(callee_sig.replace(fname, f'__revert_{commit}_{fname}'))
         else:
             logger.error(f"{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
@@ -222,7 +222,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 'file_path_old': def_file_path_old,
                 'file_path_new': def_file_path_new,
                 'file_type': 'c',
-                'patch_text': '\n'.join(rename_func(patch_header + tail_code[def_file_path_old], fname)),
+                'patch_text': '\n'.join(rename_func(patch_header + tail_code[def_file_path_old], fname, commit)),
                 'old_signature': None,
                 'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
                 'dependent_func': set(),
@@ -237,7 +237,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 patch = diff_results[key]
                 if 'old_signature' in patch and patch['old_signature'] == caller_sig:
                     depen_graph.setdefault(tail_key, set()).add(key)
-                    patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname))
+                    patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname, commit))
             
     return new_patch_key_list, function_declarations, depen_graph
 
@@ -1096,12 +1096,12 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         if 'Function body change' in patch['patch_type']:
             if 'Function removed' in patch['patch_type'] and not 'Function added' in patch['patch_type']:
                 # add prefix to function being deleted
-                modified_lines = rename_func(patch['patch_text'], fname)
-                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}')) # do not use rename_func here, because it only change line starting with '-'
+                modified_lines = rename_func(patch['patch_text'], fname, commit)
+                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{commit}_{fname}')) # do not use rename_func here, because it only change line starting with '-'
                 patch['patch_text'] = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
                 for dep_key in dependence_graph.get(key, []):
-                    modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname)
+                    modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname, commit)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
                 recreated_functions.add(patch['old_signature'])
@@ -1133,8 +1133,8 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                         'file_path_old': patch['file_path_old'],
                         'file_path_new': patch['file_path_new'],
                         'file_type': patch['file_type'],
-                        'patch_text': '\n'.join(rename_func(patch_header + func_code, fname)),
-                        'old_signature': patch['old_signature'], # __revert_{fname} is not added here
+                        'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                        'old_signature': patch['old_signature'], # __revert_commit_{fname} is not added here
                         'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
                         'dependent_func': set(),
                         'new_start_line': artificial_patch_insert_point,
@@ -1149,7 +1149,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code)
                 
                 diff_results[new_key] = artificial_patch
-                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{fname}'))
+                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{commit}_{fname}'))
                 new_patch_to_apply.append(new_key)
                 reserved_keys.add(new_key)
                 key_to_newkey[key] = new_key
@@ -1165,7 +1165,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
             caller_key = key_to_newkey.get(caller_key, caller_key)
-            modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname)
+            modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname, commit)
             diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
     
     # Remove patches that are not needed anymore
@@ -1631,7 +1631,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         # If the function is recreated, add a call to it
                         start_line = old_line_begin + i
                         end_line = start_line + 1
-                        patch_text = rename_func(f'-{line}', recreated_fname)[0] + '\n+' + line[:-1]
+                        patch_text = rename_func(f'-{line}', recreated_fname, commit)[0] + '\n+' + line[:-1]
                         patch_text = patch_header + f"@@ -{start_line},{1} +{start_line},{1} @@\n" + patch_text
                         patch = {
                             'file_path_old': file_path,
@@ -1661,14 +1661,14 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
     """
     Updates patches within LLVMFuzzerTestOneInput function to handle function call replacements when reverting patches.
     
-    This function ensures that function calls within the fuzzer are properly mapped from their __revert_ prefixed 
+    This function ensures that function calls within the fuzzer are properly mapped from their __revert_commit prefixed 
     versions back to their original names when patches are being reverted. It handles both existing patches that 
     need updating and creates new patches for function calls that aren't covered by existing patches.
     
     Args:
         diff_results: Dictionary containing all patch information
         patch_to_apply: List of patch keys to be applied
-        recreated_functions: List of function signatures that have been recreated with __revert_ prefix
+        recreated_functions: List of function signatures that have been recreated with __revert_commit prefix
         target_repo_path: Path to the target repository
         commit: Current commit hash
         next_commit: Next commit hash
@@ -1727,7 +1727,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     for i, line in enumerate(lines):
                         if line[0] not in {'-', '+'} and re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
                             # If the function is called in this patch, we need to update the call
-                            rm_line = rename_func(f'-{line[1:]}', node['spelling'])[0]
+                            rm_line = rename_func(f'-{line[1:]}', node['spelling'], commit)[0]
                             add_line = f'+{line[1:]}'
                             new_lines.append(rm_line)
                             new_lines.append(add_line)
@@ -1747,8 +1747,8 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     function_line = content[node['location']['line']-1]
                     assert(node['extent']['start']['line'] == node['extent']['end']['line']), f'Function call should be in one line, but got {node["extent"]["start"]["line"]} - {node["extent"]["end"]["line"]}'
 
-                # Create patch lines for reverting __revert_ functions back to original names
-                rm_line = rename_func(f'-{function_line}', node['spelling'])[0]
+                # Create patch lines for reverting __revert_commit_ functions back to original names
+                rm_line = rename_func(f'-{function_line}', node['spelling'], commit)[0]
                 add_line = f'+{function_line.replace('\n', '')}'
                 
                 # Construct complete patch text
@@ -1778,11 +1778,11 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                 patch_to_apply.append(new_key)
 
 
-def update_function_mappings(recreated_functions, signature_change_list):
+def update_function_mappings(recreated_functions, signature_change_list, commit: str):
     # add mapping for recreated functions
     for func_sig in recreated_functions:
         func_name = func_sig.split('(')[0].split(' ')[-1]
-        signature_change_list.append((func_name, f'__revert_{func_name}'))
+        signature_change_list.append((func_name, f'__revert_{commit}_{func_name}'))
 
 
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
@@ -1852,7 +1852,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     front_context_num = 0 # should be less than 3
     patch_flag = False
     if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num]['patch_type']:
-        # for __revert_{fname} function, we need to find the line number in the old function
+        # for __revert_{commit}_{fname} function, we need to find the line number in the old function
         for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:]:
             if line.startswith('-'):
                 index_old_infun += 1
@@ -2274,7 +2274,7 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id not in {'OSV-2021-404', 'OSV-2021-428', 'OSV-2021-439'}:
+        if bug_id not in {'OSV-2021-485'}:
             continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
@@ -2443,7 +2443,7 @@ def revert_patch_test(args):
         # Save all patches to a single file
         if patch_to_apply:
             patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
-            update_function_mappings(recreated_functions, signature_change_list)
+            update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
             final_patches = []
             for key in patch_to_apply:
@@ -2498,7 +2498,7 @@ def revert_patch_test(args):
                     file_path_old = file_path_pairs[file_path_new]
                 else:
                     file_path_old = file_path_new
-                if identifier.startswith('__revert_'):
+                if identifier.startswith(f'__revert_{commit["commit_id"]}_'):
                     # Assign a recreated function to a function pointer
                     undeclared_functions.append((identifier, location))
                     continue
@@ -2544,7 +2544,7 @@ def revert_patch_test(args):
                 file_path = location.split(':')[0]
                 line_num_after_patch = int(location.split(':')[1])
                 relative_file_path = file_path.split('/', 3)[-1]
-                if not func_name.startswith('__revert_'):
+                if not func_name.startswith(f'__revert_{commit["commit_id"]}_'):
                     # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
                     # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
                     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
@@ -2582,7 +2582,7 @@ def revert_patch_test(args):
                             __keep_bb_in_patch(bb2s[0].start_line, bb2s[0].end_line, key, final_patches, diff_results)
 
                 else:
-                    # Add declaration for the "__revert_*" function
+                    # Add declaration for the "__revert_commit_*" function
                     func_decl_line = dict()
                     for func_decl in function_declarations:
                         if func_name == func_decl.split('(')[0].split(' ')[-1]:
