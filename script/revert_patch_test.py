@@ -1232,6 +1232,10 @@ def compare_function_signatures(sig1, sig2, ignore_arg_types=False):
 
 
 def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_commit, trace1):
+    # Starts with patch_to_apply are patches of common part of trace1 and trace2.
+    # Find callees of patch_to_apply functions, if they are in trace1 add an edge from
+    # the callee definition patch to this patch(caller). Specifically, do this for the 
+    # patches remove the function definition or change the function definition.
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1242,10 +1246,6 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     trace_function_names = set()
     for index, func in trace1:
         trace_function_names.add(func.split(' ')[0])
-    # 1. Function Call Relationship;
-    # in old version of this patch, if there is a call to a fucntion, create an edge from
-    # the callee definition patch to this patch(caller). specifically, do this for the patches remove
-    # the function definition or change the function def.
     while patch_list:
         key = patch_list.pop()
         if key in visited_patches:
@@ -2440,7 +2440,6 @@ def revert_patch_test(args):
         if not os.path.exists(patch_folder):
             os.makedirs(patch_folder, exist_ok=True)
         
-        # Save all patches to a single file
         if patch_to_apply:
             patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
             update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
