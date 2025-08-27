@@ -57,6 +57,11 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{file_path}_analysis.json')
+    parsing_path = os.path.join(
+        data_path,
+        f"{target_repo_path.split('/')[-1]}-{commit}",
+        f"{file_path}_analysis.json",
+    )
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for ast_node in ast_nodes:
@@ -81,7 +86,11 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
-    parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit}', f'{file_path}_analysis.json')
+    parsing_path = os.path.join(
+        data_path,
+        f"{target_repo_path.split('/')[-1]}-{next_commit}",
+        f"{file_path}_analysis.json",
+    )
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     artificial_patch_insert_point = -1
@@ -95,7 +104,11 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
 
 
 def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
-    parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{next_commit}', f'{file_path_new}_analysis.json')
+    parsing_path = os.path.join(
+        data_path,
+        f"{target_repo_path.split('/')[-1]}-{next_commit}",
+        f"{file_path_new}_analysis.json",
+    )
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     def_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
@@ -120,7 +133,11 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
         old_line_list = []
         for line_num in range(line_range[0], line_range[1] + 1):
             old_line_list.append(get_old_line_num(file_path_new, line_num, patch_key_list, diff_results, extra_patches, target, commit))
-        parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{file_path_old}_analysis.json')
+        parsing_path = os.path.join(
+            data_path,
+            f"{target_repo_path.split('/')[-1]}-{commit}",
+            f"{file_path_old}_analysis.json",
+        )
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
         call_kinds = {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}
@@ -160,12 +177,19 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     lines = f.readlines()
                 artificial_patch_insert_point = len(lines)+1
                 # Find call in this function, check if we need to replace them with recreated functions
-                parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{def_file_path_old}_analysis.json')
+                parsing_path = os.path.join(
+                    data_path,
+                    f"{target_repo_path.split('/')[-1]}-{commit}",
+                    f"{def_file_path_old}_analysis.json",
+                )
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 for node in ast_nodes:
                     if node['kind'] == 'CALL_EXPR':
-                        if start_line <= node['location']['line'] <= start_line + func_length and any(f'__revert_{commit}_{node['spelling']}(' in function_declaration for function_declaration in function_declarations):
+                        if start_line <= node['location']['line'] <= start_line + func_length and any(
+                            f"__revert_{commit}_{node['spelling']}(" in function_declaration
+                            for function_declaration in function_declarations
+                        ):
                             # Replace the call with the recreated function
                             func_code = '\n'.join(rename_func(func_code, node['spelling'], commit))
                             
@@ -1253,7 +1277,9 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
             continue
         visited_patches.add(key)
         new_patch_to_patch.append(key)
-        logger.debug(f'Analyzing patch {key}\n{diff_results[key]['patch_text']}')
+        logger.debug(
+            f"Analyzing patch {key}\n{diff_results[key]['patch_text']}"
+        )
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
             patch_text = patch['patch_text']
@@ -2266,14 +2292,13 @@ def apply_and_test_patches(
     arch,
     file_path_pairs,
     data_path,
-    py3,
-    current_file_path,
-    testcases_env,
     bug_type,
     get_patched_traces,
     transitions,
     revert_and_trigger_set,
     revert_and_trigger_fail_set,
+    function_declarations,
+    depen_graph,
 ):
     add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     llvm_fuzzer_test_one_input_patch_update(diff_results, final_patches, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
@@ -2587,6 +2612,7 @@ def apply_and_test_patches(
         union_to_add_len = len(union_to_add)
         type_def_to_add_len = len(type_def_to_add)
         
+    testcases_env = os.getenv('TESTCASES', '')
     if build_success:
         # Run the fuzzer to test if the bug is reproduced
         testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
@@ -2830,14 +2856,13 @@ def revert_patch_test(args):
             arch,
             file_path_pairs,
             data_path,
-            py3,
-            current_file_path,
-            testcases_env,
             bug_type,
             get_patched_traces,
             transitions,
             revert_and_trigger_set,
             revert_and_trigger_fail_set,
+            function_declarations,
+            depen_graph,
         )
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
