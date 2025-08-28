@@ -12,6 +12,8 @@ from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from cfg_parser import parse_cfg_text, find_block_by_line, compute_data_dependencies
+from utils import minimize_greedy, minimize_ddmin
+from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
 
 logger = logging.getLogger(__name__)
@@ -24,13 +26,6 @@ logger.addHandler(stream_handler)
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
-
-
-def _sanitize_tool_output(text: str) -> str:
-    """Remove ANSI escape sequences and normalize newlines from build tool output."""
-    # ANSI escape sequence pattern
-    ansi_escape = re.compile(r'\x1B(?:[@-Z\-_]|\[[0-?]*[ -/]*[@-~])')
-    return ansi_escape.sub('', text).replace('\r\n', '\n').replace('\r', '\n')
 
 
 def rename_func(patch_text, fname, commit, replacement_string=None):
@@ -154,7 +149,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 and max(old_line_list) <= int(node['extent']['end']['line']):
                 caller_sig = node['signature']
         if not callee_sig:
-            logger.info(f'No callee sig found for {parsing_path}: {line_range}')
+            logger.info(f'No callee sig found for {parsing_path}: {line_range} : {old_line_list}')
         fname = callee_sig.split('(')[0].split(' ')[-1]
         for node in ast_nodes:
             if (node.get('kind') in decl_kinds or node.get('kind') in def_kinds) and node['spelling'] == fname:
@@ -1019,6 +1014,22 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
     return results
 
 
+def clean_log(text: str) -> str:
+    _ANSI_RE = re.compile(r'\x1B\[[0-?]*[ -/]*[@-~]')  # ANSI CSI sequences
+    _BACKSPACE_RE = re.compile(r'.\x08')               # overstrike patterns
+
+    if not text:
+        return ''
+    # normalize carriage returns from progress bars
+    text = text.replace('\r', '\n')
+    # remove backspace overstrikes
+    text = _BACKSPACE_RE.sub('', text)
+    # strip ANSI escape codes
+    text = _ANSI_RE.sub('', text)
+    # collapse duplicate newlines
+    return re.sub(r'\n{3,}', '\n\n', text)
+
+
 def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch):
     cmd = [
         "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
@@ -1026,30 +1037,11 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     ]
 
     logger.info(' '.join(cmd))
-    # Disable colored diagnostics and progress bars and ensure unbuffered behavior
-    env = os.environ.copy()
-    env.update({
-        "PYTHONUNBUFFERED": "1",
-        "TERM": "dumb",
-        "CLICOLOR": "0",
-        "CLICOLOR_FORCE": "0",
-        "FORCE_COLOR": "0",
-        "CLANG_FORCE_COLOR_DIAGNOSTICS": "0",
-        "GCC_COLORS": "",
-        "NINJA_STATUS": "",  # reduce ninja progress spam
-    })
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    stdout = clean_log(result.stdout)
+    stderr = clean_log(result.stderr)
+    combined = stderr + stdout
 
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        env=env,
-    )
-    
-    # Check for build errors
     build_error_patterns = [
         "Building fuzzers failed",
         "Docker build failed",
@@ -1069,18 +1061,18 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "make: *** [Makefile:",
         "ninja: build stopped:",
         "Compilation failed",
-        "failed with exit status"
-        'CMake Error',
-        'call to undeclared function'
+        "failed with exit status",   # ⬅️ add the missing comma
+        "CMake Error",               # ⬅️ this was being concatenated before
+        "call to undeclared function"
     ]
-    
+
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
-    if not os.path.exists(fuzzer_path) or any(error_pattern in result.stderr or error_pattern in result.stdout 
-            for error_pattern in build_error_patterns) or result.returncode != 0:
+    if (not os.path.exists(fuzzer_path)
+        or any(p in combined for p in build_error_patterns)
+        or result.returncode != 0):
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
-        error_log = _sanitize_tool_output(result.stderr + result.stdout)
-        return False, error_log
-    
+        return False, combined
+
     logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
     return True, ''
 
@@ -2276,10 +2268,10 @@ def get_file_path_pairs(diff_results):
 
 
 def apply_and_test_patches(
+    patch_key_list,
     diff_results,
-    final_patches,
     trace1,
-    recreated_functions,
+    # recreated_functions,
     target_repo_path,
     commit,
     next_commit,
@@ -2297,17 +2289,27 @@ def apply_and_test_patches(
     transitions,
     revert_and_trigger_set,
     revert_and_trigger_fail_set,
-    function_declarations,
+    # function_declarations,
     depen_graph,
-):
-    add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
-    llvm_fuzzer_test_one_input_patch_update(diff_results, final_patches, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
-    # Sort final_patches by new_start_line
-    final_patches = sorted(final_patches, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
-    add_context(diff_results, final_patches, next_commit['commit_id'], target_repo_path)
-    handle_file_change(diff_results, final_patches)
+    ):
+    signature_change_list = []
+    patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+    if not os.path.exists(patch_folder):
+        os.makedirs(patch_folder, exist_ok=True)
+    logger.info(f'Applying and testing {len(patch_key_list)} {patch_key_list}')
+    
+    patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
+    update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
+    patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
+    patch_key_list = list(set(patch_to_apply))
+    add_patch_for_trace_funcs(diff_results, patch_key_list, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
+    llvm_fuzzer_test_one_input_patch_update(diff_results, patch_key_list, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
+    # Sort patch_key_list by new_start_line
+    patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
+    add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
+    handle_file_change(diff_results, patch_key_list)
     with open(patch_file_path, 'w') as patch_file:
-        for key in final_patches:
+        for key in patch_key_list:
             patch = diff_results[key]   
             patch_file.write(patch['patch_text'])
             patch_file.write('\n\n')  # Add separator between patches
@@ -2334,6 +2336,8 @@ def apply_and_test_patches(
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
+        with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
+            f.write(error_log)
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes = handle_build_error(error_log)
         logger.info(f'undeclared_identifier: {undeclared_identifier}')
         logger.info(f'undeclared_functions: {undeclared_functions}')
@@ -2411,7 +2415,7 @@ def apply_and_test_patches(
                     cfgs2 = parse_cfg_text(cfg_file.read())
                 # line_num after patch -> line number before patch -> 
                 # find block start and end line in bug version -> get the part in patch need to be removed
-                line_num = get_correct_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches)
+                line_num = get_correct_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches)
                 if not check_if_in_fuzzer(line_num, cfgs2):
                     # Treat as a signature/name change at call site; feed into process_function_signature_changes
                     function_sig_changes.append(("", "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
@@ -2421,37 +2425,38 @@ def apply_and_test_patches(
                     logger.info(f'No basic block2 found for {file_path}:{line_num} in {next_commit['commit_id']}')
                     continue
                 
-                for key in final_patches:
+                for key in patch_key_list:
                     patch = diff_results[key]
                     new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
                     new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
                     if patch['file_path_new'] == relative_file_path and new_start <= bb2s[0].end_line and bb2s[0].start_line < new_start + new_offset:
-                        __keep_bb_in_patch(bb2s[0].start_line, bb2s[0].end_line, key, final_patches, diff_results)
+                        __keep_bb_in_patch(bb2s[0].start_line, bb2s[0].end_line, key, patch_key_list, diff_results)
 
             else:
                 # Add declaration for the "__revert_commit_*" function
                 func_decl_line = dict()
                 for func_decl in function_declarations:
                     if func_name == func_decl.split('(')[0].split(' ')[-1]:
-                        old_line_num = get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit['commit_id'])
+                        old_line_num = get_old_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches, target, commit['commit_id'])
                         func_decl_to_add.setdefault(relative_file_path, set()).add(f'{func_decl}')
                         if relative_file_path in func_decl_line:
                             func_decl_line[relative_file_path] = min(old_line_num, func_decl_line[relative_file_path])
                         else:
                             func_decl_line[relative_file_path] = old_line_num
                         break
-        new_patch_key_list, function_declarations, depen_graph = process_function_signature_changes(function_sig_changes, final_patches, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
+        logger.info(f'function_sig_changes: {function_sig_changes}')
+        new_patch_key_list, function_declarations, depen_graph = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
         for key in new_patch_key_list:
-            if key not in final_patches:
-                final_patches.append(key)
-        final_patches = sorted(final_patches, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
-        add_context(diff_results, final_patches, next_commit['commit_id'], target_repo_path)
-        handle_file_change(diff_results, final_patches)
+            if key not in patch_key_list:
+                patch_key_list.append(key)
+        patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
+        add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
+        handle_file_change(diff_results, patch_key_list)
         
         if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
             # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-            bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
+            bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
 
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys())
 
@@ -2547,7 +2552,7 @@ def apply_and_test_patches(
             context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
             merge_flag = 0
             
-            for key_f in final_patches:
+            for key_f in patch_key_list:
                 patch_f = diff_results[key_f]
                 if patch_f['file_path_new'] != file_path:
                     continue
@@ -2597,7 +2602,7 @@ def apply_and_test_patches(
             extra_patches[file_path] = patch
             
         with open(patch_file_path, 'w') as patch_file:
-            for key in final_patches:
+            for key in patch_key_list:
                 if key in not_write_patches:
                     continue
                 patch = diff_results[key]
@@ -2626,14 +2631,21 @@ def apply_and_test_patches(
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             if ((bug_id, next_commit['commit_id'], fuzzer) in revert_and_trigger_fail_set):
                 revert_and_trigger_fail_set.remove((bug_id, next_commit['commit_id'], fuzzer))
-            logger.info(f"Bug {bug_id} triggered successfully with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
+            if test_fuzzer_build(target, sanitizer, arch):
+                logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
+                return 'trigger_and_fuzzer_build'
+            else:
+                logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
+                return 'trigger_but_fuzzer_build_fail'
         else:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
             get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
             transitions.append((commit, next_commit, bug_id))
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
+            return 'not_trigger'
     else:
         logger.info(f"Build failed for bug {bug_id} on commit {next_commit['commit_id']}\n")
+        return 'build_fail'
 
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
@@ -2821,49 +2833,17 @@ def revert_patch_test(args):
                     break
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
-        patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
-        
-        if not os.path.exists(patch_folder):
-            os.makedirs(patch_folder, exist_ok=True)
-        
-        if patch_to_apply:
-            patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_to_apply, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
-            update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
-            final_patches = []
-            for key in patch_to_apply:
-                if key not in final_patches:
-                    final_patches.append(key)
-        else:
-            logger.error(f"No relevant patches found to revert for bug {bug_id}\n")
-            continue
 
-
-        apply_and_test_patches(
-            diff_results,
-            final_patches,
-            trace1,
-            recreated_functions,
-            target_repo_path,
-            commit,
-            next_commit,
-            target,
-            patch_file_path,
-            sanitizer,
-            bug_id,
-            fuzzer,
-            args,
-            arch,
-            file_path_pairs,
-            data_path,
-            bug_type,
-            get_patched_traces,
-            transitions,
-            revert_and_trigger_set,
-            revert_and_trigger_fail_set,
-            function_declarations,
-            depen_graph,
-        )
+        context = (diff_results, trace1, target_repo_path, commit, next_commit, target,
+            patch_file_path, sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, bug_type,
+            get_patched_traces, transitions, revert_and_trigger_set, revert_and_trigger_fail_set,
+            depen_graph,)
+        # apply_and_test_patches(patch_to_apply[2:], *context)
+        logger.info(f'Initial revert patch set: {len(patch_to_apply)} {patch_to_apply}')
+        minimal_fast = minimize_greedy(patch_to_apply, apply_and_test_patches, context)
+        logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
+        # minimal_1min = minimize_ddmin(minimal_fast, apply_and_test_patches, context)
+        # logger.info(f'Minimal revert patch set: {len(minimal_1min)} {minimal_1min}')
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")

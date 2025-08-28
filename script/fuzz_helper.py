@@ -1914,6 +1914,18 @@ def build_version(args):
       'SANITIZER=' + args.sanitizer,
       'ARCHITECTURE=' + args.architecture,
       'HELPER=True',
+
+      # ↓↓↓ make/ninja/cmake parallelism & output
+      'MAKEFLAGS=--output-sync=line -j1',   # one job; flush by line
+      'CMAKE_BUILD_PARALLEL_LEVEL=1',       # cmake-driven builds
+      'NINJA_STATUS=',                      # silence progress bar
+      # color off to avoid ANSI control sequences
+      'TERM=dumb',
+      'CLICOLOR=0',
+      'FORCE_COLOR=0',
+      'GCC_COLORS=',
+      'CLANG_FORCE_COLOR=0',
+      'CMAKE_COLOR_DIAGNOSTICS=OFF',
   ]
 
   if args.project.name != 'base-runner-debug':
