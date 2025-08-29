@@ -1707,6 +1707,9 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_file_path = patch['file_path_new']
             fuzzer_new_signature = patch['new_signature']
             fuzzer_old_signature = patch['old_signature']
+    if not fuzzer_keys:
+        # No patches for LLVMFuzzerTestOneInput, nothing to do
+        return
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
     parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{fuzzer_file_path}_analysis.json')
@@ -2268,10 +2271,9 @@ def get_file_path_pairs(diff_results):
 
 
 def apply_and_test_patches(
-    patch_key_list,
+    patch_pair_list,
     diff_results,
     trace1,
-    # recreated_functions,
     target_repo_path,
     commit,
     next_commit,
@@ -2289,10 +2291,10 @@ def apply_and_test_patches(
     transitions,
     revert_and_trigger_set,
     revert_and_trigger_fail_set,
-    # function_declarations,
     depen_graph,
     ):
     signature_change_list = []
+    patch_key_list = [key for keys in patch_pair_list for key in keys]
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
@@ -2838,9 +2840,15 @@ def revert_patch_test(args):
             patch_file_path, sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, bug_type,
             get_patched_traces, transitions, revert_and_trigger_set, revert_and_trigger_fail_set,
             depen_graph,)
-        # apply_and_test_patches(patch_to_apply[2:], *context)
-        logger.info(f'Initial revert patch set: {len(patch_to_apply)} {patch_to_apply}')
-        minimal_fast = minimize_greedy(patch_to_apply, apply_and_test_patches, context)
+        patch_by_func = dict()
+        for key in patch_to_apply:
+            if 'new_signature' in diff_results[key]:
+                patch_by_func.setdefault(diff_results[key]['new_signature'], []).append(key)
+            else:
+                patch_by_func.setdefault(diff_results[key]['old_signature'], []).append(key)
+        patch_pair_list = [tuple(v) for v in patch_by_func.values()]
+        logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+        minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, context)
         logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
         # minimal_1min = minimize_ddmin(minimal_fast, apply_and_test_patches, context)
         # logger.info(f'Minimal revert patch set: {len(minimal_1min)} {minimal_1min}')
