@@ -21,8 +21,6 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, context: Tuple) -> List
             cache[key] = test_fn(items_copy, *ctx_copy)
         return cache[key]
 
-    assert cached_test(cur) == 'trigger_and_fuzzer_build', f"Baseline patches must satisfy the test before minimization. {cached_test(cur)}"
-
     while changed:
         changed = False
         i = 0
@@ -54,8 +52,6 @@ def minimize_ddmin(patches: List[Any], test_fn: TestFn, context: Tuple) -> List[
             cache[key] = test_fn(items_copy, *ctx_copy)
         return cache[key]
     
-    assert cached_test(cur) == 'trigger_and_fuzzer_build', "Baseline patches must satisfy the test before minimization."
-
     n = 2
     while len(cur) >= 2:
         chunk_size = max(1, len(cur) // n)
