@@ -1061,8 +1061,8 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "make: *** [Makefile:",
         "ninja: build stopped:",
         "Compilation failed",
-        "failed with exit status",   # ⬅️ add the missing comma
-        "CMake Error",               # ⬅️ this was being concatenated before
+        "failed with exit status",
+        "CMake Error",
         "call to undeclared function"
     ]
 
@@ -1181,6 +1181,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
             caller_key = key_to_newkey.get(caller_key, caller_key)
+            if caller_key not in diff_results:
+                # for minimal patch
+                continue
             modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname, commit)
             diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
     
@@ -2298,7 +2301,7 @@ def apply_and_test_patches(
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
-    logger.info(f'Applying and testing {len(patch_key_list)} {patch_key_list}')
+    logger.info(f'Applying and testing {len(patch_pair_list)} {patch_pair_list}')
     
     patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
     update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
@@ -2674,7 +2677,7 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id not in {'OSV-2021-485'}:
+        if bug_id not in {'OSV-2021-485', 'OSV-2021-496'}:
             continue
         next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
         commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
@@ -2847,11 +2850,15 @@ def revert_patch_test(args):
             else:
                 patch_by_func.setdefault(diff_results[key]['old_signature'], []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
-        logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-        minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, context)
-        logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
-        # minimal_1min = minimize_ddmin(minimal_fast, apply_and_test_patches, context)
-        # logger.info(f'Minimal revert patch set: {len(minimal_1min)} {minimal_1min}')
+        if not apply_and_test_patches(patch_pair_list, *context):
+            revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+        else:
+            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, context)
+            logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
+            # make sure we have a correct minimal patch
+            apply_and_test_patches(minimal_fast, *context)
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
