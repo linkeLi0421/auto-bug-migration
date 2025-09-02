@@ -77,6 +77,49 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     return None, 0, 0
 
 
+def get_function_code_by_line(target_repo_path, commit, data_path, file_path, line_number):
+    """Get function code that contains a given line number from the old commit"""
+    os.chdir(target_repo_path)
+    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8',
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8',
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    parsing_path = os.path.join(
+        data_path,
+        f"{target_repo_path.split('/')[-1]}-{commit}",
+        f"{file_path}_analysis.json",
+    )
+
+    if not os.path.exists(parsing_path):
+        raise FileNotFoundError(f"AST analysis not found: {parsing_path}")
+
+    with open(parsing_path, 'r') as f:
+        ast_nodes = json.load(f)
+
+    for ast_node in ast_nodes:
+        if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+            continue
+        if ast_node['extent']['start']['file'] != file_path:
+            continue
+
+        start_line = ast_node['extent']['start']['line']
+        end_line   = ast_node['extent']['end']['line']
+
+        if start_line <= line_number <= end_line:
+            with open(os.path.join(target_repo_path, file_path), 'r') as fsrc:
+                file_content = fsrc.readlines()
+                func_code = ''.join(
+                    file_content[start_line-1:end_line]
+                )
+                func_length = func_code.count('\n')
+                if func_code and func_code[-1] != '\n':
+                    func_length += 1
+                return func_code, func_length, start_line
+
+    return None, 0, 0
+
+
 def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_path, func_sig):
     """Get patch insert line number from new commit for the Artificial patch"""
     os.chdir(target_repo_path)
@@ -546,102 +589,6 @@ def find_transitions(data, repo_path):
     return transitions
 
 
-'''
-Function-Level Changes
-* **Function Signature Change**:
-    * `Function Rename`: Changing the name of a function.
-    * `Parameter Addition`: Adding one or more parameters to a function.
-    * `Parameter Removal`: Removing one or more parameters from a function.
-    * `Parameter Type Change`: Modifying the data type of one or more function parameters.
-    * `Parameter Order Change`: Reordering existing function parameters.
-    * `Return Type Change`: Modifying the data type of the function's return value.
-    * `Qualifier Change`: Adding/removing `const`, `static`, `inline`, `virtual`, `explicit`, `volatile` qualifiers to a function.
-* **Function Body Change**:
-    * `Logic Change`: Modifying the internal logic or algorithm within a function.
-    * `Statement Addition`: Adding new lines of executable code.
-    * `Statement Deletion`: Removing existing lines of executable code.
-    * `Statement Modification`: Changing existing lines of executable code.
-    * `Function Call Added`: Introducing a call to another function.
-    * `Function Call Removed`: Removing a call to another function.
-    * `Function Call Argument Change`: Modifying arguments passed to a function call.
-* **Function Definition/Declaration**:
-    * `Function Added`: A new function is defined.
-    * `Function Removed`: An existing function definition is removed.
-    * `Function Declaration Added/Removed/Modified`: Changes to forward declarations, typically in header files.
-
-Class/Struct-Level Changes (primarily C++)
-* **Class/Struct Definition**:
-    * `Class/Struct Added`: A new class or struct is defined.
-    * `Class/Struct Removed`: An existing class or struct definition is removed.
-    * `Class/Struct Rename`: Changing the name of a class or struct.
-* **Member Changes**:
-    * `Member Variable Added`: Adding a new data member.
-    * `Member Variable Removed`: Removing an existing data member.
-    * `Member Variable Type Change`: Changing the type of a data member.
-    * `Member Variable Rename`: Renaming a data member.
-    * `Member Function Added` (see Function-Level Changes for methods).
-    * `Member Function Removed` (see Function-Level Changes for methods).
-    * `Access Specifier Change`: Changing `public`, `protected`, or `private` status of members.
-* **Inheritance/Polymorphism**:
-    * `Base Class Added`: Adding a new base class (inheritance).
-    * `Base Class Removed`: Removing a base class.
-    * `Virtual Function Added/Removed/Modified`: Changes related to polymorphism.
-    * `Override Specifier Added/Removed`: Adding/removing `override`.
-    * `Final Specifier Added/Removed`: Adding/removing `final`.
-* **Constructor/Destructor Changes**:
-    * `Constructor Added/Removed/Modified`.
-    * `Destructor Added/Removed/Modified`.
-    * `Default Constructor/Destructor Added/Removed` (e.g., `= default`, `= delete`).
-
-Control Flow Changes
-* `Conditional Statement Added/Removed/Modified`: Changes to `if`, `else if`, `else`, `switch` statements.
-* `Loop Added/Removed/Modified`: Changes to `for`, `while`, `do-while` loops.
-* `Break/Continue Statement Added/Removed`.
-* `Return Statement Added/Removed/Modified`.
-* `Goto Statement Added/Removed/Modified` (less common, but possible).
-
-Data Type Changes
-* `Typedef Change`: Modifying a `typedef` definition.
-* `Using Alias Change` (C++): Modifying a `using` alias for a type.
-* `Enum Definition Added/Removed/Modified`: Changes to enumerations.
-* `Union Definition Added/Removed/Modified`: Changes to unions.
-
-Preprocessor Changes
-* `Macro Definition Added/Removed/Modified`: Changes to `#define`.
-* `Include Directive Added/Removed/Modified`: Changes to `#include`.
-* `Conditional Compilation Added/Removed/Modified`: Changes involving `#ifdef`, `#ifndef`, `#if`, `#else`, `#elif`, `#endif`.
-
-Variable/Attribute Changes
-* `Variable Declaration Added/Removed`: Adding or removing local or global variables.
-* `Variable Initialization Change`: Modifying how a variable is initialized.
-* `Variable Type Change`: Changing the data type of a variable.
-* `Static Variable Added/Removed/Modified`.
-* `Extern Variable Declaration Added/Removed/Modified`.
-* `Constant Definition Added/Removed/Modified`: Changes to `const` variables.
-
-Error Handling Changes
-* `Exception Handling Added/Removed/Modified` (C++): Changes to `try`, `catch`, `throw`.
-* `Error Code Check Added/Removed/Modified`: Changes in how function return values or error flags are checked.
-
-Memory Management Changes
-* `Dynamic Memory Allocation Added/Removed/Modified`: Changes involving `new`/`delete` (C++) or `malloc`/`calloc`/`realloc`/`free` (C).
-* `Smart Pointer Usage Added/Removed/Modified` (C++): e.g., `std::unique_ptr`, `std::shared_ptr`.
-
-Concurrency Changes (C++11 and later, or using pthreads, etc.)
-* `Thread Creation/Management Change`.
-* `Mutex/Lock/Semaphore Usage Added/Removed/Modified`.
-* `Atomic Operation Added/Removed/Modified`.
-* `Condition Variable Usage Added/Removed/Modified`.
-
-Style/Formatting Changes
-* `Whitespace Change`: Modifications to spaces, tabs, newlines that don't affect logic.
-* `Comment Added/Removed/Modified`.
-* `Code Reformatting`: Changes that only alter the layout of the code (e.g., brace style, indentation). *Often, these are filtered out or handled separately in semantic diff tools.*
-'''
-def get_diff_type(diff):
-    pass
-
-
 def extract_revert_patch(h, line_start, line_end, version):
     """
     Extract and create a partial revert patch from a given diff hunk.
@@ -1081,19 +1028,11 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     
     for key in patch_to_apply:
         patch = diff_results[key]
-        patch_text = patch['patch_text']
-        lines = patch_text.split('\n')
         if 'old_signature' not in patch:
             # skip for a added function
             new_patch_to_apply.append(key)
             continue
         fname = patch['old_signature'].split('(')[0].split(' ')[-1]
-        old_line_info = key.split('-')[-1].split('+')[0]
-        old_line_begin = int(old_line_info.split(',')[0])
-        old_line_end = int(old_line_info.split(',')[1]) + old_line_begin
-        new_line_info = key.split('+')[-1]
-        new_line_begin = int(new_line_info.split(',')[0])
-        new_line_end = int(new_line_info.split(',')[1]) + new_line_begin
         
         if fname == 'LLVMFuzzerTestOneInput':
             # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
@@ -1165,7 +1104,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             new_patch_to_apply.append(key)
             logger.debug(f"Skipping non-function body change for {key}")
             
-    # 5. Rename the function by dependency graph, find the caller of the recreated function
+    # Rename the function by dependency graph, find the caller of the recreated function
     for key in key_to_newkey:
         patch = diff_results[key]
         fname = patch['old_signature'].split('(')[0].split(' ')[-1]
@@ -1268,12 +1207,13 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         )
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
-            patch_text = patch['patch_text']
             parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch['file_path_old']}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
             # filter for call expressions (clang cursors for function calls)
             call_kinds = {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}
+            def_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
+            decl_kinds = {'FUNCTION_DECL'}
             for node in ast_nodes:
                 if node.get('kind') not in call_kinds:
                     continue
@@ -1288,15 +1228,39 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                     if 'signature' not in node['callee']:
                         # function like zalloc
                         continue
-                    if node['callee']['signature'].split('(')[0].split(' ')[-1] not in trace_function_names:
+                    if node['spelling'] not in trace_function_names:
                         # if the function is not in the trace, skip it
                         continue
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
+                    callee_change_flag = False
                     for key1, diff_result in diff_results.items():
                         if 'old_signature' in diff_result and compare_function_signatures(node['callee']['signature'], diff_result['old_signature']):
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
+                            callee_change_flag = True
+                    if not callee_change_flag:
+                        # The callee function do not change betwee this two versions, add a pseudo patch
+                        # Should I find the callee file
+                        for node1 in ast_nodes:
+                            if not (node1.get('kind') in decl_kinds or node1.get('kind') in def_kinds):
+                                continue
+                            def_file_path = node1['location']['file'].replace('.h', '.c')
+                            if compare_function_signatures(node['callee']['signature'], node1['signature']):
+                                new_patch = {
+                                    'patch_text': f'diff --git a/{def_file_path} b/{def_file_path}\n--- a/{def_file_path}\n+++ b/{def_file_path}\n',
+                                    'patch_type': {'Pseudo', 'Function body change'},
+                                    'old_signature': node1['signature'],
+                                    'new_signature': node1['signature'],
+                                    'file_path_old': def_file_path,
+                                    'file_path_new': def_file_path,
+                                    'file_type': 'c',
+                                }
+                                break
+                        pseudo_key = f'pseudo_{def_file_path}_{node1['spelling']}'
+                        diff_results[pseudo_key] = new_patch
+                        patch_list.append(pseudo_key)
+                        dependence_graph.setdefault(pseudo_key, set()).add(key)
                             
     return dependence_graph, new_patch_to_patch
 
@@ -1320,15 +1284,15 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
         if lines[4][0] == '-': # meaning this patch has no context
-            if patch['file_path_new'] in patch_prev_key and prev_new_start_line[patch['file_path_new']]-3 <= patch['new_end_line']-1 and patch['new_start_line'] <= prev_new_end_line[patch['file_path_new']]+3:
+            if patch['file_path_new'] in patch_prev_key and patch['new_start_line'] <= prev_new_end_line[patch['file_path_new']]+3:
                 # merge the patches that have overlap
                 patch_prev = diff_results[patch_prev_key[patch['file_path_new']]]
                 patch_prev_lines = patch_prev['patch_text'].split('\n')
-                connect_lines_begin = patch['new_end_line']
-                connect_lines_end = patch_prev['new_start_line']
+                connect_lines_end = patch['new_start_line']
+                connect_lines_begin = patch_prev['new_end_line']
                 if connect_lines_begin < connect_lines_end:
                     with open(os.path.join(target_repo_path, patch['file_path_new']), 'r') as f:
-                        connect_lines = [f' {line}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
+                        connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin:connect_lines_end-1]]
                 else:
                     connect_lines = []
                 merged_lines = patch_prev_lines[4:] + connect_lines + lines[4:]
@@ -1340,14 +1304,13 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
-                patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin}\
-                    + {patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+connect_lines_end-connect_lines_begin} @@'] + merged_lines)
+                patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin-1}\
+                    + {patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+connect_lines_end-connect_lines_begin-1} @@'] + merged_lines)
                 patch_prev['new_start_line'] = patch['new_start_line']
                 patch_prev['new_end_line'] = patch_prev['new_start_line'] + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
                 patch_prev['old_start_line'] = patch['old_start_line']
                 patch_prev['old_end_line'] = patch_prev['old_start_line'] + patch_new_offset+patch_prev_new_offset+connect_lines_end-connect_lines_begin
                 removed_patches.add(key)
-                continue
         prev_new_start_line[patch['file_path_new']] = patch['new_start_line']
         prev_new_end_line[patch['file_path_new']] = patch['new_end_line']
         patch_prev_key[patch['file_path_new']] = key
@@ -2274,7 +2237,6 @@ def apply_and_test_patches(
     commit,
     next_commit,
     target,
-    patch_file_path,
     sanitizer,
     bug_id,
     fuzzer,
@@ -2300,7 +2262,6 @@ def apply_and_test_patches(
     update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
     patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
     patch_key_list = list(set(patch_to_apply))
-    add_patch_for_trace_funcs(diff_results, patch_key_list, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     llvm_fuzzer_test_one_input_patch_update(diff_results, patch_key_list, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     # Sort patch_key_list by new_start_line
     patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
