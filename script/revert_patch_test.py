@@ -3,7 +3,7 @@ import argparse
 import subprocess
 import json
 import os
-from git import Repo
+from git import Repo, GitCommandError
 import logging
 from pathlib import Path
 import gzip
@@ -486,7 +486,7 @@ def parse_csv_data(csv_content):
             row = {
                 'commit_id': values[0],
                 'osv_statuses': {},  # Store all OSV statuses in a dictionary
-                'poc_count': values[-1] if values[-1] else 0
+                'poc_count': 0
             }
             
             # Process all OSV columns (skipping first and last columns)
@@ -494,10 +494,58 @@ def parse_csv_data(csv_content):
                 if i < len(headers):
                     bug_id = headers[i]
                     row['osv_statuses'][bug_id] = values[i] if values[i] else None
+                    if values[i] and values[i] == '1|1':
+                        row['poc_count'] += 1
             
             data.append(row)
     
     return data
+
+
+def is_ancestor(repo_path: str, older_commit: str, newer_commit: str) -> bool:
+    """
+    Return True if `older_commit` is an ancestor of `newer_commit`,
+    False otherwise.
+    """
+    repo = Repo(repo_path)
+    try:
+        repo.git.merge_base('--is-ancestor', older_commit, newer_commit)
+        return True
+    except GitCommandError:
+        return False
+
+
+def prepare_transplant(data, repo_path):
+    # Build commit graph for easy parent/child lookup, and commits stored ordered by time
+    max_poc_count = 0
+    max_poc_row = None
+    
+    # Initialize the graph with all commits
+    for row in data:
+        if row['poc_count'] > max_poc_count:
+            max_poc_count = row['poc_count']
+            max_poc_row = row
+    
+    logger.info(f'max poc row: {max_poc_row}')
+    bug_ids_trigger = set() # do not need to change
+    bug_ids_other = set()
+    
+    for bug_id in max_poc_row['osv_statuses'].keys():
+        if max_poc_row['osv_statuses'][bug_id] == '1|1':
+            bug_ids_trigger.add(bug_id)
+        else:
+            bug_ids_other.add(bug_id)
+    bugs_need_transplant = dict() # key: bug_id; value: a commit that a poc trigger this bug, this commit should be closest to max_poc_row['commit_id']
+    for row in data:
+        for bug_id in bug_ids_other:
+            if row['osv_statuses'][bug_id] == '1|1':
+                if bug_id in bugs_need_transplant:
+                    if is_ancestor(repo_path, bugs_need_transplant[bug_id], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
+                        bugs_need_transplant[bug_id] = row
+                else:
+                    bugs_need_transplant[bug_id] = row
+    
+    return bugs_need_transplant, max_poc_row
 
 
 def find_transitions(data, repo_path):
@@ -1065,7 +1113,6 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 recreated_functions.add(patch['old_signature'])
                 
                 handle_func_signature_change.add(patch['old_signature'])
-                logger.debug(f'key {key} is a function signature change, and has dependent functions')
                 # Need a Artificial patch, to create the old function
 
                 func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch['file_path_old'], patch['old_signature'])
@@ -1268,7 +1315,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 patch_prev = diff_results[patch_prev_key[patch['file_path_new']]]
                 patch_prev_lines = patch_prev['patch_text'].split('\n')
                 connect_lines_end = patch['new_start_line']
-                connect_lines_begin = patch_prev['new_end_line']
+                # In most cases, patch_prev['new_end_line'] is the actually line number+1, except patch_prev['new_end_line'] = patch_prev['new_start_line']
+                connect_lines_begin = patch_prev['new_end_line'] if patch_prev['new_end_line'] > patch_prev['new_start_line'] else patch_prev['new_end_line']-1
                 if connect_lines_begin < connect_lines_end:
                     with open(os.path.join(target_repo_path, patch['file_path_new']), 'r') as f:
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin:connect_lines_end-1]]
@@ -2178,6 +2226,13 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
         cfgs1 = parse_cfg_text(cfg_file.read())
     with open(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
         cfgs2 = parse_cfg_text(cfg_file.read())
+    if not cfgs1:
+        logger.error(f'Cannot find cfg for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
+        exit(1)
+    if not cfgs2:
+        logger.error(f'Cannot find cfg for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list} in new commit {next_commit}')
+        exit(1)
+    
     cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit_list)
     if not bb1s:
         logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
@@ -2702,21 +2757,24 @@ def revert_patch_test(args):
     target = csv_file_path.split('/')[-1].split('.')[0]
     target_repo_path = os.path.join(repo_path, target)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
-    transitions = find_transitions(parsed_data, target_repo_path)
-    logger.info(f"Transitions found: {len(transitions)}")
+    bugs_need_transplant, max_poc_row = prepare_transplant(parsed_data, target_repo_path)
     
     get_patched_traces = dict()
     previous_bug = ''
     previous_trace_func_list = []
     signature_change_list = []
     
-    for commit, next_commit, bug_id in transitions:
+    for bug_id, row in bugs_need_transplant.items():
         if bug_id not in {'OSV-2021-485'}:
             continue
-        next_commit['commit_id'] = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'
-        commit['commit_id'] = commit['commit_id'][:6]  # use short commit id for trace file name
-        next_commit['commit_id'] = next_commit['commit_id'][:6]  # use short commit id for trace file name
+        commit = dict()
+        next_commit = dict()
+        commit['commit_id'] = row['commit_id'][:6]  # use short commit id for trace file name
+        next_commit['commit_id'] = max_poc_row['commit_id'][:6]  # use short commit id for trace file name
+        logger.info(f'bug trigger commit: {commit["commit_id"]}')
+        logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
+        transitions = [(commit, next_commit, bug_id)]
         fuzzer = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         bug_type = bug_info['reproduce']['crash_type']
@@ -2884,11 +2942,6 @@ def revert_patch_test(args):
             else:
                 patch_by_func.setdefault(diff_results[key]['old_signature'], []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
-        if bug_id == 'OSV-2021-485':
-            minimal_fast = [('blosc/frame.cblosc/frame.c-2021,18+2298,27', 'blosc/frame.cblosc/frame.c-1977,17+2252,19', 'blosc/frame.cblosc/frame.c-1950,21+2197,49', 'blosc/frame.cblosc/frame.c-1877,62+2110,76'), ('blosc/schunk.cblosc/schunk.c-446,8+558,14',), ('blosc/frame.cblosc/frame.c-1659,15+1849,30', 'blosc/frame.cblosc/frame.c-1646,3+1837,2', 'blosc/frame.cblosc/frame.c-1572,67+1753,77', 'blosc/frame.cblosc/frame.c-1553,4+1734,4', 'blosc/frame.cblosc/frame.c-1538,7+1718,8', 'blosc/frame.cblosc/frame.c-1526,5+1707,4', 'blosc/frame.cblosc/frame.c-1497,18+1676,20'), ('blosc/frame.cblosc/frame.c-1428,19+1587,27', 'blosc/frame.cblosc/frame.c-1406,12+1564,13'), ('blosc/frame.cblosc/frame.c-1257,15+1408,23', 'blosc/frame.cblosc/frame.c-1243,5+1393,6')]
-            # minimal_fast = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-50,2+46,2', 'tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-12,21+12,17'), ('blosc/schunk.cblosc/schunk.c-774,5+1067,6', 'blosc/schunk.cblosc/schunk.c-766,2+1059,2'), ('blosc/frame.cblosc/frame.c-2763,34+3458,34', 'blosc/frame.cblosc/frame.c-2753,2+3448,2'), ('blosc/frame.cblosc/frame.c-2021,18+2298,27', 'blosc/frame.cblosc/frame.c-1977,17+2252,19', 'blosc/frame.cblosc/frame.c-1950,21+2197,49', 'blosc/frame.cblosc/frame.c-1877,62+2110,76'), ('blosc/schunk.cblosc/schunk.c-446,8+558,14',), ('blosc/frame.cblosc/frame.c-1659,15+1849,30', 'blosc/frame.cblosc/frame.c-1646,3+1837,2', 'blosc/frame.cblosc/frame.c-1572,67+1753,77', 'blosc/frame.cblosc/frame.c-1553,4+1734,4', 'blosc/frame.cblosc/frame.c-1538,7+1718,8', 'blosc/frame.cblosc/frame.c-1526,5+1707,4', 'blosc/frame.cblosc/frame.c-1497,18+1676,20'), ('blosc/frame.cblosc/frame.c-1428,19+1587,27', 'blosc/frame.cblosc/frame.c-1406,12+1564,13'), ('blosc/frame.cblosc/frame.c-1257,15+1408,23', 'blosc/frame.cblosc/frame.c-1243,5+1393,6'), ('blosc/blosc2.cblosc/blosc2.c-2905,10+3371,10',), ('blosc/blosc2.cblosc/blosc2.c-3166,5+3626,14',)]
-        if bug_id == 'OSV-2021-496':
-            minimal_fast = [('blosc/frame.cblosc/frame.c-2037,7+2317,8', 'blosc/frame.cblosc/frame.c-1974,17+2252,19', 'blosc/frame.cblosc/frame.c-1947,21+2197,49', 'blosc/frame.cblosc/frame.c-1874,62+2110,76'), ('blosc/schunk.cblosc/schunk.c-461,8+558,14',), ('blosc/frame.cblosc/frame.c-1656,15+1849,30', 'blosc/frame.cblosc/frame.c-1643,3+1837,2', 'blosc/frame.cblosc/frame.c-1569,67+1753,77', 'blosc/frame.cblosc/frame.c-1550,4+1734,4', 'blosc/frame.cblosc/frame.c-1535,7+1718,8', 'blosc/frame.cblosc/frame.c-1523,5+1707,4', 'blosc/frame.cblosc/frame.c-1494,18+1676,20'), ('blosc/frame.cblosc/frame.c-1425,19+1587,27', 'blosc/frame.cblosc/frame.c-1403,12+1564,13'), ('blosc/frame.cblosc/frame.c-1254,15+1408,23', 'blosc/frame.cblosc/frame.c-1240,5+1393,6')]
         
         patches_without_context = dict()
         # tmp_context = copy.deepcopy(context)
@@ -2900,7 +2953,7 @@ def revert_patch_test(args):
         #     minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, dict(), context)
         #     logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
         #     # make sure we have a correct minimal patch
-        apply_and_test_patches(minimal_fast, patches_without_context, *context)
+        apply_and_test_patches(patch_pair_list, patches_without_context, *context)
 
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
 
@@ -2982,14 +3035,14 @@ if __name__ == "__main__":
     args = parse_arguments()
     patches_without_contexts = revert_patch_test(args)
     # Use absolute path for the cache file
-    cache_file = os.path.join(current_file_path, "patches.pkl.gz")
+    # cache_file = os.path.join(current_file_path, "patches.pkl.gz")
     
-    # Save the patches to cache file
-    save_patches_pickle(patches_without_contexts, cache_file)
+    # # Save the patches to cache file
+    # save_patches_pickle(patches_without_contexts, cache_file)
     
-    # Load the patches from cache file (only if it exists)
-    if os.path.exists(cache_file):
-        patches_without_contexts = load_patches_pickle(cache_file)
-    else:
-        logger.warning(f"Cache file {cache_file} not found, using original data")
-    merge_patches(args, patches_without_contexts)
+    # # Load the patches from cache file (only if it exists)
+    # if os.path.exists(cache_file):
+    #     patches_without_contexts = load_patches_pickle(cache_file)
+    # else:
+    #     logger.warning(f"Cache file {cache_file} not found, using original data")
+    # merge_patches(args, patches_without_contexts)
