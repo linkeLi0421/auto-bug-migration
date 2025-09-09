@@ -1956,7 +1956,7 @@ def build_version(args):
   
   if args.patch:
     build_bash += f'''
-    git apply --reverse /patch;
+    git apply --ignore-whitespace --ignore-space-change --reverse /patch;
     '''
     run_args.extend([
         '-v',
@@ -2031,7 +2031,7 @@ def get_crash_log_bash(commit:str, args):
 
 def get_trace_log_bash(commit:str, args):
   bash_trace = f'''
-    cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
+    # cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
     [ -f "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
     [ -f "/Function_instrument/libtrace.so" ] && rm /Function_instrument/libtrace.so;
     cd /Function_instrument ; make ; cd -;
@@ -2099,6 +2099,7 @@ def get_cfg_bash(args):
   """Returns the bash commands to generate CFG."""
   bash_cfg = f'''
     apt-get update && apt-get install -y bear;
+    bear compile;
     cd /llvm/build ; make install -j$(nproc) &> /dev/null ; cd -;
     cd /src/{args.project.name};
     git checkout -f {args.commit}; 
@@ -2113,7 +2114,6 @@ def get_cfg_bash(args):
     
     {'git apply --reverse /patch;' if args.patch else ''}
     
-    bear compile;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
       {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
   '''
@@ -2148,6 +2148,7 @@ def build_llvm_from_source():
       -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
       -DLLVM_BUILD_LLVM_DYLIB=ON \
       -DLLVM_ENABLE_RTTI=ON\
+      -DLLVM_ENABLE_RUNTIMES="libunwind;libcxx;libcxxabi" \
       {llvm_source_dir}/llvm;
     make -j$(nproc);
   """
@@ -2387,7 +2388,6 @@ def get_dict(args):
         if target_commit in args.commit or args.commit in target_commit:
           logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
                 args.commit, oss_fuzz_commit)
-          oss_fuzz_commit = oss_fuzz_commit
 
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
@@ -2429,6 +2429,21 @@ def get_dict(args):
 
 def collect_trace(args):
   """get traces about bug fix"""
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+      
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+                args.commit, oss_fuzz_commit)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   if not build_image_impl(args.project):
     return False
 

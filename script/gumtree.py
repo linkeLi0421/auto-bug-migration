@@ -153,8 +153,6 @@ def get_corresponding_lines(target_repo_path, file_path1, commit1, file_path2, c
         line_set.update(set(s))
     for op in parser.get_matches():
         if op.line1 in line_set and op.label != 'NULL: NULL' and op.label != 'null':
-            if op.line2 == 847:
-                print(f"Found corresponding line: {op.line1} -> {op.line2} for label {op.label}")
             corresponding_lines.add(op.line2)
     return list(corresponding_lines)
 
