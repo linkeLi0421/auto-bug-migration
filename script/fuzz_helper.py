@@ -2113,7 +2113,7 @@ def get_cfg_bash(args):
     cd -;
     
     {'git apply --reverse /patch;' if args.patch else ''}
-    
+    export LD_LIBRARY_PATH=/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
       {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
   '''

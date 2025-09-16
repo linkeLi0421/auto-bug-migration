@@ -252,10 +252,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
                 dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                 
-                # Move with force option to overwrite if destination exists
-                move_result = subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
-                if move_result.returncode == 0:
-                    build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
+                build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
     # Start of the second day (midnight of t1's date + 1 day)
@@ -327,12 +324,15 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
             logger.info(' '.join(cmd))
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                if 'Sanitizer'.lower() in result.stderr.lower() and crash_type.lower() in result.stderr.lower():
+                if sanitizer in result.stderr.lower()+result.stdout.lower():
+                    confidence_level = '0.5'
+                    if crash_type.lower() in result.stderr.lower()+result.stdout.lower():
+                        confidence_level = '1'
                     # poc works
                     if bug_exist:
-                        row.append('1|1')
+                        row.append(f'{confidence_level}|1')
                     else:
-                        row.append('1|0')
+                        row.append(f'{confidence_level}|0')
                 else:
                     # poc doesn't work
                     if bug_exist:
