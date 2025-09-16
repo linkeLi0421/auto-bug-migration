@@ -47,7 +47,7 @@ def analyze_file(directory, src_file, args):
     out_path_set = set()
     
     for cursor in tu.cursor.walk_preorder():
-        file_path = str(cursor.location.file) if cursor.location.file else ""
+        file_path = os.path.normpath(str(cursor.location.file) if cursor.location.file else "")
         file = os.path.realpath(file_path)
         if file.startswith('/src'):
             file = file.split('/', 3)[-1]
@@ -168,7 +168,7 @@ def analyze_file(directory, src_file, args):
             out_path = os.path.join(dir_path, src_file_name)
             out_path = os.path.realpath(out_path)
             if not os.path.exists(dir_path):
-                os.makedirs(dir_path)
+                os.makedirs(dir_path, exist_ok=True)
             with open(out_path, "a") as out:
                 json.dump(info, out, indent=2)
                 out.write(",\n")

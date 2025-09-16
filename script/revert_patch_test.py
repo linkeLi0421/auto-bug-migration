@@ -492,12 +492,11 @@ def parse_csv_data(csv_content):
             }
             
             # Process all OSV columns (skipping first and last columns)
-            for i in range(1, len(values) - 1):
-                if i < len(headers):
-                    bug_id = headers[i]
-                    row['osv_statuses'][bug_id] = values[i] if values[i] else None
-                    if values[i] and values[i] == '1|1':
-                        row['poc_count'] += 1
+            for i in range(1, len(headers)):
+                bug_id = headers[i]
+                row['osv_statuses'][bug_id] = values[i] if values[i] else None
+                if values[i] and values[i] == '1|1':
+                    row['poc_count'] += 1
             
             data.append(row)
     
@@ -1231,7 +1230,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 connect_lines_begin = patch_prev['new_end_line'] if patch_prev['new_end_line'] > patch_prev['new_start_line'] else patch_prev['new_end_line']-1
                 if connect_lines_begin < connect_lines_end:
                     with open(os.path.join(target_repo_path, patch['file_path_new']), 'r') as f:
-                        connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin:connect_lines_end-1]]
+                        connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
                 else:
                     connect_lines = []
                 merged_lines = patch_prev_lines[4:] + connect_lines + lines[4:]
@@ -1243,8 +1242,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
-                patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin-1)}\
-                    + {patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin-1)} @@'] + merged_lines)
+                patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
                 patch_prev['new_start_line'] = patch['new_start_line']
                 patch_prev['new_end_line'] = patch_prev['new_start_line'] + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
                 patch_prev['old_start_line'] = patch['old_start_line']
@@ -1299,6 +1297,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
             old_line_begin = old_line_begin_nocontext
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             if new_offset == new_offset_nocontext:
+                old_offset -= 1
                 context_lines2 = []
             else:
                 context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
@@ -2763,8 +2762,8 @@ def revert_patch_test(args):
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
-        get_compile_commands(target, next_commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
-        get_compile_commands(target, commit['commit_id'], sanitizer, bug_id, fuzzer, args.build_csv, arch)
+        get_compile_commands(target, next_commit['commit_id'], sanitizer, args.build_csv, arch)
+        get_compile_commands(target, commit['commit_id'], sanitizer, args.build_csv, arch)
         diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
         file_path_pairs = get_file_path_pairs(diff_results)
 
@@ -2778,7 +2777,7 @@ def revert_patch_test(args):
         for _, func in common_part: # may consume a lot of time
             if func in func_dict:
                 continue
-            func_loc = func.split(' ')[1]
+            func_loc = func.split(' ')[-1]
             file_path = os.path.join(target_repo_path, func_loc.split(':')[0])
             line_num = func_loc.split(':')[1]
             col_num = func_loc.split(':')[2]
@@ -2918,7 +2917,7 @@ def merge_patches(args, patches_without_contexts: Dict[Tuple, Dict[str, Any]]) -
             f.write('\n\n')
 
 
-def get_compile_commands(target, commit_id, sanitizer, bug_id, fuzzer, build_csv, arch):
+def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
     # use libclang to parse, and save results to files
     cmd = [
         py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
