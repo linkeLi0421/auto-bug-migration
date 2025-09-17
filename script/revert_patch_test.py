@@ -16,7 +16,7 @@ from buildAndtest import checkout_latest_commit
 from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
-from cfg_parser import parse_cfg_text, find_block_by_line, compute_data_dependencies
+from cfg_parser import CFGBlock, parse_cfg_text, find_block_by_line, compute_data_dependencies
 from utils import minimize_greedy, minimize_ddmin, apply_unified_diff_to_string, split_function_parts, diff_strings
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
@@ -531,11 +531,12 @@ def prepare_transplant(data, repo_path):
     bug_ids_other = set()
     
     for bug_id in max_poc_row['osv_statuses'].keys():
-        if max_poc_row['osv_statuses'][bug_id] == '1|1':
+        if max_poc_row['osv_statuses'][bug_id] in {'1|1', '0.5|1'}:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
     bugs_need_transplant = dict() # key: bug_id; value: a commit that a poc trigger this bug, this commit should be closest to max_poc_row['commit_id']
+    bugs_cant_use = set()
     for row in data:
         for bug_id in bug_ids_other:
             if row['osv_statuses'][bug_id] == '1|1':
@@ -544,11 +545,15 @@ def prepare_transplant(data, repo_path):
                         bugs_need_transplant[bug_id] = row
                 else:
                     bugs_need_transplant[bug_id] = row
+    for bug_id in bug_ids_other:
+        if bug_id not in bugs_need_transplant:
+            bugs_cant_use.add(bug_id)
     logger.info(f'all bugs count: {len(max_poc_row["osv_statuses"])}')
-    logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)}{bug_ids_trigger}')
-    logger.info(f'bugs need transplant count: {len(bugs_need_transplant)}{bugs_need_transplant.keys()}')
+    logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)} {bug_ids_trigger}')
+    logger.info(f'bugs need transplant count: {len(bugs_need_transplant)} {bugs_need_transplant.keys()}')
+    logger.info(f'bugs cant use count: {len(bugs_cant_use)} {bugs_cant_use}')
     
-    return bugs_need_transplant, max_poc_row
+    return bug_ids_trigger, bugs_need_transplant, max_poc_row
 
 
 def extract_revert_patch(h, line_start, line_end, version):
@@ -2077,7 +2082,7 @@ def filter_and_dedup_bb_change_pairs(bb_change_pair):
 
         new_change_list = []
         for bb1s_i, bb2s_i, cfg1, cfg2 in change_list:
-            if not cfg1 or not cfg2:
+            if not cfg1:
                 # Find nothing from get_bb_change_pair_from_line, ignore it.
                 continue
             bb1_start_line = min(bb.start_line for bb in bb1s_i)
@@ -2144,15 +2149,29 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
         logger.error(f'Cannot find cfg for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list} in new commit {next_commit}')
         exit(1)
     
-    cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit_list)
-    if not bb1s:
-        logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
-        return None, None, None, None
-
+    pseudo_blosks = []
+    for line_in_old in line_num_in_old_commit_list:
+        pseudo_block = CFGBlock(-1, line_in_old, line_in_old)
+        pseudo_block.start_line = line_in_old
+        pseudo_block.end_line = line_in_old
+        pseudo_blosks.append(pseudo_block)
     for key, patch in diff_results.items():
         if patch['file_path_new'] == relative_file_path:
-            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, bb1s)
+            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, pseudo_blosks)
             break
+    
+    cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit_list)
+    if bb2_line_num_list:
+        if not bb1s:
+            logger.error(f'Cannot find basic block for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
+            return None, None, None, None
+
+        for key, patch in diff_results.items():
+            if patch['file_path_new'] == relative_file_path:
+                bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, bb1s)
+                break
+    else:
+        bb1s = pseudo_blosks
     
     # Now we get basic blocks in new commit that correspond to bb1
     cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
@@ -2306,6 +2325,7 @@ def apply_and_test_patches(
     with open(patch_file_path, 'w') as patch_file:
         for key in patch_key_list:
             patch = diff_results[key]   
+            patches_without_context.update({key: patch})
             patch_file.write(patch['patch_text'])
             patch_file.write('\n\n')  # Add separator between patches
     
@@ -2385,6 +2405,10 @@ def apply_and_test_patches(
                         found = True
                         type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
                         break
+                    if ast_node['kind'] in {'TYPE_REF'} and ast_node['spelling'] == identifier:
+                        found = True
+                        type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
+                        break
                 if not found:
                     logger.info(f'Cannot find {identifier} in {parsing_path}')
                     exit(0)
@@ -2458,7 +2482,7 @@ def apply_and_test_patches(
             # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
             bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
 
-        path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys())
+        path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
         not_write_patches = set()
         for file_path in path_set:
@@ -2631,6 +2655,7 @@ def apply_and_test_patches(
         test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
         if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
             # trigger the bug
+            patches_without_context['patch_path'] = patch_file_path
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             if ((bug_id, next_commit['commit_id'], fuzzer) in revert_and_trigger_fail_set):
                 revert_and_trigger_fail_set.remove((bug_id, next_commit['commit_id'], fuzzer))
@@ -2651,6 +2676,31 @@ def apply_and_test_patches(
         return 'build_fail'
 
 
+def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
+    # Run the fuzzer to test if the bug is reproduced
+    testcases_env = os.getenv('TESTCASES', '')
+    bug_info_dataset = read_json_file(bug_info_path)
+    bug_info = bug_info_dataset[bug_id]
+    bug_type = bug_info['reproduce']['crash_type']
+    fuzzer = bug_info['reproduce']['fuzz_target']
+    sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
+    arch = 'i386' if 'i386' in bug_info['reproduce']['job_type'] else 'x86_64'
+    
+    build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch)
+    
+    testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
+    reproduce_cmd = [
+        py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', target, fuzzer, testcase_path, '-e', 'ASAN_OPTIONS=detect_leaks=0'
+    ]
+    logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
+    test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
+    if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
+        # trigger the bug
+        return 'trigger'
+    else:
+        return 'not_trigger'
+
+
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
     bug_info_dataset = read_json_file(args.bug_info)
@@ -2668,7 +2718,7 @@ def revert_patch_test(args):
     target = args.target
     target_repo_path = os.path.join(repo_path, target)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
-    bugs_need_transplant, max_poc_row = prepare_transplant(parsed_data, target_repo_path)
+    bug_ids_trigger, bugs_need_transplant, max_poc_row = prepare_transplant(parsed_data, target_repo_path)
     
     get_patched_traces = dict()
     previous_bug = ''
@@ -2676,12 +2726,12 @@ def revert_patch_test(args):
     signature_change_list = []
     
     for bug_id, row in bugs_need_transplant.items():
-        if bug_id not in {'OSV-2021-485'}:
-            continue
+        # if bug_id not in {'OSV-2021-485', 'OSV-2021-496', 'OSV-2021-622', 'OSV-2021-639'}:
         commit = dict()
         next_commit = dict()
         commit['commit_id'] = row['commit_id'][:6]  # use short commit id for trace file name
         next_commit['commit_id'] = max_poc_row['commit_id'][:6]  # use short commit id for trace file name
+        next_commit['commit_id'] = '972c0aa711cadabb686fa75f95559cfd2c4ad316'[:6]
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -2855,18 +2905,32 @@ def revert_patch_test(args):
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
         patches_without_context = dict()
+        if bug_id == 'OSV-2021-622':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1385,3+1395,2', 'blosc/frame.cblosc/frame.c-1368,11+1379,10')]
+        if bug_id == 'OSV-2021-485':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-2035,2+2089,2', 'blosc/frame.cblosc/frame.c-2021,7+2067,15', 'blosc/frame.cblosc/frame.c-1977,2+2023,2', 'blosc/frame.cblosc/frame.c-1950,4+1977,19', 'blosc/frame.cblosc/frame.c-1936,3+1963,3', 'blosc/frame.cblosc/frame.c-1927,2+1954,2', 'blosc/frame.cblosc/frame.c-1916,2+1938,7', 'blosc/frame.cblosc/frame.c-1907,2+1929,2', 'blosc/frame.cblosc/frame.c-1969,0+2012,4')]
+        if bug_id == 'OSV-2021-496':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
+        if bug_id == 'OSV-2024-638':
+            patch_pair_list = [('decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1370,9+1407,0', 'decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1614,3+1642,31', 'decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1159,0+1189,8')]
         # tmp_context = copy.deepcopy(context)
-        # if not apply_and_test_patches(patch_pair_list, dict(), *tmp_context):
+        # if not apply_and_test_patches(patch_pair_list, dict(), *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
         #     revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         # else:
         #     revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
         #     logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
         #     minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, dict(), context)
         #     logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
-        #     # make sure we have a correct minimal patch
-        apply_and_test_patches(patch_pair_list, patches_without_context, *context)
 
+        apply_and_test_patches(patch_pair_list, patches_without_context, *context)
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
+        # test if the local bugs is still there 
+        if 'patch_path' in patches_without_context: # if the bug trigger
+            for bug_id_trigger in bug_ids_trigger:
+                if test_fuzzer(args.bug_info, bug_id_trigger, target, commit['commit_id'], patches_without_context['patch_path']) == 'trigger':
+                    logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
+                else:
+                    logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
@@ -2879,10 +2943,10 @@ def merge_patches(args, patches_without_contexts: Dict[Tuple, Dict[str, Any]]) -
     harness_patches = dict()
     patches = dict()
     csv_file_path = args.target_test_result
-    target = csv_file_path.split('/')[-1].split('.')[0]
+    target = args.target
     repo_path = os.getenv('REPO_PATH')
     target_repo_path = os.path.join(repo_path, target)
-    target_commit_id = '83d00f2316e8c1dc9a2d5fa2c89de7d94f9ac00e'[:6]
+    target_commit_id = '4a7273'
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     patch_file_path = os.path.join(patch_folder, f"all_{target_commit_id}_patches.diff")
 
@@ -2907,8 +2971,6 @@ def merge_patches(args, patches_without_contexts: Dict[Tuple, Dict[str, Any]]) -
     key_list = sorted(key_list, key=lambda key: patches[key]['new_start_line'], reverse=True)
     for k in key_list:
         patch = patches[k]
-        # logger.info(f'k: {k}')
-        # logger.info(f'patch: {patch['patch_text']}')
     add_context(patches, key_list, target_commit_id, target_repo_path)
     with open(patch_file_path, 'w') as f:
         for key in key_list:
@@ -2946,14 +3008,28 @@ if __name__ == "__main__":
     args = parse_arguments()
     patches_without_contexts = revert_patch_test(args)
     # Use absolute path for the cache file
-    # cache_file = os.path.join(current_file_path, "patches.pkl.gz")
+    cache_file = os.path.join(current_file_path, "patches.pkl.gz")
     
-    # # Save the patches to cache file
+    # Save the patches to cache file
     # save_patches_pickle(patches_without_contexts, cache_file)
     
-    # # Load the patches from cache file (only if it exists)
-    # if os.path.exists(cache_file):
-    #     patches_without_contexts = load_patches_pickle(cache_file)
-    # else:
-    #     logger.warning(f"Cache file {cache_file} not found, using original data")
-    # merge_patches(args, patches_without_contexts)
+    # patches_without_contexts = load_patches_pickle(cache_file)
+    # need_merge = dict()
+    # for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
+    #     if bug_id in {'OSV-2021-485', 'OSV-2021-622'}:
+    #         need_merge.setdefault((bug_id, commit_id, fuzzer), dict()).update(patch_dict)
+        # logger.info(f'bug_id {bug_id}')
+        # for patch in patch_dict.values():
+        #     if 'new_signature' in patch:
+        #         logger.info(f'new_signature: {patch['new_signature']}')
+        #     elif 'old_signature' in patch:
+        #         logger.info(f'old_signature: {patch['old_signature']}')
+    # merge_patches(args, need_merge)
+    
+    # test all-bug-patch for local bugs
+    # bug_ids_trigger = {'OSV-2021-485', 'OSV-2021-496', 'OSV-2021-622', 'OSV-2021-1791', 'OSV-2023-319', 'OSV-2021-897', 'OSV-2021-997', 'OSV-2021-1589', 'OSV-2023-51', 'OSV-2022-34', 'OSV-2022-4'}
+    # for bug_id_trigger in bug_ids_trigger:
+    #     if test_fuzzer(args.bug_info, bug_id_trigger, args.target) == 'trigger':
+    #         logger.info(f'\ttrigger bug {bug_id_trigger}')
+    #     else:
+    #         logger.info(f'\tnot trigger bug {bug_id_trigger}')
