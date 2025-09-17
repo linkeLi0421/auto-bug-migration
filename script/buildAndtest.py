@@ -324,7 +324,7 @@ def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
             logger.info(' '.join(cmd))
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                if sanitizer in result.stderr.lower()+result.stdout.lower():
+                if 'sanitizer' in result.stderr.lower()+result.stdout.lower() and sanitizer in result.stderr.lower()+result.stdout.lower():
                     confidence_level = '0.5'
                     if crash_type.lower() in result.stderr.lower()+result.stdout.lower():
                         confidence_level = '1'
