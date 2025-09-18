@@ -2681,7 +2681,7 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
     testcases_env = os.getenv('TESTCASES', '')
     bug_info_dataset = read_json_file(bug_info_path)
     bug_info = bug_info_dataset[bug_id]
-    bug_type = bug_info['reproduce']['crash_type']
+    crash_type = bug_info['reproduce']['crash_type'].split(' ')[0]
     fuzzer = bug_info['reproduce']['fuzz_target']
     sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
     arch = 'i386' if 'i386' in bug_info['reproduce']['job_type'] else 'x86_64'
@@ -2694,11 +2694,16 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
     ]
     logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
     test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
-    if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
+    if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
         # trigger the bug
-        return 'trigger'
+        confidence_level = '0.5'
+        if crash_type.lower() in test_result.stderr.lower()+test_result.stdout.lower():
+            confidence_level = '1'
+        return f'trigger with confidence level: {confidence_level}'
     else:
-        return 'not_trigger'
+        logger.info('1111111111111111111111111111111111111111111111111')
+        logger.info(test_result.stderr.lower()+test_result.stdout.lower())
+        return 'not trigger'
 
 
 def revert_patch_test(args):
@@ -2927,10 +2932,10 @@ def revert_patch_test(args):
         # test if the local bugs is still there 
         if 'patch_path' in patches_without_context: # if the bug trigger
             for bug_id_trigger in bug_ids_trigger:
-                if test_fuzzer(args.bug_info, bug_id_trigger, target, commit['commit_id'], patches_without_context['patch_path']) == 'trigger':
-                    logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
-                else:
+                if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':
                     logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
+                else:
+                    logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
