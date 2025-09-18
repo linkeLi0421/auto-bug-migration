@@ -56,35 +56,29 @@ def get_commit_timestamp(repo_path, commit_hash):
     return commit_timestamp
 
 
-def git_first_last_commit(folder_path):
+def git_first_last_commit(target, target_bug_ids, bug_info_path):
     # Initialize variables to store the oldest introduced and newest fixed commits
     oldest_introduced_commit = None
     newest_fixed_commit = None
     oldest_time = None
     newest_time = None
+    
+    for bug_id in target_bug_ids:
+        bug_info = bug_infos[bug_id]
+        if not bug_info["fixed"]:
+            continue
+        introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
+        fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
 
-    # Use glob to search for all bug_info.json files recursively in subdirectories
-    json_files = glob.glob(os.path.join(folder_path, '**', 'bug_info.json'), recursive=True)
+        # Update the oldest introduced commit
+        if oldest_time is None or introduced_timestamp < oldest_time:
+            oldest_introduced_commit = bug_info["introduced"]
+            oldest_time = introduced_timestamp
 
-    # Loop through each file and read the JSON data
-    for file in json_files:
-        with open(file, 'r') as f:
-            data = json.load(f)
-
-            # Extract information for each bug in the JSON data
-            for bug_id, bug_info in data.items():
-                introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
-                fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
-
-                # Update the oldest introduced commit
-                if oldest_time is None or introduced_timestamp < oldest_time:
-                    oldest_introduced_commit = bug_info["introduced"]
-                    oldest_time = introduced_timestamp
-
-                # Update the newest fixed commit
-                if newest_time is None or fixed_timestamp > newest_time:
-                    newest_fixed_commit = bug_info["fixed"]
-                    newest_time = fixed_timestamp
+        # Update the newest fixed commit
+        if newest_time is None or fixed_timestamp > newest_time:
+            newest_fixed_commit = bug_info["fixed"]
+            newest_time = fixed_timestamp
 
     return oldest_introduced_commit, newest_fixed_commit
 
@@ -160,7 +154,7 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
     return valid_pocs
 
 
-def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
+def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer):
     '''
     Run helper.py build_image and build_fuzzers
     ''' 
@@ -178,7 +172,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     # Replace '--depth=1' in the Dockerfile
     if not os.path.exists(target_dockerfile_path):
         logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
-        return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
+        return do_bug_build(target_path, bug_ids_path, bug_infos, commit_id, month+6, build_writer)
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
@@ -186,22 +180,18 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
     with open(target_dockerfile_path, 'w') as dockerfile:
         dockerfile.write(updated_content)
     
-    json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
     sanitizers = set()
     archs = set()
-    
-    for json_file_path in json_files:
-        with open(json_file_path) as f:
-            data = json.load(f)
-        for bug_id, bug_info in data.items():
-            sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
-            sanitizers.add(sanitizer)
-            job_type = bug_info['reproduce']['job_type']
-            if len(job_type.split('_')) > 3:
-                arch = job_type.split('_')[2]
-            else:
-                arch = 'x86_64'
-            archs.add(arch)
+    for bug_id in target_bug_ids:
+        bug_info = bug_infos[bug_id]
+        sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
+        sanitizers.add(sanitizer)
+        job_type = bug_info['reproduce']['job_type']
+        if len(job_type.split('_')) > 3:
+            arch = job_type.split('_')[2]
+        else:
+            arch = 'x86_64'
+        archs.add(arch)
     
     os.chdir(target_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8')
@@ -242,7 +232,7 @@ def do_bug_build(target_path, bug_path, commit_id, month, build_writer):
                 "failed with exit status"
             ]) or result.returncode != 0:
                 logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
-                return do_bug_build(target_path, bug_path, commit_id, month+6, build_writer)
+                return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month+6, build_writer)
             else:
                 # build finish here
                 logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
@@ -276,7 +266,7 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     else:
         return False
 
-def do_bug_test(target_path, bug_path, commit_id, writer, json_files):
+def do_bug_test(target_path, commit_id, writer, json_files):
     '''
     Run helper.py reproduce
     '''
@@ -547,7 +537,6 @@ def find_matching_commit(repo1_path: str,
 if __name__ == "__main__":
     # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
     parser = argparse.ArgumentParser()
-    parser.add_argument("--bug", help="Path to the folder")
     parser.add_argument("--repo", help="Path to the repository")
     parser.add_argument("--target", help="Name of the target")
     parser.add_argument("--mode", choices=["build", "test", "both"], default="both",
@@ -566,9 +555,25 @@ if __name__ == "__main__":
         exit(1)
     target_storage_path = os.path.join(storage_path, target)
     
+    arch = 'x86_64' # We have enouth x86 bugs
     repo_path = args.repo
-    bug_path = args.bug
-    first_commit, lastest_commit = git_first_last_commit(bug_path)
+    bug_ids_path = os.getenv("BUGIDS_PATH")
+    bug_info_path = os.getenv("BUGINFO_PATH")
+
+    with open(bug_ids_path, "r") as f:
+        bug_ids = json.load(f)
+        target_bug_ids = bug_ids[target]
+    with open(bug_info_path, "r") as f:
+        bug_infos = json.load(f)
+    
+    filter_bug_ids = []
+    for bug_id in target_bug_ids:
+        bug_info = bug_infos[bug_id]
+        if 'i386' not in bug_info['reproduce']['job_type']:
+            filter_bug_ids.append(bug_id)
+    
+    first_commit, lastest_commit = git_first_last_commit(target, filter_bug_ids, bug_infos)
+    logger.info(f'firse_commit {first_commit}')
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
@@ -589,7 +594,7 @@ if __name__ == "__main__":
             # Write header if file doesn't exist
             build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
             for commit in commits:  # from latest to old
-                do_bug_build(repo_path, bug_path, commit, 1, build_writer)
+                do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer)
         
     
     if args.mode in ["test", "both"]:
@@ -600,16 +605,12 @@ if __name__ == "__main__":
         json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
         sorted_json_files = sorted(json_files)
         csv_header = ['commit id']
-        for json_file_path in sorted_json_files:
-            dir_path = os.path.dirname(json_file_path)
-            testcases_folder_path = os.path.join(dir_path, "testcases")
-            with open(json_file_path) as f:
-                data = json.load(f)
-            for bug_id, bug_info in data.items():
-                csv_header.append(bug_id)
+        for bug_id in filter_bug_ids:
+            bug_info = bug_infos[bug_id]
+            csv_header.append(bug_id)
         csv_header.append('poc count')
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            do_bug_test(repo_path, bug_path, commit, test_writer, sorted_json_files)
+            do_bug_test(repo_path, commit, test_writer, sorted_json_files)
         test_csv_file.close()
