@@ -1,0 +1,213 @@
+2025-09-03 23:56:13,028 - INFO - auxiliary patch: _extra_blosc/blosc2.c_OSV-2021-485_54a733_blosc/blosc2.c
+2025-09-03 23:56:13,028 - INFO - auxiliary patch text: diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -73,14 +73,6 @@
+ /* Synchronization variables */
+ 
+ /* Global context for non-contextual API */
+-enum {
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_NAN_RUNLEN = 2,
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_ZERO_RUNLEN = 1,
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_VALUE_RUNLEN = 3,
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_RUNLEN_MASK = 3,
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC_VERSION_FORMAT = 4,
+-};
+-void __revert_54a733_OSV_2021_485_blosc_init();
+ static blosc2_context* g_global_context;
+ static pthread_mutex_t global_comp_mutex;
+ static int g_compressor = BLOSC_BLOSCLZ;
+
+2025-09-03 23:56:13,028 - INFO - auxiliary patch: _extra_blosc/schunk.c_OSV-2021-485_54a733_blosc/schunk.c
+2025-09-03 23:56:13,028 - INFO - auxiliary patch text: diff --git a/blosc/schunk.c b/blosc/schunk.c
+--- a/blosc/schunk.c
++++ b/blosc/schunk.c
+@@ -43,11 +43,6 @@
+ 
+ 
+ /* Get the cparams associated with a super-chunk */
+-blosc2_frame_s * __revert_54a733_OSV_2021_485_frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy);
+-int __revert_54a733_OSV_2021_485_frame_decompress_chunk(blosc2_context * dctx, blosc2_frame_s * frame, int nchunk, void * dest, int32_t nbytes);
+-blosc2_schunk * __revert_54a733_OSV_2021_485_frame_to_schunk(blosc2_frame_s * frame, _Bool copy);
+-int __revert_54a733_OSV_2021_485_blosc2_cbuffer_sizes(const void * cbuffer, int32_t * nbytes, int32_t * cbytes, int32_t * blocksize);
+-int __revert_54a733_OSV_2021_485_blosc2_decompress_ctx(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize);
+ int blosc2_schunk_get_cparams(blosc2_schunk *schunk, blosc2_cparams **cparams) {
+   *cparams = calloc(sizeof(blosc2_cparams), 1);
+   (*cparams)->schunk = schunk;
+
+2025-09-03 23:56:13,028 - INFO - auxiliary patch: _extra_blosc/frame.c_OSV-2021-485_54a733_blosc/frame.c
+2025-09-03 23:56:13,028 - INFO - auxiliary patch text: diff --git a/blosc/frame.c b/blosc/frame.c
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -40,22 +40,6 @@
+ 
+ 
+ /* Create a new (empty) frame */
+-enum {
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_NAN_RUNLEN = 2,
+-__revert_cons_54a733_OSV_2021_485_83d00f_BLOSC2_ZERO_RUNLEN = 1,
+-};
+-int __revert_54a733_OSV_2021_485_frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free);
+-int __revert_54a733_OSV_2021_485_blosc2_schunk_get_dparams(blosc2_schunk * schunk, blosc2_dparams ** dparams);
+-FILE * __revert_54a733_OSV_2021_485_sframe_open_index(const char * urlpath, const char * mode);
+-int __revert_54a733_OSV_2021_485_blosc2_chunk_zeros(size_t nbytes, size_t typesize, void * dest, size_t destsize);
+-FILE * __revert_54a733_OSV_2021_485_sframe_open_chunk(const char * urlpath, int64_t nchunk, const char * mode);
+-int __revert_54a733_OSV_2021_485_blosc2_getitem(const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize);
+-int __revert_54a733_OSV_2021_485_blosc2_chunk_nans(size_t nbytes, size_t typesize, void * dest, size_t destsize);
+-blosc2_context * __revert_54a733_OSV_2021_485_blosc2_create_cctx(blosc2_cparams cparams);
+-int __revert_54a733_OSV_2021_485_blosc2_schunk_get_cparams(blosc2_schunk * schunk, blosc2_cparams ** cparams);
+-int __revert_54a733_OSV_2021_485_blosc2_cbuffer_sizes(const void * cbuffer, int32_t * nbytes, int32_t * cbytes, int32_t * blocksize);
+-blosc2_context * __revert_54a733_OSV_2021_485_blosc2_create_dctx(blosc2_dparams dparams);
+-int __revert_54a733_OSV_2021_485_blosc2_decompress_ctx(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize);
+ blosc2_frame_s* frame_new(const char* urlpath) {
+   blosc2_frame_s* new_frame = calloc(1, sizeof(blosc2_frame_s));
+   if (urlpath != NULL) {
+
+2025-09-03 23:56:13,028 - INFO - auxiliary patch: _extra_tests/fuzz/fuzz_decompress_frame.c_OSV-2021-485_54a733_tests/fuzz/fuzz_decompress_frame.c
+2025-09-03 23:56:13,028 - INFO - auxiliary patch text: diff --git a/tests/fuzz/fuzz_decompress_frame.c b/tests/fuzz/fuzz_decompress_frame.c
+--- a/tests/fuzz/fuzz_decompress_frame.c
++++ b/tests/fuzz/fuzz_decompress_frame.c
+@@ -8,32 +8,24 @@
+ extern "C" {
+ #endif
+ 
+-int __revert_54a733_OSV_2021_485_blosc2_schunk_decompress_chunk(blosc2_schunk * schunk, int nchunk, void * dest, int32_t nbytes);
+-blosc2_schunk * __revert_54a733_OSV_2021_485_blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy);
+-void __revert_54a733_OSV_2021_485_blosc_init();
+-int __revert_54a733_OSV_2021_485_blosc_set_nthreads(int nthreads_new);
+ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+-  const char *compressors[] = { "blosclz", "lz4", "lz4hc", "snappy", "zlib", "zstd" };
+-  int32_t i = 0, dsize = 0, filter = BLOSC_BITSHUFFLE;
++  int32_t i = 0, dsize = 0;
+   int32_t nchunk = 0;
+ 
+-  __revert_54a733_OSV_2021_485_blosc_init();
+-  __revert_54a733_OSV_2021_485_blosc_set_nthreads(1);
+-
+-  blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+-  dparams.nthreads = 1;
++  blosc2_init();
++  blosc2_set_nthreads(1);
+ 
+   /* Create a super-chunk backed by an in-memory frame */
+-  blosc2_schunk* schunk = __revert_54a733_OSV_2021_485_blosc2_schunk_from_buffer((uint8_t *) data, size, false);
++  blosc2_schunk* schunk = blosc2_schunk_from_buffer((uint8_t *) data, (int64_t)size, false);
+   if (schunk == NULL) {
+     blosc2_destroy();
+     return 0;
+   }
+   /* Don't allow address sanitizer to allocate more than INT32_MAX */
+   if (schunk->nbytes >= INT32_MAX) {
+     blosc2_schunk_free(schunk);
+     blosc2_destroy();
+     return 0;
+   }
+   /* Decompress data */
+   uint8_t *uncompressed_data = (uint8_t *)malloc((size_t)schunk->nbytes+1);
+2025-09-03 23:56:13,035 - INFO - auxiliary patch: _extra_blosc/blosc2.c_OSV-2021-496_f489cd_blosc/blosc2.c
+2025-09-03 23:56:13,035 - INFO - auxiliary patch text: diff --git a/blosc/blosc2.c b/blosc/blosc2.c
+--- a/blosc/blosc2.c
++++ b/blosc/blosc2.c
+@@ -73,14 +73,6 @@
+ /* Synchronization variables */
+ 
+ /* Global context for non-contextual API */
+-enum {
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_NAN_RUNLEN = 2,
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_ZERO_RUNLEN = 1,
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_VALUE_RUNLEN = 3,
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_RUNLEN_MASK = 3,
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC_VERSION_FORMAT = 4,
+-};
+-void __revert_f489cd_OSV_2021_496_blosc_init();
+ static blosc2_context* g_global_context;
+ static pthread_mutex_t global_comp_mutex;
+ static int g_compressor = BLOSC_BLOSCLZ;
+
+2025-09-03 23:56:13,035 - INFO - auxiliary patch: _extra_blosc/schunk.c_OSV-2021-496_f489cd_blosc/schunk.c
+2025-09-03 23:56:13,035 - INFO - auxiliary patch text: diff --git a/blosc/schunk.c b/blosc/schunk.c
+--- a/blosc/schunk.c
++++ b/blosc/schunk.c
+@@ -43,11 +43,6 @@
+ 
+ 
+ /* Get the cparams associated with a super-chunk */
+-int __revert_f489cd_OSV_2021_496_blosc2_cbuffer_sizes(const void * cbuffer, int32_t * nbytes, int32_t * cbytes, int32_t * blocksize);
+-int __revert_f489cd_OSV_2021_496_blosc2_decompress_ctx(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize);
+-blosc2_schunk * __revert_f489cd_OSV_2021_496_frame_to_schunk(blosc2_frame_s * frame, _Bool copy);
+-int __revert_f489cd_OSV_2021_496_frame_decompress_chunk(blosc2_context * dctx, blosc2_frame_s * frame, int nchunk, void * dest, int32_t nbytes);
+-blosc2_frame_s * __revert_f489cd_OSV_2021_496_frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy);
+ int blosc2_schunk_get_cparams(blosc2_schunk *schunk, blosc2_cparams **cparams) {
+   *cparams = calloc(sizeof(blosc2_cparams), 1);
+   (*cparams)->schunk = schunk;
+
+2025-09-03 23:56:13,035 - INFO - auxiliary patch: _extra_blosc/frame.c_OSV-2021-496_f489cd_blosc/frame.c
+2025-09-03 23:56:13,035 - INFO - auxiliary patch text: diff --git a/blosc/frame.c b/blosc/frame.c
+--- a/blosc/frame.c
++++ b/blosc/frame.c
+@@ -40,22 +40,6 @@
+ 
+ 
+ /* Create a new (empty) frame */
+-enum {
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_NAN_RUNLEN = 2,
+-__revert_cons_f489cd_OSV_2021_496_83d00f_BLOSC2_ZERO_RUNLEN = 1,
+-};
+-int __revert_f489cd_OSV_2021_496_blosc2_getitem(const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize);
+-int __revert_f489cd_OSV_2021_496_blosc2_schunk_get_cparams(blosc2_schunk * schunk, blosc2_cparams ** cparams);
+-int __revert_f489cd_OSV_2021_496_blosc2_cbuffer_sizes(const void * cbuffer, int32_t * nbytes, int32_t * cbytes, int32_t * blocksize);
+-int __revert_f489cd_OSV_2021_496_blosc2_chunk_nans(size_t nbytes, size_t typesize, void * dest, size_t destsize);
+-int __revert_f489cd_OSV_2021_496_blosc2_decompress_ctx(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize);
+-blosc2_context * __revert_f489cd_OSV_2021_496_blosc2_create_dctx(blosc2_dparams dparams);
+-int __revert_f489cd_OSV_2021_496_blosc2_schunk_get_dparams(blosc2_schunk * schunk, blosc2_dparams ** dparams);
+-FILE * __revert_f489cd_OSV_2021_496_sframe_open_chunk(const char * urlpath, int64_t nchunk, const char * mode);
+-FILE * __revert_f489cd_OSV_2021_496_sframe_open_index(const char * urlpath, const char * mode);
+-int __revert_f489cd_OSV_2021_496_blosc2_chunk_zeros(size_t nbytes, size_t typesize, void * dest, size_t destsize);
+-int __revert_f489cd_OSV_2021_496_frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free);
+-blosc2_context * __revert_f489cd_OSV_2021_496_blosc2_create_cctx(blosc2_cparams cparams);
+ blosc2_frame_s* frame_new(const char* urlpath) {
+   blosc2_frame_s* new_frame = calloc(1, sizeof(blosc2_frame_s));
+   if (urlpath != NULL) {
+
+2025-09-03 23:56:13,035 - INFO - auxiliary patch: _extra_tests/fuzz/fuzz_decompress_frame.c_OSV-2021-496_f489cd_tests/fuzz/fuzz_decompress_frame.c
+2025-09-03 23:56:13,035 - INFO - auxiliary patch text: diff --git a/tests/fuzz/fuzz_decompress_frame.c b/tests/fuzz/fuzz_decompress_frame.c
+--- a/tests/fuzz/fuzz_decompress_frame.c
++++ b/tests/fuzz/fuzz_decompress_frame.c
+@@ -8,32 +8,24 @@
+ extern "C" {
+ #endif
+ 
+-int __revert_f489cd_OSV_2021_496_blosc_set_nthreads(int nthreads_new);
+-void __revert_f489cd_OSV_2021_496_blosc_init();
+-int __revert_f489cd_OSV_2021_496_blosc2_schunk_decompress_chunk(blosc2_schunk * schunk, int nchunk, void * dest, int32_t nbytes);
+-blosc2_schunk * __revert_f489cd_OSV_2021_496_blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy);
+ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+-  const char *compressors[] = { "blosclz", "lz4", "lz4hc", "snappy", "zlib", "zstd" };
+-  int32_t i = 0, dsize = 0, filter = BLOSC_BITSHUFFLE;
++  int32_t i = 0, dsize = 0;
+   int32_t nchunk = 0;
+ 
+-  __revert_f489cd_OSV_2021_496_blosc_init();
+-  __revert_f489cd_OSV_2021_496_blosc_set_nthreads(1);
+-
+-  blosc2_dparams dparams = BLOSC2_DPARAMS_DEFAULTS;
+-  dparams.nthreads = 1;
++  blosc2_init();
++  blosc2_set_nthreads(1);
+ 
+   /* Create a super-chunk backed by an in-memory frame */
+-  blosc2_schunk* schunk = __revert_f489cd_OSV_2021_496_blosc2_schunk_from_buffer((uint8_t *) data, size, false);
++  blosc2_schunk* schunk = blosc2_schunk_from_buffer((uint8_t *) data, (int64_t)size, false);
+   if (schunk == NULL) {
+     blosc2_destroy();
+     return 0;
+   }
+   /* Don't allow address sanitizer to allocate more than INT32_MAX */
+   if (schunk->nbytes >= INT32_MAX) {
+     blosc2_schunk_free(schunk);
+     blosc2_destroy();
+     return 0;
+   }
+   /* Decompress data */
+   uint8_t *uncompressed_data = (uint8_t *)malloc((size_t)schunk->nbytes+1);
+2025-09-03 23:56:13,035 - INFO - function signature: int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)
