@@ -594,17 +594,13 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='patch file to apply in the builder')
   build_version_parser.add_argument('--build_csv',
                             help='this file contains a target project commit id and corresponding commit id')
+  build_version_parser.add_argument('--parse_file',
+                                    help='Use script/libclang.py to parse a file')
   build_version_parser.add_argument(
       '--preprocess',
       action='store_true',
       default=False,
       help='get preprocessed files based on compile_commands.json.'
-  )
-  build_version_parser.add_argument(
-      '--compile_commands',
-      action='store_true',
-      default=False,
-      help='Run builder in “cmdjson” mode (boolean flag).'
   )
   build_version_parser.add_argument('--no_corpus',
                             action='store_true',
@@ -1974,14 +1970,14 @@ def build_version(args):
     mkdir /data/{args.project.name}-{args.commit[:6]};
     python3 /script/mv.py ./ /data/{args.project.name}-{args.commit[:6]};
     '''
-  elif args.compile_commands:
+  elif args.parse_file:
     build_bash += f'''
     cd -;
     apt-get update && apt-get install -y bear;
     apt install libclang-18-dev -y;
     pip install libclang==18.*;
     bear compile;
-    python3 /script/libclang.py;
+    python3 /script/libclang.py --file_path {args.parse_file};
     # Remove existing output directory if it already exists
     if [ -d "/data/{args.project.name}-{args.commit[:6]}" ]; then
         rm -rf "/data/{args.project.name}-{args.commit[:6]}"

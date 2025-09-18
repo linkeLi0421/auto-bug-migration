@@ -546,6 +546,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", help="Path to the repository")
     parser.add_argument("--target", help="Name of the target")
+    parser.add_argument("--harness", help="Name of the fuzz harness")
     parser.add_argument("--mode", choices=["build", "test", "both"], default="both",
                        help="Specify the operation mode: 'build' for building only, 'test' for testing only, or 'both' for both operations")
     args = parser.parse_args()
@@ -582,12 +583,11 @@ if __name__ == "__main__":
         bug_info = bug_infos[bug_id]
         if 'i386' in bug_info['reproduce']['job_type']:
             continue
-        if bug_info['reproduce']['fuzz_target'] != 'ssml-fuzzer':
+        if bug_info['reproduce']['fuzz_target'] != args.harness:
             continue
         filter_bug_ids.append(bug_id)
     
     first_commit, lastest_commit = git_first_last_commit(filter_bug_ids, bug_infos)
-    logger.info(f'firse_commit {first_commit}')
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
@@ -607,7 +607,7 @@ if __name__ == "__main__":
             
             # Write header if file doesn't exist
             build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
-            for commit in commits:  # from latest to old
+            for commit in commits:
                 do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer)
         
     
@@ -616,6 +616,7 @@ if __name__ == "__main__":
         test_csv_file = open(test_csv_file_path, mode='w', newline='')
         test_writer = csv.writer(test_csv_file)
 
+        filter_bug_ids = ['OSV-2025-534']
         csv_header = ['commit id']
         for bug_id in filter_bug_ids:
             bug_info = bug_infos[bug_id]

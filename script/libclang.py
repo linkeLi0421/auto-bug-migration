@@ -3,6 +3,8 @@ import json
 from clang.cindex import Index, CursorKind, Config
 from clang.cindex import TranslationUnit
 import subprocess
+import argparse
+from pathlib import Path
 
 Config.set_library_file('/usr/lib/llvm-18/lib/libclang.so')  # adjust for your system
 index = Index.create()
@@ -307,15 +309,21 @@ def load_compile_commands(path="compile_commands.json"):
     for entry in data:
         directory = entry["directory"]
         file = entry["file"]
+        path = Path(file)
+        normalized = path.resolve()  # full absolute path
         args = entry.get("arguments") or entry["command"].split()
-        commands[file] = (directory, args)
+        commands[normalized] = (directory, args)
     return commands
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--file_path", help="Path of the file to be parsed")
     compile_db = load_compile_commands()
     out_path_set = set()
     for src_file in compile_db:
+        if src_file.as_posix().split("/", 3)[-1] != parser.parse_args().file_path:
+            continue
         directory, args = compile_db[src_file]
         
         # Redirect the output file to /null

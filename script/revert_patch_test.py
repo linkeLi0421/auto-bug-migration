@@ -31,6 +31,8 @@ logger.addHandler(stream_handler)
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
+build_csv = ''
+arch = ''
 
 
 def rename_func(patch_text, fname, commit, replacement_string=None):
@@ -55,13 +57,9 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
+    
+    do_parse_file(target, commit, file_path)
     parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{file_path}_analysis.json')
-    parsing_path = os.path.join(
-        data_path,
-        f"{target_repo_path.split('/')[-1]}-{commit}",
-        f"{file_path}_analysis.json",
-    )
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for ast_node in ast_nodes:
@@ -88,6 +86,7 @@ def get_function_code_by_line(target_repo_path, commit, data_path, file_path, li
     subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8',
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    do_parse_file(target, commit, file_path)
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{commit}",
@@ -129,6 +128,7 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
+    do_parse_file(target, next_commit, file_path)
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{next_commit}",
@@ -147,6 +147,7 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
 
 
 def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
+    do_parse_file(target, next_commit, file_path_new)
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{next_commit}",
@@ -176,6 +177,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
         old_line_list = []
         for line_num in range(line_range[0], line_range[1] + 1):
             old_line_list.append(get_old_line_num(file_path_new, line_num, patch_key_list, diff_results, extra_patches, target, commit))
+        do_parse_file(target, commit, file_path_old)
         parsing_path = os.path.join(
             data_path,
             f"{target_repo_path.split('/')[-1]}-{commit}",
@@ -222,6 +224,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     lines = f.readlines()
                 artificial_patch_insert_point = len(lines)+1
                 # Find call in this function, check if we need to replace them with recreated functions
+                do_parse_file(target, commit, def_file_path_old)
                 parsing_path = os.path.join(
                     data_path,
                     f"{target_repo_path.split('/')[-1]}-{commit}",
@@ -339,12 +342,12 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
     bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
     
     for field_name, struct_name, file_path, line_num in miss_member_structs:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, build_csv, target_repo_path)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
         
     for identifier, file_path, line_num in miss_decls:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, build_csv, target_repo_path)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
 
@@ -523,7 +526,7 @@ def prepare_transplant(data, repo_path):
     
     # Initialize the graph with all commits
     for row in data:
-        if row['poc_count'] > max_poc_count:
+        if row['poc_count'] >= max_poc_count:
             max_poc_count = row['poc_count']
             max_poc_row = row
     
@@ -539,7 +542,7 @@ def prepare_transplant(data, repo_path):
     bugs_cant_use = set()
     for row in data:
         for bug_id in bug_ids_other:
-            if row['osv_statuses'][bug_id] == '1|1':
+            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1'}:
                 if bug_id in bugs_need_transplant:
                     if is_ancestor(repo_path, bugs_need_transplant[bug_id], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
                         bugs_need_transplant[bug_id] = row
@@ -747,6 +750,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 continue
                 
             file_path = os.path.join(target_repo_path, path_b)
+            do_parse_file(target, new_commit, path_b)
             parsing_path = os.path.join(data_path, f'{target}-{new_commit}', f'{path_b}_analysis.json')
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
@@ -825,6 +829,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
 
             file_path = os.path.join(target_repo_path, path_a)
+            do_parse_file(target, old_commit, path_a)
             parsing_path = os.path.join(data_path, f'{target}-{old_commit}', f'{path_a}_analysis.json')
 
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
@@ -1173,6 +1178,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         )
         patch = diff_results[key]
         if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
+            do_parse_file(target, old_commit, patch['file_path_old'])
             parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch['file_path_old']}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
@@ -1602,6 +1608,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 break
         if flag:
             continue
+        do_parse_file(target, next_commit, file_path)
         parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{file_path}_analysis.json')
         if os.path.exists(parsing_path):
             with open(parsing_path, 'r') as f:
@@ -1701,6 +1708,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_keys.add(key)
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
+    do_parse_file(target, next_commit, fuzzer_file_path)
     parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{fuzzer_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -1882,6 +1890,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
                 break
         index_old_infun -= front_context_num # I want the index inside the function, not the context lines
         old_function_signature = diff_results[key_of_line_num]['old_signature']
+        do_parse_file(target, commit, diff_results[key_of_line_num]["file_path_old"])
         parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{diff_results[key_of_line_num]["file_path_old"]}_analysis.json')
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
@@ -2220,6 +2229,7 @@ def get_full_funsig(patch, target, commit, version:str):
     patch_file_path = patch[f'file_path_{version}']
     patch_start_line = patch[f'{version}_start_line']
     patch_end_line = patch[f'{version}_end_line']
+    do_parse_file(target, commit, patch_file_path)
     parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -2348,7 +2358,7 @@ def apply_and_test_patches(
         count += 1
         if count > 10:
             break
-        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch)
         if build_success:
             break
         with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
@@ -2368,6 +2378,7 @@ def apply_and_test_patches(
                 # Assign a recreated function to a function pointer
                 undeclared_functions.append((identifier, location))
                 continue
+            do_parse_file(target, commit['commit_id'], file_path_old)
             parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{file_path_old}_analysis.json')
             if os.path.exists(parsing_path):
                 with open(parsing_path, 'r') as f:
@@ -2423,12 +2434,12 @@ def apply_and_test_patches(
                 # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
                 # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
                 if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
-                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
+                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', build_csv,
                                 '--architecture', arch, '--target_file', relative_file_path, target]
                     logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
                     result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
-                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit['commit_id'], '--build_csv', args.build_csv,
+                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit['commit_id'], '--build_csv', build_csv,
                                 '--architecture', arch, '--target_file', relative_file_path, target]
                     logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
                     result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2684,9 +2695,8 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
     crash_type = bug_info['reproduce']['crash_type'].split(' ')[0]
     fuzzer = bug_info['reproduce']['fuzz_target']
     sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
-    arch = 'i386' if 'i386' in bug_info['reproduce']['job_type'] else 'x86_64'
     
-    build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch)
+    build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, build_csv, arch)
     
     testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
     reproduce_cmd = [
@@ -2709,6 +2719,8 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
 def revert_patch_test(args):
     csv_file_path = args.target_test_result
     bug_info_dataset = read_json_file(args.bug_info)
+    global build_csv
+    build_csv = args.build_csv
     checkout_latest_commit(ossfuzz_path)
     revert_and_trigger_set = set()
     patches_without_contexts = dict()
@@ -2746,6 +2758,7 @@ def revert_patch_test(args):
         bug_type = bug_info['reproduce']['crash_type']
         job_type = bug_info['reproduce']['job_type']
         patch_path_list = []
+        global arch
         if len(job_type.split('_')) > 3:
             arch = job_type.split('_')[2]
         else:
@@ -2770,10 +2783,10 @@ def revert_patch_test(args):
     
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
-                                '--build_csv', args.build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
+                                '--build_csv', build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
         else:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
-                                '--build_csv', args.build_csv, '--architecture', arch]
+                                '--build_csv', build_csv, '--architecture', arch]
         testcases_env = os.getenv('TESTCASES', '')
         if testcases_env:
             collect_trace_cmd.extend(['--testcases', testcases_env])
@@ -2781,7 +2794,7 @@ def revert_patch_test(args):
             logger.info("TESTCASES environment variable not set. Exiting.")
             exit(1)
 
-        collect_trace_cmd.extend(['--build_csv', args.build_csv])
+        collect_trace_cmd.extend(['--build_csv', build_csv])
 
         collect_trace_cmd.extend(['--test_input', 'testcase-' + bug_id])
 
@@ -2817,8 +2830,6 @@ def revert_patch_test(args):
         trace2 = extract_function_calls(trace_path2)
         common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
-        get_compile_commands(target, next_commit['commit_id'], sanitizer, args.build_csv, arch)
-        get_compile_commands(target, commit['commit_id'], sanitizer, args.build_csv, arch)
         diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
         file_path_pairs = get_file_path_pairs(diff_results)
 
@@ -2837,6 +2848,7 @@ def revert_patch_test(args):
             line_num = func_loc.split(':')[1]
             col_num = func_loc.split(':')[2]
             relative_path = func_loc.split(':')[0]
+            do_parse_file(target, commit['commit_id'], relative_path)
             parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{relative_path}_analysis.json')
             if os.path.exists(file_path):
                 with open(parsing_path, 'r') as f:
@@ -2984,16 +2996,15 @@ def merge_patches(args, patches_without_contexts: Dict[Tuple, Dict[str, Any]]) -
             f.write('\n\n')
 
 
-def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
+def do_parse_file(target, commit_id, file_path):
     # use libclang to parse, and save results to files
     cmd = [
-        py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-        '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
+        py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id,
+        '--build_csv', build_csv, '--parse_file', file_path, '--architecture', arch , target
     ]
     
-    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}')):
-        logger.info(' '.join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True)
+    logger.info(' '.join(cmd))
+    subprocess.run(cmd, capture_output=True, text=True)
 
 
 def save_patches_pickle(patches: Dict[str, Dict[str, Any]], path: str | Path) -> None:
