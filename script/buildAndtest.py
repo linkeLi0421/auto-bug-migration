@@ -56,8 +56,8 @@ def get_commit_timestamp(repo_path, commit_hash):
     return commit_timestamp
 
 
-def git_first_last_commit(target, target_bug_ids, bug_info_path):
-    # Initialize variables to store the oldest introduced and newest fixed commits
+def git_first_last_commit(target_bug_ids, bug_infos):
+    # Initialize variables to store the oldest fixed and newest fixed commits
     oldest_introduced_commit = None
     newest_fixed_commit = None
     oldest_time = None
@@ -71,16 +71,25 @@ def git_first_last_commit(target, target_bug_ids, bug_info_path):
         fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
 
         # Update the oldest introduced commit
-        if oldest_time is None or introduced_timestamp < oldest_time:
+        if oldest_time is None or fixed_timestamp < oldest_time:
             oldest_introduced_commit = bug_info["introduced"]
-            oldest_time = introduced_timestamp
+            oldest_time = fixed_timestamp
 
         # Update the newest fixed commit
         if newest_time is None or fixed_timestamp > newest_time:
             newest_fixed_commit = bug_info["fixed"]
             newest_time = fixed_timestamp
 
-    return oldest_introduced_commit, newest_fixed_commit
+    repo = git.Repo(repo_path)
+    commit = repo.commit(oldest_introduced_commit)
+    oldest_time = None
+    for idx, p in enumerate(commit.parents, start=1):
+        commit_time = p.committed_datetime
+        if oldest_time is None or commit_time < oldest_time:
+            start_commit = p.hexsha
+            oldest_time = commit_time
+    
+    return start_commit, newest_fixed_commit
 
 
 def find_max_valid_period(pocs):
@@ -212,7 +221,8 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
 
             logger.info(' '.join(cmd))
             result = subprocess.run(cmd, capture_output=True, text=True)
-            if any(error_pattern in result.stderr or error_pattern in result.stdout for error_pattern in [
+            if "Sanitizer" not in result.stderr+result.stdout and\
+                any(error_pattern in result.stderr or error_pattern in result.stdout for error_pattern in [
                 "Building fuzzers failed",
                 "Docker build failed",
                 "clang++: error:",
@@ -266,7 +276,7 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     else:
         return False
 
-def do_bug_test(target_path, commit_id, writer, json_files):
+def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
     '''
     Run helper.py reproduce
     '''
@@ -276,68 +286,65 @@ def do_bug_test(target_path, commit_id, writer, json_files):
     bug_exist_count = 0
     testcases_env = os.getenv('TESTCASES', '')
     
-    for json_file_path in json_files:
-        dir_path = os.path.dirname(json_file_path)
-        with open(json_file_path) as f:
-            data = json.load(f)
-        for bug_id, bug_info in data.items():
-            poc_path = os.path.join(testcases_env, 'testcase-' + bug_id)
-            introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
-            fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
-            fuzzing_engine = bug_info['reproduce']['fuzzing_engine']
-            fuzz_target = bug_info['reproduce']['fuzz_target']
-            sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
-            crash_type = bug_info['reproduce']['crash_type']
-            job_type = bug_info['reproduce']['job_type']
-            if len(job_type.split('_')) > 3:
-                arch = job_type.split('_')[2]
-            else:
-                arch = 'x86_64'
-            arch_str = f"-{arch}" if arch != 'x86_64' else ''
+    for bug_id in filter_bug_ids:
+        bug_info = bug_infos[bug_id]
+        poc_path = os.path.join(testcases_env, 'testcase-' + bug_id)
+        introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
+        fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
+        fuzzing_engine = bug_info['reproduce']['fuzzing_engine']
+        fuzz_target = bug_info['reproduce']['fuzz_target']
+        sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
+        crash_type = bug_info['reproduce']['crash_type']
+        job_type = bug_info['reproduce']['job_type']
+        if len(job_type.split('_')) > 3:
+            arch = job_type.split('_')[2]
+        else:
+            arch = 'x86_64'
+        arch_str = f"-{arch}" if arch != 'x86_64' else ''
 
-            bug_exist = is_ancestor(repo_path, commit_id, bug_info["introduced"])\
-              and is_ancestor(repo_path, bug_info["fixed"], commit_id) and commit_id != bug_info["fixed"]  
-            if bug_exist:
-                bug_exist_count += 1
+        bug_exist = is_ancestor(repo_path, commit_id, bug_info["introduced"])\
+            and is_ancestor(repo_path, bug_info["fixed"], commit_id) and commit_id != bug_info["fixed"]  
+        if bug_exist:
+            bug_exist_count += 1
 
-            source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
+        source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
 
-            if os.path.exists(source_dir):
-                pass
-            else:
-                logger.error(f"Source directory or file does not exist: {source_dir}")
-                return
+        if os.path.exists(source_dir):
+            pass
+        else:
+            logger.error(f"Source directory or file does not exist: {source_dir}")
+            return
 
-            cmd = [
-                'python3', f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
-            ]
-            logger.info(' '.join(cmd))
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-                if 'sanitizer' in result.stderr.lower()+result.stdout.lower() and sanitizer in result.stderr.lower()+result.stdout.lower():
-                    confidence_level = '0.5'
-                    if crash_type.lower() in result.stderr.lower()+result.stdout.lower():
-                        confidence_level = '1'
-                    # poc works
-                    if bug_exist:
-                        row.append(f'{confidence_level}|1')
-                    else:
-                        row.append(f'{confidence_level}|0')
+        cmd = [
+            'python3', f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
+        ]
+        logger.info(' '.join(cmd))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            if 'sanitizer' in result.stderr.lower()+result.stdout.lower() and sanitizer in result.stderr.lower()+result.stdout.lower():
+                confidence_level = '0.5'
+                if crash_type.lower() in result.stderr.lower()+result.stdout.lower():
+                    confidence_level = '1'
+                # poc works
+                if bug_exist:
+                    row.append(f'{confidence_level}|1')
                 else:
-                    # poc doesn't work
-                    if bug_exist:
-                        row.append('0|1')
-                    else:
-                        row.append('0|0')
-            except subprocess.TimeoutExpired:
-                logger.info(f"Timeout occurred while running command: {' '.join(cmd)}")
-                result = None
-                row.append('time out')
-            except Exception as e:
-                logger.info(f"An error occurred while running command: {' '.join(cmd)}")
-                logger.info(f"Error message: {str(e)}")
-                row.append('')
-                result = None
+                    row.append(f'{confidence_level}|0')
+            else:
+                # poc doesn't work
+                if bug_exist:
+                    row.append('0|1')
+                else:
+                    row.append('0|0')
+        except subprocess.TimeoutExpired:
+            logger.info(f"Timeout occurred while running command: {' '.join(cmd)}")
+            result = None
+            row.append('time out')
+        except Exception as e:
+            logger.info(f"An error occurred while running command: {' '.join(cmd)}")
+            logger.info(f"Error message: {str(e)}")
+            row.append('')
+            result = None
     row.append(bug_exist_count)
     writer.writerow(row)
 
@@ -568,11 +575,18 @@ if __name__ == "__main__":
     
     filter_bug_ids = []
     for bug_id in target_bug_ids:
+        # if '2020' not in bug_id and '2021' not in bug_id and '2022' not in bug_id:
+        #     continue
+        if bug_id not in bug_infos:
+            continue
         bug_info = bug_infos[bug_id]
-        if 'i386' not in bug_info['reproduce']['job_type']:
-            filter_bug_ids.append(bug_id)
+        if 'i386' in bug_info['reproduce']['job_type']:
+            continue
+        if bug_info['reproduce']['fuzz_target'] != 'ssml-fuzzer':
+            continue
+        filter_bug_ids.append(bug_id)
     
-    first_commit, lastest_commit = git_first_last_commit(target, filter_bug_ids, bug_infos)
+    first_commit, lastest_commit = git_first_last_commit(filter_bug_ids, bug_infos)
     logger.info(f'firse_commit {first_commit}')
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
@@ -602,8 +616,6 @@ if __name__ == "__main__":
         test_csv_file = open(test_csv_file_path, mode='w', newline='')
         test_writer = csv.writer(test_csv_file)
 
-        json_files = glob.glob(os.path.join(bug_path, '**', 'bug_info.json'), recursive=True)
-        sorted_json_files = sorted(json_files)
         csv_header = ['commit id']
         for bug_id in filter_bug_ids:
             bug_info = bug_infos[bug_id]
@@ -612,5 +624,5 @@ if __name__ == "__main__":
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            do_bug_test(repo_path, commit, test_writer, sorted_json_files)
+            do_bug_test(repo_path, commit, test_writer, filter_bug_ids, bug_infos)
         test_csv_file.close()

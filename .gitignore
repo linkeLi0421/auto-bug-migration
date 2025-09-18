@@ -20,3 +20,4 @@ llvm_build_dirs
 /llvm-project
 /data
 /patch
+/pocs

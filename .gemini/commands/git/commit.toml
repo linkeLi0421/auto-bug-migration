@@ -1,0 +1,15 @@
+# In: <project>/.gemini/commands/git/commit.toml
+# Invoked via: /git:commit
+
+description = "Generates a Git commit message based on staged changes. And push it to remote"
+
+# The prompt uses !{...} to execute the command and inject its output.
+prompt = """
+1. Please generate a Conventional Commit message based on the following git diff and wirte ot .git/COMMIT_EDITMSG :
+```diff
+!{git diff --staged}
+```
+2. Please commit with  ```!{git commit -F @.git/COMMIT_EDITMSG }```
+3. Please push to remote ```!{git push}```
+4. Do not try to commit other files!
+"""

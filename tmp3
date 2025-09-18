@@ -1,0 +1,486 @@
+INFO:__main__:Found matching commit for base_commit in CSV: 972c0a -> 6bcb16032811dc50833902634ba0bade78db040b
+INFO:__main__:Checked out OSS-FUZZ to commit 6bcb16032811dc50833902634ba0bade78db040b
+INFO:__main__:Running: docker build -t gcr.io/oss-fuzz/libavc --file /home/user/oss-fuzz-for-select/oss-fuzz/projects/libavc/Dockerfile /home/user/oss-fuzz-for-select/oss-fuzz/projects/libavc.
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 993B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for gcr.io/oss-fuzz-base/base-builder:latest
+#2 DONE 0.4s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/6] FROM gcr.io/oss-fuzz-base/base-builder:latest@sha256:064201d2459c3f5b19bae8e1d3f8ce71ad24c89d7e24a603e235e6fe7bd7ca71
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 DONE 0.0s
+
+#6 [4/6] ADD https://storage.googleapis.com/android_media/external/libavc/fuzzer/avc_dec_fuzzer_seed_corpus.zip /src/
+#6 DONE 0.2s
+
+#5 [internal] load build context
+#5 transferring context: 30B done
+#5 DONE 0.0s
+
+#7 [2/6] RUN apt-get update && apt-get install -y wget cmake
+#7 CACHED
+
+#8 [3/6] RUN git clone https://github.com/ittiam-systems/libavc.git
+#8 CACHED
+
+#9 [4/6] ADD https://storage.googleapis.com/android_media/external/libavc/fuzzer/avc_dec_fuzzer_seed_corpus.zip /src/
+#9 CACHED
+
+#10 [5/6] COPY build.sh /src/
+#10 CACHED
+
+#11 [6/6] WORKDIR libavc
+#11 CACHED
+
+#12 exporting to image
+#12 exporting layers done
+#12 writing image sha256:9621a3a909acb900fbeaa2f9ca78292c5629638fb3405a5b2ce437c563917410 done
+#12 naming to gcr.io/oss-fuzz/libavc done
+#12 DONE 0.0s
+
+ 1 warning found (use docker --debug to expand):
+ - WorkdirRelativePath: Relative workdir "libavc" can have unexpected results if the base image changes (line 22)
+INFO:__main__:Cleaning existing build artifacts.
+INFO:__main__:Running: docker run --privileged --shm-size=2g --platform linux/amd64 --rm -i -v /home/user/oss-fuzz-for-select/oss-fuzz/build/out/libavc:/out -t gcr.io/oss-fuzz/libavc /bin/bash -c 'rm -rf /out/*'.
+INFO:__main__:Running: docker run --privileged --shm-size=2g --platform linux/amd64 --rm -i -v /home/user/oss-fuzz-for-select/oss-fuzz/build/work/libavc:/work -t gcr.io/oss-fuzz/libavc /bin/bash -c 'rm -rf /work/*'.
+INFO:__main__:Out directory is empty. Deleting the folder.
+INFO:__main__:Work directory is empty. Deleting the folder.
+INFO:__main__:Running: docker run --privileged --shm-size=2g --platform linux/amd64 --rm -i -e FUZZING_ENGINE=libfuzzer -e SANITIZER=address -e ARCHITECTURE=x86_64 -e HELPER=True -e 'MAKEFLAGS=--output-sync=line -j1' -e CMAKE_BUILD_PARALLEL_LEVEL=1 -e NINJA_STATUS= -e TERM=dumb -e CLICOLOR=0 -e FORCE_COLOR=0 -e GCC_COLORS= -e CLANG_FORCE_COLOR=0 -e CMAKE_COLOR_DIAGNOSTICS=OFF -e FUZZING_LANGUAGE=c++ -v /home/user/oss-fuzz-for-select/patch/OSV-2024-638_972c0a_patches.diff:/patch -v /home/user/oss-fuzz-for-select/oss-fuzz/build/out/libavc:/out -v /home/user/oss-fuzz-for-select/oss-fuzz/build/work/libavc:/work -v /home/user/oss-fuzz-for-select/data:/data -v /home/user/oss-fuzz-for-select/script:/script -t gcr.io/oss-fuzz/libavc /bin/bash -c '
+  cd /src/libavc;
+  git checkout -f 972c0a;
+  
+    git apply --ignore-whitespace --ignore-space-change --reverse /patch;
+    
+    cd -;
+    compile;
+    '.
+Note: switching to '972c0a'.
+
+You are in 'detached HEAD' state. You can look around, make experimental
+changes and commit them, and you can discard any commits you make in this
+state without impacting any branches by switching back to a branch.
+
+If you want to create a new branch to retain commits you create, you may
+do so (now or later) by using -c with the switch command. Example:
+
+  git switch -c <new-branch-name>
+
+Or undo this operation with:
+
+  git switch -
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 972c0aa libavcdec: Fix timeout issue in AVC Decoder
+/src/libavc
+---------------------------------------------------------------
+vm.mmap_rnd_bits = 28
+Compiling libFuzzer to /usr/lib/libFuzzingEngine.a...  done.
+---------------------------------------------------------------
+CC=clang
+CXX=clang++
+CFLAGS=-O1   -fno-omit-frame-pointer   -gline-tables-only   -Wno-error=incompatible-function-pointer-types   -Wno-error=int-conversion   -Wno-error=deprecated-declarations   -Wno-error=implicit-function-declaration   -Wno-error=implicit-int   -Wno-error=unknown-warning-option   -Wno-error=vla-cxx-extension   -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope -fsanitize=fuzzer-no-link
+CXXFLAGS=-O1   -fno-omit-frame-pointer   -gline-tables-only   -Wno-error=incompatible-function-pointer-types   -Wno-error=int-conversion   -Wno-error=deprecated-declarations   -Wno-error=implicit-function-declaration   -Wno-error=implicit-int   -Wno-error=unknown-warning-option   -Wno-error=vla-cxx-extension   -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -fsanitize=address -fsanitize-address-use-after-scope -fsanitize=fuzzer-no-link -stdlib=libc++
+RUSTFLAGS=--cfg fuzzing -Zsanitizer=address -Cdebuginfo=1 -Cforce-frame-pointers
+---------------------------------------------------------------
++ /src/libavc/fuzzer/ossfuzz.sh
+/work/build /src/libavc
+-- The C compiler identification is Clang 22.0.0
+-- The CXX compiler identification is Clang 22.0.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/local/bin/clang - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/local/bin/clang++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- The ASM compiler identification is Clang with GNU-like command-line
+-- Found assembler: /usr/local/bin/clang
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Performing Test COMPILER_HAS_SANITIZE_FUZZER
+-- Performing Test COMPILER_HAS_SANITIZE_FUZZER - Success
+-- Configuring done (0.8s)
+-- Generating done (0.0s)
+-- Build files have been written to: /work/build
+[  0%] Building C object CMakeFiles/libavcdec.dir/common/ih264_buf_mgr.c.o
+[  0%] Building C object CMakeFiles/libavcdec.dir/common/ih264_cabac_tables.c.o
+[  0%] Building C object CMakeFiles/libavcdec.dir/common/ih264_chroma_intra_pred_filters.c.o
+[  7%] Building C object CMakeFiles/libavcdec.dir/common/ih264_cavlc_tables.c.o
+[  7%] Building C object CMakeFiles/libavcdec.dir/common/ih264_common_tables.c.o
+[  7%] Building C object CMakeFiles/libavcdec.dir/common/ih264_deblk_edge_filters.c.o
+[  7%] Building C object CMakeFiles/libavcdec.dir/common/ih264_deblk_tables.c.o
+[ 14%] Building C object CMakeFiles/libavcdec.dir/common/ih264_disp_mgr.c.o
+[ 14%] Building C object CMakeFiles/libavcdec.dir/common/ih264_dpb_mgr.c.o
+[ 14%] Building C object CMakeFiles/libavcdec.dir/common/ih264_ihadamard_scaling.c.o
+[ 14%] Building C object CMakeFiles/libavcdec.dir/common/ih264_inter_pred_filters.c.o
+[ 14%] Building C object CMakeFiles/libavcdec.dir/common/ih264_iquant_itrans_recon.c.o
+[ 21%] Building C object CMakeFiles/libavcdec.dir/common/ih264_list.c.o
+[ 21%] Building C object CMakeFiles/libavcdec.dir/common/ih264_luma_intra_pred_filters.c.o
+[ 21%] Building C object CMakeFiles/libavcdec.dir/common/ih264_mem_fns.c.o
+[ 21%] Building C object CMakeFiles/libavcdec.dir/common/ih264_padding.c.o
+[ 21%] Building C object CMakeFiles/libavcdec.dir/common/ih264_resi_trans_quant.c.o
+[ 28%] Building C object CMakeFiles/libavcdec.dir/common/ih264_trans_data.c.o
+[ 28%] Building C object CMakeFiles/libavcdec.dir/common/ih264_weighted_pred.c.o
+[ 28%] Building C object CMakeFiles/libavcdec.dir/common/ithread.c.o
+[ 28%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_chroma_intra_pred_filters_ssse3.c.o
+[ 28%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_deblk_chroma_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_deblk_luma_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_ihadamard_scaling_sse42.c.o
+[ 35%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_inter_pred_filters_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_ihadamard_scaling_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_iquant_itrans_recon_dc_ssse3.c.o
+[ 42%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_iquant_itrans_recon_sse42.c.o
+[ 42%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_iquant_itrans_recon_ssse3.c.o
+[ 42%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_luma_intra_pred_filters_ssse3.c.o
+[ 42%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_mem_fns_ssse3.c.o
+[ 42%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_padding_ssse3.c.o
+[ 50%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_resi_trans_quant_sse42.c.o
+[ 50%] Building C object CMakeFiles/libavcdec.dir/common/x86/ih264_weighted_pred_sse42.c.o
+[ 50%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_api.c.o
+[ 50%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_bitstrm.c.o
+[ 50%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_cabac.c.o
+[ 57%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_cabac_init_tables.c.o
+[ 57%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_compute_bs.c.o
+[ 57%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_deblocking.c.o
+[ 57%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_dpb_mgr.c.o
+[ 57%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_format_conv.c.o
+[ 64%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_function_selector_generic.c.o
+[ 64%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_inter_pred.c.o
+[ 64%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_mb_utils.c.o
+[ 64%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_mvpred.c.o
+[ 64%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_nal.c.o
+[ 71%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_bslice.c.o
+[ 71%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_cabac.c.o
+[ 71%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_cavlc.c.o
+[ 71%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_headers.c.o
+[ 78%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_islice.c.o
+[ 78%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_mb_header.c.o
+[ 78%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_pslice.c.o
+[ 78%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_parse_slice.c.o
+[ 78%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_process_bslice.c.o
+[ 85%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_process_intra_mb.c.o
+[ 85%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_process_pslice.c.o
+[ 85%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_quant_scaling.c.o
+[ 85%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_sei.c.o
+[ 85%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_tables.c.o
+[ 92%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_thread_compute_bs.c.o
+[ 92%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_thread_parse_decode.c.o
+[ 92%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_utils.c.o
+[ 92%] Building C object CMakeFiles/libavcdec.dir/decoder/ih264d_vui.c.o
+[ 92%] Building C object CMakeFiles/libavcdec.dir/decoder/x86/ih264d_function_selector.c.o
+[100%] Building C object CMakeFiles/libavcdec.dir/decoder/x86/ih264d_function_selector_sse42.c.o
+[100%] Building C object CMakeFiles/libavcdec.dir/decoder/x86/ih264d_function_selector_ssse3.c.o
+[100%] Linking C static library libavcdec.a
+[100%] Built target libavcdec
+[100%] Building CXX object CMakeFiles/avc_dec_fuzzer.dir/fuzzer/avc_dec_fuzzer.cpp.o
+[100%] Linking CXX executable avc_dec_fuzzer
+[100%] Built target avc_dec_fuzzer
+[  0%] Building C object CMakeFiles/libavcenc.dir/common/ih264_buf_mgr.c.o
+[  0%] Building C object CMakeFiles/libavcenc.dir/common/ih264_cabac_tables.c.o
+[  6%] Building C object CMakeFiles/libavcenc.dir/common/ih264_cavlc_tables.c.o
+[  6%] Building C object CMakeFiles/libavcenc.dir/common/ih264_chroma_intra_pred_filters.c.o
+[  6%] Building C object CMakeFiles/libavcenc.dir/common/ih264_common_tables.c.o
+[  6%] Building C object CMakeFiles/libavcenc.dir/common/ih264_deblk_edge_filters.c.o
+[  6%] Building C object CMakeFiles/libavcenc.dir/common/ih264_deblk_tables.c.o
+[ 12%] Building C object CMakeFiles/libavcenc.dir/common/ih264_disp_mgr.c.o
+[ 12%] Building C object CMakeFiles/libavcenc.dir/common/ih264_dpb_mgr.c.o
+[ 12%] Building C object CMakeFiles/libavcenc.dir/common/ih264_ihadamard_scaling.c.o
+[ 12%] Building C object CMakeFiles/libavcenc.dir/common/ih264_inter_pred_filters.c.o
+[ 12%] Building C object CMakeFiles/libavcenc.dir/common/ih264_iquant_itrans_recon.c.o
+[ 18%] Building C object CMakeFiles/libavcenc.dir/common/ih264_list.c.o
+[ 18%] Building C object CMakeFiles/libavcenc.dir/common/ih264_luma_intra_pred_filters.c.o
+[ 18%] Building C object CMakeFiles/libavcenc.dir/common/ih264_mem_fns.c.o
+[ 18%] Building C object CMakeFiles/libavcenc.dir/common/ih264_padding.c.o
+[ 18%] Building C object CMakeFiles/libavcenc.dir/common/ih264_resi_trans_quant.c.o
+[ 25%] Building C object CMakeFiles/libavcenc.dir/common/ih264_trans_data.c.o
+[ 25%] Building C object CMakeFiles/libavcenc.dir/common/ih264_weighted_pred.c.o
+[ 25%] Building C object CMakeFiles/libavcenc.dir/common/ithread.c.o
+[ 25%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_chroma_intra_pred_filters_ssse3.c.o
+[ 25%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_deblk_chroma_ssse3.c.o
+[ 31%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_deblk_luma_ssse3.c.o
+[ 31%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_ihadamard_scaling_sse42.c.o
+[ 31%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_ihadamard_scaling_ssse3.c.o
+[ 31%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_inter_pred_filters_ssse3.c.o
+[ 31%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_iquant_itrans_recon_dc_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_iquant_itrans_recon_sse42.c.o
+[ 37%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_iquant_itrans_recon_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_luma_intra_pred_filters_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_mem_fns_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_padding_ssse3.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_resi_trans_quant_sse42.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/common/x86/ih264_weighted_pred_sse42.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_api.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_bitstream.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_cabac.c.o
+[ 50%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_cabac_encode.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_cabac_init.c.o
+[ 43%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_cavlc.c.o
+[ 50%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_core_coding.c.o
+[ 56%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_deblk.c.o
+[ 56%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_encode.c.o
+[ 56%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_encode_header.c.o
+[ 56%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_fmt_conv.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_globals.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_function_selector_generic.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_half_pel.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_intra_modes_eval.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_mc.c.o
+[ 62%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_me.c.o
+[ 68%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_modify_frm_rate.c.o
+[ 68%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_process.c.o
+[ 68%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_rc_mem_interface.c.o
+[ 68%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_rate_control.c.o
+[ 68%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_sei.c.o
+[ 75%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_time_stamp.c.o
+[ 75%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_utils.c.o
+[ 75%] Building C object CMakeFiles/libavcenc.dir/encoder/ih264e_version.c.o
+[ 75%] Building C object CMakeFiles/libavcenc.dir/encoder/ime.c.o
+[ 75%] Building C object CMakeFiles/libavcenc.dir/encoder/ime_distortion_metrics.c.o
+[ 81%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_bit_allocation.c.o
+[ 81%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_est_sad.c.o
+[ 81%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_cbr_buffer_control.c.o
+[ 81%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_fixed_point_error_bits.c.o
+[ 81%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_frame_info_collector.c.o
+[ 87%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_mb_model_based.c.o
+[ 87%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_rate_control_api.c.o
+[ 87%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_picture_type.c.o
+[ 87%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_vbr_storage_vbv.c.o
+[ 87%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_rd_model.c.o
+[ 93%] Building C object CMakeFiles/libavcenc.dir/encoder/irc_vbr_str_prms.c.o
+[ 93%] Building C object CMakeFiles/libavcenc.dir/encoder/psnr.c.o
+[ 93%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ih264e_function_selector.c.o
+[ 93%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ih264e_function_selector_sse42.c.o
+[ 93%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ih264e_function_selector_ssse3.c.o
+[100%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ih264e_half_pel_ssse3.c.o
+[100%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ih264e_intra_modes_eval_ssse3.c.o
+[100%] Building C object CMakeFiles/libavcenc.dir/encoder/x86/ime_distortion_metrics_sse42.c.o
+[100%] Linking C static library libavcenc.a
+[100%] Built target libavcenc
+[100%] Building CXX object CMakeFiles/avc_enc_fuzzer.dir/fuzzer/avc_enc_fuzzer.cpp.o
+[100%] Linking CXX executable avc_enc_fuzzer
+[100%] Built target avc_enc_fuzzer
+[  0%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_buf_mgr.c.o
+[  5%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_cabac_tables.c.o
+[  5%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_cavlc_tables.c.o
+[  5%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_chroma_intra_pred_filters.c.o
+[  5%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_common_tables.c.o
+[  5%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_deblk_edge_filters.c.o
+[ 11%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_deblk_tables.c.o
+[ 11%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_disp_mgr.c.o
+[ 11%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_dpb_mgr.c.o
+[ 11%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_ihadamard_scaling.c.o
+[ 11%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_inter_pred_filters.c.o
+[ 17%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_iquant_itrans_recon.c.o
+[ 17%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_list.c.o
+[ 17%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_luma_intra_pred_filters.c.o
+[ 17%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_mem_fns.c.o
+[ 17%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_padding.c.o
+[ 23%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_resi_trans_quant.c.o
+[ 23%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_trans_data.c.o
+[ 23%] Building C object CMakeFiles/libmvcdec.dir/common/ih264_weighted_pred.c.o
+[ 23%] Building C object CMakeFiles/libmvcdec.dir/common/ithread.c.o
+[ 23%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_chroma_intra_pred_filters_ssse3.c.o
+[ 29%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_deblk_chroma_ssse3.c.o
+[ 29%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_deblk_luma_ssse3.c.o
+[ 29%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_ihadamard_scaling_sse42.c.o
+[ 29%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_ihadamard_scaling_ssse3.c.o
+[ 29%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_iquant_itrans_recon_dc_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_inter_pred_filters_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_iquant_itrans_recon_sse42.c.o
+[ 35%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_iquant_itrans_recon_ssse3.c.o
+[ 35%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_luma_intra_pred_filters_ssse3.c.o
+[ 41%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_mem_fns_ssse3.c.o
+[ 41%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_padding_ssse3.c.o
+[ 41%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_resi_trans_quant_sse42.c.o
+[ 41%] Building C object CMakeFiles/libmvcdec.dir/common/x86/ih264_weighted_pred_sse42.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_bitstrm.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_api.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_cabac.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_cabac_init_tables.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_compute_bs.c.o
+[ 52%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_dpb_mgr.c.o
+[ 47%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_deblocking.c.o
+[ 52%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_format_conv.c.o
+[ 52%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_function_selector_generic.c.o
+[ 52%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_inter_pred.c.o
+[ 52%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_mb_utils.c.o
+[ 58%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_mvpred.c.o
+[ 58%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_nal.c.o
+[ 58%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_bslice.c.o
+[ 58%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_cabac.c.o
+[ 58%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_cavlc.c.o
+[ 64%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_islice.c.o
+[ 64%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_headers.c.o
+[ 64%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_mb_header.c.o
+[ 64%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_pslice.c.o
+[ 64%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_parse_slice.c.o
+[ 70%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_process_bslice.c.o
+[ 70%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_process_intra_mb.c.o
+[ 70%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_process_pslice.c.o
+[ 70%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_quant_scaling.c.o
+[ 70%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_sei.c.o
+[ 76%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_tables.c.o
+[ 76%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_thread_compute_bs.c.o
+[ 76%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_thread_parse_decode.c.o
+[ 76%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_utils.c.o
+[ 76%] Building C object CMakeFiles/libmvcdec.dir/decoder/ih264d_vui.c.o
+[ 82%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_api.c.o
+[ 82%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_api_utils.c.o
+[ 82%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_dpb_manager.c.o
+[ 82%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_error_handler.c.o
+[ 82%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_nalu_parser.c.o
+[ 88%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_slice_functions.c.o
+[ 88%] Building C object CMakeFiles/libmvcdec.dir/decoder/mvc/imvcd_utils.c.o
+[ 88%] Building C object CMakeFiles/libmvcdec.dir/decoder/x86/ih264d_function_selector.c.o
+[ 88%] Building C object CMakeFiles/libmvcdec.dir/decoder/x86/ih264d_function_selector_sse42.c.o
+[ 88%] Building C object CMakeFiles/libmvcdec.dir/decoder/x86/ih264d_function_selector_ssse3.c.o
+[ 94%] Linking C static library libmvcdec.a
+[ 94%] Built target libmvcdec
+[ 94%] Building CXX object CMakeFiles/mvc_dec_fuzzer.dir/fuzzer/mvc_dec_fuzzer.cpp.o
+[100%] Linking CXX executable mvc_dec_fuzzer
+[100%] Built target mvc_dec_fuzzer
+[  0%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_buf_mgr.c.o
+[  0%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_cabac_tables.c.o
+[  0%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_cavlc_tables.c.o
+[  0%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_chroma_intra_pred_filters.c.o
+[  4%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_common_tables.c.o
+[  4%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_deblk_edge_filters.c.o
+[  4%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_deblk_tables.c.o
+[  4%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_disp_mgr.c.o
+[  8%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_dpb_mgr.c.o
+[  8%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_ihadamard_scaling.c.o
+[  8%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_inter_pred_filters.c.o
+[  8%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_iquant_itrans_recon.c.o
+[  8%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_list.c.o
+[ 12%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_luma_intra_pred_filters.c.o
+[ 12%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_mem_fns.c.o
+[ 12%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_padding.c.o
+[ 12%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_resi_trans_quant.c.o
+[ 12%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_trans_data.c.o
+[ 16%] Building C object CMakeFiles/libsvcdec.dir/common/ih264_weighted_pred.c.o
+[ 16%] Building C object CMakeFiles/libsvcdec.dir/common/ithread.c.o
+[ 16%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_chroma_intra_pred_filters_ssse3.c.o
+[ 16%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_deblk_chroma_ssse3.c.o
+[ 16%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_deblk_luma_ssse3.c.o
+[ 20%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_ihadamard_scaling_sse42.c.o
+[ 20%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_ihadamard_scaling_ssse3.c.o
+[ 20%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_inter_pred_filters_ssse3.c.o
+[ 20%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_iquant_itrans_recon_dc_ssse3.c.o
+[ 20%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_iquant_itrans_recon_sse42.c.o
+[ 25%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_iquant_itrans_recon_ssse3.c.o
+[ 25%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_luma_intra_pred_filters_ssse3.c.o
+[ 25%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_mem_fns_ssse3.c.o
+[ 25%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_padding_ssse3.c.o
+[ 25%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_resi_trans_quant_sse42.c.o
+[ 29%] Building C object CMakeFiles/libsvcdec.dir/common/x86/ih264_weighted_pred_sse42.c.o
+[ 29%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_common_tables.c.o
+[ 29%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_cabac_tables.c.o
+[ 29%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_intra_resample.c.o
+[ 29%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_iquant_itrans_recon.c.o
+[ 33%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_mem_fns.c.o
+[ 33%] Building C object CMakeFiles/libsvcdec.dir/common/svc/isvc_resi_trans_quant.c.o
+[ 33%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_iquant_itrans_recon_dc_ssse3.c.o
+[ 33%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_iquant_itrans_recon_sse42.c.o
+[ 33%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_iquant_itrans_recon_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_mem_fns_sse42.c.o
+[ 37%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_mem_fns_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_padding_ssse3.c.o
+[ 37%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_resi_trans_quant_sse42.c.o
+[ 37%] Building C object CMakeFiles/libsvcdec.dir/common/x86/svc/isvc_intra_resample_sse42.c.o
+[ 41%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_api.c.o
+[ 41%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_bitstrm.c.o
+[ 41%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_cabac.c.o
+[ 41%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_cabac_init_tables.c.o
+[ 41%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_compute_bs.c.o
+[ 45%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_deblocking.c.o
+[ 45%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_dpb_mgr.c.o
+[ 45%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_function_selector_generic.c.o
+[ 45%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_format_conv.c.o
+[ 45%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_inter_pred.c.o
+[ 50%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_mb_utils.c.o
+[ 50%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_mvpred.c.o
+[ 50%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_nal.c.o
+[ 50%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_bslice.c.o
+[ 50%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_cabac.c.o
+[ 54%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_cavlc.c.o
+[ 54%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_headers.c.o
+[ 54%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_islice.c.o
+[ 54%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_mb_header.c.o
+[ 54%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_pslice.c.o
+[ 58%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_parse_slice.c.o
+[ 58%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_process_bslice.c.o
+[ 58%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_process_intra_mb.c.o
+[ 58%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_process_pslice.c.o
+[ 62%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_quant_scaling.c.o
+[ 62%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_sei.c.o
+[ 62%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_tables.c.o
+[ 62%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_thread_compute_bs.c.o
+[ 62%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_thread_parse_decode.c.o
+[ 66%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_utils.c.o
+[ 66%] Building C object CMakeFiles/libsvcdec.dir/decoder/ih264d_vui.c.o
+[ 66%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_api.c.o
+[ 66%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_cabac.c.o
+[ 66%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_cabac_init_tables.c.o
+[ 70%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_compute_bs.c.o
+[ 70%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_function_selector_generic.c.o
+[ 70%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_mb_utils.c.o
+[ 70%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_nal.c.o
+[ 70%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_nal_parse.c.o
+[ 75%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_cavlc.c.o
+[ 75%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_ebslice.c.o
+[ 75%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_eislice.c.o
+[ 75%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_epslice.c.o
+[ 75%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_headers.c.o
+[ 79%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_slice.c.o
+[ 79%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_process_ebslice.c.o
+[ 79%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_process_epslice.c.o
+[ 79%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_thread_compute_bs.c.o
+[ 79%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_thread_parse_decode.c.o
+[ 83%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_utils.c.o
+[ 83%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_vui.c.o
+[ 83%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_ii_pred.c.o
+[ 83%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_intra_resamp.c.o
+[ 83%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_iquant_itrans.c.o
+[ 87%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_iquant_itrans_residual.c.o
+[ 87%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_iquant_itrans_residual_recon.c.o
+[ 87%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_mode_mv_resamp.c.o
+[ 87%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_pred_residual_recon.c.o
+[ 87%] Building C object CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_residual_resamp.c.o
+[ 91%] Building C object CMakeFiles/libsvcdec.dir/decoder/x86/ih264d_function_selector.c.o
+[ 91%] Building C object CMakeFiles/libsvcdec.dir/decoder/x86/ih264d_function_selector_sse42.c.o
+[ 91%] Building C object CMakeFiles/libsvcdec.dir/decoder/x86/ih264d_function_selector_ssse3.c.o
+[ 91%] Building C object CMakeFiles/libsvcdec.dir/decoder/x86/svc/isvcd_function_selector.c.o
+[ 91%] Building C object CMakeFiles/libsvcdec.dir/decoder/x86/svc/isvcd_function_selector_sse42.c.o
+/src/libavc/decoder/svc/isvcd_parse_headers.c:1969:24: error: no member named 'pic_width' in 'struct _SvcDecLyrStruct'
+ 1969 |     if(ps_svc_lyr_dec->pic_width < u2_pic_wd)
+      |        ~~~~~~~~~~~~~~  ^
+/src/libavc/decoder/svc/isvcd_parse_headers.c:1971:25: error: no member named 'pic_width' in 'struct _SvcDecLyrStruct'
+ 1971 |         ps_svc_lyr_dec->pic_width = u2_pic_wd;
+      |         ~~~~~~~~~~~~~~  ^
+/src/libavc/decoder/svc/isvcd_parse_headers.c:1973:24: error: no member named 'pic_height' in 'struct _SvcDecLyrStruct'
+ 1973 |     if(ps_svc_lyr_dec->pic_height < u2_pic_ht)
+      |        ~~~~~~~~~~~~~~  ^
+/src/libavc/decoder/svc/isvcd_parse_headers.c:1975:25: error: no member named 'pic_height' in 'struct _SvcDecLyrStruct'
+ 1975 |         ps_svc_lyr_dec->pic_height = u2_pic_ht;
+      |         ~~~~~~~~~~~~~~  ^
+4 errors generated.
+make[3]: *** [CMakeFiles/libsvcdec.dir/build.make:1350: CMakeFiles/libsvcdec.dir/decoder/svc/isvcd_parse_headers.c.o] Error 1
+make[3]: *** Waiting for unfinished jobs....
+make[2]: *** [CMakeFiles/Makefile2:215: CMakeFiles/libsvcdec.dir/all] Error 2
+make[1]: *** [CMakeFiles/Makefile2:482: CMakeFiles/svc_dec_fuzzer.dir/rule] Error 2
+make: *** [Makefile:306: svc_dec_fuzzer] Error 2

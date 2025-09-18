@@ -182,7 +182,7 @@ def get_delete_lines(target_repo_path, file_path1, commit1, file_path2, commit2,
     parser = GumTreeTextDiffParser(result.stdout, original_code1=file_content1, original_code2=file_content2)
     delete_lines = []
     for op in parser.get_deletes():
-        if op.line2 >= bb1_start_line and op.line1 <= bb1_end_line:
+        if op.label != 'compound_statement' and op.line2 >= bb1_start_line and op.line1 <= bb1_end_line:
             delete_lines.append((op.line1, op.line2))
     return delete_lines
 
