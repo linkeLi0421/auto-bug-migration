@@ -325,6 +325,7 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                                   help='Use docker cache when building image.')
   build_image_parser.add_argument('--no-pull',
                                   action='store_true',
+                                  default=True,
                                   help='Do not pull latest base image.')
   _add_external_project_args(build_image_parser)
 
@@ -1719,7 +1720,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       'gcr.io/oss-fuzz-base/%s' % image_name,
       'reproduce',
       fuzzer_name,
-      '-runs=1',
+      '-runs=100',
   ] + fuzzer_args
   if fuzzer_path:
     run_args[5] = f'{fuzzer_path}:/out'

@@ -426,8 +426,6 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
 
 
 def get_diff_unified(repo_path, commit1, commit2, patch_path, context_lines=3):
-    from git import Repo
-    import os
 
     repo = Repo(repo_path)
 
@@ -523,7 +521,7 @@ def prepare_transplant(data, repo_path):
     
     # Initialize the graph with all commits
     for row in data:
-        if row['poc_count'] > max_poc_count:
+        if row['poc_count'] >= max_poc_count:
             max_poc_count = row['poc_count']
             max_poc_row = row
     
@@ -539,7 +537,7 @@ def prepare_transplant(data, repo_path):
     bugs_cant_use = set()
     for row in data:
         for bug_id in bug_ids_other:
-            if row['osv_statuses'][bug_id] == '1|1':
+            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1'}:
                 if bug_id in bugs_need_transplant:
                     if is_ancestor(repo_path, bugs_need_transplant[bug_id], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
                         bugs_need_transplant[bug_id] = row
@@ -1429,6 +1427,11 @@ def handle_build_error(error_log):
     matches = re.findall(pattern, error_log)
     undeclared_functions = [(identifier, f"{filepath}:{line}:{column}") for filepath, line, column, identifier in matches]
     
+    # --- Conflicting types (treat like undeclared) ---
+    pattern = r"(/src.+?):(\d+):(\d+):.*conflicting types for '(\w+)'"
+    matches = re.findall(pattern, error_log)
+    undeclared_functions.extend((identifier, f"{filepath}:{line}:{column}") for filepath, line, column, identifier in matches)
+    
     # --- Missing struct members ---
     pattern = r"(/src.+?):(\d+):(\d+):.*no member named '(\w+)' in '([^']+)'"
     matches = re.findall(pattern, error_log)
@@ -2304,8 +2307,11 @@ def apply_and_test_patches(
     revert_and_trigger_set,
     revert_and_trigger_fail_set,
     depen_graph,
+    signature_change_list,
     ):
-    signature_change_list = []
+    if not patch_pair_list:
+        return
+    
     patch_key_list = [key for keys in patch_pair_list for key in keys]
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
@@ -2653,7 +2659,7 @@ def apply_and_test_patches(
         ]
         logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
         test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
-        if bug_type.lower() in test_result.stdout.lower() or bug_type.lower() in test_result.stderr.lower():
+        if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
             patches_without_context['patch_path'] = patch_file_path
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
@@ -2701,8 +2707,6 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
             confidence_level = '1'
         return f'trigger with confidence level: {confidence_level}'
     else:
-        logger.info('1111111111111111111111111111111111111111111111111')
-        logger.info(test_result.stderr.lower()+test_result.stdout.lower())
         return 'not trigger'
 
 
@@ -2729,18 +2733,19 @@ def revert_patch_test(args):
     previous_bug = ''
     previous_trace_func_list = []
     signature_change_list = []
+    transitions = []
     
     for bug_id, row in bugs_need_transplant.items():
-        # if bug_id not in {'OSV-2021-485', 'OSV-2021-496', 'OSV-2021-622', 'OSV-2021-639'}:
         commit = dict()
         next_commit = dict()
         commit['commit_id'] = row['commit_id'][:6]  # use short commit id for trace file name
         next_commit['commit_id'] = max_poc_row['commit_id'][:6]  # use short commit id for trace file name
-        next_commit['commit_id'] = '972c0aa711cadabb686fa75f95559cfd2c4ad316'[:6]
+        transitions.append((commit, next_commit, bug_id))
+    
+    for commit, next_commit, bug_id in transitions:
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
-        transitions = [(commit, next_commit, bug_id)]
         fuzzer = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         bug_type = bug_info['reproduce']['crash_type']
@@ -2849,7 +2854,7 @@ def revert_patch_test(args):
             else:
                 trace_func_list.append((func.split(' ')[0], func_loc))
                 
-        logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
+        logger.info(f"Trace function set: {len(trace_func_list)}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
@@ -2900,7 +2905,7 @@ def revert_patch_test(args):
         context = (diff_results, trace1, target_repo_path, commit, next_commit, target,
             sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, bug_type,
             get_patched_traces, transitions, revert_and_trigger_set, revert_and_trigger_fail_set,
-            depen_graph,)
+            depen_graph, signature_change_list)
         patch_by_func = dict()
         for key in patch_to_apply:
             if 'new_signature' in diff_results[key]:
@@ -2916,26 +2921,24 @@ def revert_patch_test(args):
             patch_pair_list = [('blosc/frame.cblosc/frame.c-2035,2+2089,2', 'blosc/frame.cblosc/frame.c-2021,7+2067,15', 'blosc/frame.cblosc/frame.c-1977,2+2023,2', 'blosc/frame.cblosc/frame.c-1950,4+1977,19', 'blosc/frame.cblosc/frame.c-1936,3+1963,3', 'blosc/frame.cblosc/frame.c-1927,2+1954,2', 'blosc/frame.cblosc/frame.c-1916,2+1938,7', 'blosc/frame.cblosc/frame.c-1907,2+1929,2', 'blosc/frame.cblosc/frame.c-1969,0+2012,4')]
         if bug_id == 'OSV-2021-496':
             patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
-        if bug_id == 'OSV-2024-638':
-            patch_pair_list = [('decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1370,9+1407,0', 'decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1614,3+1642,31', 'decoder/svc/isvcd_parse_headers.cdecoder/svc/isvcd_parse_headers.c-1159,0+1189,8')]
-        # tmp_context = copy.deepcopy(context)
-        # if not apply_and_test_patches(patch_pair_list, dict(), *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
-        #     revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
-        # else:
-        #     revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-        #     logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-        #     minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, dict(), context)
-        #     logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
+        tmp_context = copy.deepcopy(context)
+        if not apply_and_test_patches(patch_pair_list, dict(), *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+            revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+        else:
+            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, dict(), context)
+            logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
 
-        apply_and_test_patches(patch_pair_list, patches_without_context, *context)
+        # apply_and_test_patches(patch_pair_list, patches_without_context, *context)
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
-        # test if the local bugs is still there 
-        if 'patch_path' in patches_without_context: # if the bug trigger
-            for bug_id_trigger in bug_ids_trigger:
-                if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':
-                    logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
-                else:
-                    logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
+        # # test if the local bugs is still there 
+        # if 'patch_path' in patches_without_context: # if the bug trigger
+        #     for bug_id_trigger in bug_ids_trigger:
+        #         if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':
+        #             logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
+        #         else:
+        #             logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
 
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
@@ -3014,11 +3017,18 @@ if __name__ == "__main__":
     patches_without_contexts = revert_patch_test(args)
     # Use absolute path for the cache file
     cache_file = os.path.join(current_file_path, "patches.pkl.gz")
+    for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
+        logger.info(f'bug_id {bug_id}')
+        for patch in patch_dict.values():
+            if 'new_signature' in patch:
+                logger.info(f'  new_signature {patch["new_signature"]}')
+            elif 'old_signature' in patch:
+                logger.info(f'  old_signature {patch["old_signature"]}')
     
     # Save the patches to cache file
-    # save_patches_pickle(patches_without_contexts, cache_file)
+    save_patches_pickle(patches_without_contexts, cache_file)
     
-    # patches_without_contexts = load_patches_pickle(cache_file)
+    patches_without_contexts = load_patches_pickle(cache_file)
     # need_merge = dict()
     # for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
     #     if bug_id in {'OSV-2021-485', 'OSV-2021-622'}:
@@ -3031,10 +3041,3 @@ if __name__ == "__main__":
         #         logger.info(f'old_signature: {patch['old_signature']}')
     # merge_patches(args, need_merge)
     
-    # test all-bug-patch for local bugs
-    # bug_ids_trigger = {'OSV-2021-485', 'OSV-2021-496', 'OSV-2021-622', 'OSV-2021-1791', 'OSV-2023-319', 'OSV-2021-897', 'OSV-2021-997', 'OSV-2021-1589', 'OSV-2023-51', 'OSV-2022-34', 'OSV-2022-4'}
-    # for bug_id_trigger in bug_ids_trigger:
-    #     if test_fuzzer(args.bug_info, bug_id_trigger, args.target) == 'trigger':
-    #         logger.info(f'\ttrigger bug {bug_id_trigger}')
-    #     else:
-    #         logger.info(f'\tnot trigger bug {bug_id_trigger}')
