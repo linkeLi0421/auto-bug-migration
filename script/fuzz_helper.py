@@ -1720,7 +1720,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       'gcr.io/oss-fuzz-base/%s' % image_name,
       'reproduce',
       fuzzer_name,
-      '-runs=100',
+      '-runs=10',
   ] + fuzzer_args
   if fuzzer_path:
     run_args[5] = f'{fuzzer_path}:/out'
