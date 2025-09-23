@@ -562,7 +562,7 @@ if __name__ == "__main__":
         exit(1)
     target_storage_path = os.path.join(storage_path, target)
     
-    arch = 'x86_64' # We have enouth x86 bugs
+    arch = 'x86_64' # We have enough x86 bugs
     repo_path = args.repo
     bug_ids_path = os.getenv("BUGIDS_PATH")
     bug_info_path = os.getenv("BUGINFO_PATH")
