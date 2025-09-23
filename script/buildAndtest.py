@@ -33,27 +33,10 @@ def get_folder_names(directory):
     return folder_names
 
 
-def get_commit_timestamp(repo_path, commit_hash):
-    """
-    Get the timestamp of a commit in a Git repository.
-
-    Args:
-        repo_path (str): The path to the Git repository.
-        commit_hash (str): The hash of the commit.
-
-    Returns:
-        : The timestamp of the commit.
-    """
-    # Open the repository
+def get_commit_timestamp(repo_path: str, commit_hash: str) -> int:
     repo = git.Repo(repo_path)
-
-    # Get the commit object
-    commit = repo.commit(commit_hash)
-
-    # Get the commit timestamp (author date or commit date)
-    commit_timestamp = commit.committed_datetime  # or use .authored_datetime for author date
-
-    return commit_timestamp
+    ts = repo.git.show("-s", "--format=%ct", commit_hash).strip()
+    return int(ts)
 
 
 def git_first_last_commit(target_bug_ids, bug_infos):
@@ -251,7 +234,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 # Create the destination directory if it doesn't exist
                 dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                
+                subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
                 build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
@@ -289,8 +272,6 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
     for bug_id in filter_bug_ids:
         bug_info = bug_infos[bug_id]
         poc_path = os.path.join(testcases_env, 'testcase-' + bug_id)
-        introduced_timestamp = get_commit_timestamp(repo_path, bug_info["introduced"])
-        fixed_timestamp = get_commit_timestamp(repo_path, bug_info["fixed"])
         fuzzing_engine = bug_info['reproduce']['fuzzing_engine']
         fuzz_target = bug_info['reproduce']['fuzz_target']
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
@@ -587,7 +568,6 @@ if __name__ == "__main__":
         filter_bug_ids.append(bug_id)
     
     first_commit, lastest_commit = git_first_last_commit(filter_bug_ids, bug_infos)
-    logger.info(f'firse_commit {first_commit}')
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
