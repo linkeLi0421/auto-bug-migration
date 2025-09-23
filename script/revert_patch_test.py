@@ -521,6 +521,10 @@ def prepare_transplant(data, repo_path):
     
     # Initialize the graph with all commits
     for row in data:
+        row['poc_count'] = 0
+        for bug_id in row['osv_statuses'].keys():
+            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1'}:
+                row['poc_count'] += 1
         if row['poc_count'] >= max_poc_count:
             max_poc_count = row['poc_count']
             max_poc_row = row
@@ -549,7 +553,7 @@ def prepare_transplant(data, repo_path):
     logger.info(f'all bugs count: {len(max_poc_row["osv_statuses"])}')
     logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)} {bug_ids_trigger}')
     logger.info(f'bugs need transplant count: {len(bugs_need_transplant)} {bugs_need_transplant.keys()}')
-    logger.info(f'bugs cant use count: {len(bugs_cant_use)} {bugs_cant_use}')
+    logger.info(f'bugs cant use count: {len(bugs_cant_use)} {bugs_cant_use}\n')
     
     return bug_ids_trigger, bugs_need_transplant, max_poc_row
 
@@ -700,9 +704,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
         path = path_b if 'dev/null' not in path_b else path_a
         # Derive file extension/type from path:
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
-        if ext not in ['c', 'cpp', 'h', 'hpp', 'cxx', 'cc']:
-            # Skip non-C/C++ files
-            logger.debug(f'Skipping non-C/C++ file: {path}')
+        if ext not in ['c']:
+            # Skip non-C files
+            logger.debug(f'Skipping non-C file: {path}')
             continue
 
         patch_text = diff
@@ -737,6 +741,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 old_end_num = max(old_begin_num, old_begin_num + int(old_line_num.split(',')[1]) - first_index - last_index - 1)
 
                 new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
+                new_line_num = '1,0' if new_line_num == '1' else new_line_num
                 begin_num = int(new_line_num.split(',')[0]) + first_index
                 end_num = max(begin_num, begin_num + int(new_line_num.split(',')[1]) - first_index - last_index - 1)
             else:
@@ -968,9 +973,11 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "call to undeclared function"
     ]
 
+    pattern = r"ERROR:.*Sanitizer"
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
-    if (not os.path.exists(fuzzer_path)
-        or any(p in combined for p in build_error_patterns)
+    if not re.search(pattern, combined) \
+        and (not os.path.exists(fuzzer_path) \
+        or any(p in combined for p in build_error_patterns) \
         or result.returncode != 0):
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
         return False, combined
@@ -1230,7 +1237,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 patch_prev_lines = patch_prev['patch_text'].split('\n')
                 connect_lines_end = patch['new_start_line']
                 # In most cases, patch_prev['new_end_line'] is the actually line number+1, except patch_prev['new_end_line'] = patch_prev['new_start_line']
-                connect_lines_begin = patch_prev['new_end_line'] if patch_prev['new_end_line'] > patch_prev['new_start_line'] else patch_prev['new_end_line']-1
+                connect_lines_begin = patch_prev['new_end_line']
                 if connect_lines_begin < connect_lines_end:
                     with open(os.path.join(target_repo_path, patch['file_path_new']), 'r') as f:
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
@@ -1300,7 +1307,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
             old_line_begin = old_line_begin_nocontext
             old_offset = old_offset_nocontext + new_offset - new_offset_nocontext
             if new_offset == new_offset_nocontext:
-                old_offset -= 1
                 context_lines2 = []
             else:
                 context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
@@ -1592,10 +1598,13 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     # For function do not change but appear in trace, add a patch if they should call recreated functions
     # Assume target_repo in new commit
     new_patch_to_apply = set()
+    trace_set = set() # avoid duplicate functions in loop
     for index, func in trace1:
         fname = func.split(' ')[0]
         location = func.split(' ')[1]
         file_path = location.split(':')[0][1:]  # remove leading /
+        trace_set.add((fname, file_path))
+    for fname, file_path in trace_set:
         old_line_begin = None
         old_line_end = None
         flag = False # flag to indicate if the function is changed between commit and next_commit
@@ -2288,6 +2297,9 @@ def get_file_path_pairs(diff_results):
 def apply_and_test_patches(
     patch_pair_list,
     patches_without_context,
+    get_patched_traces,
+    transitions,
+    signature_change_list,
     diff_results,
     trace1,
     target_repo_path,
@@ -2301,13 +2313,7 @@ def apply_and_test_patches(
     arch,
     file_path_pairs,
     data_path,
-    bug_type,
-    get_patched_traces,
-    transitions,
-    revert_and_trigger_set,
-    revert_and_trigger_fail_set,
     depen_graph,
-    signature_change_list,
     ):
     if not patch_pair_list:
         return
@@ -2391,16 +2397,15 @@ def apply_and_test_patches(
                         break
                     if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
                         found = True
-                        if '#include' in ast_node['extent']['start']['file']:
-                            # macro defined in header file from system include paths
-                            var_del_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
-                        else:
-                            # macro defined in .h file in the target repo
-                            var_del_to_add.setdefault(file_path_new, dict())[f'#include "{ast_node['extent']['start']['file'].split('/')[-1]}":{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = None
+                        var_del_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
                         break
                     if ast_node['kind'] in {'DECL_REF_EXPR'} and ast_node['spelling'] == identifier:
                         found = True
-                        miss_decls.append((ast_node['spelling'], location.split(':')[0], int(location.split(':')[1])))
+                        if 'type_ref' in ast_node and ast_node['type_ref']['target_kind'] == 'VAR_DECL':
+                            # use type def here, because they are similiar
+                            type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
+                        else: 
+                            miss_decls.append((ast_node['spelling'], location.split(':')[0], int(location.split(':')[1])))
                         break
                     if ast_node['kind'] in {'UNION_DECL', 'ENUM_DECL'} and ast_node['spelling'] == identifier:
                         # typedef union{...}...; typedef enum{...}...;
@@ -2419,7 +2424,7 @@ def apply_and_test_patches(
                     logger.info(f'Cannot find {identifier} in {parsing_path}')
                     exit(0)
             else:
-                logger.error(f'Cannot find {identifier} in parsing_path: {parsing_path}!')
+                logger.error(f'Cannot find parsing_path: {parsing_path}!')
 
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
@@ -2558,7 +2563,8 @@ def apply_and_test_patches(
                     var_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r') as f:
                         file_content = f.readlines()
-                        var_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
+                        new_identifier = f'__rervert_{commit['commit_id']}_{identifier}'
+                        var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
             
             if file_path in type_def_to_add:
                 locs = list(type_def_to_add[file_path])
@@ -2662,9 +2668,6 @@ def apply_and_test_patches(
         if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
             patches_without_context['patch_path'] = patch_file_path
-            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-            if ((bug_id, next_commit['commit_id'], fuzzer) in revert_and_trigger_fail_set):
-                revert_and_trigger_fail_set.remove((bug_id, next_commit['commit_id'], fuzzer))
             if test_fuzzer_build(target, sanitizer, arch):
                 logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_and_fuzzer_build'
@@ -2672,7 +2675,6 @@ def apply_and_test_patches(
                 logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_but_fuzzer_build_fail'
         else:
-            revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
             get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
             transitions.append((commit, next_commit, bug_id))
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
@@ -2852,7 +2854,8 @@ def revert_patch_test(args):
                         break
                 trace_func_list.append((func_dict[func], func_loc))
             else:
-                trace_func_list.append((func.split(' ')[0], func_loc))
+                func_dict[func] = func.split(' ')[0]
+                trace_func_list.append((func_dict[func], func_loc))
                 
         logger.info(f"Trace function set: {len(trace_func_list)}")
         if not trace_func_list:
@@ -2903,9 +2906,7 @@ def revert_patch_test(args):
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
         context = (diff_results, trace1, target_repo_path, commit, next_commit, target,
-            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, bug_type,
-            get_patched_traces, transitions, revert_and_trigger_set, revert_and_trigger_fail_set,
-            depen_graph, signature_change_list)
+            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
         patch_by_func = dict()
         for key in patch_to_apply:
             if 'new_signature' in diff_results[key]:
@@ -2922,15 +2923,17 @@ def revert_patch_test(args):
         if bug_id == 'OSV-2021-496':
             patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
         tmp_context = copy.deepcopy(context)
-        if not apply_and_test_patches(patch_pair_list, dict(), *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        signature_change_list = []
+        if not apply_and_test_patches(patch_pair_list, dict(), get_patched_traces, transitions, signature_change_list, *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, dict(), context)
+            # try to minimize the patch set
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, get_patched_traces, transitions, signature_change_list, *context)
             logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
 
-        # apply_and_test_patches(patch_pair_list, patches_without_context, *context)
+        # apply_and_test_patches(minimal_fast, patches_without_context, get_patched_traces, transitions, *context)
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
         # # test if the local bugs is still there 
         # if 'patch_path' in patches_without_context: # if the bug trigger

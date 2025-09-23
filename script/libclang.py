@@ -8,6 +8,26 @@ Config.set_library_file('/usr/lib/llvm-18/lib/libclang.so')  # adjust for your s
 index = Index.create()
 
 
+def _extent_dict(cur, include_paths):
+    if not cur or not cur.extent or not cur.extent.start or not cur.extent.end:
+        return None
+    def _disp(p):
+        if not p:
+            return ""
+        real = os.path.realpath(str(p))
+        if real.startswith("/src"):
+            return real.split("/", 3)[-1]
+        if any(ip in str(p) for ip in include_paths):
+            return "#include <" + os.path.basename(real) + ">"
+        return real
+    s = cur.extent.start
+    e = cur.extent.end
+    return {
+        "start": {"file": _disp(s.file), "line": s.line, "column": s.column},
+        "end":   {"file": _disp(e.file), "line": e.line, "column": e.column},
+    }
+
+
 def extract_include_paths() -> list[str]:
     # Run the Clang command and capture stderr
     result = subprocess.run(
@@ -119,6 +139,17 @@ def analyze_file(directory, src_file, args):
                     for arg in target.get_arguments():
                         callee_args.append(f"{arg.type.spelling} {arg.spelling}")
                     info["callee"]["signature"] = f"{target.result_type.spelling} {target.spelling}({', '.join(callee_args)})"
+                decl = target.get_definition() if target else None
+                if not decl and target:
+                    decl = target  # use the declaration if no definition found
+                info["type_ref"] = {
+                    "target_kind": target.kind.name if target else "",
+                    "target_name": target.spelling if target else "",
+                    "usr": (target.get_usr() if target else ""),
+                    "canonical_type": (target.type.get_canonical().spelling if target and target.type else ""),
+                    "decl_location": None,
+                    "typedef_extent": _extent_dict(decl, include_paths),   # <-- full typedef range (includes name + semicolon)
+                }
         elif cursor.kind == CursorKind.ENUM_CONSTANT_DECL:
             info['enum_value'] = cursor.enum_value
         elif cursor.kind == CursorKind.TYPEDEF_DECL:
@@ -128,33 +159,13 @@ def analyze_file(directory, src_file, args):
             decl = target.get_definition() if target else None
             if not decl and target:
                 decl = target  # use the declaration if no definition found
-
-            def _extent_dict(cur):
-                if not cur or not cur.extent or not cur.extent.start or not cur.extent.end:
-                    return None
-                def _disp(p):
-                    if not p:
-                        return ""
-                    real = os.path.realpath(str(p))
-                    if real.startswith("/src"):
-                        return real.split("/", 3)[-1]
-                    if any(ip in str(p) for ip in include_paths):
-                        return "#include <" + os.path.basename(real) + ">"
-                    return real
-                s = cur.extent.start
-                e = cur.extent.end
-                return {
-                    "start": {"file": _disp(s.file), "line": s.line, "column": s.column},
-                    "end":   {"file": _disp(e.file), "line": e.line, "column": e.column},
-                }
-
             info["type_ref"] = {
                 "target_kind": target.kind.name if target else "",
                 "target_name": target.spelling if target else "",
                 "usr": (target.get_usr() if target else ""),
                 "canonical_type": (target.type.get_canonical().spelling if target and target.type else ""),
                 "decl_location": None,
-                "typedef_extent": _extent_dict(decl),   # <-- full typedef range (includes name + semicolon)
+                "typedef_extent": _extent_dict(decl, include_paths),   # <-- full typedef range (includes name + semicolon)
             }
 
             # Try to resolve the underlying declaration (struct/union/enum) and record its full range too
@@ -173,17 +184,17 @@ def analyze_file(directory, src_file, args):
                     "kind": underlying_def.kind.name,
                     "name": underlying_decl.spelling or underlying_def.spelling,
                     "decl_location": {
-                        "file": _extent_dict(underlying_def)["start"]["file"] if _extent_dict(underlying_def) else "",
+                        "file": _extent_dict(underlying_def, include_paths)["start"]["file"] if _extent_dict(underlying_def, include_paths) else "",
                         "line": underlying_def.location.line if underlying_def.location else 0,
                         "column": underlying_def.location.column if underlying_def.location else 0,
                     },
-                    "extent": _extent_dict(underlying_def),  # <-- range of enum { … } block
+                    "extent": _extent_dict(underlying_def, include_paths),  # <-- range of enum { … } block
                 }
             else:
                 # Fallback: keep at least the decl location of the typedef
                 if decl and decl.location and decl.location.file:
                     info["type_ref"]["decl_location"] = {
-                        "file": _extent_dict(decl)["start"]["file"] if _extent_dict(decl) else "",
+                        "file": _extent_dict(decl, include_paths)["start"]["file"] if _extent_dict(decl, include_paths) else "",
                         "line": decl.location.line,
                         "column": decl.location.column,
                     }
