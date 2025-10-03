@@ -100,7 +100,7 @@ def analyze_file(directory, src_file, args, defs_by_usr):
                                CursorKind.UNION_DECL,
                                CursorKind.ENUM_DECL,
                                CursorKind.ENUM_CONSTANT_DECL,
-                               CursorKind.CALL_EXPR,
+                            #    CursorKind.CALL_EXPR,
                                CursorKind.DECL_REF_EXPR,
                                CursorKind.MACRO_DEFINITION,
                                CursorKind.TYPEDEF_DECL,
@@ -137,26 +137,6 @@ def analyze_file(directory, src_file, args, defs_by_usr):
                 arg_list.append(f"{arg.type.spelling} {arg.spelling}")
             signature = f"{cursor.result_type.spelling} {cursor.spelling}({', '.join(arg_list)})"
             info["signature"] = signature
-        elif cursor.kind == CursorKind.CALL_EXPR:
-            # Extract call expression information
-            num_args = len(list(cursor.get_arguments()))
-            info["num_arguments"] = num_args
-            
-            # Get callee information if available
-            callee = cursor.referenced
-            if callee:
-                info["callee"] = {
-                    "name": callee.spelling,
-                    "type": callee.type.spelling if hasattr(callee, "type") else "",
-                    "result_type": callee.result_type.spelling if hasattr(callee, "result_type") else "",
-                }
-                
-                # Try to build signature for the callee if it's a function declaration
-                if callee.kind == CursorKind.FUNCTION_DECL:
-                    callee_args = []
-                    for arg in callee.get_arguments():
-                        callee_args.append(f"{arg.type.spelling} {arg.spelling}")
-                    info["callee"]["signature"] = f"{callee.result_type.spelling} {callee.spelling}({', '.join(callee_args)})"
         elif cursor.kind == CursorKind.DECL_REF_EXPR:
             target = cursor.referenced
             if target is not None:
@@ -372,7 +352,6 @@ def main():
 
     for src_file in compile_db:
         directory, args = compile_db[src_file]
-        
         # Redirect the output file to /null
         if "-o" in args:
             idx = args.index("-o")

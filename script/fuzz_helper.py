@@ -1951,7 +1951,7 @@ def build_version(args):
     ])
 
   build_bash = f'''
-  export CFLAGS="-fdiagnostics-absolute-paths $CFLAGS";
+  export CFLAGS="-fdiagnostics-absolute-paths -ferror-limit=0 $CFLAGS";
   cd /src/{args.project.name};
   git checkout -f {args.commit};
   '''

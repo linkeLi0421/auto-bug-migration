@@ -3,7 +3,7 @@ import subprocess
 import sys
 import re
 from typing import List, Tuple, Optional
-from bisect import bisect_right
+from bisect import bisect_right, bisect_left
 
 gumtree_path = os.getenv('GUMTREE_PATH')
 
@@ -55,6 +55,8 @@ class GumTreeTextDiffParser:
         # Split sections by '===\n' or lines that contain only '==='
         sections = re.split(r'^===\s*$', self.raw_text.strip(), flags=re.MULTILINE)
 
+        min_line2 = dict()
+        max_line2 = dict()
         for section in sections:
             lines = [line.strip() for line in section.strip().splitlines() if line.strip()]
             if not lines:
@@ -76,6 +78,16 @@ class GumTreeTextDiffParser:
                 self.matches.append(
                     DiffOperation(label1, (start1, end1), (start2, end2), line1, line2)
                 )
+                if line1 in min_line2:
+                    min_line2[line1] = min(line2, min_line2[line1])
+                else:
+                    min_line2[line1] = line2
+                
+                if line1 in max_line2:
+                    max_line2[line1] = max(line2, max_line2[line1])
+                else:
+                    max_line2[line1] = line2
+                
             elif lines[0] == "delete-node" or lines[0] == "delete-tree":
                 for line in lines[2:]:
                     m = self._parse_line(line)
@@ -91,6 +103,32 @@ class GumTreeTextDiffParser:
                 self.deletes.append(
                     DiffOperation(label, (start, end), (-1, -1), line_start, line_end)
                 )
+
+        def closest_less_than(sorted_list, x):
+            # Find insertion point for x
+            idx = bisect_left(sorted_list, x)
+            
+            # If idx == 0, nothing is less than x
+            if idx == 0:
+                return None  
+            
+            # Otherwise, the closest smaller item is right before the insertion point
+            return idx - 1
+
+        # Filter some matches
+        line1_list = sorted(list(min_line2.keys()))
+        new_matches = []
+        for match in self.matches:
+            smaller_line1_idx = closest_less_than(line1_list, match.line1)
+            smaller_line1 = line1_list[smaller_line1_idx] if smaller_line1_idx is not None else None
+            lager_line1 = line1_list[smaller_line1_idx + 2] if smaller_line1_idx and smaller_line1_idx + 2 < len(line1_list) else None
+            if smaller_line1 and match.line2 < min_line2[smaller_line1]:
+                continue
+            if lager_line1 and match.line2 > max_line2[lager_line1]:
+                continue
+            new_matches.append(match)
+        self.matches = new_matches
+    
 
     def _parse_line(self, line: str) -> Optional[Tuple[str, int, int]]:
         # Example line: "identifier: j [28021,28022]"
