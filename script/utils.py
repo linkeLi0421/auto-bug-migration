@@ -20,7 +20,7 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
         if key not in cache:
             items_copy = copy.deepcopy(items)
             ctx_copy   = copy.deepcopy(context)
-            cache[key] = test_fn(items_copy, patches_without_context, *ctx_copy)
+            cache[key] = test_fn(items_copy, patches_without_context, get_patched_traces, transitions, signature_change_list, *ctx_copy)
         return cache[key]
 
     while changed:
