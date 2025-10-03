@@ -57,11 +57,6 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     subprocess.run(["git", "checkout", '-f', commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{file_path}_analysis.json')
-    parsing_path = os.path.join(
-        data_path,
-        f"{target_repo_path.split('/')[-1]}-{commit}",
-        f"{file_path}_analysis.json",
-    )
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for ast_node in ast_nodes:
@@ -166,6 +161,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
+    recreated_functions = set()
     for code, error_type, file_path, line_range in function_sig_changes:
         def_file_path = None
         file_path_new = file_path.split('/', 3)[-1]
@@ -190,7 +186,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
         caller_sig = None
         # 1 get caller and callee
         for node in ast_nodes:
-            if not callee_sig and node.get('kind') in call_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
+            if 'type_ref' in node and not callee_sig and node.get('kind') in call_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
                 and max(old_line_list) <= int(node['extent']['end']['line']):
                 callee_sig = node['callee']['signature']
             if not caller_sig and node.get('kind') in def_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
@@ -204,13 +200,21 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 def_file_path = node['location']['file'].replace('.h', '.c')
         
         def_file_path_new = def_file_path_old = def_file_path
-        for file_path_new, file_path_old in file_path_pairs.items():
-            if file_path_old == def_file_path:
-                def_file_path_new = file_path_new
+        for file_path_new_, file_path_old_ in file_path_pairs.items():
+            if file_path_old_ == def_file_path:
+                def_file_path_new = file_path_new_
 
         if callee_sig and caller_sig:
+            need_recreate = True # If we have already recreate this function, just change the callsite this time
+            if callee_sig.replace(fname, f'__revert_{commit}_{fname}') in function_declarations:
+                need_recreate = False
+            function_declarations.add(callee_sig.replace(fname, f'__revert_{commit}_{fname}'))
+            
             func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, def_file_path_old, callee_sig)
+            if not func_code:
+                logger.error(f'No func code found for {def_file_path_old}: {callee_sig}')
             func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
+            recreated_functions.add(callee_sig)
             
             callee_sig_new = get_new_funcsig(fname, next_commit, def_file_path_new, target_repo_path)
             if not callee_sig_new:
@@ -238,80 +242,93 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                             # Replace the call with the recreated function
                             func_code = '\n'.join(rename_func(func_code, node['spelling'], commit))
                             
-                tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, def_file_path_new))
+                func_code = '\n'.join(rename_func(func_code, fname, commit))
+                tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, def_file_path_new, caller_sig, callee_sig, need_recreate))
             else:
-                artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
-                # Create the Artificial patch here
-                patch_header = f'diff --git a/{def_file_path_old} b/{def_file_path_new}\n--- a/{def_file_path_old}\n+++ b/{def_file_path_new}\n'
-                patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
-                artificial_patch = {
-                    'file_path_old': def_file_path_old,
-                    'file_path_new': def_file_path_new,
-                    'file_type': 'c',
-                    'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
-                    'old_signature': callee_sig, # __revert_{commit}_{fname} is not added here
-                    'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
-                    'dependent_func': set(),
-                    'new_start_line': artificial_patch_insert_point,
-                    'new_end_line': artificial_patch_insert_point,
-                    'old_start_line': artificial_patch_insert_point,
-                    'old_end_line': artificial_patch_insert_point + func_length,
-                }
-                new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
-                diff_results[new_key] = artificial_patch
-                new_patch_key_list.add(new_key)
+                if need_recreate:
+                    artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
+                    # Create the Artificial patch here
+                    patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
+                    patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
+                    artificial_patch = {
+                        'file_path_old': def_file_path_old,
+                        'file_path_new': def_file_path_new,
+                        'file_type': 'c',
+                        'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                        'old_signature': callee_sig, # __revert_{commit}_{fname} is not added here
+                        'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
+                        'dependent_func': set(),
+                        'new_start_line': artificial_patch_insert_point,
+                        'new_end_line': artificial_patch_insert_point,
+                        'old_start_line': artificial_patch_insert_point,
+                        'old_end_line': artificial_patch_insert_point + func_length,
+                    }
+                    logger.info(f'process_func: {callee_sig}')
+                    new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
+                    diff_results[new_key] = artificial_patch
+                    new_patch_key_list.add(new_key)
                 # change the callsite, update depen_graph
                 for key in patch_key_list:
                     patch = diff_results[key]
                     if 'old_signature' in patch and patch['old_signature'] == caller_sig:
                         depen_graph.setdefault(new_key, set()).add(key)
-                        patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname, commit))
-            function_declarations.add(callee_sig.replace(fname, f'__revert_{commit}_{fname}'))
+                        modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
+                        diff_results[key]['patch_text'] = '\n'.join(modified_lines)
         else:
-            logger.error(f"{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
+            logger.error(f"-{file_path_old}+{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
     if len(tail_fun_info_list) > 0:
         tail_code = dict() 
         tail_code_len = dict()
         tail_insert_point = dict()
         tail_def_file_path_new = dict()
-        for func_code, insert_point, func_length, def_file_path_old, def_file_path_new in tail_fun_info_list:
-            tail_code[def_file_path_old] = tail_code.get(def_file_path_old, '') + func_code
-            tail_code_len[def_file_path_old] = tail_code_len.get(def_file_path_old, 0) + func_length
-            tail_insert_point[def_file_path_old] = insert_point
-            tail_def_file_path_new[def_file_path_old] = def_file_path_new
-        
+        tail_details = dict()
+        tail_hiden_func_dict = dict()
+        for func_code, insert_point, func_length, def_file_path_old, def_file_path_new, caller_sig, callee_sig, need_recreate in tail_fun_info_list:
+            if need_recreate:
+                tail_hiden_func_dict.setdefault(def_file_path_old, dict())[callee_sig] = tail_code.get(def_file_path_old, '').count('\n')
+                tail_code[def_file_path_old] = tail_code.get(def_file_path_old, '') + func_code + '\n'
+                tail_code_len[def_file_path_old] = tail_code_len.get(def_file_path_old, 0) + func_length
+                tail_insert_point[def_file_path_old] = insert_point
+                tail_def_file_path_new[def_file_path_old] = def_file_path_new
+            tail_details.setdefault(def_file_path_old, set()).add((caller_sig, callee_sig))
+            
         for def_file_path_old in tail_code:
             insert_point = tail_insert_point[def_file_path_old]
             def_file_path_new = tail_def_file_path_new[def_file_path_old]
             tail_key = f'{def_file_path_old}{def_file_path_new}-{insert_point},{tail_code_len[def_file_path_old]}+{insert_point},0'
-            patch_header = f'diff --git a/{def_file_path_old} b/{def_file_path_new}\n--- a/{def_file_path_old}\n+++ b/{def_file_path_new}\n'
+            patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
             patch_header += f'@@ -{insert_point},{tail_code_len[def_file_path_old]} +{insert_point},0 @@\n'
             diff_results[tail_key] = {
                 'file_path_old': def_file_path_old,
                 'file_path_new': def_file_path_new,
                 'file_type': 'c',
-                'patch_text': '\n'.join(rename_func(patch_header + tail_code[def_file_path_old], fname, commit)),
-                'old_signature': None,
-                'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
+                'patch_text': patch_header + tail_code[def_file_path_old],
+                'old_signature': f'tail_{def_file_path_old}',
+                'patch_type': {'Function removed', 'Function body change', 'Recreated function', 'Tail function'},
                 'dependent_func': set(),
                 'new_start_line': insert_point,
                 'new_end_line': insert_point,
                 'old_start_line': insert_point,
                 'old_end_line': insert_point + tail_code_len[def_file_path_old],
+                'hiden_func_dict': tail_hiden_func_dict[def_file_path_old],
             }
             new_patch_key_list.add(tail_key)
             # change the callsite, update depen_graph
-            for key in patch_key_list:
-                patch = diff_results[key]
-                if 'old_signature' in patch and patch['old_signature'] == caller_sig:
-                    depen_graph.setdefault(tail_key, set()).add(key)
-                    patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fname, commit))
+            logger.info(f'def_file_path_old: {def_file_path_old}')
+            for caller_sig, callee_sig in tail_details[def_file_path_old]:
+                fname = callee_sig.split('(')[0].split(' ')[-1]
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                        depen_graph.setdefault(tail_key, set()).add(key)
+                        modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
+                        diff_results[key]['patch_text'] = '\n'.join(modified_lines)
             
-    return new_patch_key_list, function_declarations, depen_graph
+    return new_patch_key_list, function_declarations, depen_graph, recreated_functions
 
 
-def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch):
+def process_undeclared_identifiers(miss_member_structs, miss_decls, last_round, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list):
     """
     Process undeclared identifiers by analyzing and extracting basic block change pairs.
     
@@ -338,13 +355,15 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
     """
     bb_change_pair = dict() # key: relative file path, value: list of (bb1s, bb2s, cfg1), change from bb1s to bb2s
     
+    diff_results_last_round, final_patches_last_round, extra_patches_last_round = last_round
+    
     for field_name, struct_name, file_path, line_num in miss_member_structs:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches_last_round, diff_results_last_round, extra_patches_last_round, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path, signature_change_list)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
         
     for identifier, file_path, line_num in miss_decls:
-        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches, diff_results, extra_patches, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path)
+        bb1s, bb2s, cfg1, cfg2 = get_bb_change_pair_from_line(file_path, [line_num], final_patches_last_round, diff_results_last_round, extra_patches_last_round, target, next_commit['commit_id'], commit['commit_id'], arch, args.build_csv, target_repo_path, signature_change_list)
         relative_file_path = file_path.split('/', 3)[-1]
         bb_change_pair.setdefault(relative_file_path, []).append((bb1s, bb2s, cfg1, cfg2))
 
@@ -366,6 +385,11 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
                 if bb_to_update_incfg2 == []:
                     continue
                 bb_to_update_incfg1 = get_corresponding_bb(target_repo_path, bb_to_update_incfg2, relative_file_path, next_commit['commit_id'], commit['commit_id'], [cfg1])
+                if not bb_to_update_incfg1:
+                    pseudo_bb1 = CFGBlock(-1) # Create an empty block, suggest should 
+                    pseudo_bb1.start_line = bb1_start_line
+                    pseudo_bb1.end_line = bb1_start_line-1
+                    bb_to_update_incfg1 = [pseudo_bb1]
                 bb_change_list_update.append((bb_to_update_incfg1, bb_to_update_incfg2, cfg1, cfg2))
         
         # Deduplicate bb_change_list_update based on bb1s and bb2s
@@ -397,6 +421,14 @@ def process_undeclared_identifiers(miss_member_structs, miss_decls, final_patche
             for bb2 in bb2s:
                 bb2_start_line = min(bb2_start_line, bb2.start_line)
                 bb2_end_line = max(bb2_end_line, bb2.end_line)
+            if bb1_start_line > bb1_end_line:
+                # When bb1s is the pseudo block, means we are going to insert a block. We want a larger syntactic construct
+                # (like the body of an if)
+                # TODO: relative_file_path is not accurate here
+                delete_lines = get_delete_lines(target_repo_path, relative_file_path, next_commit['commit_id'], relative_file_path, commit['commit_id'], bb2_start_line, bb2_end_line)
+                for line1, line2 in delete_lines:
+                    bb2_start_line = min(bb2_start_line, line1)
+                    bb2_end_line = max(bb2_end_line, line2)
             if bb2s == []:
                 # When bb2s is empty, means some blocks need to be removed from the patch, delete the whole 
                 # part of code to avoid syntax error (like in if statement, need remove multiple lines)
@@ -797,6 +829,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         'new_function_start_line': int(node['extent']['start']['line']),
                         'new_function_end_line': int(node['extent']['end']['line']),
                     }
+                    break
         
         # checkout target repo to the new commit, and parse the code from that
         os.chdir(target_repo_path)
@@ -1043,8 +1076,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
 
                 def create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code):
                     """Create the Artificial patch data structure"""
-                    patch_lines = patch['patch_text'].split('\n')
-                    patch_header = f'{patch_lines[0]}\n{patch_lines[1]}\n{patch_lines[2]}\n'
+                    patch_header = f'diff --git a/{patch["file_path_new"]} b/{patch["file_path_new"]}\n--- a/{patch["file_path_new"]}\n+++ b/{patch["file_path_new"]}\n'
                     patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
                     artificial_patch = {
                         'file_path_old': patch['file_path_old'],
@@ -1243,6 +1275,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
                 else:
                     connect_lines = []
+                if patch_prev_lines[-1] == '\\ No newline at end of file':
+                    patch_prev_lines = patch_prev_lines[:-1]
                 merged_lines = patch_prev_lines[4:] + connect_lines + lines[4:]
                 
                 patch_prev_old_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
@@ -1250,8 +1284,24 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 patch_prev_new_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
                 patch_prev_new_offset = int(patch_prev_lines[3].split('@@')[-2].strip().split(',')[-1])
                 
+                prev_front_context_len = 0
+                for line in patch_prev_lines[4:]:
+                    if line.startswith('+') or line.startswith('-'):
+                        break
+                    prev_front_context_len += 1
+                
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
+                patch_prev['patch_type'] = {'Merged funcions'}.union(patch['patch_type']).union(patch_prev['patch_type'])
+                for func in patch.setdefault('hiden_func_dict', dict()):
+                    logger.info(f'{func}---{patch['hiden_func_dict'][func]}')
+                    patch['hiden_func_dict'][func] += len(patch_prev_lines[4:] + connect_lines)
+                logger.info(f'offset: {len(patch_prev_lines[4:] + connect_lines)}')
+                patch_prev.setdefault('hiden_func_dict', dict()).update(patch['hiden_func_dict'])
+                patch_prev['hiden_func_dict'][patch_prev['old_signature']] = prev_front_context_len
+                patch_prev['hiden_func_dict'] = dict(
+                    sorted(patch_prev['hiden_func_dict'].items(), key=lambda x: x[1])  # ascending by offset
+                )
                 patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
                 patch_prev['new_start_line'] = patch['new_start_line']
                 patch_prev['new_end_line'] = patch_prev['new_start_line'] + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
@@ -1511,7 +1561,40 @@ def handle_build_error(error_log):
     matches = re.findall(pattern, error_log)
     undeclared_identifiers.extend([(type_name, f"{filepath}:{line}:{column}") for filepath, line, column, type_name in matches])
     
-    return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes
+    # --- Incomplete type definitions ---
+    incomplete_types = []
+    pattern = r"(/src.+?):(\d+):(\d+):.*incomplete definition of type '([^']+)'"
+    for i, error_line in enumerate(error_lines):
+        match = re.search(pattern, error_line)
+        if match:
+            error_filepath, error_line_num, error_column, type_name = match.groups()
+            error_location = f"{error_filepath}:{error_line_num}:{error_column}"
+            
+            # Look for the corresponding "note: forward declaration" in following lines
+            forward_decl_location = None
+            
+            for j in range(i + 1, len(error_lines)):
+                current_line = error_lines[j]
+                
+                # Stop if we hit another error/warning (but allow notes)
+                if any(sign in current_line for sign in {'warning:', 'error:'}):
+                    break
+                
+                # Look for the note about forward declaration
+                note_pattern = r"(/src.+?):(\d+):(\d+):.*note:.*forward declaration of '([^']+)'"
+                note_match = re.search(note_pattern, current_line)
+                
+                if note_match:
+                    note_filepath, note_line, note_column, note_type = note_match.groups()
+                    # Match the type name (handle both "struct blosc2_frame_s" and "blosc2_frame_s")
+                    clean_type_name = type_name.replace('struct ', '')
+                    if note_type == clean_type_name or note_type == type_name:
+                        forward_decl_location = f"{note_filepath}:{note_line}:{note_column}"
+                        break
+            
+            incomplete_types.append((type_name, error_location, forward_decl_location))
+    
+    return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes, incomplete_types
 
 
 def find_first_code_line(file_path):
@@ -1731,6 +1814,8 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
     for node in ast_nodes:
         if node.get('kind') not in {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}:
             continue
+        if 'type_ref' not in node:
+            continue
         
         # Check if this call is within the LLVMFuzzerTestOneInput function and references a recreated function
         if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_sig.split('(')[0].split(' ')[-1] for func_sig in recreated_functions):
@@ -1892,8 +1977,26 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
             if line_num + add_num  == old_start + index_old_infun:
                 # this is the line we are looking for, we can get this line's index in the function
                 break
-        index_old_infun -= front_context_num # I want the index inside the function, not the context lines
         old_function_signature = diff_results[key_of_line_num]['old_signature']
+        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+            last_offset = front_context_num
+            last_func_sig = old_function_signature
+            flag = False
+            for func_sig, offset in diff_results[key_of_line_num]['hiden_func_dict'].items():
+                if offset > index_old_infun:
+                    index_old_infun -= last_offset
+                    old_function_signature = last_func_sig
+                    flag = True
+                    break
+                last_offset = offset
+                last_func_sig = func_sig
+            if not flag:
+                # The code we want to find is in the last function
+                logger.info(f'last function: {old_function_signature}')
+                index_old_infun -= last_offset
+                old_function_signature = last_func_sig
+        else:
+            index_old_infun -= front_context_num # I want the index inside the function, not the context lines
         parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{diff_results[key_of_line_num]["file_path_old"]}_analysis.json')
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
@@ -2127,11 +2230,14 @@ def filter_and_dedup_bb_change_pairs(bb_change_pair):
 
 def get_corresponding_bb(target_repo_path, bb1s, file_path, commit, next_commit, cfgs2):
     bb2_line_num_list = get_corresponding_lines(target_repo_path, file_path, commit, file_path, next_commit, bb1s)
+    if None in cfgs2:
+        # There is no corresponding block in another commit;
+        return []
     cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
     return bb2s
 
 
-def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path):
+def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path, signature_change_list):
     relative_file_path = file_path.split('/', 3)[-1]
     line_num_after_patch_list = line_num_list
     if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
@@ -2163,7 +2269,7 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
     
     pseudo_blosks = []
     for line_in_old in line_num_in_old_commit_list:
-        pseudo_block = CFGBlock(-1, line_in_old, line_in_old)
+        pseudo_block = CFGBlock(-1)
         pseudo_block.start_line = line_in_old
         pseudo_block.end_line = line_in_old
         pseudo_blosks.append(pseudo_block)
@@ -2186,7 +2292,17 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
         bb1s = pseudo_blosks
     
     # Now we get basic blocks in new commit that correspond to bb1
-    cfg2, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], bb2_line_num_list)
+    bb2s = []
+    cfg2 = None
+    fname1 = cfg1.function_signature.split('(')[0].split(' ')[-1]
+    for bb2_line_num in bb2_line_num_list:
+        cfg, bbs = find_block_by_line(cfgs2, file_path.split('/')[-1], [bb2_line_num])
+        fname = cfg.function_signature.split('(')[0].split(' ')[-1]
+        if not fname1 == fname and (fname1, fname) not in signature_change_list:
+            # Filter those error matching from gumtree
+            continue
+        bb2s.extend(bbs)
+        cfg2 = cfg
     
     return bb1s, bb2s, cfg1, cfg2
     
@@ -2347,10 +2463,11 @@ def apply_and_test_patches(
     var_del_to_add = dict() # key: file path, value: set of variable declarations
     union_to_add = dict() # key: file path, value: set of union declarations
     type_def_to_add = dict() # key: file path, value: set of type definitions
-    con_to_add_len = 0
-    var_del_to_add_len = 0
-    union_to_add_len = 0
-    type_def_to_add_len = 0
+    incomplete_type_to_add = dict() # key: file path, value: set of incomplete types
+    last_undeclared_identifier = []
+    last_undeclared_functions = []
+    last_miss_member_structs = []
+    last_incomplete_types = []
     # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
     error_log = 'undeclared identifier'
     count = 0
@@ -2365,10 +2482,39 @@ def apply_and_test_patches(
             break
         with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
             f.write(error_log)
-        undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes = handle_build_error(error_log)
+        undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
         logger.info(f'undeclared_identifier: {undeclared_identifier}')
         logger.info(f'undeclared_functions: {undeclared_functions}')
-        logger.info(f'miss_member_structs: {miss_member_structs}')
+        logger.info(f'miss_member_structs: {len(miss_member_structs)} {miss_member_structs}')
+        logger.info(f'incomplete_types: {incomplete_types}')
+        
+        diff_results_last_round = copy.deepcopy(diff_results) # Read-only, used for querying, because I will change these objects in this round
+        patch_key_list_last_round = copy.deepcopy(patch_key_list)
+        extra_patches_last_round = copy.deepcopy(extra_patches)
+        last_round = (diff_results_last_round, patch_key_list_last_round, extra_patches_last_round)
+        
+        for type_name, error_location, forward_decl_location in incomplete_types:
+            pure_type = type_name.split(' ')[-1]
+            error_file_path_new = error_location.split(':')[0].split('/', 3)[-1]
+            parsing_path = os.path.join(
+                data_path,
+                f"{target_repo_path.split('/')[-1]}-{next_commit['commit_id']}",
+                f"{error_file_path_new}_analysis.json",
+            )
+            with open(parsing_path, 'r') as f:
+                ast_nodes = json.load(f)
+            for node in ast_nodes:
+                if node.get('kind') == 'TYPEDEF_DECL' and node.get('spelling') == pure_type:
+                    add_file_path = node['extent']['start']['file']
+                    add_start_line = node['extent']['start']['line']
+                    add_end_line = node['extent']['end']['line']
+                if node.get('kind') == 'TYPEDEF_DECL' and node.get('typedef') == type_name and node.get('spelling') != pure_type:
+                    type_used = node['spelling']
+                    delete_file_path = node['extent']['start']['file']
+                    delete_start = node['extent']['start']['line']
+                    delete_end = node['extent']['end']['line']
+            incomplete_type_to_add[(delete_file_path, delete_start, delete_end)] = (add_file_path, add_start_line, add_end_line, pure_type, type_used)
+        
         miss_decls = []
         for identifier, location in undeclared_identifier:
             file_path_new = location.split('/',3)[-1].split(':')[0]
@@ -2422,7 +2568,6 @@ def apply_and_test_patches(
                         break
                 if not found:
                     logger.info(f'Cannot find {identifier} in {parsing_path}')
-                    exit(0)
             else:
                 logger.error(f'Cannot find parsing_path: {parsing_path}!')
 
@@ -2431,6 +2576,19 @@ def apply_and_test_patches(
             line_num_after_patch = int(location.split(':')[1])
             relative_file_path = file_path.split('/', 3)[-1]
             if not func_name.startswith(f'__revert_{commit["commit_id"]}_'):
+                # Check if this function is a 'macro' function
+                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{relative_file_path}_analysis.json')
+                with open(parsing_path, 'r') as f:
+                    ast_nodes = json.load(f)
+                is_macro = False
+                for ast_node in ast_nodes:
+                    if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
+                        type_def_to_add.setdefault(relative_file_path, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                        is_macro = True
+                        break
+                if is_macro:
+                    continue
+                
                 # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
                 # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
                 if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
@@ -2453,7 +2611,7 @@ def apply_and_test_patches(
                 line_num = get_correct_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches)
                 if not check_if_in_fuzzer(line_num, cfgs2):
                     # Treat as a signature/name change at call site; feed into process_function_signature_changes
-                    function_sig_changes.append(("", "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
+                    function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
                     continue
                 _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
                 if not bb2s:
@@ -2480,7 +2638,9 @@ def apply_and_test_patches(
                             func_decl_line[relative_file_path] = old_line_num
                         break
         logger.info(f'function_sig_changes: {function_sig_changes}')
-        new_patch_key_list, function_declarations, depen_graph = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
+        new_patch_key_list, function_declarations, depen_graph, recreated_functions2 = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
+        recreated_functions = recreated_functions | recreated_functions2
+        update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
             if key not in patch_key_list:
                 patch_key_list.append(key)
@@ -2488,10 +2648,10 @@ def apply_and_test_patches(
         add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
         handle_file_change(diff_results, patch_key_list)
         
-        if con_to_add_len == len(con_to_add) and var_del_to_add_len == len(var_del_to_add) and union_to_add_len == len(union_to_add) and type_def_to_add_len == len(type_def_to_add):
+        if last_undeclared_identifier == undeclared_identifier and last_undeclared_functions == undeclared_functions and last_miss_member_structs == miss_member_structs and last_incomplete_types == incomplete_types:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
             # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-            bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch)
+            bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
 
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
@@ -2563,8 +2723,12 @@ def apply_and_test_patches(
                     var_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r') as f:
                         file_content = f.readlines()
-                        new_identifier = f'__rervert_{commit['commit_id']}_{identifier}'
+                        new_identifier = f'__rervert_var_{commit['commit_id']}_{identifier}'
                         var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if patch['file_path_new'] == file_path_new:
+                        patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
             
             if file_path in type_def_to_add:
                 locs = list(type_def_to_add[file_path])
@@ -2637,6 +2801,42 @@ def apply_and_test_patches(
                 }
             extra_patches[file_path] = patch
             
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for key, details in incomplete_type_to_add.items():
+            delete_file_path, delete_start, delete_end = key
+            add_file_path, add_start_line, add_end_line, incomplete_type, type_used = details
+            with open(os.path.join(target_repo_path, add_file_path), 'r') as f:
+                file_lines = f.readlines()
+                add_code_lines = [f'-{line[:-1]}' for line in file_lines[add_start_line-1:add_end_line]]
+                add_code_lines[-1] = add_code_lines[-1].replace(incomplete_type, type_used) + '\n'
+            
+            with open(os.path.join(target_repo_path, delete_file_path), 'r') as f:
+                file_lines = f.readlines()
+                delete_code_lines = [f'+{line[:-1]}' for line in file_lines[delete_start-1:delete_end]]
+            
+            patch_header = f"diff --git a/{delete_file_path} b/{delete_file_path}\n"
+            patch_header += f"--- a/{delete_file_path}\n"
+            patch_header += f"+++ b/{delete_file_path}\n"
+            patch_text = patch_header + f"@@ -{delete_start},{add_end_line-add_start_line+1} +{delete_start},{delete_end-delete_start+1} @@\n"
+            patch_text += "\n".join(add_code_lines) + "\n".join(delete_code_lines)
+            patch = {
+                'file_path_old': delete_file_path,
+                'file_path_new': delete_file_path,
+                'patch_text': patch_text,
+                'new_start_line': delete_start,
+                'new_end_line': delete_end,
+                'old_signature': f'incomplete {incomplete_type}',
+                'new_signature': f'incomplete {type_used}',
+                'patch_type': {'Type change'},
+            }
+            key = f'{delete_file_path}-{delete_start}-{delete_end}'
+            diff_results[key] = patch
+            if key not in patch_key_list:
+                patch_key_list.append(key)
+            add_context(diff_results, [key], next_commit['commit_id'], target_repo_path)
+        
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
                 # not_write_patches means the patch is merged with the extra patches
@@ -2651,10 +2851,10 @@ def apply_and_test_patches(
                 patch_file.write('\n\n')
                 patches_without_context[f'_extra_{patch['file_path_new']}'] = patch
         # update length of con_to_add, var_del_to_add, union_to_add
-        con_to_add_len = len(con_to_add)
-        var_del_to_add_len = len(var_del_to_add)
-        union_to_add_len = len(union_to_add)
-        type_def_to_add_len = len(type_def_to_add)
+        last_undeclared_identifier = undeclared_identifier
+        last_undeclared_functions = undeclared_functions
+        last_miss_member_structs = miss_member_structs
+        last_incomplete_types = incomplete_types
         
     testcases_env = os.getenv('TESTCASES', '')
     if build_success:
@@ -2769,7 +2969,8 @@ def revert_patch_test(args):
         with open(target_dockerfile_path, 'r') as dockerfile:
             dockerfile_content = dockerfile.read()
         
-        dockerfile_content = dockerfile_content.replace('--depth 1', '')
+        if '@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0' not in dockerfile_content:
+            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0')
         updated_content = dockerfile_content.replace('--depth=1', '')
         
         with open(target_dockerfile_path, 'w') as dockerfile:
@@ -2822,7 +3023,7 @@ def revert_patch_test(args):
         
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
-        common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2, signature_change_list)
+        common_part = compare_traces(trace1, trace2, signature_change_list)
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
         get_compile_commands(target, next_commit['commit_id'], sanitizer, args.build_csv, arch)
         get_compile_commands(target, commit['commit_id'], sanitizer, args.build_csv, arch)
@@ -2905,11 +3106,15 @@ def revert_patch_test(args):
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
-        context = (diff_results, trace1, target_repo_path, commit, next_commit, target,
+        context = (diff_results, trace1[:len(common_part)//2+1], target_repo_path, commit, next_commit, target,
             sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
         patch_by_func = dict()
-        for key in patch_to_apply:
+        for key in patch_to_apply[:]:
             if 'new_signature' in diff_results[key]:
+                if not diff_results[key]['new_signature']:
+                    # Some special cases, dont know why now
+                    patch_to_apply.remove(key)
+                    continue
                 patch_by_func.setdefault(diff_results[key]['new_signature'], []).append(key)
             else:
                 patch_by_func.setdefault(diff_results[key]['old_signature'], []).append(key)
@@ -2923,14 +3128,13 @@ def revert_patch_test(args):
         if bug_id == 'OSV-2021-496':
             patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
         tmp_context = copy.deepcopy(context)
-        signature_change_list = []
         if not apply_and_test_patches(patch_pair_list, dict(), get_patched_traces, transitions, signature_change_list, *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
             # try to minimize the patch set
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, get_patched_traces, transitions, signature_change_list, *context)
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, get_patched_traces, transitions, signature_change_list, context)
             logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
 
         # apply_and_test_patches(minimal_fast, patches_without_context, get_patched_traces, transitions, *context)
