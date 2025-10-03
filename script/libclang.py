@@ -53,7 +53,29 @@ def extract_include_paths() -> list[str]:
     return include_paths
 
 
-def analyze_file(directory, src_file, args):
+def get_defs(directory, src_file, args):
+    path = os.path.join(directory, src_file)
+    include_paths = extract_include_paths()
+    
+    if not os.path.exists(path):
+        print(f"File does not exist: {path}")
+        return set()
+    tu = index.parse(path, args=args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+    results = []
+    dir_path, file_name = os.path.split(path)
+    dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
+    out_path_set = set()
+    defs_by_usr = {}
+    
+    for cursor in tu.cursor.walk_preorder():
+        if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition():
+            usr = cursor.get_usr()
+            if usr:
+                defs_by_usr[usr] = cursor
+    return defs_by_usr
+
+
+def analyze_file(directory, src_file, args, defs_by_usr):
     path = os.path.join(directory, src_file)
     include_paths = extract_include_paths()
     
@@ -98,6 +120,18 @@ def analyze_file(directory, src_file, args):
             # Build a precise function signature
             if cursor.is_definition():
                 info['kind'] = 'FUNCTION_DEFI'
+            else:
+                def_cursor = defs_by_usr.get(cursor.get_usr())
+                if def_cursor and def_cursor.location:
+                    def_file_path = os.path.normpath(str(def_cursor.location.file) if def_cursor.location.file else "")
+                    def_file = os.path.realpath(def_file_path)
+                    if def_file.startswith('/src'):
+                        def_file = def_file.split('/', 3)[-1]
+                    info["location"] = {
+                        "file": def_file,
+                        "line": def_cursor.location.line,
+                        "column": def_cursor.location.column,
+                    }
             arg_list = []
             for arg in cursor.get_arguments():
                 arg_list.append(f"{arg.type.spelling} {arg.spelling}")
@@ -229,7 +263,6 @@ def analyze_file(directory, src_file, args):
             out_path = os.path.realpath(os.path.join(folder, file_name))
             if not os.path.exists(folder):
                 os.makedirs(folder)
-            print(f"Processing {file_relative_path} at {cursor.location.line}:{cursor.location.column} - {cursor.kind.name} {cursor.spelling} {out_path}")
             with open(out_path, "a") as out:
                 json.dump(info, out, indent=2)
                 out.write(",\n")
@@ -326,6 +359,7 @@ def load_compile_commands(path="compile_commands.json"):
 def main():
     compile_db = load_compile_commands()
     out_path_set = set()
+    defs_by_usr = dict()
     for src_file in compile_db:
         directory, args = compile_db[src_file]
         
@@ -334,7 +368,18 @@ def main():
             idx = args.index("-o")
             if idx + 1 < len(args):
                 args[idx + 1] = "/dev/null"
-        out_path_set.update(analyze_file(directory, src_file, args))
+        defs_by_usr.update(get_defs(directory, src_file, args))
+
+    for src_file in compile_db:
+        directory, args = compile_db[src_file]
+        
+        # Redirect the output file to /null
+        if "-o" in args:
+            idx = args.index("-o")
+            if idx + 1 < len(args):
+                args[idx + 1] = "/dev/null"
+        out_path_set.update(analyze_file(directory, src_file, args, defs_by_usr))
+
     for out_path in out_path_set:
         with open(out_path, "r+") as f:
             data = f.read().rstrip(",\n")
