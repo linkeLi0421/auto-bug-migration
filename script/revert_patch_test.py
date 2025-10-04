@@ -315,7 +315,6 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
             }
             new_patch_key_list.add(tail_key)
             # change the callsite, update depen_graph
-            logger.info(f'def_file_path_old: {def_file_path_old}')
             for caller_sig, callee_sig in tail_details[def_file_path_old]:
                 fname = callee_sig.split('(')[0].split(' ')[-1]
                 for key in patch_key_list:
@@ -1293,10 +1292,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
                 patch_prev['patch_type'] = {'Merged funcions'}.union(patch['patch_type']).union(patch_prev['patch_type'])
-                for func in patch.setdefault('hiden_func_dict', dict()):
-                    logger.info(f'{func}---{patch['hiden_func_dict'][func]}')
-                    patch['hiden_func_dict'][func] += len(patch_prev_lines[4:] + connect_lines)
-                logger.info(f'offset: {len(patch_prev_lines[4:] + connect_lines)}')
                 patch_prev.setdefault('hiden_func_dict', dict()).update(patch['hiden_func_dict'])
                 patch_prev['hiden_func_dict'][patch_prev['old_signature']] = prev_front_context_len
                 patch_prev['hiden_func_dict'] = dict(
@@ -1992,7 +1987,6 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
                 last_func_sig = func_sig
             if not flag:
                 # The code we want to find is in the last function
-                logger.info(f'last function: {old_function_signature}')
                 index_old_infun -= last_offset
                 old_function_signature = last_func_sig
         else:
@@ -2945,6 +2939,8 @@ def revert_patch_test(args):
         transitions.append((commit, next_commit, bug_id))
     
     for commit, next_commit, bug_id in transitions:
+        if bug_id != 'OSV-2021-247':
+            continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
