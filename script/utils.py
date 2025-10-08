@@ -6,7 +6,7 @@ import difflib
 # Type: test_fn takes a list of patches (order preserved) and returns True/False
 TestFn = Callable[[List[Any]], bool]
 
-def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], context: Tuple) -> List[Any]:
+def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
     """
     Fast heuristic: try removing one patch at a time (left-to-right),
     keep the removal if test_fn still returns True. Repeat until stable.
@@ -19,8 +19,8 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
         key = tuple(id(x) for x in items)  # identity-based; avoids equals() surprises
         if key not in cache:
             items_copy = copy.deepcopy(items)
-            ctx_copy   = copy.deepcopy(context)
-            cache[key] = test_fn(items_copy, patches_without_context, get_patched_traces, transitions, signature_change_list, *ctx_copy)
+            ctx_copy   = copy.deepcopy(inmutable_args)
+            cache[key] = test_fn(items_copy, patches_without_context, *mutable_args, *ctx_copy)
         return cache[key]
 
     while changed:

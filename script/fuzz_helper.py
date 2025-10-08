@@ -2167,6 +2167,8 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
   # Replace '--depth=1' in the Dockerfile
   with open(target_dockerfile_path, 'r') as dockerfile:
       dockerfile_content = dockerfile.read()
+  if '@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0' not in dockerfile_content:
+            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0')
   updated_content = dockerfile_content.replace('--depth 1', '')
   updated_content = updated_content.replace('--depth=1', '')
   with open(target_dockerfile_path, 'w') as dockerfile:

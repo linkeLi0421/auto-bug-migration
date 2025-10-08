@@ -9,6 +9,7 @@ from pathlib import Path
 import gzip
 import pickle
 import copy
+import sys
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Any
 
@@ -20,6 +21,11 @@ from cfg_parser import CFGBlock, parse_cfg_text, find_block_by_line, compute_dat
 from utils import minimize_greedy, minimize_ddmin, apply_unified_diff_to_string, split_function_parts, diff_strings
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
+
+HERE = os.path.dirname(__file__)               # script/
+OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
+sys.path.insert(0, OPENAI_DIR)
+from openai_client import solve_code_migration, generate_diff
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -263,7 +269,6 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         'old_start_line': artificial_patch_insert_point,
                         'old_end_line': artificial_patch_insert_point + func_length,
                     }
-                    logger.info(f'process_func: {callee_sig}')
                     new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                     diff_results[new_key] = artificial_patch
                     new_patch_key_list.add(new_key)
@@ -1291,8 +1296,15 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
-                patch_prev['patch_type'] = {'Merged funcions'}.union(patch['patch_type']).union(patch_prev['patch_type'])
-                patch_prev.setdefault('hiden_func_dict', dict()).update(patch['hiden_func_dict'])
+                patch_prev['patch_type'] = {'Merged functions'}.union(patch['patch_type']).union(patch_prev['patch_type'])
+                if 'hiden_func_dict' not in patch:
+                    patch_front_context_len = 0
+                    for line in lines[4:]:
+                        if line.startswith('+') or line.startswith('-'):
+                            break
+                        patch_front_context_len += 1
+                    patch.setdefault('hiden_func_dict', dict())[patch['old_signature']] = patch_front_context_len
+                patch_prev.setdefault('hiden_func_dict', dict()).update({key: offset+patch_prev_old_offset for key, offset in patch['hiden_func_dict'].items()})
                 patch_prev['hiden_func_dict'][patch_prev['old_signature']] = prev_front_context_len
                 patch_prev['hiden_func_dict'] = dict(
                     sorted(patch_prev['hiden_func_dict'].items(), key=lambda x: x[1])  # ascending by offset
@@ -1360,6 +1372,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
 
         lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
             + context_lines1 + lines[4:] + context_lines2
+        for func_sig in patch.get('hiden_func_dict', {}):
+            patch['hiden_func_dict'][func_sig] += len(context_lines1)
         patch['patch_text'] = '\n'.join(lines)
         patch['old_start_line'] = old_line_begin
         patch['old_end_line'] = old_line_begin + old_offset
@@ -1485,8 +1499,17 @@ def handle_build_error(error_log):
     
     # --- Missing struct members ---
     pattern = r"(/src.+?):(\d+):(\d+):.*no member named '(\w+)' in '([^']+)'"
-    matches = re.findall(pattern, error_log)
-    missing_struct_members = [(member, struct_name, filepath, int(line)) for filepath, line, column, member, struct_name in matches]
+    missing_struct_members = dict()
+
+    lines = error_log.splitlines()
+    for i, line in enumerate(lines):
+        match = re.search(pattern, line)
+        if match:
+            filepath, line_num, column, member, struct_name = match.groups()
+            # Grab this line + the next 2 lines (if they exist)
+            context_lines = lines[i : i + 3]
+            full_message = "\n".join(context_lines).strip()
+            missing_struct_members[(member, struct_name, filepath, int(line_num))] = full_message
     
     # --- Too few arguments ---
     pattern = r"(/src.+?):(\d+):(\d+):.*too few arguments to function call.*"
@@ -1928,6 +1951,175 @@ def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extr
             start_line += 1
     
     return line_num + add_num
+
+
+def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, extra_patches):
+    add_num = 0 # the number of lines added by patches
+    key_of_line_num = None
+    
+    if relative_file_path in extra_patches:
+        patch = extra_patches[relative_file_path]
+        add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
+    for key in reversed(patch_key_list):
+        patch = diff_results[key]
+        if 'file_path_new' in patch and patch['file_path_new'] == relative_file_path or patch['file_path_new'].endswith(relative_file_path):
+            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
+            add_num += new_offset - old_offset
+            if line_num + add_num <= old_start:
+                key_of_line_num = key
+                add_num -= new_offset - old_offset
+                break
+
+    index_old_infun = 0
+    front_context_num = 0 # should be less than 3
+    patch_flag = False
+    if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num]['patch_type']:
+        for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:]:
+            if line.startswith('-'):
+                index_old_infun += 1
+                if not patch_flag:
+                    patch_flag = True
+            elif line.startswith('+'):
+                if not patch_flag:
+                    patch_flag = True
+            else:
+                index_old_infun += 1
+                if not patch_flag:
+                    front_context_num += 1
+                    assert(front_context_num <= 3), f'front_context_num should be less than 3, but got {front_context_num}'
+            if line_num + add_num  == old_start + index_old_infun:
+                # this is the line we are looking for, we can get this line's index in the function
+                break
+        func_start_index = front_context_num
+        func_end_index = len(diff_results[key_of_line_num]['patch_text'].split('\n'))
+        old_function_signature = diff_results[key_of_line_num]['old_signature']
+        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+            last_offset = front_context_num
+            last_func_sig = old_function_signature
+            flag = False
+            for func_sig, offset in diff_results[key_of_line_num]['hiden_func_dict'].items():
+                if offset > index_old_infun:
+                    flag = True
+                    func_start_index = last_offset
+                    func_end_index = offset
+                    old_function_signature = last_func_sig
+                    break
+                last_offset = offset
+                last_func_sig = func_sig
+            if not flag:
+                # The code we want to find is in the last function
+                func_start_index = last_offset
+                old_function_signature = last_func_sig
+                func_end_index = len(diff_results[key_of_line_num]['patch_text'].split('\n'))
+    
+    return key_of_line_num, old_function_signature, func_start_index, func_end_index
+
+
+def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id):
+    struct_error_dict = dict()
+    struct_per_fuc_dict = dict()
+    solutions_per_patch = dict()
+    
+    # 1. Divide error into groups based on their function signature
+    for (field_name, struct_name, file_path, line_num), full_message in miss_member_structs.items():
+        relative_file_path = file_path.split('/', 3)[-1]
+        key_of_line_num, old_function_signature, func_start_index, func_end_index = get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, extra_patches)
+        struct_error_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), []).append((field_name, struct_name.split(' ')[-1], relative_file_path, line_num, full_message))
+        struct_per_fuc_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), set()).add(struct_name.split(' ')[-1])
+
+    # 2. Handle each group of errors, prepare function source code and struct defination
+    for (key_of_line_num, old_function_signature, func_start_index, func_end_index), field_struct_list in struct_error_dict.items():
+        relative_file_path = field_struct_list[0][2]
+        fname = old_function_signature.split('(')[0].split(' ')[-1]
+        # 2.1. get source code of the function
+        func_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
+        # 2.2. get struct defination
+        struct_defs = ''
+        struct_set = struct_per_fuc_dict[(key_of_line_num, old_function_signature, func_start_index, func_end_index)]
+        for key in patch_key_list:
+            patch = diff_results[key]
+            if 'Incomplete type' not in patch['patch_type']:
+                continue
+            if patch['new_signature'][11:] not in struct_set:
+                # f'incomplete {incomplete_type}'
+                continue
+            patch_text_lines = patch['patch_text'].split('\n')
+            struct_defs += '\n'.join([line[1:] for line in patch_text_lines if line.startswith('-') and not line.startswith('---')]) + '\n'
+            struct_set.remove(patch['new_signature'][11:])
+            
+        parsing_path = os.path.join(data_path, f'{target}-{next_commit["commit_id"]}', f'{relative_file_path}_analysis.json')
+        with open(parsing_path, 'r') as f:
+            ast_nodes = json.load(f)
+        for node in ast_nodes:
+            if node.get('kind') not in {'STRUCT_DECL', 'TYPEDEF_DECL', 'TYPE_REF'}:
+                continue
+            if node['spelling'] in struct_set:
+                struct_set.remove(node['spelling'])
+                # Found the struct definition
+                struct_file_path = node['extent']['start']['file']
+                start_line = node['extent']['start']['line']
+                end_line = node['extent']['end']['line']
+            
+                if node.get('kind') == 'TYPE_REF':
+                    struct_file_path = node['extent']['start']['file']
+                    start_line = node['type_ref']['typedef_extent']['start']['line']
+                    end_line = node['type_ref']['typedef_extent']['end']['line']
+
+                os.chdir(target_repo_path)
+                subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(os.path.join(target_repo_path, struct_file_path), 'r') as f:
+                    file_content = f.readlines()
+                    struct_code = ''.join(line for line in file_content[start_line-1:end_line])
+                    struct_defs += struct_code
+        # 2.3. get the error message
+        error_message = ''
+        for field_name, struct_name, relative_file_path, line_num, full_message in field_struct_list:
+            error_message += full_message
+        
+        # 2.4. get the solution code
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}.txt')
+        if not os.path.exists(solution_path):
+            logger.info(f'Create patch using open ai api for {fname}')
+            solution_code = solve_code_migration(struct_defs, func_code, error_message)
+            os.makedirs(os.path.dirname(solution_path), exist_ok=True)
+            with open(solution_path, 'w', encoding='utf-8') as f:
+                f.write(solution_code)
+        else:
+            with open(solution_path, 'r', encoding='utf-8') as f:
+                solution_code = f.read()
+        solutions_per_patch.setdefault(key_of_line_num, dict())[old_function_signature] = solution_code
+        
+    # 3. change patch in diff_results
+    for key_of_line_num, solution_code_dict in solutions_per_patch.items():
+        patch_text = diff_results[key_of_line_num]['patch_text']
+        start_line = int(patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+        patch_text_lines = patch_text.split('\n')
+        patch_text_lines = [line for line in patch_text_lines if not line.startswith('\\')]
+        context_line_num = len([line for line in patch_text_lines[4:] if not line.startswith('-')]) # 6 in most cases
+        end_context_len = len([line for line in patch_text_lines[-3:] if line.startswith(' ')]) # 3 in most cases
+        front_context_len = context_line_num - end_context_len # 3 in most cases
+        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+            last_offset = len(patch_text_lines)-end_context_len
+            hiden_func_dict = dict(sorted(diff_results[key_of_line_num]['hiden_func_dict'].items(), key=lambda x: x[1], reverse=True)) # descending by offset
+            for func_sig in hiden_func_dict:
+                if func_sig not in solution_code_dict:
+                    last_offset = 4 + hiden_func_dict[func_sig]
+                    continue
+                solution_code = solution_code_dict[func_sig]
+                patch_text_lines[4+hiden_func_dict[func_sig]:last_offset] = [f'-{line}' for line in solution_code.split('\n')]
+                last_offset = 4 + hiden_func_dict[func_sig]
+        else:
+            # There should be only one func_sig here
+            assert(len(solution_code_dict) == 1)
+            for func_sig in solution_code_dict:
+                solution_code = solution_code_dict[func_sig]
+            patch_text_lines[4+front_context_len:len(patch_text_lines)-end_context_len] = [f'-{line}' for line in solution_code.split('\n')]
+        offset = len(patch_text_lines)
+        patch_text_lines[3] = f'@@ -{start_line},{offset-4} +{start_line},{context_line_num} @@'
+        diff_results[key_of_line_num]['patch_text'] = '\n'.join(patch_text_lines)
 
 
 def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches, target, commit):
@@ -2460,7 +2652,7 @@ def apply_and_test_patches(
     incomplete_type_to_add = dict() # key: file path, value: set of incomplete types
     last_undeclared_identifier = []
     last_undeclared_functions = []
-    last_miss_member_structs = []
+    last_miss_member_structs = dict()
     last_incomplete_types = []
     # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
     error_log = 'undeclared identifier'
@@ -2479,7 +2671,7 @@ def apply_and_test_patches(
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
         logger.info(f'undeclared_identifier: {undeclared_identifier}')
         logger.info(f'undeclared_functions: {undeclared_functions}')
-        logger.info(f'miss_member_structs: {len(miss_member_structs)} {miss_member_structs}')
+        logger.info(f'miss_member_structs: {len(miss_member_structs)} {[item for item in miss_member_structs]}')
         logger.info(f'incomplete_types: {incomplete_types}')
         
         diff_results_last_round = copy.deepcopy(diff_results) # Read-only, used for querying, because I will change these objects in this round
@@ -2645,7 +2837,8 @@ def apply_and_test_patches(
         if last_undeclared_identifier == undeclared_identifier and last_undeclared_functions == undeclared_functions and last_miss_member_structs == miss_member_structs and last_incomplete_types == incomplete_types:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
             # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
-            bb_change_pair = process_undeclared_identifiers(miss_member_structs, miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
+            handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id)
+            bb_change_pair = process_undeclared_identifiers([], miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
 
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
@@ -2823,7 +3016,7 @@ def apply_and_test_patches(
                 'new_end_line': delete_end,
                 'old_signature': f'incomplete {incomplete_type}',
                 'new_signature': f'incomplete {type_used}',
-                'patch_type': {'Type change'},
+                'patch_type': {'Incomplete type'},
             }
             key = f'{delete_file_path}-{delete_start}-{delete_end}'
             diff_results[key] = patch
@@ -2961,16 +3154,6 @@ def revert_patch_test(args):
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
-        # Replace '--depth=1' in the Dockerfile
-        with open(target_dockerfile_path, 'r') as dockerfile:
-            dockerfile_content = dockerfile.read()
-        
-        if '@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0' not in dockerfile_content:
-            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0')
-        updated_content = dockerfile_content.replace('--depth=1', '')
-        
-        with open(target_dockerfile_path, 'w') as dockerfile:
-            dockerfile.write(updated_content)
     
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
@@ -3102,8 +3285,9 @@ def revert_patch_test(args):
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
-        context = (diff_results, trace1[:len(common_part)//2+1], target_repo_path, commit, next_commit, target,
+        inmutable_args = (diff_results, trace1[:len(common_part)//2+1], target_repo_path, commit, next_commit, target,
             sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
+        mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
         for key in patch_to_apply[:]:
             if 'new_signature' in diff_results[key]:
@@ -3123,17 +3307,17 @@ def revert_patch_test(args):
             patch_pair_list = [('blosc/frame.cblosc/frame.c-2035,2+2089,2', 'blosc/frame.cblosc/frame.c-2021,7+2067,15', 'blosc/frame.cblosc/frame.c-1977,2+2023,2', 'blosc/frame.cblosc/frame.c-1950,4+1977,19', 'blosc/frame.cblosc/frame.c-1936,3+1963,3', 'blosc/frame.cblosc/frame.c-1927,2+1954,2', 'blosc/frame.cblosc/frame.c-1916,2+1938,7', 'blosc/frame.cblosc/frame.c-1907,2+1929,2', 'blosc/frame.cblosc/frame.c-1969,0+2012,4')]
         if bug_id == 'OSV-2021-496':
             patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
-        tmp_context = copy.deepcopy(context)
-        if not apply_and_test_patches(patch_pair_list, dict(), get_patched_traces, transitions, signature_change_list, *tmp_context) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        tmp = copy.deepcopy(inmutable_args)
+        if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
             # try to minimize the patch set
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, get_patched_traces, transitions, signature_change_list, context)
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
             logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
 
-        # apply_and_test_patches(minimal_fast, patches_without_context, get_patched_traces, transitions, *context)
+        # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
         # # test if the local bugs is still there 
         # if 'patch_path' in patches_without_context: # if the bug trigger
