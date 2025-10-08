@@ -25,7 +25,7 @@ from gumtree import get_corresponding_lines, get_delete_lines
 HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
-from openai_client import solve_code_migration, generate_diff
+from openai_client import solve_code_migration
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -162,19 +162,61 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     return None
 
 
-def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict):
+def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict):
     # From the error_log like "too few arguments in function call" get the caller and callee info;
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
     recreated_functions = set()
-    for code, error_type, file_path, line_range in function_sig_changes:
+    for func_name, error_type, file_path, line_range in function_sig_changes:
         def_file_path = None
         file_path_new = file_path.split('/', 3)[-1]
         if file_path_new in file_path_pairs:
             file_path_old = file_path_pairs[file_path_new]
         else:
             file_path_old = file_path_new
+        
+        # Sometimes the caller function is in extra_patches, at this situation,
+        # we can't find function code using the line number
+        if file_path_new in extra_patches:
+            extra_patch = extra_patches[file_path_new]
+            if line_range[1] >= extra_patch['old_start_line'] and line_range[0] <= extra_patch['old_start_line'] + int(extra_patch['patch_text'].split('@@')[1].split(',')[1].split(' ')[0]):
+                new_func = dict()
+                for key in type_def_to_add[file_path_new]: # the error should locate in one of them
+                    file_path = key.split(':')[0]
+                    parsing_path = os.path.join(
+                        data_path,
+                        f"{target_repo_path.split('/')[-1]}-{commit}",
+                        f"{file_path}_analysis.json",
+                    )
+                    with open(parsing_path, 'r') as f:
+                        ast_nodes = json.load(f)
+                    found = False
+                    for ast_node in ast_nodes:
+                        if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == func_name:
+                            found = True
+                            new_func[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                            break
+                    if found:
+                        break
+                    for ast_node in ast_nodes:
+                        if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == func_name:
+                            # Define in other file, find out the definition
+                            def_file_path = ast_node['location']['file']
+                            def_parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{ast_node['location']['file']}_analysis.json')
+                            with open(def_parsing_path, 'r') as f:
+                                def_ast_nodes = json.load(f)
+                            for def_ast_node in def_ast_nodes:
+                                if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == identifier:
+                                    found = True
+                                    new_func[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                                    break
+                            break
+                    if found:
+                        break
+                type_def_to_add[file_path_new] = {**type_def_to_add[file_path_new], **new_func}
+                continue
+        
         old_line_list = []
         for line_num in range(line_range[0], line_range[1] + 1):
             old_line_list.append(get_old_line_num(file_path_new, line_num, patch_key_list, diff_results, extra_patches, target, commit))
@@ -329,7 +371,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
                         diff_results[key]['patch_text'] = '\n'.join(modified_lines)
             
-    return new_patch_key_list, function_declarations, depen_graph, recreated_functions
+    return new_patch_key_list, function_declarations, depen_graph, recreated_functions, type_def_to_add
 
 
 def process_undeclared_identifiers(miss_member_structs, miss_decls, last_round, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list):
@@ -2753,6 +2795,31 @@ def apply_and_test_patches(
                         type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
                         break
                 if not found:
+                    # 1. Functions added by DECL_REF_EXPR branch above, search FUNCTION_DECL and FUNCTION_DEFI
+                    for ast_node in ast_nodes:
+                        if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == identifier:
+                            found = True
+                            # Add the function definition to the begin of the dict, so we have function def in the begin of the patch
+                            dict_ = type_def_to_add.setdefault(file_path_new, dict())
+                            type_def_to_add[file_path_new] = {**dict_, f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}': identifier}
+                            break
+                    if found:
+                        break
+                    for ast_node in ast_nodes:
+                        if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == identifier:
+                            # Define in other file, find out the definition
+                            def_parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{ast_node['location']['file']}_analysis.json')
+                            with open(def_parsing_path, 'r') as f:
+                                def_ast_nodes = json.load(f)
+                            for def_ast_node in def_ast_nodes:
+                                if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == identifier:
+                                    found = True
+                                    dict_ = type_def_to_add.setdefault(file_path_new, dict())
+                                    type_def_to_add[file_path_new] = {**dict_, f'{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}': identifier}
+                                    break
+                            break
+                    if found:
+                        break
                     logger.info(f'Cannot find {identifier} in {parsing_path}')
             else:
                 logger.error(f'Cannot find parsing_path: {parsing_path}!')
@@ -2824,7 +2891,7 @@ def apply_and_test_patches(
                             func_decl_line[relative_file_path] = old_line_num
                         break
         logger.info(f'function_sig_changes: {function_sig_changes}')
-        new_patch_key_list, function_declarations, depen_graph, recreated_functions2 = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph)
+        new_patch_key_list, function_declarations, depen_graph, recreated_functions2, type_def_to_add = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add)
         recreated_functions = recreated_functions | recreated_functions2
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
@@ -3132,7 +3199,9 @@ def revert_patch_test(args):
         transitions.append((commit, next_commit, bug_id))
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id != 'OSV-2021-247':
+        if bug_id in {'OSV-2021-404', 'OSV-2022-1242', 'OSV-2021-247', 'OSV-2021-27', 'OSV-2021-429'}:
+            continue
+        if bug_id not in {'OSV-2023-51'}:
             continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
@@ -3307,17 +3376,17 @@ def revert_patch_test(args):
             patch_pair_list = [('blosc/frame.cblosc/frame.c-2035,2+2089,2', 'blosc/frame.cblosc/frame.c-2021,7+2067,15', 'blosc/frame.cblosc/frame.c-1977,2+2023,2', 'blosc/frame.cblosc/frame.c-1950,4+1977,19', 'blosc/frame.cblosc/frame.c-1936,3+1963,3', 'blosc/frame.cblosc/frame.c-1927,2+1954,2', 'blosc/frame.cblosc/frame.c-1916,2+1938,7', 'blosc/frame.cblosc/frame.c-1907,2+1929,2', 'blosc/frame.cblosc/frame.c-1969,0+2012,4')]
         if bug_id == 'OSV-2021-496':
             patch_pair_list = [('blosc/frame.cblosc/frame.c-1974,2+2023,2', 'blosc/frame.cblosc/frame.c-1947,4+1977,19', 'blosc/frame.cblosc/frame.c-1933,3+1963,3', 'blosc/frame.cblosc/frame.c-1924,2+1954,2', 'blosc/frame.cblosc/frame.c-1913,2+1938,7', 'blosc/frame.cblosc/frame.c-1904,2+1929,2', 'blosc/frame.cblosc/frame.c-1966,0+2012,4')]
-        tmp = copy.deepcopy(inmutable_args)
-        if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
-            revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
-        else:
-            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-            logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-            # try to minimize the patch set
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
-            logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
+        # tmp = copy.deepcopy(inmutable_args)
+        # if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        #     revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+        # else:
+        #     revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+        #     logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+        #     # try to minimize the patch set
+        #     minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
+        #     logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
 
-        # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
+        apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
         patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
         # # test if the local bugs is still there 
         # if 'patch_path' in patches_without_context: # if the bug trigger
