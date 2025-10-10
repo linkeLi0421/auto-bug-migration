@@ -90,13 +90,14 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def solve_code_migration(error_message, data_structure, source_code, model="gpt-4o"):
+def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-4o"):
     """
     Solve code migration problems using OpenAI API
     
     Args:
         error_message: The compilation error message
-        data_structure: The relevant data structure definition
+        data_structureA: The relevant data structure definition in version A
+        data_structureB: The relevant data structure definition in version B
         source_code: The source code causing the error
         model: OpenAI model to use (default: gpt-4o)
     
@@ -108,13 +109,17 @@ def solve_code_migration(error_message, data_structure, source_code, model="gpt-
 
 {error_message}
 
-Related data structure is:
-{data_structure}
+Related data structure in version A is:
+{data_structureA}
+
+Related data structure in version B is:
+{data_structureB}
 
 Related source code is:
 {source_code}
 
 Please fix only the function code to resolve the compilation error.
+If a struct field from version A is deleted in version B, not renamed. Please remove related codes.
 Output only the corrected C function (no struct definitions, no explanations, no comments).
 Wrap it in ```c ... ``` so I can parse it easily.
 """
@@ -127,7 +132,6 @@ Wrap it in ```c ... ``` so I can parse it easily.
                 {"role": "user", "content": prompt}
             ],
             temperature=0.3,
-            max_completion_tokens=2000
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
@@ -137,118 +141,243 @@ Wrap it in ```c ... ``` so I can parse it easily.
 
 # Example usage
 if __name__ == "__main__":
-    error_msg = """/src/c-blosc2/blosc/frame.c:478:28: error: no member named 'sdata' in 'blosc2_frame'
-  478 |   uint8_t* framep = frame->sdata;
-      |                     ~~~~~  ^/src/c-blosc2/blosc/frame.c:485:14: error: no member named 'sdata' in 'blosc2_frame'
-  485 |   if (frame->sdata == NULL) {
-      |       ~~~~~  ^/src/c-blosc2/blosc/frame.c:488:16: error: no member named 'eframe' in 'blosc2_frame'
-  488 |     if (frame->eframe) {
-      |         ~~~~~  ^"""
+    error_msg = """/src/c-blosc2/blosc/blosc2.c:4207:14: error: no member named 'udbtune' in 'struct blosc2_context_s'
+ 4207 |     context->udbtune->btune_free(context);
+      |     ~~~~~~~  ^/src/c-blosc2/blosc/blosc2.c:4210:22: error: no member named 'preparams' in 'struct blosc2_context_s'; did you mean 'pparams'?
+ 4210 |     my_free(context->preparams);
+      |                      ^~~~~~~~~/src/c-blosc2/blosc/blosc2.c:4212:16: error: no member named 'postfilter' in 'struct blosc2_context_s'; did you mean 'prefilter'?
+ 4212 |   if (context->postfilter != NULL) {
+      |                ^~~~~~~~~~/src/c-blosc2/blosc/blosc2.c:4213:22: error: no member named 'postparams' in 'struct blosc2_context_s'; did you mean 'pparams'?
+ 4213 |     my_free(context->postparams);
+      |                      ^~~~~~~~~~"""
 
-    struct_def = """typedef struct {
-  char* urlpath;
-  uint8_t* cframe;
-  bool avoid_cframe_free;
-  uint8_t* coffsets;
-  int64_t len;
-  int64_t maxlen;
-  uint32_t trailer_len;
-  bool sframe;
-} blosc2_frame;"""
+    struct_defA = """struct blosc2_context_s {
+  const uint8_t* src;
+  /* The source buffer */
+  uint8_t* dest;
+  /* The destination buffer */
+  uint8_t header_flags;
+  /* Flags for header */
+  uint8_t blosc2_flags;
+  /* Flags specific for blosc2 */
+  int32_t sourcesize;
+  /* Number of bytes in source buffer */
+  int32_t header_overhead;
+  /* The number of bytes in chunk header */
+  int32_t nblocks;
+  /* Number of total blocks in buffer */
+  int32_t leftover;
+  /* Extra bytes at end of buffer */
+  int32_t blocksize;
+  /* Length of the block in bytes */
+  int32_t output_bytes;
+  /* Counter for the number of input bytes */
+  int32_t srcsize;
+  /* Counter for the number of output bytes */
+  int32_t destsize;
+  /* Maximum size for destination buffer */
+  int32_t typesize;
+  /* Type size */
+  int32_t* bstarts;
+  /* Starts for every block inside the compressed buffer */
+  int32_t runlen_type;
+  /* Run-length type for chunk.  0 if not run-length */
+  int compcode;
+  /* Compressor code to use */
+  int clevel;
+  /* Compression level (1-9) */
+  int use_dict;
+  /* Whether to use dicts or not */
+  void* dict_buffer;
+  /* The buffer to keep the trained dictionary */
+  int32_t dict_size;
+  /* The size of the trained dictionary */
+  void* dict_cdict;
+  /* The dictionary in digested form for compression */
+  void* dict_ddict;
+  /* The dictionary in digested form for decompression */
+  uint8_t filter_flags;
+  /* The filter flags in the filter pipeline */
+  uint8_t filters[BLOSC2_MAX_FILTERS];
+  /* the (sequence of) filters */
+  uint8_t filters_meta[BLOSC2_MAX_FILTERS];
+  /* the metainfo for filters */
+  blosc2_prefilter_fn prefilter;
+  /* prefilter function */
+  blosc2_postfilter_fn postfilter;
+  /* postfilter function */
+  blosc2_prefilter_params *preparams;
+  /* prefilter params */
+  blosc2_postfilter_params *postparams;
+  /* postfilter params */
+  bool* block_maskout;
+  /* The blocks that are not meant to be decompressed.
+   * If NULL (default), all blocks in a chunk should be read. */
+  int block_maskout_nitems;
+  /* The number of items in block_maskout array (must match
+   * the number of blocks in chunk) */
+  blosc2_schunk* schunk;
+  /* Associated super-chunk (if available) */
+  struct thread_context* serial_context;
+  /* Cache for temporaries for serial operation */
+  int do_compress;
+  /* 1 if we are compressing, 0 if decompressing */
+  void *btune;
+  /* Entry point for BTune persistence between runs */
+  blosc2_btune *udbtune;
+  /* User-defined BTune parameters */
+  /* Threading */
+  int nthreads;
+  int new_nthreads;
+  int threads_started;
+  int end_threads;
+  pthread_t *threads;
+  struct thread_context *thread_contexts; /* only for user-managed threads */
+  pthread_mutex_t count_mutex;
+#ifdef BLOSC_POSIX_BARRIERS
+  pthread_barrier_t barr_init;
+  pthread_barrier_t barr_finish;
+#else
+  int count_threads;
+  pthread_mutex_t count_threads_mutex;
+  pthread_cond_t count_threads_cv;
+#endif
+#if !defined(_WIN32)
+  pthread_attr_t ct_attr;      /* creation time attrs for threads */
+#endif
+  int thread_giveup_code;
+  /* error code when give up */
+  int thread_nblock;       /* block counter */
+  int dref_not_init;       /* data ref in delta not initialized */
+  pthread_mutex_t delta_mutex;
+  pthread_cond_t delta_cv;
+};"""
 
-    code = """int __revert_1a42fc_get_header_info(blosc2_frame *frame, int32_t *header_len, int64_t *frame_len, int64_t *nbytes,
-                    int64_t *cbytes, int32_t *chunksize, int32_t *nchunks, int32_t *typesize,
-                    uint8_t *compcode, uint8_t *clevel, uint8_t *filters, uint8_t *filters_meta) {
-  uint8_t* framep = frame->sdata;
-  uint8_t header[FRAME_HEADER_MINLEN];
+    struct_defB = """typedef struct blosc2_context_s blosc2_context;   /* opaque type */
+struct blosc2_context_s {
+  const uint8_t* src;
+  /* The source buffer */
+  uint8_t* dest;
+  /* The destination buffer */
+  uint8_t header_flags;
+  /* Flags for header */
+  uint8_t blosc2_flags;
+  /* Flags specific for blosc2 */
+  int32_t sourcesize;
+  /* Number of bytes in source buffer */
+  int32_t header_overhead;
+  /* The number of bytes in chunk header */
+  int32_t nblocks;
+  /* Number of total blocks in buffer */
+  int32_t leftover;
+  /* Extra bytes at end of buffer */
+  int32_t blocksize;
+  /* Length of the block in bytes */
+  int32_t output_bytes;
+  /* Counter for the number of input bytes */
+  int32_t srcsize;
+  /* Counter for the number of output bytes */
+  int32_t destsize;
+  /* Maximum size for destination buffer */
+  int32_t typesize;
+  /* Type size */
+  int32_t* bstarts;
+  /* Starts for every block inside the compressed buffer */
+  int compcode;
+  /* Compressor code to use */
+  int clevel;
+  /* Compression level (1-9) */
+  int use_dict;
+  /* Whether to use dicts or not */
+  void* dict_buffer;
+  /* The buffer to keep the trained dictionary */
+  int32_t dict_size;
+  /* The size of the trained dictionary */
+  void* dict_cdict;
+  /* The dictionary in digested form for compression */
+  void* dict_ddict;
+  /* The dictionary in digested form for decompression */
+  uint8_t filter_flags;
+  /* The filter flags in the filter pipeline */
+  uint8_t filters[BLOSC2_MAX_FILTERS];
+  /* the (sequence of) filters */
+  uint8_t filters_meta[BLOSC2_MAX_FILTERS];
+  /* the metainfo for filters */
+  blosc2_prefilter_fn prefilter;
+  /* prefilter function */
+  blosc2_prefilter_params *pparams;
+  /* prefilter params */
+  bool* block_maskout;
+  /* The blocks that are not meant to be decompressed.
+   * If NULL (default), all blocks in a chunk should be read. */
+  int block_maskout_nitems;
+  /* The number of items in block_maskout array (must match
+   * the number of blocks in chunk) */
+  blosc2_schunk* schunk;
+  /* Associated super-chunk (if available) */
+  struct thread_context* serial_context;
+  /* Cache for temporaries for serial operation */
+  int do_compress;
+  /* 1 if we are compressing, 0 if decompressing */
+  void *btune;
+  /* Entry point for BTune persistence between runs */
 
-  if (frame->len <= 0) {
-    return -1;
+  /* Threading */
+  int nthreads;
+  int new_nthreads;
+  int threads_started;
+  int end_threads;
+  pthread_t *threads;
+  struct thread_context *thread_contexts; /* only for user-managed threads */
+  pthread_mutex_t count_mutex;
+#ifdef BLOSC_POSIX_BARRIERS
+  pthread_barrier_t barr_init;
+  pthread_barrier_t barr_finish;
+#else
+  int count_threads;
+  pthread_mutex_t count_threads_mutex;
+  pthread_cond_t count_threads_cv;
+#endif
+#if !defined(_WIN32)
+  pthread_attr_t ct_attr;      /* creation time attrs for threads */
+#endif
+  int thread_giveup_code;
+  /* error code when give up */
+  int thread_nblock;       /* block counter */
+  int dref_not_init;       /* data ref in delta not initialized */
+  pthread_mutex_t delta_mutex;
+  pthread_cond_t delta_cv;
+};"""
+
+    code = """ivoid __revert_abfebc_blosc2_free_ctx(blosc2_context* context) {
+  release_threadpool(context);
+  if (context->serial_context != NULL) {
+    free_thread_context(context->serial_context);
+  }
+  if (context->dict_cdict != NULL) {
+#ifdef HAVE_ZSTD
+    ZSTD_freeCDict(context->dict_cdict);
+#endif
+  }
+  if (context->dict_ddict != NULL) {
+#ifdef HAVE_ZSTD
+    ZSTD_freeDDict(context->dict_ddict);
+#endif
+  }
+  if (context->btune != NULL) {
+    context->udbtune->btune_free(context);
+  }
+  if (context->prefilter != NULL) {
+    my_free(context->preparams);
+  }
+  if (context->postfilter != NULL) {
+    my_free(context->postparams);
   }
 
-  if (frame->sdata == NULL) {
-    size_t rbytes = 0;
-    FILE* fp = NULL;
-    if (frame->eframe) {
-      char* eframe_name = malloc(strlen(frame->urlpath) + strlen("/chunks.b2frame") + 1);
-      sprintf(eframe_name, "%s/chunks.b2frame", frame->urlpath);
-      fp = fopen(eframe_name, "rb");
-      free(eframe_name);
-    }
-    else {
-      fp = fopen(frame->urlpath, "rb");
-    }
-    if (fp != NULL) {
-      rbytes = fread(header, 1, FRAME_HEADER_MINLEN, fp);
-      fclose(fp);
-    }
-    (void) rbytes;
-    if (rbytes != FRAME_HEADER_MINLEN) {
-      return -1;
-    }
-    framep = header;
+  if (context->block_maskout != NULL) {
+    free(context->block_maskout);
   }
-
-  // Fetch some internal lengths
-  __revert_1a42fc_swap_store(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
-  __revert_1a42fc_swap_store(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
-  __revert_1a42fc_swap_store(nbytes, framep + FRAME_NBYTES, sizeof(*nbytes));
-  __revert_1a42fc_swap_store(cbytes, framep + FRAME_CBYTES, sizeof(*cbytes));
-  __revert_1a42fc_swap_store(chunksize, framep + FRAME_CHUNKSIZE, sizeof(*chunksize));
-  if (typesize != NULL) {
-    __revert_1a42fc_swap_store(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
-  }
-
-  if (*header_len <= 0 || *header_len > *frame_len) {
-    BLOSC_TRACE_ERROR("Header length is invalid or exceeds length of the frame.");
-    return -1;
-  }
-
-  // Codecs
-  uint8_t frame_codecs = framep[FRAME_CODECS];
-  if (clevel != NULL) {
-    *clevel = frame_codecs >> 4u;
-  }
-  if (compcode != NULL) {
-    *compcode = frame_codecs & 0xFu;
-  }
-
-  // Filters
-  if (filters != NULL && filters_meta != NULL) {
-    uint8_t nfilters = framep[FRAME_FILTER_PIPELINE];
-    if (nfilters > BLOSC2_MAX_FILTERS) {
-      BLOSC_TRACE_ERROR("The number of filters in frame header are too large for Blosc2.");
-      return -1;
-    }
-    uint8_t *filters_ = framep + FRAME_FILTER_PIPELINE + 1;
-    uint8_t *filters_meta_ = framep + FRAME_FILTER_PIPELINE + 1 + FRAME_FILTER_PIPELINE_MAX;
-    for (int i = 0; i < nfilters; i++) {
-      filters[i] = filters_[i];
-      filters_meta[i] = filters_meta_[i];
-    }
-  }
-
-  if (*nbytes > 0 && *chunksize > 0) {
-    // We can compute the number of chunks only when the frame has actual data
-    *nchunks = (int32_t) (*nbytes / *chunksize);
-    if (*nbytes % *chunksize > 0) {
-      if (*nchunks == INT32_MAX) {
-        BLOSC_TRACE_ERROR("Number of chunks exceeds maximum allowed.");
-        return -1;
-      }
-      *nchunks += 1;
-    }
-
-    // Sanity check for compressed sizes
-    if ((*cbytes < 0) || ((int64_t)*nchunks * *chunksize < *nbytes)) {
-      BLOSC_TRACE_ERROR("Invalid compressed size in frame header.");
-      return -1;
-    }
-  } else {
-    *nchunks = 0;
-  }
-
-  return 0;
+  my_free(context);
 }"""
 
     solution = '''blosc2_frame* blosc2_frame_from_sframe(uint8_t *sframe, int64_t len, bool copy) {
@@ -283,7 +412,7 @@ if __name__ == "__main__":
 }'''
 
     print("Querying OpenAI API...")
-    solution = solve_code_migration(error_msg, struct_def, code)
+    solution = solve_code_migration(error_msg, struct_defA, struct_defB, code)
     print("\n" + "="*80)
     print("SOLUTION:")
     print("="*80)

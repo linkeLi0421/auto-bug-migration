@@ -203,11 +203,11 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == func_name:
                             # Define in other file, find out the definition
                             def_file_path = ast_node['location']['file']
-                            def_parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{ast_node['location']['file']}_analysis.json')
+                            def_parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{ast_node['location']['file']}_analysis.json')
                             with open(def_parsing_path, 'r') as f:
                                 def_ast_nodes = json.load(f)
                             for def_ast_node in def_ast_nodes:
-                                if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == identifier:
+                                if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == func_name:
                                     found = True
                                     new_func[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
                                     break
@@ -2060,6 +2060,7 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
 
 
 def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id):
+    logger.info(f'enter handle miss member structs {len(miss_member_structs)}')
     struct_error_dict = dict()
     struct_per_fuc_dict = dict()
     solutions_per_patch = dict()
@@ -2078,8 +2079,41 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         # 2.1. get source code of the function
         func_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
         # 2.2. get struct defination
-        struct_defs = ''
+        struct_defs_v1 = ''
+        struct_defs_v2 = ''
         struct_set = struct_per_fuc_dict[(key_of_line_num, old_function_signature, func_start_index, func_end_index)]
+        patch = diff_results[key_of_line_num]
+        file_path_v1 = patch['file_path_old']
+        parsing_path = os.path.join(data_path, f'{target}-{commit["commit_id"]}', f'{file_path_v1}_analysis.json')
+        with open(parsing_path, 'r') as f:
+            ast_nodes = json.load(f)
+        for node in ast_nodes:
+            if node.get('kind') not in {'STRUCT_DECL', 'TYPEDEF_DECL', 'TYPE_REF'}:
+                continue
+            if node['spelling'] in struct_set:
+                # Found the struct definition
+                struct_file_path = node['extent']['start']['file']
+                start_line = node['extent']['start']['line']
+                end_line = node['extent']['end']['line']
+            
+                if node.get('kind') == 'TYPE_REF':
+                    if node['type_ref']['underlying']['kind'] == 'NO_DECL_FOUND':
+                        struct_file_path = node['type_ref']['typedef_extent']['start']['file']
+                        start_line = node['type_ref']['typedef_extent']['start']['line']
+                        end_line = node['type_ref']['typedef_extent']['end']['line']
+                    else:
+                        struct_file_path = node['type_ref']['underlying']['extent']['start']['file']
+                        start_line = node['type_ref']['underlying']['extent']['start']['line']
+                        end_line = node['type_ref']['underlying']['extent']['end']['line']
+
+                os.chdir(target_repo_path)
+                subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with open(os.path.join(target_repo_path, struct_file_path), 'r') as f:
+                    file_content = f.readlines()
+                    struct_code = ''.join(line for line in file_content[start_line-1:end_line])
+                    struct_defs_v1 += struct_code
+        
         for key in patch_key_list:
             patch = diff_results[key]
             if 'Incomplete type' not in patch['patch_type']:
@@ -2088,7 +2122,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 # f'incomplete {incomplete_type}'
                 continue
             patch_text_lines = patch['patch_text'].split('\n')
-            struct_defs += '\n'.join([line[1:] for line in patch_text_lines if line.startswith('-') and not line.startswith('---')]) + '\n'
+            struct_defs_v2 += '\n'.join([line[1:] for line in patch_text_lines if line.startswith('-') and not line.startswith('---')]) + '\n'
             struct_set.remove(patch['new_signature'][11:])
             
         parsing_path = os.path.join(data_path, f'{target}-{next_commit["commit_id"]}', f'{relative_file_path}_analysis.json')
@@ -2105,9 +2139,14 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 end_line = node['extent']['end']['line']
             
                 if node.get('kind') == 'TYPE_REF':
-                    struct_file_path = node['extent']['start']['file']
-                    start_line = node['type_ref']['typedef_extent']['start']['line']
-                    end_line = node['type_ref']['typedef_extent']['end']['line']
+                    if node['type_ref']['underlying']['kind'] == 'NO_DECL_FOUND':
+                        struct_file_path = node['type_ref']['typedef_extent']['start']['file']
+                        start_line = node['type_ref']['typedef_extent']['start']['line']
+                        end_line = node['type_ref']['typedef_extent']['end']['line']
+                    else:
+                        struct_file_path = node['type_ref']['underlying']['extent']['start']['file']
+                        start_line = node['type_ref']['underlying']['extent']['start']['line']
+                        end_line = node['type_ref']['underlying']['extent']['end']['line']
 
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2115,7 +2154,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 with open(os.path.join(target_repo_path, struct_file_path), 'r') as f:
                     file_content = f.readlines()
                     struct_code = ''.join(line for line in file_content[start_line-1:end_line])
-                    struct_defs += struct_code
+                    struct_defs_v2 += struct_code
         # 2.3. get the error message
         error_message = ''
         for field_name, struct_name, relative_file_path, line_num, full_message in field_struct_list:
@@ -2125,7 +2164,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
-            solution_code = solve_code_migration(struct_defs, func_code, error_message)
+            solution_code = solve_code_migration(error_message, struct_defs_v1, struct_defs_v2, func_code)
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
                 f.write(solution_code)
@@ -2666,7 +2705,7 @@ def apply_and_test_patches(
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
-    logger.info(f'Applying and testing {len(patch_pair_list)} {patch_pair_list}')
+    logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key]['old_signature'] for key in patch_key_list]}')
     
     patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
     update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
@@ -2703,7 +2742,7 @@ def apply_and_test_patches(
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
-        if count > 10:
+        if count > 20:
             break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
@@ -2803,8 +2842,7 @@ def apply_and_test_patches(
                             dict_ = type_def_to_add.setdefault(file_path_new, dict())
                             type_def_to_add[file_path_new] = {**dict_, f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}': identifier}
                             break
-                    if found:
-                        break
+                if not found:
                     for ast_node in ast_nodes:
                         if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == identifier:
                             # Define in other file, find out the definition
@@ -2818,8 +2856,7 @@ def apply_and_test_patches(
                                     type_def_to_add[file_path_new] = {**dict_, f'{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}': identifier}
                                     break
                             break
-                    if found:
-                        break
+                if not found:
                     logger.info(f'Cannot find {identifier} in {parsing_path}')
             else:
                 logger.error(f'Cannot find parsing_path: {parsing_path}!')
@@ -3130,7 +3167,7 @@ def apply_and_test_patches(
                 return 'trigger_but_fuzzer_build_fail'
         else:
             get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
-            transitions.append((commit, next_commit, bug_id))
+            transitions.insert(0, (commit, next_commit, bug_id))
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             return 'not_trigger'
     else:
@@ -3199,10 +3236,10 @@ def revert_patch_test(args):
         transitions.append((commit, next_commit, bug_id))
     
     for commit, next_commit, bug_id in transitions:
-        if bug_id in {'OSV-2021-404', 'OSV-2022-1242', 'OSV-2021-247', 'OSV-2021-27', 'OSV-2021-429'}:
-            continue
-        if bug_id not in {'OSV-2023-51'}:
-            continue
+        # if bug_id in {'OSV-2021-404', 'OSV-2022-1242', 'OSV-2021-247', 'OSV-2021-27', 'OSV-2021-429', 'OSV-2023-51'}:
+        #     continue
+        # if bug_id not in {'OSV-2021-22'}:
+        #     continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -3306,7 +3343,7 @@ def revert_patch_test(args):
                 func_dict[func] = func.split(' ')[0]
                 trace_func_list.append((func_dict[func], func_loc))
                 
-        logger.info(f"Trace function set: {len(trace_func_list)}")
+        logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
