@@ -2046,7 +2046,7 @@ def get_trace_log_bash(commit:str, args):
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
     git checkout -f {commit};
-    {'git apply --reverse /patch;' if args.patch else ''} 
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''} 
     cd -;
     
     # Compile and collect trace
@@ -2114,7 +2114,7 @@ def get_cfg_bash(args):
     make -j$(nproc);
     cd -;
     
-    {'git apply --reverse /patch;' if args.patch else ''}
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     export LD_LIBRARY_PATH=/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
       {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
