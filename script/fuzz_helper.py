@@ -1952,6 +1952,7 @@ def build_version(args):
 
   build_bash = f'''
   export CFLAGS="-fdiagnostics-absolute-paths -ferror-limit=0 $CFLAGS";
+  export CFLAGS="-Wno-error $CFLAGS";
   cd /src/{args.project.name};
   git checkout -f {args.commit};
   '''
@@ -2040,8 +2041,8 @@ def get_trace_log_bash(commit:str, args):
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
     export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
@@ -2447,6 +2448,7 @@ def collect_trace(args):
         if target_commit in args.commit or args.commit in target_commit:
           logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
                 args.commit, oss_fuzz_commit)
+          break
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   if not build_image_impl(args.project):
     return False

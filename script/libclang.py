@@ -78,12 +78,11 @@ def get_defs(directory, src_file, args):
 def analyze_file(directory, src_file, args, defs_by_usr):
     path = os.path.join(directory, src_file)
     include_paths = extract_include_paths()
-    
+    args = [f"-I{os.path.abspath(os.path.join(directory, arg[2:]))}" if arg.startswith("-I") and not os.path.isabs(arg[2:]) else arg for arg in args]
     if not os.path.exists(path):
         print(f"File does not exist: {path}")
         return set()
     tu = index.parse(path, args=args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
-    results = []
     dir_path, file_name = os.path.split(path)
     dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
     out_path_set = set()

@@ -2217,12 +2217,11 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
             old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
             new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
             old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-            patch_lines = patch['patch_text'].split('\n')
-            add_num += new_offset - old_offset
-            if line_num + add_num <= old_start:
+            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+            if new_start <= line_num + add_num <= new_start + new_offset - 1:
                 key_of_line_num = key
-                add_num -= new_offset - old_offset
                 break
+            add_num += new_offset - old_offset
 
     index_old_infun = 0
     front_context_num = 0 # should be less than 3
@@ -2277,7 +2276,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
         # should not reach here
     else:
         # must be code in LLVMFuzzerTestOneInput
-        return line_num + add_num
+        return line_num + add_num - new_start + old_start
     return 0
 
 
@@ -2899,22 +2898,8 @@ def apply_and_test_patches(
                 # line_num after patch -> line number before patch -> 
                 # find block start and end line in bug version -> get the part in patch need to be removed
                 line_num = get_correct_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches)
-                if not check_if_in_fuzzer(line_num, cfgs2):
-                    # Treat as a signature/name change at call site; feed into process_function_signature_changes
-                    function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
-                    continue
-                _, bb2s = find_block_by_line(cfgs2, file_path.split('/')[-1], [line_num])
-                if not bb2s:
-                    logger.info(f'No basic block2 found for {file_path}:{line_num} in {next_commit['commit_id']}')
-                    continue
-                
-                for key in patch_key_list:
-                    patch = diff_results[key]
-                    new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-                    new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-                    if patch['file_path_new'] == relative_file_path and new_start <= bb2s[0].end_line and bb2s[0].start_line < new_start + new_offset:
-                        __keep_bb_in_patch(bb2s[0].start_line, bb2s[0].end_line, key, patch_key_list, diff_results)
-
+                # Treat as a signature/name change at call site; feed into process_function_signature_changes
+                function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 func_decl_line = dict()
