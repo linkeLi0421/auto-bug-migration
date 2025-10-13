@@ -90,7 +90,7 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-4o"):
+def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-5-mini"):
     """
     Solve code migration problems using OpenAI API
     
@@ -131,7 +131,6 @@ Wrap it in ```c ... ``` so I can parse it easily.
                 {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3,
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
