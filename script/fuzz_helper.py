@@ -2052,8 +2052,8 @@ def get_trace_log_bash(commit:str, args):
     
     # Compile and collect trace
     compile;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> tmp.txt;
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} ./tmp.txt; 
+    /out/{args.fuzzer_name} /corpus/{args.test_input};
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
   '''
   return bash_trace
 
