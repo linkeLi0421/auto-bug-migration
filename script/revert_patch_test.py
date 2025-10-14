@@ -12,6 +12,7 @@ import copy
 import sys
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Any
+from dataclasses import dataclass
 
 from buildAndtest import checkout_latest_commit
 from run_fuzz_test import read_json_file, py3
@@ -37,6 +38,39 @@ logger.addHandler(stream_handler)
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
+
+
+@dataclass(frozen=True)
+class FunctionInfo:
+    """
+    A hashable dataclass to store function metadata including signature, name, and special keywords.
+    """
+    name: str
+    signature: str
+    file_path_old: str
+    keywords: tuple[str, ...] = ()
+    
+    def __post_init__(self):
+        """Ensure keywords is always a tuple (for immutability)."""
+        if not isinstance(self.keywords, tuple):
+            # Use object.__setattr__ because the dataclass is frozen
+            object.__setattr__(self, 'keywords', tuple(self.keywords))
+    
+    def has_keyword(self, keyword: str) -> bool:
+        """Check if a specific keyword is present."""
+        return keyword in self.keywords
+    
+    def is_static(self) -> bool:
+        """Check if function is static."""
+        return 'static' in self.keywords
+    
+    def is_classmethod(self) -> bool:
+        """Check if function is a classmethod."""
+        return 'classmethod' in self.keywords
+    
+    def is_async(self) -> bool:
+        """Check if function is async."""
+        return 'async' in self.keywords
 
 
 def is_function_static(source_code: str) -> bool:
@@ -271,7 +305,6 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
             if not func_code:
                 logger.error(f'No func code found for {def_file_path_old}: {callee_sig}')
             func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
-            recreated_functions.add(callee_sig)
             
             callee_sig_new = get_new_funcsig(fname, next_commit, def_file_path_new, target_repo_path)
             if not callee_sig_new:
@@ -321,11 +354,8 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         'old_end_line': artificial_patch_insert_point + func_length,
                     }
                     new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
-                    if is_function_static(func_code):
-                        artificial_patch['patch_type'].add('Static Function')
-                        recreated_functions.add((artificial_patch['old_signature'], artificial_patch['file_path_old']))
-                    else:
-                        recreated_functions.add((artificial_patch['old_signature'], ''))
+                    artificial_patch['patch_type'].add('Static Function')
+                    recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch['old_signature'], file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
                     diff_results[new_key] = artificial_patch
                     new_patch_key_list.add(new_key)
                 # change the callsite, update depen_graph
@@ -355,11 +385,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 tail_code_len[def_file_path_old] = tail_code_len.get(def_file_path_old, 0) + func_length
                 tail_insert_point[def_file_path_old] = insert_point
                 tail_def_file_path_new[def_file_path_old] = def_file_path_new
-                if is_function_static(func_code):
-                    recreated_functions.add((callee_sig, def_file_path_old))
-                    static_func_path[callee_sig] = def_file_path_old
-                else:
-                    recreated_functions.add((callee_sig, ''))
+                recreated_functions.add(FunctionInfo(name=fname, signature=callee_sig, file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
             tail_details.setdefault(def_file_path_old, set()).add((caller_sig, callee_sig))
             
         for def_file_path_old in tail_code:
@@ -1080,7 +1106,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
     if not re.search(pattern, combined) \
         and (not os.path.exists(fuzzer_path) \
-        or any(p in combined for p in build_error_patterns) \
+        or any(' ' + p in combined for p in build_error_patterns) \
         or result.returncode != 0):
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
         return False, combined
@@ -1125,7 +1151,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname, commit)
                     diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
-                recreated_functions.add(patch['old_signature'])
+                recreated_functions.add(FunctionInfo(name=fname, signature=patch['old_signature'], file_path_old=patch['file_path_old']))
                 key_to_newkey[key] = key
             
             elif 'old_signature' in patch and 'new_signature' in patch:
@@ -1165,12 +1191,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                     return artificial_patch, new_key
                 artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code)
-                if is_function_static(func_code):
-                    artificial_patch['patch_type'].add('Static Function')
-                    recreated_functions.add((artificial_patch['old_signature'], artificial_patch['file_path_old']))
-                else:
-                    recreated_functions.add((artificial_patch['old_signature'], ''))
-
+                recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch['old_signature'], file_path_old=artificial_patch['file_path_old'], keywords=['static'] if is_function_static(func_code) else []))
                 diff_results[new_key] = artificial_patch
                 function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{commit}_{fname}'))
                 new_patch_to_apply.append(new_key)
@@ -1850,11 +1871,11 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             with open(os.path.join(target_repo_path, file_path), 'r', encoding="latin-1") as f:
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
-            for func_signature, static_func_path in recreated_functions:
-                if static_func_path and static_func_path != file_path:
+            for func_info in recreated_functions:
+                if func_info.is_static() and func_info.file_path_old != file_path:
                     # This function is a static function, only can be seen in that file.
                     continue
-                recreated_fname = func_signature.split('(')[0].split(' ')[-1]
+                recreated_fname = func_info.name
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
                     if '{' in line:
@@ -1954,7 +1975,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             continue
         
         # Check if this call is within the LLVMFuzzerTestOneInput function and references a recreated function
-        if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_sig.split('(')[0].split(' ')[-1] for func_sig, _ in recreated_functions):
+        if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_info.name for func_info in recreated_functions):
             
             # Track whether this call is already covered by an existing patch
             Inpatch_flag = False
@@ -2024,9 +2045,8 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
 
 def update_function_mappings(recreated_functions, signature_change_list, commit: str):
     # add mapping for recreated functions
-    for func_sig, _ in recreated_functions:
-        func_name = func_sig.split('(')[0].split(' ')[-1]
-        signature_change_list.append((func_name, f'__revert_{commit}_{func_name}'))
+    for func_info in recreated_functions:
+        signature_change_list.append((func_info.name, f'__revert_{commit}_{func_info.name}'))
 
 
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
@@ -2295,7 +2315,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
             new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
             old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
             new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-            if new_start <= line_num + add_num <= new_start + new_offset - 1:
+            if new_start <= line_num + add_num <= new_start + old_offset - 1:
                 key_of_line_num = key
                 break
             add_num += new_offset - old_offset
@@ -2831,6 +2851,9 @@ def apply_and_test_patches(
         logger.info(f'miss_member_structs: {len(miss_member_structs)} {[item for item in miss_member_structs]}')
         logger.info(f'incomplete_types: {incomplete_types}')
         
+        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(miss_member_structs) == 0 and len(incomplete_types) == 0:
+            break
+        
         diff_results_last_round = copy.deepcopy(diff_results) # Read-only, used for querying, because I will change these objects in this round
         patch_key_list_last_round = copy.deepcopy(patch_key_list)
         extra_patches_last_round = copy.deepcopy(extra_patches)
@@ -3023,7 +3046,14 @@ def apply_and_test_patches(
                 # function declaration patch
                 func_decls = func_decl_to_add[file_path]
                 for func_decl in func_decls:
-                    func_decl_text += f'-{func_decl};\n'
+                    flag = False
+                    prefix = f"__revert_{commit['commit_id']}_"
+                    for func_info in recreated_functions:
+                        if func_info.signature == func_decl.replace(prefix, ""):
+                            flag = True
+                            func_decl_text += f'-{' '.join(func_info.keywords)} {func_decl};\n'
+                    if not flag:
+                        func_decl_text += f'-{func_decl};\n'
                     func_decl_len += 1
                 
             if file_path in union_to_add:
