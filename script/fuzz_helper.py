@@ -1951,7 +1951,8 @@ def build_version(args):
     ])
 
   build_bash = f'''
-  export CFLAGS="-fdiagnostics-absolute-paths -Wno-error $CFLAGS";
+  export CFLAGS="-fdiagnostics-absolute-paths -ferror-limit=0 $CFLAGS";
+  export CFLAGS="-Wno-error $CFLAGS";
   cd /src/{args.project.name};
   git checkout -f {args.commit};
   '''
@@ -2040,19 +2041,19 @@ def get_trace_log_bash(commit:str, args):
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
     export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
     git checkout -f {commit};
-    {'git apply --reverse /patch;' if args.patch else ''} 
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''} 
     cd -;
     
     # Compile and collect trace
     compile;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> tmp.txt;
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} ./tmp.txt; 
+    /out/{args.fuzzer_name} /corpus/{args.test_input};
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
   '''
   return bash_trace
 
@@ -2114,7 +2115,7 @@ def get_cfg_bash(args):
     make -j$(nproc);
     cd -;
     
-    {'git apply --reverse /patch;' if args.patch else ''}
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     export LD_LIBRARY_PATH=/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
       {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
@@ -2167,6 +2168,8 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
   # Replace '--depth=1' in the Dockerfile
   with open(target_dockerfile_path, 'r') as dockerfile:
       dockerfile_content = dockerfile.read()
+  if '@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0' not in dockerfile_content:
+            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0')
   updated_content = dockerfile_content.replace('--depth 1', '')
   updated_content = updated_content.replace('--depth=1', '')
   with open(target_dockerfile_path, 'w') as dockerfile:
@@ -2445,6 +2448,7 @@ def collect_trace(args):
         if target_commit in args.commit or args.commit in target_commit:
           logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
                 args.commit, oss_fuzz_commit)
+          break
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   if not build_image_impl(args.project):
     return False
