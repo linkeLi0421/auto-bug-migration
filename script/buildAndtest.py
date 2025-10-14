@@ -299,9 +299,16 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
         cmd = [
             'python3', f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
         ]
-        logger.info(' '.join(cmd))
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            logger.info(' '.join(cmd))
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",   # or "ignore"
+                timeout=60,
+            )
             if 'sanitizer' in result.stderr.lower()+result.stdout.lower() and sanitizer in result.stderr.lower()+result.stdout.lower():
                 confidence_level = '0.5'
                 if crash_type.lower() in result.stderr.lower()+result.stdout.lower():
@@ -529,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--target", help="Name of the target")
     parser.add_argument("--mode", choices=["build", "test", "both"], default="both",
                        help="Specify the operation mode: 'build' for building only, 'test' for testing only, or 'both' for both operations")
+    parser.add_argument("--fuzzer", help = "Harness to test")
     args = parser.parse_args()
     target = args.target
     current_file_path = os.path.dirname(os.path.abspath(__file__))
@@ -563,7 +571,7 @@ if __name__ == "__main__":
         bug_info = bug_infos[bug_id]
         if 'i386' in bug_info['reproduce']['job_type']:
             continue
-        if bug_info['reproduce']['fuzz_target'] != 'ssml-fuzzer':
+        if bug_info['reproduce']['fuzz_target'] != args.fuzzer:
             continue
         filter_bug_ids.append(bug_id)
     
