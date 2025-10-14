@@ -19,11 +19,11 @@ def compare_traces(trace1, trace2, signature_change_list=None):
         func1 = trace1[i][1].split(' ')[0]
         func2 = trace2[i][1].split(' ')[0]
         if func1 != func2 and not (signature_change_list and any((func1, func2) == sig_pair or (func2, func1) == sig_pair for sig_pair in signature_change_list)) and (func2 != f'__revert_{func1}'):
-            return common_part, trace1[i:], trace2[i:]
+            return common_part
         common_part.append(trace1[i])
         common_part.append(trace2[i])
     # If no difference is found in the common length, return remaining functions
-    return common_part, trace1[min_length:], trace2[min_length:]
+    return common_part
 
 
 def main():
@@ -38,18 +38,11 @@ def main():
     print(f'trace1: {trace1[:100]}')
     print(f'trace2: {trace2[:100]}')
 
-    common_part, remaining_trace1, remaining_trace2 = compare_traces(trace1, trace2)
-
-    remaining_funcs1 = {func.split(' ')[0] for _, func in remaining_trace1}
-    remaining_funcs2 = {func.split(' ')[0] for _, func in remaining_trace2}
-    common_funcs = remaining_funcs1.intersection(remaining_funcs2)
+    common_part = compare_traces(trace1, trace2)
 
     if args.two_bug_mode:
-        for func in common_funcs:
+        for _, func in common_part:
             print(f"fun:{func}")
-        if len(common_funcs) == 0:
-            for _, func in common_part:
-                print(f"fun:{func}")
     else:
         for func in common_part:
             print(f'fun:{func}')

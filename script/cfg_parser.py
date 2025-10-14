@@ -88,8 +88,7 @@ def parse_cfg_text(cfg_text: str) -> List[SourceCFG]:
     func_sig_re = re.compile(r'^Function signature: (.+)$')
     file_line_re = re.compile(r'^Defined in file: (.+) at line (\d+)$')
     defuse_chain_re = re.compile(r'Def-Use Chain:')
-    defuse_entry_re = re.compile(r'\s*(USE|DEF) ([^ ]+) (?:used|defined|at line) (\d+) \(([^)]+)\)')
-
+    defuse_entry_re = re.compile(r'\s*(USE|DEF)\s+(\S+).*?(\d+)\s*\(([^)]+)\)')
     in_defuse_chain = False
 
     for line in lines:
