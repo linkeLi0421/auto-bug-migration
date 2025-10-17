@@ -26,7 +26,7 @@ from gumtree import get_corresponding_lines, get_delete_lines
 HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
-from openai_client import solve_code_migration
+from handle_struct_use import solve_code_migration
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -205,12 +205,11 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     return None
 
 
-def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict):
+def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions):
     # From the error_log like "too few arguments in function call" get the caller and callee info;
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
-    recreated_functions = set()
     for func_name, error_type, file_path, line_range in function_sig_changes:
         def_file_path = None
         file_path_new = file_path.split('/', 3)[-1]
@@ -277,8 +276,8 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
         caller_sig = None
         # 1 get caller and callee
         for node in ast_nodes:
-            if 'type_ref' in node and not callee_sig and node.get('kind') in call_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
-                and max(old_line_list) <= int(node['extent']['end']['line']):
+            if 'type_ref' in node and not callee_sig and node.get('kind') in call_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) >= min(old_line_list) \
+                and max(old_line_list) >= int(node['extent']['end']['line']):
                 callee_sig = node['callee']['signature']
             if not caller_sig and node.get('kind') in def_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
                 and max(old_line_list) <= int(node['extent']['end']['line']):
@@ -358,15 +357,15 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch['old_signature'], file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
                     diff_results[new_key] = artificial_patch
                     new_patch_key_list.add(new_key)
-                # change the callsite, update depen_graph
-                for key in patch_key_list:
-                    patch = diff_results[key]
-                    if patch['file_path_old'] != def_file_path_old:
-                        continue
-                    if 'old_signature' in patch and patch['old_signature'] == caller_sig:
-                        depen_graph.setdefault(new_key, set()).add(key)
-                        modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
-                        diff_results[key]['patch_text'] = '\n'.join(modified_lines)
+                    # change the callsite, update depen_graph
+                    for key in patch_key_list:
+                        patch = diff_results[key]
+                        if patch['file_path_old'] != def_file_path_old:
+                            continue
+                        if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                            depen_graph.setdefault(new_key, set()).add(key)
+                            modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
+                            diff_results[key]['patch_text'] = '\n'.join(modified_lines)
         else:
             logger.error(f"-{file_path_old}+{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
@@ -421,7 +420,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
                         diff_results[key]['patch_text'] = '\n'.join(modified_lines)
             
-    return new_patch_key_list, function_declarations, depen_graph, recreated_functions, type_def_to_add
+    return new_patch_key_list, function_declarations, depen_graph, type_def_to_add
 
 
 def process_undeclared_identifiers(miss_member_structs, miss_decls, last_round, final_patches, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list):
@@ -1607,7 +1606,7 @@ def handle_build_error(error_log):
             missing_struct_members[(member, struct_name, filepath, int(line_num))] = full_message
     
     # --- Too few arguments ---
-    pattern = r"(/src.+?):(\d+):(\d+):.*too few arguments to function call.*"
+    pattern = r"(/src.+?):(\d+):(\d+):.*too (?:few|many) arguments to function call.*"
     next_error = {'note:', 'warning:', 'error:'}
     line_num_pattern = r"^\s*(\d+)\s*\|\s*(.*)"
     function_sig_changes = []
@@ -1638,7 +1637,7 @@ def handle_build_error(error_log):
                     line_num_set.add(int(lnum))
                     fun_call_code += code.strip() + " "
             function_sig_changes.append(
-                (fun_call_code.strip(), "too_few_arguments_fun_call", filepath, (min(line_num_set), max(line_num_set)))
+                (fun_call_code.strip(), "too_few_or_many_arguments_fun_call", filepath, (min(line_num_set), max(line_num_set)))
             )
     
     # --- Type mismatch in function calls ---
@@ -1710,101 +1709,110 @@ def handle_build_error(error_log):
     return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes, incomplete_types
 
 
-def find_first_code_line(file_path, skip_conditionals=False): 
-    """ 
-    Returns the 1-based line number where actual C code starts. 
-    Skips: 
-      - blank lines 
-      - single-line and multi-line comments 
+def find_first_code_line(file_path, skip_conditionals=False):
+    """
+    Returns the 1-based line number where actual C code starts.
+    Skips:
+      - blank lines
+      - single-line and multi-line comments
       - preprocessor directives (including multi-line #define macros)
-      - (optionally) code inside conditional preprocessor blocks like #ifdef/#ifndef/#if ... #endif 
-    
+      - (optionally) code inside conditional preprocessor blocks like #ifdef/#ifndef/#if ... #endif
+
     Set skip_conditionals=True to also skip code inside #ifdef blocks.
-    """ 
-    with open(file_path, 'r', encoding="latin-1") as f: 
-        lines = f.readlines() 
- 
-    in_multiline_comment = False 
-    in_multiline_preprocessor = False  # NEW: Track multi-line macros
-    conditional_depth = 0 
- 
-    for idx, line in enumerate(lines): 
-        stripped = line.strip() 
-        
-        # Check if previous line was a multi-line preprocessor directive
+    """
+    with open(file_path, 'r', encoding="latin-1") as f:
+        lines = f.readlines()
+
+    in_multiline_comment = False
+    in_multiline_preprocessor = False  # Track multi-line macros / continued preprocessor lines
+    conditional_stack = []  # store 1-based line numbers of #if/#ifdef/#ifndef entries
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+
+        # If previous line started a multi-line preprocessor directive, handle continuation
         if in_multiline_preprocessor:
-            # Check if this line also ends with backslash (continuation)
             if stripped.endswith('\\'):
-                continue  # Still in multi-line preprocessor
+                continue  # still in a continued preprocessor
             else:
                 in_multiline_preprocessor = False
-                continue  # This is the last line of the preprocessor directive
- 
+                continue  # this was the last continued preprocessor line
+
         # Handle multi-line comments
-        if in_multiline_comment: 
-            if "*/" in stripped: 
+        if in_multiline_comment:
+            if "*/" in stripped:
                 in_multiline_comment = False
                 after_comment = stripped.split("*/", 1)[1].strip()
                 if after_comment and not after_comment.startswith("//"):
                     if not after_comment.startswith("#"):
-                        if not skip_conditionals or conditional_depth == 0:
-                            return idx + 1
-            continue 
-        
+                        # Found code after a closing comment: determine appropriate insertion point
+                        if not skip_conditionals and conditional_stack:
+                            # prefer to insert before outermost conditional
+                            return conditional_stack[0]
+                        return idx + 1
+            continue
+
         # Check for /* - handle inline closing
         if "/*" in stripped:
-            before_comment = stripped.split("/*")[0].strip()
-            
+            before_comment = stripped.split("/*", 1)[0].strip()
+
             if "*/" in stripped:
                 after_comment = stripped.split("*/", 1)[-1].strip()
-                combined = before_comment + " " + after_comment
-                stripped = combined.strip()
+                combined = (before_comment + " " + after_comment).strip()
+                stripped = combined
             else:
                 in_multiline_comment = True
                 if before_comment:
                     stripped = before_comment
                 else:
                     continue
- 
-        # Skip blank or single-line comment 
-        if not stripped or stripped.startswith("//"): 
-            continue 
- 
-        # Track preprocessor conditional depth
-        if (stripped.startswith("#if ") or 
-            stripped.startswith("#ifdef ") or 
+
+        # Skip blank or single-line comment
+        if not stripped or stripped.startswith("//"):
+            continue
+
+        # Track preprocessor conditional depth / stack
+        is_if = (
+            stripped.startswith("#if ") or
+            stripped.startswith("#ifdef ") or
             stripped.startswith("#ifndef ") or
             stripped == "#if" or
             stripped == "#ifdef" or
-            stripped == "#ifndef"):
-            conditional_depth += 1
-            # Check if it's a multi-line conditional
+            stripped == "#ifndef"
+        )
+        if is_if:
+            # record the 1-based line number where this conditional starts
+            conditional_stack.append(idx + 1)
+            # check for continued preprocessor line
             if stripped.endswith('\\'):
                 in_multiline_preprocessor = True
-            continue 
-            
-        if stripped.startswith("#endif"): 
-            if conditional_depth > 0: 
-                conditional_depth -= 1
-            continue 
-            
-        if stripped.startswith("#else") or stripped.startswith("#elif"): 
-            continue 
- 
-        # Skip ALL preprocessor lines (including #define, #include, etc.)
-        if stripped.startswith("#"): 
-            # Check if this preprocessor directive continues on next line
+            continue
+
+        if stripped.startswith("#endif"):
+            if conditional_stack:
+                conditional_stack.pop()
+            continue
+
+        if stripped.startswith("#else") or stripped.startswith("#elif"):
+            # keep conditional stack as-is; we don't change stack height
+            continue
+
+        # Skip ALL other preprocessor lines (including #define, #include, etc.)
+        if stripped.startswith("#"):
             if stripped.endswith('\\'):
                 in_multiline_preprocessor = True
-            continue 
- 
-        # Skip code inside #if / #ifdef blocks if requested
-        if skip_conditionals and conditional_depth > 0: 
-            continue 
- 
-        # Found actual code!
-        return idx + 1 
- 
+            continue
+
+        # If we reach here, we've found an actual code line.
+        # If it's inside a conditional and the caller did NOT request skipping conditionals,
+        # prefer to insert before the outermost conditional start so we don't end up inside.
+        if not skip_conditionals and conditional_stack:
+            return conditional_stack[0]
+
+        # Otherwise return this line (1-based)
+        return idx + 1
+
+    # No code found -> return line after last line
     return len(lines) + 1
 
 
@@ -2181,6 +2189,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         patch = diff_results[key_of_line_num]
         file_path_v1 = patch['file_path_old']
         parsing_path = os.path.join(data_path, f'{target}-{commit["commit_id"]}', f'{file_path_v1}_analysis.json')
+        deduplicate_struct = set()
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
         for node in ast_nodes:
@@ -2208,7 +2217,9 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 with open(os.path.join(target_repo_path, struct_file_path), 'r', encoding="latin-1") as f:
                     file_content = f.readlines()
                     struct_code = ''.join(line for line in file_content[start_line-1:end_line])
-                    struct_defs_v1 += struct_code
+                    if struct_code not in deduplicate_struct:
+                        deduplicate_struct.add(struct_code)
+                        struct_defs_v1 += struct_code
         
         for key in patch_key_list:
             patch = diff_results[key]
@@ -2224,11 +2235,11 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         parsing_path = os.path.join(data_path, f'{target}-{next_commit["commit_id"]}', f'{relative_file_path}_analysis.json')
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
+        deduplicate_struct = set()
         for node in ast_nodes:
             if node.get('kind') not in {'STRUCT_DECL', 'TYPEDEF_DECL', 'TYPE_REF'}:
                 continue
             if node['spelling'] in struct_set:
-                struct_set.remove(node['spelling'])
                 # Found the struct definition
                 struct_file_path = node['extent']['start']['file']
                 start_line = node['extent']['start']['line']
@@ -2250,7 +2261,9 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 with open(os.path.join(target_repo_path, struct_file_path), 'r', encoding="latin-1") as f:
                     file_content = f.readlines()
                     struct_code = ''.join(line for line in file_content[start_line-1:end_line])
-                    struct_defs_v2 += struct_code
+                    if struct_code not in deduplicate_struct:
+                        deduplicate_struct.add(struct_code)
+                        struct_defs_v2 += struct_code
         # 2.3. get the error message
         error_message = ''
         for field_name, struct_name, relative_file_path, line_num, full_message in field_struct_list:
@@ -2827,10 +2840,9 @@ def apply_and_test_patches(
     union_to_add = dict() # key: file path, value: set of union declarations
     type_def_to_add = dict() # key: file path, value: set of type definitions
     incomplete_type_to_add = dict() # key: file path, value: set of incomplete types
-    last_undeclared_identifier = []
-    last_undeclared_functions = []
-    last_miss_member_structs = dict()
-    last_incomplete_types = []
+    last_type_def_to_add = dict()
+    recreated_cons = set()
+    recreated_var = set()
     # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
     error_log = 'undeclared identifier'
     count = 0
@@ -2846,18 +2858,19 @@ def apply_and_test_patches(
         with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
             f.write(error_log)
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
-        logger.info(f'undeclared_identifier: {undeclared_identifier}')
+        logger.info(f'undeclared_identifier: {len(undeclared_identifier)} {undeclared_identifier}')
         logger.info(f'undeclared_functions: {undeclared_functions}')
         logger.info(f'miss_member_structs: {len(miss_member_structs)} {[item for item in miss_member_structs]}')
         logger.info(f'incomplete_types: {incomplete_types}')
         
-        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(miss_member_structs) == 0 and len(incomplete_types) == 0:
+        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(miss_member_structs) == 0 and len(incomplete_types) == 0 and len(function_sig_changes) == 0:
             break
         
         diff_results_last_round = copy.deepcopy(diff_results) # Read-only, used for querying, because I will change these objects in this round
         patch_key_list_last_round = copy.deepcopy(patch_key_list)
         extra_patches_last_round = copy.deepcopy(extra_patches)
         last_round = (diff_results_last_round, patch_key_list_last_round, extra_patches_last_round)
+        un_dec_vars_to_add = dict() # key: file path, value: set of undeclared variables
         
         for type_name, error_location, forward_decl_location in incomplete_types:
             pure_type = type_name.split(' ')[-1]
@@ -2892,6 +2905,8 @@ def apply_and_test_patches(
                 # Assign a recreated function to a function pointer
                 undeclared_functions.append((identifier, location))
                 continue
+            if identifier.startswith(f'__revert_cons_{commit["commit_id"]}_'):
+                identifier = identifier.split(f'__revert_cons_{commit["commit_id"]}_')[-1]
             parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{file_path_old}_analysis.json')
             if os.path.exists(parsing_path):
                 with open(parsing_path, 'r') as f:
@@ -2900,22 +2915,19 @@ def apply_and_test_patches(
                 for ast_node in ast_nodes:
                     if ast_node['kind'] in {'ENUM_CONSTANT_DECL'} and ast_node['spelling'] == identifier:
                         found = True
-                        con_to_add.setdefault(file_path_new, dict())[f'__revert_cons_{commit["commit_id"]}_{next_commit["commit_id"]}_{ast_node['spelling']} = {ast_node['enum_value']},\n'] = identifier
-                        # Change the name where use this enum
-                        for key in patch_key_list:
-                            patch = diff_results[key]
-                            if patch['file_path_new'] == file_path_new:
-                                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_cons_{commit["commit_id"]}_{next_commit["commit_id"]}_{ast_node["spelling"]}'))
+                        con_to_add.setdefault(file_path_new, dict())[f'__revert_cons_{commit["commit_id"]}_{ast_node['spelling']} = {ast_node['enum_value']},\n'] = identifier
+                        recreated_cons.add(identifier)
                         break
                     if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
                         found = True
                         var_del_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
                         break
                     if ast_node['kind'] in {'DECL_REF_EXPR'} and ast_node['spelling'] == identifier:
+                        # A reference (use) of a declared entity such as a variable, function, or enum constant.
                         found = True
                         if 'type_ref' in ast_node and ast_node['type_ref']['target_kind'] == 'VAR_DECL':
                             # use type def here, because they are similiar
-                            type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
+                            un_dec_vars_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
                         else: 
                             miss_decls.append((ast_node['spelling'], location.split(':')[0], int(location.split(':')[1])))
                         break
@@ -3012,9 +3024,9 @@ def apply_and_test_patches(
                         else:
                             func_decl_line[relative_file_path] = old_line_num
                         break
+
         logger.info(f'function_sig_changes: {function_sig_changes}')
-        new_patch_key_list, function_declarations, depen_graph, recreated_functions2, type_def_to_add = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add)
-        recreated_functions = recreated_functions | recreated_functions2
+        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
             if key not in patch_key_list:
@@ -3023,11 +3035,16 @@ def apply_and_test_patches(
         add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
         handle_file_change(diff_results, patch_key_list)
         
-        if last_undeclared_identifier == undeclared_identifier and last_undeclared_functions == undeclared_functions and last_miss_member_structs == miss_member_structs and last_incomplete_types == incomplete_types:
+        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(incomplete_types) == 0:
+        # if last_undeclared_identifier == undeclared_identifier and last_undeclared_functions == undeclared_functions and last_miss_member_structs == miss_member_structs and last_incomplete_types == incomplete_types:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
             # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
             handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id)
             bb_change_pair = process_undeclared_identifiers([], miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
+
+        if type_def_to_add == last_type_def_to_add:
+            for file_path in type_def_to_add:
+                type_def_to_add[file_path] = {**un_dec_vars_to_add.get(file_path, dict()), **type_def_to_add.get(file_path, dict())}
 
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
@@ -3091,6 +3108,18 @@ def apply_and_test_patches(
             var_len = 0
             var_text = ''
             ids = set()
+                        
+            if file_path in type_def_to_add:
+                locs = list(type_def_to_add[file_path])
+                for log in reversed(locs):
+                    path = log.split(':')[0]
+                    start_line = int(log.split(':')[1])
+                    end_line = int(log.split(':')[2])
+                    var_len += end_line - start_line + 1
+                    with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
+                        file_content = f.readlines()
+                        var_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
+            
             if file_path in var_del_to_add:
                 # variable declaration patch
                 locs = list(var_del_to_add[file_path])
@@ -3116,17 +3145,6 @@ def apply_and_test_patches(
                     if patch['file_path_new'] == file_path:
                         for identifier in ids:
                             patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
-            
-            if file_path in type_def_to_add:
-                locs = list(type_def_to_add[file_path])
-                for log in reversed(locs):
-                    path = log.split(':')[0]
-                    start_line = int(log.split(':')[1])
-                    end_line = int(log.split(':')[2])
-                    var_len += end_line - start_line + 1
-                    with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
-                        file_content = f.readlines()
-                        var_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
 
             # need new version to get the context lines
             if enum_len+include_len+func_decl_len+var_len+union_len == 0:
@@ -3158,7 +3176,7 @@ def apply_and_test_patches(
                     patch = {
                         'file_path_old': file_path,
                         'file_path_new': file_path,
-                        'patch_text': patch_header + context1 + include_text + var_text + enum_text + func_decl_text + union_text + gap_text + f_text,
+                        'patch_text': patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + gap_text + f_text,
                         'new_start_line': start,
                         'new_end_line': patch_f['new_end_line'],
                         'old_start_line': start,
@@ -3176,7 +3194,7 @@ def apply_and_test_patches(
                 patch = {
                     'file_path_old': file_path,
                     'file_path_new': file_path,
-                    'patch_text': patch_header + context1 + include_text + var_text + enum_text + func_decl_text + union_text + context2,
+                    'patch_text': patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + context2,
                     'new_start_line': start,
                     'new_end_line': end,
                     'old_start_line': start,
@@ -3224,6 +3242,26 @@ def apply_and_test_patches(
                 patch_key_list.append(key)
             add_context(diff_results, [key], next_commit['commit_id'], target_repo_path)
         
+        for identifier in recreated_cons:
+            for key in patch_key_list:
+                patch = diff_results[key]
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
+            for patch in extra_patches.values():
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
+        for identifier in recreated_var:
+            for key in patch_key_list:
+                patch = diff_results[key]
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
+            for patch in extra_patches.values():
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
+        # Sometimes, recreated function here call other recreate functions
+        for fun_info in recreated_functions:
+            for key in patch_key_list:
+                patch = diff_results[key]
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fun_info.name, commit['commit_id']))
+            for patch in extra_patches.values():
+                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fun_info.name, commit['commit_id']))
+        
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
                 # not_write_patches means the patch is merged with the extra patches
@@ -3238,10 +3276,7 @@ def apply_and_test_patches(
                 patch_file.write('\n\n')
                 patches_without_context[f'_extra_{patch['file_path_new']}'] = patch
         # update length of con_to_add, var_del_to_add, union_to_add
-        last_undeclared_identifier = undeclared_identifier
-        last_undeclared_functions = undeclared_functions
-        last_miss_member_structs = miss_member_structs
-        last_incomplete_types = incomplete_types
+        last_type_def_to_add = copy.deepcopy(type_def_to_add)
         
     testcases_env = os.getenv('TESTCASES', '')
     if build_success:
