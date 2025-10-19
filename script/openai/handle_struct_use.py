@@ -1,88 +1,9 @@
 import os
 from openai import OpenAI
 import re
-import difflib
 
 # Initialize the client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-
-def generate_diff(old_code, new_code, filename="file.c", start_line_old=1, start_line_new=1):
-    """
-    Generate a unified diff text (a patch) between two code versions for a single function.
-    The caller provides the function source for old_code and new_code and the file-line
-    numbers where each function version starts (start_line_old / start_line_new).
-    The returned patch is ready to be applied (contains ---/+++ headers and @@ hunks
-    with correct absolute line numbers).
-
-    Args:
-        old_code: string containing the old version of the function
-        new_code: string containing the new version of the function
-        filename: path displayed in diff header (used in a/... and b/...)
-        start_line_old: 1-based line number in the file where the old function starts
-        start_line_new: 1-based line number in the file where the new function starts
-
-    Returns:
-        Unified diff text (str). Returns an empty string when there are no changes.
-    """
-    old_lines = old_code.rstrip("\n").splitlines()
-    new_lines = new_code.rstrip("\n").splitlines()
-
-    # difflib.unified_diff uses 1-based line numbers relative to the sequences passed.
-    # We'll compute the diff for the function text and then shift the hunk start
-    # numbers by (start_line - 1) to get absolute file line numbers.
-    diff_iter = difflib.unified_diff(
-        old_lines,
-        new_lines,
-        fromfile=f"a/{filename}",
-        tofile=f"b/{filename}",
-        fromfiledate="",
-        tofiledate="",
-        lineterm="",
-        n=3,  # context lines
-    )
-
-    diff_text = "\n".join(diff_iter)
-    if not diff_text:
-        return ""  # no changes
-
-    # Adjust the @@ -old_start,old_count +new_start,new_count @@ to absolute line numbers
-    diff_text = adjust_diff_start_lines(diff_text, start_line_old, start_line_new)
-    return diff_text
-
-
-def adjust_diff_start_lines(diff_text, old_start, new_start):
-    """
-    Adjust all @@ -a,b +c,d @@ hunk headers in diff_text by adding (old_start-1)
-    to 'a' and (new_start-1) to 'c'.
-
-    This preserves the hunk sizes (b and d) emitted by difflib, but relocates
-    the hunk to the proper absolute file lines.
-    """
-    def repl(match):
-        # match groups: full numbers strings like "1,7" and "1,7"
-        old_range = match.group(1)  # e.g. "1,7"
-        new_range = match.group(2)  # e.g. "1,8"
-
-        # Parse old start/count
-        old_parts = old_range.split(",")
-        old_a = int(old_parts[0])
-        old_b = int(old_parts[1]) if len(old_parts) > 1 else 1
-
-        # Parse new start/count
-        new_parts = new_range.split(",")
-        new_c = int(new_parts[0])
-        new_d = int(new_parts[1]) if len(new_parts) > 1 else 1
-
-        # Shift starts to absolute lines (caller provided 1-based start_line)
-        abs_old_a = old_a + (old_start - 1)
-        abs_new_c = new_c + (new_start - 1)
-
-        return f"@@ -{abs_old_a},{old_b} +{abs_new_c},{new_d} @@"
-
-    # Replace all hunk header occurrences. This will preserve other parts of the diff.
-    adjusted = re.sub(r"@@ -(\d+,\d+) \+(\d+,\d+) @@", repl, diff_text)
-    return adjusted
 
 
 def extract_code(text):

@@ -1604,7 +1604,7 @@ def handle_build_error(error_log):
             full_message = "\n".join(context_lines).strip()
             missing_struct_members[(member, struct_name, filepath, int(line_num))] = full_message
     
-    # --- Too few arguments ---
+    # --- Too few / many arguments ---
     pattern = r"(/src.+?):(\d+):(\d+):.*too (?:few|many) arguments to function call.*"
     next_error = {'note:', 'warning:', 'error:'}
     line_num_pattern = r"^\s*(\d+)\s*\|\s*(.*)"
@@ -1618,10 +1618,13 @@ def handle_build_error(error_log):
         if match:
             filepath, line_num, col_num = match.groups()
             line_num_set.add(int(line_num))
-            # collect following lines, but carefully
-            for j in range(i+1, len(error_lines)):
+            
+            # --- Capture the full error block ---
+            context_lines = [error_line]
+            for j in range(i + 1, len(error_lines)):
                 if any(sign in error_lines[j] for sign in next_error):
                     break
+                context_lines.append(error_lines[j])
 
                 # skip caret/tilde continuation lines
                 if re.match(r"^\s*\|\s*\^", error_lines[j]) or re.match(r"^\s*\|\s*~", error_lines[j]):
@@ -1630,15 +1633,16 @@ def handle_build_error(error_log):
                 line_num_match = re.search(line_num_pattern, error_lines[j])
                 if line_num_match:
                     lnum, code = line_num_match.groups()
-                    # only accept lines from the SAME file region (not header notes)
                     if abs(int(lnum) - int(line_num)) > 5:
                         continue
                     line_num_set.add(int(lnum))
                     fun_call_code += code.strip() + " "
+            
+            full_message = "\n".join(context_lines).strip()
             function_sig_changes.append(
-                (fun_call_code.strip(), "too_few_or_many_arguments_fun_call", filepath, (min(line_num_set), max(line_num_set)))
+                (fun_call_code.strip(), "too_few_or_many_arguments_fun_call", filepath, (min(line_num_set), max(line_num_set)), full_message)
             )
-    
+
     # --- Type mismatch in function calls ---
     pattern_type_mismatch = r"(/src.+?):(\d+):(\d+):.*passing '([^']+)'.*to parameter of incompatible type '([^']+)'.*"
     for i, error_line in enumerate(error_lines):
@@ -1648,9 +1652,14 @@ def handle_build_error(error_log):
         if match:
             filepath, line_num, col_num, from_type, to_type = match.groups()
             line_num_set.add(int(line_num))
-            for j in range(i+1, len(error_lines)):
+
+            # --- Capture the full error block ---
+            context_lines = [error_line]
+            for j in range(i + 1, len(error_lines)):
                 if any(sign in error_lines[j] for sign in next_error):
                     break
+                context_lines.append(error_lines[j])
+
                 if re.match(r"^\s*\|\s*\^", error_lines[j]) or re.match(r"^\s*\|\s*~", error_lines[j]):
                     continue
                 line_num_match = re.search(line_num_pattern, error_lines[j])
@@ -1660,12 +1669,11 @@ def handle_build_error(error_log):
                         continue
                     line_num_set.add(int(lnum))
                     fun_call_code += code.strip() + " "
+            
+            full_message = "\n".join(context_lines).strip()
             function_sig_changes.append(
-                (fun_call_code.strip(), "type_mismatch_function_call", filepath, (min(line_num_set), max(line_num_set)))
+                (fun_call_code.strip(), "type_mismatch_function_call", filepath, (min(line_num_set), max(line_num_set)), full_message)
             )
-    
-    # Sort results
-    function_sig_changes.sort(key=lambda x: (x[2], x[3][0] if isinstance(x[3], tuple) else x[3]), reverse=True)
     
     # --- Unknown type names ---
     pattern = r"(/src.+?):(\d+):(\d+):.*unknown type name '([^']+)'"
@@ -2272,6 +2280,9 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
+            logger.info(f'Error message: {error_message}')
+            logger.info(f'struct_defs_v1: {struct_defs_v1}')
+            logger.info(f'struct_defs_v2: {struct_defs_v2}')
             solution_code = solve_code_migration(error_message, struct_defs_v1, struct_defs_v2, func_code)
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
@@ -2310,6 +2321,57 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
         patch_text_lines[3] = f'@@ -{start_line},{old_offset} +{start_line},{new_offset} @@'
         diff_results[key_of_line_num]['patch_text'] = '\n'.join(patch_text_lines)
+
+
+def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, patch_key_list, diff_results, extra_patches, target_repo_path, commit):
+    # insert function definition before the error line
+    add_num = 0 # the number of lines added by patches
+    key_of_line_num = None
+    
+    # 1. get the patch where error occurs
+    if file_path in extra_patches:
+        patch = extra_patches[file_path]
+        add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
+    for key in reversed(patch_key_list):
+        patch = diff_results[key]
+        if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
+            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
+            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+            if new_start <= error_line_num + add_num <= new_start + old_offset - 1:
+                key_of_line_num = key
+                break
+            add_num += new_offset - old_offset
+
+    # 2. read the definition
+    def_file_path = def_loc.split(':')[0]
+    def_func_start = def_loc.split(':')[1]
+    def_func_end = def_loc.split(':')[2]
+    os.chdir(target_repo_path)
+    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(os.path.join(target_repo_path, def_file_path), 'r', encoding='utf-8') as f:
+        func_def = f.readlines()[int(def_func_start)-1:int(def_func_end)]
+        func_def = [f'-{line[:-1]}' for line in func_def]
+    
+    # 3. insert def into patch
+    patch = diff_results[key_of_line_num]
+    logger.info(f'see result0:\n{patch['patch_text']}')
+    patch_lines = patch['patch_text'].split('\n')
+    front_context_len = 0
+    for line in patch_lines[4:]:
+        if line.startswith('+') or line.startswith('-'):
+            break
+        front_context_len += 1
+    patch['hiden_func_dict'][func_sig] = front_context_len
+    patch['hiden_func_dict'][patch['old_signature']] = front_context_len + len(func_def)
+    old_start = int(patch_lines[3].split('-')[1].split(',')[0])
+    old_offset = int(patch_lines[3].split(',')[1].split(' ')[0])
+    new_start = int(patch_lines[3].split('+')[1].split(',')[0])
+    new_offset = int(patch_lines[3].split(',')[-1].split(' ')[0])
+    patch_lines[3] = f'@@ -{old_start},{old_offset+len(func_def)} +{new_start},{new_offset} @@'
+    patch['patch_text'] = '\n'.join(patch_lines[:4+front_context_len] + func_def + patch_lines[4+front_context_len+func_def.count('\n'):])
 
 
 def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches, target, commit):
@@ -2838,6 +2900,7 @@ def apply_and_test_patches(
     union_to_add = dict() # key: file path, value: set of union declarations
     type_def_to_add = dict() # key: file path, value: set of type definitions
     incomplete_type_to_add = dict() # key: file path, value: set of incomplete types
+    func_def_to_add = dict() # key: (file path, function def location), value: insert line numeber
     last_type_def_to_add = dict()
     recreated_cons = set()
     recreated_var = set()
@@ -2947,9 +3010,9 @@ def apply_and_test_patches(
                     for ast_node in ast_nodes:
                         if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == identifier:
                             found = True
-                            # Add the function definition to the begin of the dict, so we have function def in the begin of the patch
-                            dict_ = type_def_to_add.setdefault(file_path_new, dict())
-                            type_def_to_add[file_path_new] = {**dict_, f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}': identifier}
+                            key = (file_path_new, f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}', f'{ast_node['signature']}')
+                            if key not in func_def_to_add or (key in func_def_to_add and func_def_to_add[key] > int(location.split(':')[1])):
+                                func_def_to_add[key] = int(location.split(':')[1])
                             break
                 if not found:
                     for ast_node in ast_nodes:
@@ -2961,8 +3024,9 @@ def apply_and_test_patches(
                             for def_ast_node in def_ast_nodes:
                                 if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == identifier:
                                     found = True
-                                    dict_ = type_def_to_add.setdefault(file_path_new, dict())
-                                    type_def_to_add[file_path_new] = {**dict_, f'{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}': identifier}
+                                    key = (file_path_new, f'{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}', f'{def_ast_node['signature']}')
+                                    if key not in func_def_to_add or (key in func_def_to_add and func_def_to_add[key] > int(location.split(':')[1])):
+                                        func_def_to_add[key] = int(location.split(':')[1])
                                     break
                             break
                 if not found:
@@ -3016,10 +3080,8 @@ def apply_and_test_patches(
         add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
         handle_file_change(diff_results, patch_key_list)
         
-        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(incomplete_types) == 0:
-        # if last_undeclared_identifier == undeclared_identifier and last_undeclared_functions == undeclared_functions and last_miss_member_structs == miss_member_structs and last_incomplete_types == incomplete_types:
+        if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(incomplete_types) == 0 and len(func_def_to_add) == 0:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
-            # Process miss_decls and miss_member_structs; replace them with corresponding block in new version
             handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id)
             bb_change_pair = process_undeclared_identifiers([], miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
 
@@ -3027,6 +3089,11 @@ def apply_and_test_patches(
             for file_path in type_def_to_add:
                 type_def_to_add[file_path] = {**un_dec_vars_to_add.get(file_path, dict()), **type_def_to_add.get(file_path, dict())}
 
+        # insert function directly from version A before the error shows
+        for (file_path_new, def_loc, func_sig), error_line_num in func_def_to_add.items():
+            insert_func_def_before_error(file_path_new, func_sig, def_loc, error_line_num, patch_key_list, diff_results, extra_patches, target_repo_path, commit)
+
+        # front patch part
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
         not_write_patches = set()
