@@ -11,8 +11,8 @@ import pickle
 import copy
 import sys
 from collections import defaultdict
-from typing import List, Dict, Set, Tuple, Any
-from dataclasses import dataclass
+from typing import List, Dict, Set, Tuple, Any, Optional
+from dataclasses import dataclass, field
 
 from buildAndtest import checkout_latest_commit
 from run_fuzz_test import read_json_file, py3
@@ -38,6 +38,21 @@ logger.addHandler(stream_handler)
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
+
+
+@dataclass(frozen=True)
+class FunctionLocation:
+    """
+    Represents the location of a function in source code.
+    """
+    file_path: str
+    start_line: int
+    end_line: int
+    
+    def __post_init__(self):
+        """Validate that start_line <= end_line."""
+        if self.start_line > self.end_line:
+            raise ValueError(f"start_line ({self.start_line}) must be <= end_line ({self.end_line})")
 
 
 @dataclass(frozen=True)
@@ -71,6 +86,81 @@ class FunctionInfo:
     def is_async(self) -> bool:
         """Check if function is async."""
         return 'async' in self.keywords
+
+
+@dataclass
+class PatchInfo:
+    """
+    Represents a single code patch, encapsulating its metadata and content.
+    """
+    # Core patch information
+    file_path_old: str
+    file_path_new: str
+    patch_text: str
+    file_type: str
+
+    # Line number information for the patch hunk
+    old_start_line: int
+    old_end_line: int
+    new_start_line: int
+    new_end_line: int
+
+    # Metadata about the patch content and type, initialized with a default
+    patch_type: Set[str] = field(default_factory=set)
+
+    # Optional: Information about the function this patch modifies
+    old_signature: Optional[str] = None
+    new_signature: Optional[str] = None
+    old_function_start_line: Optional[int] = None
+    old_function_end_line: Optional[int] = None
+    new_function_start_line: Optional[int] = None
+    new_function_end_line: Optional[int] = None
+
+    # Optional: For dependency tracking and complex patch generation
+    dependent_func: Set[str] = field(default_factory=set)
+    hiden_func_dict: Dict[str, int] = field(default_factory=dict)
+    # Stores original source locations for functions recreated in this patch
+    # Maps function signature to FunctionLocation containing file_path, start_line, end_line
+    recreated_function_locations: Dict[str, FunctionLocation] = field(default_factory=dict)
+
+    def has_type(self, patch_type: str) -> bool:
+        """Checks if the patch has a specific type."""
+        return patch_type in self.patch_type
+
+    @property
+    def is_function_modification(self) -> bool:
+        """Returns True if the patch modifies a function."""
+        return bool(self.old_signature or self.new_signature)
+
+    def _get_function_name_from_sig(self, signature: Optional[str]) -> Optional[str]:
+        """Helper to extract function name from a signature string."""
+        if not signature:
+            return None
+        try:
+            # Extracts the last word before the first parenthesis, e.g., "int my_func(int)" -> "my_func"
+            return signature.split('(')[0].split()[-1]
+        except IndexError:
+            return None
+
+    @property
+    def old_function_name(self) -> Optional[str]:
+        """Returns the name of the function from the old signature."""
+        return self._get_function_name_from_sig(self.old_signature)
+
+    @property
+    def new_function_name(self) -> Optional[str]:
+        """Returns the name of the function from the new signature."""
+        return self._get_function_name_from_sig(self.new_signature)
+
+    @property
+    def is_file_deletion(self) -> bool:
+        """Returns True if the patch represents a file deletion."""
+        return self.file_path_new == '/dev/null'
+
+    @property
+    def is_file_addition(self) -> bool:
+        """Returns True if the patch represents a file addition."""
+        return self.file_path_old == '/dev/null'
 
 
 def is_function_static(source_code: str) -> bool:
@@ -210,7 +300,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
-    for func_name, error_type, file_path, line_range in function_sig_changes:
+    for func_name, error_type, file_path, line_range, error_message in function_sig_changes:
         def_file_path = None
         file_path_new = file_path.split('/', 3)[-1]
         if file_path_new in file_path_pairs:
@@ -222,7 +312,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
         # we can't find function code using the line number
         if file_path_new in extra_patches:
             extra_patch = extra_patches[file_path_new]
-            if line_range[1] >= extra_patch['old_start_line'] and line_range[0] <= extra_patch['old_start_line'] + int(extra_patch['patch_text'].split('@@')[1].split(',')[1].split(' ')[0]):
+            if line_range[1] >= extra_patch.old_start_line and line_range[0] <= extra_patch.old_start_line + int(extra_patch.patch_text.split('@@')[1].split(',')[1].split(' ')[0]):
                 new_func = dict()
                 for key in type_def_to_add[file_path_new]: # the error should locate in one of them
                     file_path = key.split(':')[0]
@@ -237,7 +327,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     for ast_node in ast_nodes:
                         if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == func_name:
                             found = True
-                            new_func[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                            new_func[f'{ast_node["extent"]["start"]["file"]}:{ast_node["extent"]["start"]["line"]}:{ast_node["extent"]["end"]["line"]}'] = func_name
                             break
                     if found:
                         break
@@ -245,13 +335,13 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                         if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == func_name:
                             # Define in other file, find out the definition
                             def_file_path = ast_node['location']['file']
-                            def_parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{ast_node['location']['file']}_analysis.json')
+                            def_parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{ast_node["location"]["file"]}_analysis.json')
                             with open(def_parsing_path, 'r') as f:
                                 def_ast_nodes = json.load(f)
                             for def_ast_node in def_ast_nodes:
                                 if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == func_name:
                                     found = True
-                                    new_func[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                                    new_func[f'{ast_node["extent"]["start"]["file"]}:{ast_node["extent"]["start"]["line"]}:{ast_node["extent"]["end"]["line"]}'] = func_name
                                     break
                             break
                     if found:
@@ -339,33 +429,34 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                     # Create the Artificial patch here
                     patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
                     patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
-                    artificial_patch = {
-                        'file_path_old': def_file_path_old,
-                        'file_path_new': def_file_path_new,
-                        'file_type': 'c',
-                        'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
-                        'old_signature': callee_sig, # __revert_{commit}_{fname} is not added here
-                        'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
-                        'dependent_func': set(),
-                        'new_start_line': artificial_patch_insert_point,
-                        'new_end_line': artificial_patch_insert_point,
-                        'old_start_line': artificial_patch_insert_point,
-                        'old_end_line': artificial_patch_insert_point + func_length,
-                    }
+                    artificial_patch = PatchInfo(
+                        file_path_old=def_file_path_old,
+                        file_path_new=def_file_path_new,
+                        file_type='c',
+                        patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                        old_signature=callee_sig, # __revert_{commit}_{fname} is not added here
+                        patch_type={'Function removed', 'Function body change', 'Recreated function'},
+                        dependent_func=set(),
+                        new_start_line=artificial_patch_insert_point,
+                        new_end_line=artificial_patch_insert_point,
+                        old_start_line=artificial_patch_insert_point,
+                        old_end_line=artificial_patch_insert_point + func_length,
+                        recreated_function_locations={callee_sig: FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)},
+                    )
                     new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
-                    artificial_patch['patch_type'].add('Static Function')
-                    recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch['old_signature'], file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
+                    artificial_patch.patch_type.add('Static Function')
+                    recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch.old_signature, file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
                     diff_results[new_key] = artificial_patch
                     new_patch_key_list.add(new_key)
                     # change the callsite, update depen_graph
                     for key in patch_key_list:
                         patch = diff_results[key]
-                        if patch['file_path_old'] != def_file_path_old:
+                        if patch.file_path_old != def_file_path_old:
                             continue
-                        if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                        if patch.old_signature and patch.old_signature == caller_sig:
                             depen_graph.setdefault(new_key, set()).add(key)
-                            modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
-                            diff_results[key]['patch_text'] = '\n'.join(modified_lines)
+                            modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
+                            diff_results[key].patch_text = '\n'.join(modified_lines)
         else:
             logger.error(f"-{file_path_old}+{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
@@ -393,32 +484,32 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
             tail_key = f'{def_file_path_old}{def_file_path_new}-{insert_point},{tail_code_len[def_file_path_old]}+{insert_point},0'
             patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
             patch_header += f'@@ -{insert_point},{tail_code_len[def_file_path_old]} +{insert_point},0 @@\n'
-            diff_results[tail_key] = {
-                'file_path_old': def_file_path_old,
-                'file_path_new': def_file_path_new,
-                'file_type': 'c',
-                'patch_text': patch_header + tail_code[def_file_path_old],
-                'old_signature': f'tail_{def_file_path_old}',
-                'patch_type': {'Function removed', 'Function body change', 'Recreated function', 'Tail function'},
-                'dependent_func': set(),
-                'new_start_line': insert_point,
-                'new_end_line': insert_point,
-                'old_start_line': insert_point,
-                'old_end_line': insert_point + tail_code_len[def_file_path_old],
-                'hiden_func_dict': tail_hiden_func_dict[def_file_path_old],
-            }
+            diff_results[tail_key] = PatchInfo(
+                file_path_old=def_file_path_old,
+                file_path_new=def_file_path_new,
+                file_type='c',
+                patch_text=patch_header + tail_code[def_file_path_old],
+                old_signature=f'tail_{def_file_path_old}',
+                patch_type={'Function removed', 'Function body change', 'Recreated function', 'Tail function'},
+                dependent_func=set(),
+                new_start_line=insert_point,
+                new_end_line=insert_point,
+                old_start_line=insert_point,
+                old_end_line=insert_point + tail_code_len[def_file_path_old],
+                hiden_func_dict=tail_hiden_func_dict[def_file_path_old],
+            )
             new_patch_key_list.add(tail_key)
             # change the callsite, update depen_graph
             for caller_sig, callee_sig in tail_details[def_file_path_old]:
                 fname = callee_sig.split('(')[0].split(' ')[-1]
                 for key in patch_key_list:
                     patch = diff_results[key]
-                    if callee_sig in static_func_path and patch['file_path_old'] != static_func_path[callee_sig]:
+                    if callee_sig in static_func_path and patch.file_path_old != static_func_path[callee_sig]:
                         continue
-                    if 'old_signature' in patch and patch['old_signature'] == caller_sig:
+                    if patch.old_signature and patch.old_signature == caller_sig:
                         depen_graph.setdefault(tail_key, set()).add(key)
-                        modified_lines = rename_func(diff_results[key]['patch_text'], fname, commit)
-                        diff_results[key]['patch_text'] = '\n'.join(modified_lines)
+                        modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
+                        diff_results[key].patch_text = '\n'.join(modified_lines)
             
     return new_patch_key_list, function_declarations, depen_graph, type_def_to_add
 
@@ -775,35 +866,6 @@ def extract_revert_patch(h, line_start, line_end, version):
     return '\n'.join(patch_lines), old_line_start, old_line_cursor['num'], new_line_start, new_line_cursor['num']
 
 
-def update_type_set(patch):
-    """
-    Determine the type of changes in a patch.
-    
-    Args:
-        patch: The patch text to analyze.
-    
-    Returns:
-        a list of signature changed function pairs
-    """
-    type_set = patch.get('patch_type', set())
-    sig_change_list = []
-    old_signature = patch.get('old_signature', '')
-    new_signature = patch.get('new_signature', '')
-    logger.debug(f'\nold_signature: {old_signature}\nnew_signature: {new_signature}')
-    if old_signature != '' and new_signature != '' and old_signature != new_signature:
-        # function signature changed
-        type_set.add('Function added')
-        type_set.add('Function removed')
-        type_set.add('Function signature change')
-        sig_change_list.append((old_signature, new_signature))
-    if patch['file_path_new'] == '/dev/null':
-        type_set.add('Function removed')
-        type_set.add('File removed')
-    patch['patch_type'] = type_set
-
-    return sig_change_list
-
-
 def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_commit: str, target: str, signature_change_list: list):
     """
     Analyze a GitPython DiffIndex and return metadata per hunk.
@@ -908,22 +970,20 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                     if node['extent']['start']['line'] == new_line_start and node['extent']['end']['line'] == new_line_cursor-1:
                         no_merge.add(key_new)
                     
-                    dependent_func = set()
-                    results[key_new] = {
-                        'file_path_old':   path_a,
-                        'file_path_new':   path_b,
-                        'file_type':   ext,
-                        'patch_text':  patch_text,
-                        'new_signature':   signature,
-                        'patch_type': type_set,
-                        'dependent_func': dependent_func,
-                        'new_start_line': int(new_line_start),
-                        'new_end_line': int(new_line_cursor),
-                        'old_start_line': int(old_line_start),
-                        'old_end_line': int(old_line_cursor),
-                        'new_function_start_line': int(node['extent']['start']['line']),
-                        'new_function_end_line': int(node['extent']['end']['line']),
-                    }
+                    results[key_new] = PatchInfo(
+                        file_path_old=path_a,
+                        file_path_new=path_b,
+                        file_type=ext,
+                        patch_text=patch_text,
+                        new_signature=signature,
+                        patch_type=type_set,
+                        new_start_line=int(new_line_start),
+                        new_end_line=int(new_line_cursor),
+                        old_start_line=int(old_line_start),
+                        old_end_line=int(old_line_cursor),
+                        new_function_start_line=int(node['extent']['start']['line']),
+                        new_function_end_line=int(node['extent']['end']['line']),
+                    )
                     break
         
         # checkout target repo to the new commit, and parse the code from that
@@ -990,9 +1050,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             if f'{path_a}{path_b}' not in k:
                                 # not same file, skip
                                 continue
-                            if 'new_signature' not in v:
+                            if v.new_signature is None:
                                 continue
-                            old_start_i, old_end_i, new_start_i, new_end_i = v['old_start_line'], v['old_end_line'], v['new_start_line'], v['new_end_line']
+                            old_start_i, old_end_i, new_start_i, new_end_i = v.old_start_line, v.old_end_line, v.new_start_line, v.new_end_line
                             if new_start_i == new_end_i:
                                 # this situation is handled in add_context()
                                 continue
@@ -1015,37 +1075,43 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                     patch_text = patch_header + sub_patch
                     type_set = {'Function body change'}
                     
-                    dependent_func = set()
-                    
                     if k_old in results:
-                        results[k_old]['old_signature'] = signature
+                        results[k_old].old_signature = signature
                     else:
-                        results[k_old] = {
-                            'file_path_old':   path_a,
-                            'file_path_new':   path_b,
-                            'file_type':   ext,
-                            'patch_text':  patch_text,
-                            'old_signature':   signature,
-                            'patch_type': type_set,
-                            'dependent_func': dependent_func,
-                            'new_start_line': int(new_line_start),
-                            'new_end_line': int(new_line_cursor),
-                            'old_start_line': int(old_line_start),
-                            'old_end_line': int(old_line_cursor),
-                            'old_function_start_line': int(node['extent']['start']['line']),
-                            'old_function_end_line': int(node['extent']['end']['line']),
-                        }
+                        results[k_old] = PatchInfo(
+                            file_path_old=path_a,
+                            file_path_new=path_b,
+                            file_type=ext,
+                            patch_text=patch_text,
+                            old_signature=signature,
+                            patch_type=type_set,
+                            new_start_line=int(new_line_start),
+                            new_end_line=int(new_line_cursor),
+                            old_start_line=int(old_line_start),
+                            old_end_line=int(old_line_cursor),
+                            old_function_start_line=int(node['extent']['start']['line']),
+                            old_function_end_line=int(node['extent']['end']['line']),
+                        )
                     
                     for k_new, k_old in key_merged.items():
-                        old_func_name = results[k_old]['old_signature'].split('(')[0].split(' ')[-1]
-                        new_func_name = results[k_new]['new_signature'].split('(')[0].split(' ')[-1]
-                        if old_func_name != new_func_name:
-                            signature_change_list.append((old_func_name, new_func_name))
-                        results[k_old]['new_signature'] = results[k_new]['new_signature']
-                        results[k_old]['new_start_line'] = results[k_new]['new_start_line']
-                        results[k_old]['new_end_line'] = results[k_new]['new_end_line']
+                        patch_old = results[k_old]
+                        patch_new = results[k_new]
+                        if patch_old.old_function_name != patch_new.new_function_name:
+                            signature_change_list.append((patch_old.old_function_name, patch_new.new_function_name))
+                        patch_old.new_signature = patch_new.new_signature
+                        patch_old.new_start_line = patch_new.new_start_line
+                        patch_old.new_end_line = patch_new.new_end_line
                         del results[k_new]
-    
+
+    for patch in results.values():
+        if patch.old_signature and patch.new_signature and patch.old_signature != patch.new_signature:
+            patch.patch_type.add('Function added')
+            patch.patch_type.add('Function removed')
+            patch.patch_type.add('Function signature change')
+        if patch.is_file_deletion:
+            patch.patch_type.add('Function removed')
+            patch.patch_type.add('File removed')
+
     return results
 
 
@@ -1127,71 +1193,73 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     
     for key in patch_to_apply:
         patch = diff_results[key]
-        if 'old_signature' not in patch:
+        if not patch.old_signature:
             # skip for a added function
             new_patch_to_apply.append(key)
             continue
-        fname = patch['old_signature'].split('(')[0].split(' ')[-1]
+        fname = patch.old_function_name
         
         if fname == 'LLVMFuzzerTestOneInput':
             # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
             new_patch_to_apply.append(key)
             continue
-        if 'Function body change' in patch['patch_type']:
-            if 'Function removed' in patch['patch_type'] and not 'Function added' in patch['patch_type']:
+        if 'Function body change' in patch.patch_type:
+            if 'Function removed' in patch.patch_type and 'Function added' not in patch.patch_type:
                 # TODO: remove this part
                 # add prefix to function being deleted
-                modified_lines = rename_func(patch['patch_text'], fname, commit)
-                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{commit}_{fname}')) # do not use rename_func here, because it only change line starting with '-'
-                patch['patch_text'] = '\n'.join(modified_lines)
+                modified_lines = rename_func(patch.patch_text, fname, commit)
+                function_declarations.add(patch.old_signature.replace(fname, f'__revert_{commit}_{fname}')) # do not use rename_func here, because it only change line starting with '-'
+                patch.patch_text = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
                 for dep_key in dependence_graph.get(key, []):
-                    modified_lines = rename_func(diff_results[dep_key]['patch_text'], fname, commit)
-                    diff_results[dep_key]['patch_text'] = '\n'.join(modified_lines)
+                    modified_lines = rename_func(diff_results[dep_key].patch_text, fname, commit)
+                    diff_results[dep_key].patch_text = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
-                recreated_functions.add(FunctionInfo(name=fname, signature=patch['old_signature'], file_path_old=patch['file_path_old']))
+                recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, file_path_old=patch.file_path_old))
                 key_to_newkey[key] = key
             
-            elif 'old_signature' in patch and 'new_signature' in patch:
-                if (patch['old_signature'], patch['file_path_old']) in handle_func_signature_change:
+            elif patch.old_signature and patch.new_signature:
+                if (patch.old_signature, patch.file_path_old) in handle_func_signature_change:
                     continue
                 # Delete all other patches that have the same signature
-                removed_old_signatures.add(patch['old_signature'])
-                removed_new_signatures.add(patch['new_signature'])
+                removed_old_signatures.add(patch.old_signature)
+                removed_new_signatures.add(patch.new_signature)
                                 
-                handle_func_signature_change.add((patch['old_signature'], patch['file_path_old']))
+                handle_func_signature_change.add((patch.old_signature, patch.file_path_old))
                 # Need a Artificial patch, to create the old function
 
-                func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch['file_path_old'], patch['old_signature'])
+                func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch.file_path_old, patch.old_signature)
                 func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
+                func_loc = FunctionLocation(file_path=patch.file_path_old, start_line=start_line, end_line=start_line + func_length - 1)
 
-                artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, patch['file_path_new'], patch['new_signature'])
+                artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, patch.file_path_new, patch.new_signature)
 
-                def create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code):
+                def create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code, func_loc):
                     """Create the Artificial patch data structure"""
-                    patch_header = f'diff --git a/{patch["file_path_new"]} b/{patch["file_path_new"]}\n--- a/{patch["file_path_new"]}\n+++ b/{patch["file_path_new"]}\n'
+                    patch_header = f'diff --git a/{patch.file_path_new} b/{patch.file_path_new}\n--- a/{patch.file_path_new}\n+++ b/{patch.file_path_new}\n'
                     patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
-                    artificial_patch = {
-                        'file_path_old': patch['file_path_old'],
-                        'file_path_new': patch['file_path_new'],
-                        'file_type': patch['file_type'],
-                        'patch_text': '\n'.join(rename_func(patch_header + func_code, fname, commit)),
-                        'old_signature': patch['old_signature'], # __revert_commit_{fname} is not added here
-                        'patch_type': {'Function removed', 'Function body change', 'Recreated function'},
-                        'dependent_func': set(),
-                        'new_start_line': artificial_patch_insert_point,
-                        'new_end_line': artificial_patch_insert_point,
-                        'old_start_line': artificial_patch_insert_point,
-                        'old_end_line': artificial_patch_insert_point + func_length,
-                        'old_function_start_line': artificial_patch_insert_point,
-                        'old_function_end_line': artificial_patch_insert_point + func_length,
-                    }
-                    new_key = f'{patch["file_path_old"]}{patch["file_path_new"]}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
+                    artificial_patch = PatchInfo(
+                        file_path_old=patch.file_path_old,
+                        file_path_new=patch.file_path_new,
+                        file_type=patch.file_type,
+                        patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                        old_signature=patch.old_signature, # __revert_commit_{fname} is not added here
+                        patch_type={'Function removed', 'Function body change', 'Recreated function'},
+                        dependent_func=set(),
+                        new_start_line=artificial_patch_insert_point,
+                        new_end_line=artificial_patch_insert_point,
+                        old_start_line=artificial_patch_insert_point,
+                        old_end_line=artificial_patch_insert_point + func_length,
+                        old_function_start_line=artificial_patch_insert_point,
+                        old_function_end_line=artificial_patch_insert_point + func_length,
+                        recreated_function_locations={patch.old_signature: func_loc},
+                    )
+                    new_key = f'{patch.file_path_old}{patch.file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
                     return artificial_patch, new_key
-                artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code)
-                recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch['old_signature'], file_path_old=artificial_patch['file_path_old'], keywords=['static'] if is_function_static(func_code) else []))
+                artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code, func_loc)
+                recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch.old_signature, file_path_old=artificial_patch.file_path_old, keywords=['static'] if is_function_static(func_code) else []))
                 diff_results[new_key] = artificial_patch
-                function_declarations.add(patch['old_signature'].replace(fname, f'__revert_{commit}_{fname}'))
+                function_declarations.add(patch.old_signature.replace(fname, f'__revert_{commit}_{fname}'))
                 new_patch_to_apply.append(new_key)
                 reserved_keys.add(new_key)
                 key_to_newkey[key] = new_key
@@ -1204,28 +1272,28 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
     for key in key_to_newkey:
         patch = diff_results[key]
         artificial_patch = diff_results[key_to_newkey[key]]
-        fname = patch['old_signature'].split('(')[0].split(' ')[-1]
+        fname = patch.old_function_name
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
             caller_key = key_to_newkey.get(caller_key, caller_key)
             if caller_key not in diff_results:
                 # for minimal patch
                 continue
-            if 'Static Function' in artificial_patch['patch_type'] and artificial_patch['file_path_old'] != diff_results[caller_key]['file_path_old']:
+            if 'Static Function' in artificial_patch.patch_type and artificial_patch.file_path_old != diff_results[caller_key].file_path_old:
                 # If recreate function is static, it is only seen to that file
                 continue
-            modified_lines = rename_func(diff_results[caller_key]['patch_text'], fname, commit)
-            diff_results[caller_key]['patch_text'] = '\n'.join(modified_lines)
+            modified_lines = rename_func(diff_results[caller_key].patch_text, fname, commit)
+            diff_results[caller_key].patch_text = '\n'.join(modified_lines)
     
     # Remove patches that are not needed anymore
     for key in new_patch_to_apply:
         if key in reserved_keys:
             continue
         patch = diff_results[key]
-        if 'old_signature' in patch and patch['old_signature'] in removed_old_signatures:
+        if patch.old_signature and patch.old_signature in removed_old_signatures:
             new_patch_to_apply.remove(key)
             continue
-        if 'new_signature' in patch and patch['new_signature'] in removed_new_signatures:
+        if patch.new_signature and patch.new_signature in removed_new_signatures:
             new_patch_to_apply.remove(key)
     return new_patch_to_apply, function_declarations, recreated_functions
 
@@ -1303,11 +1371,11 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         visited_patches.add(key)
         new_patch_to_patch.append(key)
         logger.debug(
-            f"Analyzing patch {key}\n{diff_results[key]['patch_text']}"
+            f"Analyzing patch {key}\n{diff_results[key].patch_text}"
         )
         patch = diff_results[key]
-        if 'Function body change' in patch['patch_type'] and patch['file_path_old']:
-            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch['file_path_old']}_analysis.json')
+        if 'Function body change' in patch.patch_type and patch.file_path_old:
+            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch.file_path_old}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
             # filter for call expressions (clang cursors for function calls)
@@ -1317,11 +1385,11 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
             for node in ast_nodes:
                 if node.get('kind') not in call_kinds:
                     continue
-                if 'old_function_start_line' not in patch or 'old_function_end_line' not in patch:
+                if not patch.old_function_start_line or not patch.old_function_end_line:
                     # this patch is not related to a function in old version
                     continue
                 # check if the call is within the patch range
-                if node['extent']['end']['line'] <= patch['old_function_end_line'] and node['extent']['start']['line'] >= patch['old_function_start_line']:
+                if node['extent']['end']['line'] <= patch.old_function_end_line and node['extent']['start']['line'] >= patch.old_function_start_line:
                     if 'callee' not in node:
                         # indirect call, can get the callee. skip now
                         continue
@@ -1334,7 +1402,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
                     logger.debug(f'Found call expression in patch {key}: {node["callee"]}')
                     # find the definition of this function in the diff results
                     for key1, diff_result in diff_results.items():
-                        if 'old_signature' in diff_result and compare_function_signatures(node['callee']['signature'], diff_result['old_signature']):
+                        if diff_result.old_signature and compare_function_signatures(node['callee']['signature'], diff_result.old_signature):
                             patch_list.append(key1)
                             dependence_graph.setdefault(key1, set()).add(key)
                             
@@ -1355,20 +1423,20 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     patch_prev_key = dict()
     for key in reversed(final_patches):
         patch = diff_results[key]
-        patch_text = patch['patch_text']
+        patch_text = patch.patch_text
         lines = patch_text.split('\n')
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
         if lines[4][0] == '-': # meaning this patch has no context
-            if patch['file_path_new'] in patch_prev_key and patch['new_start_line'] <= prev_new_end_line[patch['file_path_new']]+3:
+            if patch.file_path_new in patch_prev_key and patch.new_start_line <= prev_new_end_line[patch.file_path_new]+3:
                 # merge the patches that have overlap
-                patch_prev = diff_results[patch_prev_key[patch['file_path_new']]]
-                patch_prev_lines = patch_prev['patch_text'].split('\n')
-                connect_lines_end = patch['new_start_line']
-                # In most cases, patch_prev['new_end_line'] is the actually line number+1, except patch_prev['new_end_line'] = patch_prev['new_start_line']
-                connect_lines_begin = patch_prev['new_end_line']
+                patch_prev = diff_results[patch_prev_key[patch.file_path_new]]
+                patch_prev_lines = patch_prev.patch_text.split('\n')
+                connect_lines_end = patch.new_start_line
+                # In most cases, patch_prev.new_end_line is the actually line number+1, except patch_prev.new_end_line = patch_prev.new_start_line
+                connect_lines_begin = patch_prev.new_end_line
                 if connect_lines_begin < connect_lines_end:
-                    with open(os.path.join(target_repo_path, patch['file_path_new']), 'r', encoding="latin-1") as f:
+                    with open(os.path.join(target_repo_path, patch.file_path_new), 'r', encoding="latin-1") as f:
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
                 else:
                     connect_lines = []
@@ -1389,28 +1457,28 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 
                 patch_old_offset = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
                 patch_new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
-                patch_prev['patch_type'] = {'Merged functions'}.union(patch['patch_type']).union(patch_prev['patch_type'])
-                if 'hiden_func_dict' not in patch:
+                patch_prev.patch_type = {'Merged functions'}.union(patch.patch_type).union(patch_prev.patch_type)
+                if not patch.hiden_func_dict:
                     patch_front_context_len = 0
                     for line in lines[4:]:
                         if line.startswith('+') or line.startswith('-'):
                             break
                         patch_front_context_len += 1
-                    patch.setdefault('hiden_func_dict', dict())[patch['old_signature']] = patch_front_context_len
-                patch_prev.setdefault('hiden_func_dict', dict()).update({key: offset+patch_prev_old_offset for key, offset in patch['hiden_func_dict'].items()})
-                patch_prev['hiden_func_dict'][patch_prev['old_signature']] = prev_front_context_len
-                patch_prev['hiden_func_dict'] = dict(
-                    sorted(patch_prev['hiden_func_dict'].items(), key=lambda x: x[1])  # ascending by offset
+                    patch.hiden_func_dict.setdefault(patch.old_signature, patch_front_context_len)
+                patch_prev.hiden_func_dict.update({key: offset+patch_prev_old_offset for key, offset in patch.hiden_func_dict.items()})
+                patch_prev.hiden_func_dict[patch_prev.old_signature] = prev_front_context_len
+                patch_prev.hiden_func_dict = dict(
+                    sorted(patch_prev.hiden_func_dict.items(), key=lambda x: x[1])  # ascending by offset
                 )
-                patch_prev['patch_text'] = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
-                patch_prev['new_start_line'] = patch['new_start_line']
-                patch_prev['new_end_line'] = patch_prev['new_start_line'] + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
-                patch_prev['old_start_line'] = patch['old_start_line']
-                patch_prev['old_end_line'] = patch_prev['old_start_line'] + patch_new_offset+patch_prev_new_offset+connect_lines_end-connect_lines_begin
+                patch_prev.patch_text = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
+                patch_prev.new_start_line = patch.new_start_line
+                patch_prev.new_end_line = patch_prev.new_start_line + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
+                patch_prev.old_start_line = patch.old_start_line
+                patch_prev.old_end_line = patch_prev.old_start_line + patch_new_offset+patch_prev_new_offset+connect_lines_end-connect_lines_begin
                 removed_patches.add(key)
-        prev_new_start_line[patch['file_path_new']] = patch['new_start_line']
-        prev_new_end_line[patch['file_path_new']] = patch['new_end_line']
-        patch_prev_key[patch['file_path_new']] = key
+        prev_new_start_line[patch.file_path_new] = patch.new_start_line
+        prev_new_end_line[patch.file_path_new] = patch.new_end_line
+        patch_prev_key[patch.file_path_new] = key
 
     for key in removed_patches:
         final_patches.remove(key)
@@ -1418,14 +1486,14 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     # 2. Add context lines to the patches
     for key in final_patches:
         patch = diff_results[key]
-        patch_text = patch['patch_text']
+        patch_text = patch.patch_text
         lines = patch_text.split('\n')
-        if not patch['file_path_new'] or patch['file_path_new'] == '/dev/null':
+        if not patch.file_path_new or patch.file_path_new == '/dev/null':
             # a patch delete a file, skip now
             continue
         context_lines1 = []
         context_lines2 = []
-        file_path = os.path.join(target_repo_path, patch['file_path_new'])
+        file_path = os.path.join(target_repo_path, patch.file_path_new)
         with open(file_path, 'r', encoding="latin-1") as f:
             content = [line.rstrip('\n') for line in f.readlines()]
         old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
@@ -1465,113 +1533,27 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
 
         lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
             + context_lines1 + lines[4:] + context_lines2
-        for func_sig in patch.get('hiden_func_dict', {}):
-            patch['hiden_func_dict'][func_sig] += len(context_lines1)
-        patch['patch_text'] = '\n'.join(lines)
-        patch['old_start_line'] = old_line_begin
-        patch['old_end_line'] = old_line_begin + old_offset
-        patch['new_start_line'] = new_line_begin
-        patch['new_end_line'] = new_line_begin + new_offset
-
-
-def delete_patch_context_single_hunk(diff_results, final_patches):
-    """
-    Assumptions:
-      - Each patch has exactly one hunk, with the header at lines[3].
-      - For normal keys: remove leading & trailing ' ' context, keep '-' and '+'.
-      - For keys starting with '_extra_':
-          * Remove only leading front context.
-          * Keep only the contiguous '-' lines right after that context.
-          * Discard the following ' ' lines (and anything else).
-          * new_count becomes 0.
-    Updates patch['patch_text'] and line range fields.
-    """
-    for key in final_patches:
-        patch = diff_results[key]
-        text = patch.get('patch_text') or ''
-        if not text:
-            continue
-
-        lines = text.splitlines()
-        if len(lines) < 4 or '@@' not in lines[3]:
-            # Not a valid single-hunk unified diff with header on line 4
-            continue
-
-        header = lines[3]
-        header_mid = header.split('@@')[-2].strip()  # e.g. "-12,5 +12,7"
-        parts = header_mid.split()
-        old_start = int(parts[0].split('-')[1].split(',')[0])
-        new_start = int(parts[1].split('+')[1].split(',')[0])
-
-        # Hunk body (single hunk)
-        body = lines[4:]
-
-        # Leading context count: only until first +/- line
-        leading_ctx = 0
-        for ln in body:
-            if ln.startswith(' '):
-                leading_ctx += 1
-            elif ln.startswith('-') or ln.startswith('+'):
-                break
-            elif ln == r'\ No newline at end of file':
-                break
-            else:
-                break
-
-        # Shift starts by leading context
-        new_old_start = old_start + leading_ctx
-        new_new_start = new_start + leading_ctx
-
-        if key.startswith('_extra_'):
-            # Keep only the contiguous '-' block immediately after leading context
-            i = leading_ctx
-            minus_block = []
-            while i < len(body) and body[i].startswith('-'):
-                minus_block.append(body[i])
-                i += 1
-            # Ignore anything after (spaces, '+', markers, etc.)
-            old_only = len(minus_block)
-            new_only = 0
-            new_header = f'@@ -{new_old_start},{old_only} +{new_new_start},{new_only} @@'
-            new_lines = lines[:3] + [new_header] + minus_block
-        else:
-            # Normal behavior: strip leading & trailing context; keep +/- lines
-            trailing_ctx = 0
-            for ln in reversed(body):
-                if ln.startswith(' ') or ln == r'\ No newline at end of file':
-                    trailing_ctx += 1
-                elif ln.startswith('-') or ln.startswith('+'):
-                    break
-                else:
-                    break
-
-            core = body[leading_ctx : len(body) - trailing_ctx if trailing_ctx else len(body)]
-            stripped = [ln for ln in core if ln and (ln[0] == '-' or ln[0] == '+')]
-
-            old_only = sum(1 for ln in stripped if ln[0] == '-')
-            new_only = sum(1 for ln in stripped if ln[0] == '+')
-
-            new_header = f'@@ -{new_old_start},{old_only} +{new_new_start},{new_only} @@'
-            new_lines = lines[:3] + [new_header] + stripped
-        patch['patch_text'] = '\n'.join(new_lines)
-        patch['old_start_line'] = new_old_start
-        patch['new_start_line'] = new_new_start
-        patch['old_end_line'] = new_old_start + old_only
-        patch['new_end_line'] = new_new_start + new_only
+        for func_sig in patch.hiden_func_dict:
+            patch.hiden_func_dict[func_sig] += len(context_lines1)
+        patch.patch_text = '\n'.join(lines)
+        patch.old_start_line = old_line_begin
+        patch.old_end_line = old_line_begin + old_offset
+        patch.new_start_line = new_line_begin
+        patch.new_end_line = new_line_begin + new_offset
 
 
 def handle_file_change(diff_results, patch_to_apply):
     for key in diff_results:
         patch = diff_results[key]
         # Delete and add file
-        if patch['file_path_new'] == '/dev/null':
-            lines = patch['patch_text'].split('\n')
+        if patch.file_path_new == '/dev/null':
+            lines = patch.patch_text.split('\n')
             lines.insert(2, 'deleted file mode 100644')
-            patch['patch_text'] = '\n'.join(lines)
-        if patch['file_path_old'] == '/dev/null':
-            lines = patch['patch_text'].split('\n')
+            patch.patch_text = '\n'.join(lines)
+        if patch.file_path_old == '/dev/null':
+            lines = patch.patch_text.split('\n')
             lines.insert(1, 'new file mode 100644')
-            patch['patch_text'] = '\n'.join(lines)
+            patch.patch_text = '\n'.join(lines)
 
 
 def handle_build_error(error_log):
@@ -1861,7 +1843,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
         old_line_end = None
         flag = False # flag to indicate if the function is changed between commit and next_commit
         for key in final_patches:
-            if 'old_signature' in diff_results[key] and fname == diff_results[key]['old_signature'].split('(')[0].split(' ')[-1]:
+            if diff_results[key].old_signature and fname == diff_results[key].old_function_name:
                 flag = True
                 break
         if flag:
@@ -1904,22 +1886,22 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         end_line = start_line + 1
                         patch_text = rename_func(f'-{line}', recreated_fname, commit)[0] + '\n+' + line[:-1]
                         patch_text = patch_header + f"@@ -{start_line},{1} +{start_line},{1} @@\n" + patch_text
-                        patch = {
-                            'file_path_old': file_path,
-                            'file_path_new': file_path,
-                            'file_type': 'c',
-                            'patch_text': patch_text,
-                            'old_signature': fname,
-                            'new_signature': fname,
-                            'patch_type': {'Function body change'},
-                            'dependent_func': set(),
-                            'new_start_line': start_line,
-                            'new_end_line': end_line,
-                            'old_start_line': start_line,
-                            'old_end_line': end_line,
-                            'old_function_start_line': old_line_begin,
-                            'old_function_end_line': old_line_end,
-                        }
+                        patch = PatchInfo(
+                            file_path_old=file_path,
+                            file_path_new=file_path,
+                            file_type='c',
+                            patch_text=patch_text,
+                            old_signature=fname,
+                            new_signature=fname,
+                            patch_type={'Function body change'},
+                            dependent_func=set(),
+                            new_start_line=start_line,
+                            new_end_line=end_line,
+                            old_start_line=start_line,
+                            old_end_line=end_line,
+                            old_function_start_line=old_line_begin,
+                            old_function_end_line=old_line_end,
+                        )
                         new_key = f'{file_path}{file_path}-{start_line},{1}+{start_line},{1}'
                         
                         diff_results[new_key] = patch
@@ -1958,12 +1940,12 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
     # Step 1: Identify all patches that affect LLVMFuzzerTestOneInput function
     for key in patch_to_apply:
         patch = diff_results[key]
-        if not ('old_signature' in patch and 'new_signature' in patch):
+        if not (patch.old_signature and patch.new_signature):
             # This patch is not a function body change, skip it
             continue
-        if patch['file_path_new'] != fuzzer_file_path:
+        if patch.file_path_new != fuzzer_file_path:
             continue
-        if ('LLVMFuzzerTestOneInput' in patch['old_signature'] or 'LLVMFuzzerTestOneInput' in patch['new_signature']):
+        if ('LLVMFuzzerTestOneInput' in patch.old_signature or 'LLVMFuzzerTestOneInput' in patch.new_signature):
             # This is a patch for LLVMFuzzerTestOneInput, we need to update the function calls
             fuzzer_keys.add(key)
 
@@ -1998,7 +1980,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             # Step 3a: Check if this call is within any existing patch
             for key in fuzzer_keys:
                 patch = diff_results[key]
-                lines = patch['patch_text'].split('\n')
+                lines = patch.patch_text.split('\n')
                 new_lines = []
                 new_start_line = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
@@ -2014,7 +1996,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                             new_lines.append(add_line)
                         else:
                             new_lines.append(line)
-                    patch['patch_text'] = '\n'.join(new_lines)
+                    patch.patch_text = '\n'.join(new_lines)
             
             # Step 3b: Create new patch for calls not covered by existing patches
             if not Inpatch_flag:
@@ -2035,22 +2017,22 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                 # Construct complete patch text
                 patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
                 # Create new patch entry
-                patch = {
-                    'file_path_old': fuzzer_file_path,
-                    'file_path_new': fuzzer_file_path,
-                    'file_type': 'c',
-                    'patch_text': patch_text,
-                    'old_signature': fuzzer_old_signature,
-                    'new_signature': fuzzer_new_signature,
-                    'patch_type': {'Function body change'},
-                    'dependent_func': set(),
-                    'new_start_line': new_start_line,
-                    'new_end_line': new_start_line + new_offset,
-                    'old_start_line': new_start_line,
-                    'old_end_line': new_start_line + new_offset,
-                    'old_function_start_line': fuzzer_start_line,
-                    'old_function_end_line': fuzzer_end_line,
-                }
+                patch = PatchInfo(
+                    file_path_old=fuzzer_file_path,
+                    file_path_new=fuzzer_file_path,
+                    file_type='c',
+                    patch_text=patch_text,
+                    old_signature=fuzzer_old_signature,
+                    new_signature=fuzzer_new_signature,
+                    patch_type={'Function body change'},
+                    dependent_func=set(),
+                    new_start_line=new_start_line,
+                    new_end_line=new_start_line + new_offset,
+                    old_start_line=new_start_line,
+                    old_end_line=new_start_line + new_offset,
+                    old_function_start_line=fuzzer_start_line,
+                    old_function_end_line=fuzzer_end_line,
+                )
                 
                 # Add new patch to diff_results and patch_to_apply list
                 new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{new_start_line},{new_offset}+{new_start_line},{new_offset}'
@@ -2072,20 +2054,20 @@ def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extr
     patch = None
     for key in reversed(patch_key_list):
         patch = diff_results[key]
-        if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
-            new_start_line = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+        if patch.file_path_new and (patch.file_path_new == file_path or patch.file_path_new.endswith(file_path)):
+            new_start_line = int(patch.patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
+            old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
             if new_start_line <= line_num < new_start_line + new_offset:
                 # TODO: check again
-                # logger.info(f'here:\n{new_start_line} {new_start_line + new_offset}\n {patch['patch_text']}')
+                # logger.info(f'here:\n{new_start_line} {new_start_line + new_offset}\n {patch.patch_text}')
                 break
             add_num += new_offset - old_offset
         
     if patch:
-        lines = patch['patch_text'].split('\n')
+        lines = patch.patch_text.split('\n')
     elif file_path in extra_patches:
-        lines = extra_patches[file_path]['patch_text'].split('\n')
+        lines = extra_patches[file_path].patch_text.split('\n')
     else:
         logger.error(f'Cannot find patch of the line. file_path: {file_path}, line_num: {line_num}')
         
@@ -2112,13 +2094,13 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
     
     if relative_file_path in extra_patches:
         patch = extra_patches[relative_file_path]
-        add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
+        add_num -= patch.old_end_line - patch.old_start_line + 1 - (patch.new_end_line - patch.new_start_line + 1)
     for key in reversed(patch_key_list):
         patch = diff_results[key]
-        if 'file_path_new' in patch and patch['file_path_new'] == relative_file_path or patch['file_path_new'].endswith(relative_file_path):
-            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
+        if patch.file_path_new and (patch.file_path_new == relative_file_path or patch.file_path_new.endswith(relative_file_path)):
+            old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
+            old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
             add_num += new_offset - old_offset
             if line_num + add_num <= old_start:
                 key_of_line_num = key
@@ -2128,8 +2110,8 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
     index_old_infun = 0
     front_context_num = 0 # should be less than 3
     patch_flag = False
-    if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num]['patch_type']:
-        for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:]:
+    if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num].patch_type:
+        for line in diff_results[key_of_line_num].patch_text.split('\n')[4:]:
             if line.startswith('-'):
                 index_old_infun += 1
                 if not patch_flag:
@@ -2146,13 +2128,13 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
                 # this is the line we are looking for, we can get this line's index in the function
                 break
         func_start_index = front_context_num
-        func_end_index = len(diff_results[key_of_line_num]['patch_text'].split('\n'))
-        old_function_signature = diff_results[key_of_line_num]['old_signature']
-        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+        func_end_index = len(diff_results[key_of_line_num].patch_text.split('\n'))
+        old_function_signature = diff_results[key_of_line_num].old_signature
+        if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = front_context_num
             last_func_sig = old_function_signature
             flag = False
-            for func_sig, offset in diff_results[key_of_line_num]['hiden_func_dict'].items():
+            for func_sig, offset in diff_results[key_of_line_num].hiden_func_dict.items():
                 if offset > index_old_infun:
                     flag = True
                     func_start_index = last_offset
@@ -2165,7 +2147,7 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
                 # The code we want to find is in the last function
                 func_start_index = last_offset
                 old_function_signature = last_func_sig
-                func_end_index = len(diff_results[key_of_line_num]['patch_text'].split('\n'))
+                func_end_index = len(diff_results[key_of_line_num].patch_text.split('\n'))
     
     return key_of_line_num, old_function_signature, func_start_index, func_end_index
 
@@ -2188,13 +2170,13 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         relative_file_path = field_struct_list[0][2]
         fname = old_function_signature.split('(')[0].split(' ')[-1]
         # 2.1. get source code of the function
-        func_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
+        func_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num].patch_text.split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
         # 2.2. get struct defination
         struct_defs_v1 = ''
         struct_defs_v2 = ''
         struct_set = struct_per_fuc_dict[(key_of_line_num, old_function_signature, func_start_index, func_end_index)]
         patch = diff_results[key_of_line_num]
-        file_path_v1 = patch['file_path_old']
+        file_path_v1 = patch.file_path_old
         parsing_path = os.path.join(data_path, f'{target}-{commit["commit_id"]}', f'{file_path_v1}_analysis.json')
         deduplicate_struct = set()
         with open(parsing_path, 'r') as f:
@@ -2230,14 +2212,14 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         
         for key in patch_key_list:
             patch = diff_results[key]
-            if 'Incomplete type' not in patch['patch_type']:
+            if 'Incomplete type' not in patch.patch_type:
                 continue
-            if patch['new_signature'][11:] not in struct_set:
+            if patch.new_signature[11:] not in struct_set:
                 # f'incomplete {incomplete_type}'
                 continue
-            patch_text_lines = patch['patch_text'].split('\n')
+            patch_text_lines = patch.patch_text.split('\n')
             struct_defs_v2 += '\n'.join([line[1:] for line in patch_text_lines if line.startswith('-') and not line.startswith('---')]) + '\n'
-            struct_set.remove(patch['new_signature'][11:])
+            struct_set.remove(patch.new_signature[11:])
             
         parsing_path = os.path.join(data_path, f'{target}-{next_commit["commit_id"]}', f'{relative_file_path}_analysis.json')
         with open(parsing_path, 'r') as f:
@@ -2294,16 +2276,16 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         
     # 3. change patch in diff_results
     for key_of_line_num, solution_code_dict in solutions_per_patch.items():
-        patch_text = diff_results[key_of_line_num]['patch_text']
+        patch_text = diff_results[key_of_line_num].patch_text
         start_line = int(patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
         patch_text_lines = patch_text.split('\n')
         patch_text_lines = [line for line in patch_text_lines if not line.startswith('\\')]
         context_line_num = len([line for line in patch_text_lines[4:] if not line.startswith('-')]) # 6 in most cases
         end_context_len = len([line for line in patch_text_lines[-3:] if line.startswith(' ')]) # 3 in most cases
         front_context_len = context_line_num - end_context_len # 3 in most cases
-        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+        if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = len(patch_text_lines)-end_context_len
-            hiden_func_dict = dict(sorted(diff_results[key_of_line_num]['hiden_func_dict'].items(), key=lambda x: x[1], reverse=True)) # descending by offset
+            hiden_func_dict = dict(sorted(diff_results[key_of_line_num].hiden_func_dict.items(), key=lambda x: x[1], reverse=True)) # descending by offset
             for func_sig in hiden_func_dict:
                 if func_sig not in solution_code_dict:
                     last_offset = 4 + hiden_func_dict[func_sig]
@@ -2320,7 +2302,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         old_offset = len([line for line in patch_text_lines if line[0] in {'-', ' '} and not line.startswith('--')])
         new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
         patch_text_lines[3] = f'@@ -{start_line},{old_offset} +{start_line},{new_offset} @@'
-        diff_results[key_of_line_num]['patch_text'] = '\n'.join(patch_text_lines)
+        diff_results[key_of_line_num].patch_text = '\n'.join(patch_text_lines)
 
 
 def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, patch_key_list, diff_results, extra_patches, target_repo_path, commit):
@@ -2331,14 +2313,14 @@ def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, p
     # 1. get the patch where error occurs
     if file_path in extra_patches:
         patch = extra_patches[file_path]
-        add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
+        add_num -= patch.old_end_line - patch.old_start_line + 1 - (patch.new_end_line - patch.new_start_line + 1)
     for key in reversed(patch_key_list):
         patch = diff_results[key]
-        if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
-            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+        if patch.file_path_new and (patch.file_path_new == file_path or patch.file_path_new.endswith(file_path)):
+            old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
+            old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+            new_start = int(patch.patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
             if new_start <= error_line_num + add_num <= new_start + old_offset - 1:
                 key_of_line_num = key
                 break
@@ -2348,30 +2330,34 @@ def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, p
     def_file_path = def_loc.split(':')[0]
     def_func_start = def_loc.split(':')[1]
     def_func_end = def_loc.split(':')[2]
+    def_loc = FunctionLocation(file_path=def_file_path, start_line=def_func_start, end_line=def_func_end)
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    with open(os.path.join(target_repo_path, def_file_path), 'r', encoding='utf-8') as f:
-        func_def = f.readlines()[int(def_func_start)-1:int(def_func_end)]
+    with open(os.path.join(target_repo_path, def_loc.file_path), 'r', encoding='utf-8') as f:
+        func_def = f.readlines()[int(def_loc.start_line)-1:int(def_loc.end_line)]
         func_def = [f'-{line[:-1]}' for line in func_def]
     
     # 3. insert def into patch
     patch = diff_results[key_of_line_num]
-    logger.info(f'see result0:\n{patch['patch_text']}')
-    patch_lines = patch['patch_text'].split('\n')
+    patch_lines = patch.patch_text.split('\n')
     front_context_len = 0
     for line in patch_lines[4:]:
         if line.startswith('+') or line.startswith('-'):
             break
         front_context_len += 1
-    patch['hiden_func_dict'][func_sig] = front_context_len
-    patch['hiden_func_dict'][patch['old_signature']] = front_context_len + len(func_def)
+        
+    for key in patch.hiden_func_dict:
+        patch.hiden_func_dict[key] += len(func_def)
+    patch.hiden_func_dict[func_sig] = front_context_len
+    patch.recreated_function_locations[func_sig] = def_loc
+
     old_start = int(patch_lines[3].split('-')[1].split(',')[0])
     old_offset = int(patch_lines[3].split(',')[1].split(' ')[0])
     new_start = int(patch_lines[3].split('+')[1].split(',')[0])
     new_offset = int(patch_lines[3].split(',')[-1].split(' ')[0])
     patch_lines[3] = f'@@ -{old_start},{old_offset+len(func_def)} +{new_start},{new_offset} @@'
-    patch['patch_text'] = '\n'.join(patch_lines[:4+front_context_len] + func_def + patch_lines[4+front_context_len+func_def.count('\n'):])
+    patch.patch_text = '\n'.join(patch_lines[:4+front_context_len] + func_def + patch_lines[4+front_context_len+func_def.count('\n'):])
 
 
 def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches, target, commit):
@@ -2381,14 +2367,14 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     
     if file_path in extra_patches:
         patch = extra_patches[file_path]
-        add_num -= patch['old_end_line'] - patch['old_start_line'] + 1 - (patch['new_end_line'] - patch['new_start_line'] + 1)
+        add_num -= patch.old_end_line - patch.old_start_line + 1 - (patch.new_end_line - patch.new_start_line + 1)
     for key in reversed(patch_key_list):
         patch = diff_results[key]
-        if 'file_path_new' in patch and patch['file_path_new'] == file_path or patch['file_path_new'].endswith(file_path):
-            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
+        if patch.file_path_new and (patch.file_path_new == file_path or patch.file_path_new.endswith(file_path)):
+            old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
+            old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+            new_start = int(patch.patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
             if new_start <= line_num + add_num <= new_start + old_offset - 1:
                 key_of_line_num = key
                 break
@@ -2397,9 +2383,9 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     index_old_infun = 0
     front_context_num = 0 # should be less than 3
     patch_flag = False
-    if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num]['patch_type']:
+    if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num].patch_type:
         # for __revert_{commit}_{fname} function, we need to find the line number in the old function
-        for line in diff_results[key_of_line_num]['patch_text'].split('\n')[4:]:
+        for line in diff_results[key_of_line_num].patch_text.split('\n')[4:]:
             if line.startswith('-'):
                 index_old_infun += 1
                 if not patch_flag:
@@ -2415,12 +2401,12 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
             if line_num + add_num  == old_start + index_old_infun:
                 # this is the line we are looking for, we can get this line's index in the function
                 break
-        old_function_signature = diff_results[key_of_line_num]['old_signature']
-        if 'Merged functions' in diff_results[key_of_line_num]['patch_type'] or 'Tail function' in diff_results[key_of_line_num]['patch_type']:
+        old_function_signature = diff_results[key_of_line_num].old_signature
+        if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = front_context_num
             last_func_sig = old_function_signature
             flag = False
-            for func_sig, offset in diff_results[key_of_line_num]['hiden_func_dict'].items():
+            for func_sig, offset in diff_results[key_of_line_num].hiden_func_dict.items():
                 if offset > index_old_infun:
                     index_old_infun -= last_offset
                     old_function_signature = last_func_sig
@@ -2434,13 +2420,13 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
                 old_function_signature = last_func_sig
         else:
             index_old_infun -= front_context_num # I want the index inside the function, not the context lines
-        parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{diff_results[key_of_line_num]["file_path_old"]}_analysis.json')
+        parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{diff_results[key_of_line_num].file_path_old}_analysis.json')
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
         for node in ast_nodes:
             if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                 continue
-            if node['spelling'] == old_function_signature.split('(')[0].split(' ')[-1] and node['extent']['start']['file'] == diff_results[key_of_line_num]['file_path_old']:
+            if node['spelling'] == old_function_signature.split('(')[0].split(' ')[-1] and node['extent']['start']['file'] == diff_results[key_of_line_num].file_path_old:
                 # Found the function definition
                 start_line = node['extent']['start']['line']
                 return start_line + index_old_infun
@@ -2473,8 +2459,8 @@ def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
     bbs = []
     # 1. compare function name
     patch = diff_results[patch_key]
-    old_signature = patch['old_signature']
-    new_signature = patch['new_signature']
+    old_signature = patch.old_signature
+    new_signature = patch.new_signature
     cfg2 = None
     for cfg in cfgs2:
         try:
@@ -2490,14 +2476,14 @@ def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
 
     # 2. iterate patch to align the basic blocks:
     #    if bb in two cfg have common lines in patch, then they are corresponding
-    old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-    old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-    new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-    new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
+    old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+    old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+    new_start = int(patch.patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
+    new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
     ptr1 = old_start + old_offset # line number in old commit
     ptr2 = new_start + new_offset # line number in new commit
     common_unchanged_lines = []
-    patch_lines = patch['patch_text'].split('\n')[4:]
+    patch_lines = patch.patch_text.split('\n')[4:]
     bb2_start = None
     bb2_end = None
     for line in reversed(patch_lines):
@@ -2528,66 +2514,6 @@ def corresponding_bb(cfg1, cfgs2, bb1, patch_key, diff_results):
             # there is overlap, so probably they are corresponding, do not check the unchanged lines for now
             bbs.append(bb)
     return bbs
-
-
-def __keep_bb_in_patch(bbstart, bbend, key, final_patches, diff_results):
-    # A patch will be used to revert (git apply --reverse); but we 
-    # want to keep a specific basic block from new version in the path
-    patch = diff_results[key]
-    ptr1 = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0]) - 1  # line number in old commit
-    ptr2 = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0]) - 1  # line number in new commit
-    bb1_start = None
-    bb1_end = None
-    lines = patch['patch_text'].split('\n')[4:]
-    new_lines = []
-    for line in lines:
-        if line.startswith('-'):
-            ptr1 += 1
-        elif line.startswith('+'):
-            ptr2 += 1
-        else:
-            ptr1 += 1
-            ptr2 += 1
-
-        if ptr2 == bbstart:
-            bb1_start = ptr1
-        if ptr2 == bbend + 1:
-            bb1_end = ptr1
-    if not bb1_end:
-        bb1_end = ptr1
-    
-    ptr1 = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0]) - 1
-    ptr2 = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0]) - 1
-    removed = 0
-    added = 0
-    for line in lines:
-        if line.startswith('-'):
-            removed += 1
-            ptr1 += 1
-
-        elif line.startswith('+'):
-            added += 1
-            ptr2 += 1
-        else:
-            ptr1 += 1
-            ptr2 += 1
-        # remove '-' lines, and keep the '+' lines
-        if bb1_start <= ptr1 <= bb1_end or bbstart <= ptr2 <= bbend:
-            if line.startswith('+') or line.startswith(' '):
-                if line.startswith('+'):
-                    added -= 1
-                new_lines.append(' ' + line[1:])
-            else:
-                removed -= 1
-        else:
-            new_lines.append(line)
-        
-    if removed == 0 and added == 0:
-        del diff_results[key]
-        final_patches.remove(key)
-        return
-    
-    patch['patch_text'] = '\n'.join(patch['patch_text'].split('\n')[:4] + new_lines)
 
 
 def get_code_from_file(target_repo_path, file_path, commit, start_line, end_line):
@@ -2710,8 +2636,8 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
         pseudo_block.end_line = line_in_old
         pseudo_blosks.append(pseudo_block)
     for key, patch in diff_results.items():
-        if patch['file_path_new'] == relative_file_path:
-            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, pseudo_blosks)
+        if patch.file_path_new == relative_file_path:
+            bb2_line_num_list = get_corresponding_lines(target_repo_path, patch.file_path_old, commit, patch.file_path_new, next_commit, pseudo_blosks)
             break
     
     cfg1, bb1s = find_block_by_line(cfgs1, file_path.split('/')[-1], line_num_in_old_commit_list)
@@ -2721,8 +2647,8 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
             return None, None, None, None
 
         for key, patch in diff_results.items():
-            if patch['file_path_new'] == relative_file_path:
-                bb2_line_num_list = get_corresponding_lines(target_repo_path, patch['file_path_old'], commit, patch['file_path_new'], next_commit, bb1s)
+            if patch.file_path_new == relative_file_path:
+                bb2_line_num_list = get_corresponding_lines(target_repo_path, patch.file_path_old, commit, patch.file_path_new, next_commit, bb1s)
                 break
     else:
         bb1s = pseudo_blosks
@@ -2748,42 +2674,42 @@ def keep_bb_in_patch(bb1_start_line, bb1_end_line, bb2_start_line, bb2_end_line,
         patch = diff_results[key]
         real_patch_start_line = 0
         try:
-            signature_match = compare_function_signatures(patch['old_signature'], cfg1.function_signature, ignore_arg_types=True)
+            signature_match = compare_function_signatures(patch.old_signature, cfg1.function_signature, ignore_arg_types=True)
         except (ValueError, AttributeError):
             signature_match = False
-        if patch['file_path_new'] == relative_file_path and 'Recreated function' in patch['patch_type'] and signature_match:
+        if patch.file_path_new == relative_file_path and 'Recreated function' in patch.patch_type and signature_match:
             logger.debug(f'bb1 {bb1_start_line} - {bb1_end_line} in patch {key}')
             logger.debug(f'bb2 {bb2_start_line} - {bb2_end_line} in new commit {next_commit}')
-            old_start = int(patch['patch_text'].split('@@')[1].strip().split('-')[1].split(',')[0])
-            old_offset = int(patch['patch_text'].split('@@')[1].strip().split(' ')[0].split(',')[1])
-            new_start = int(patch['patch_text'].split('@@')[1].strip().split('+')[1].split(',')[0])
-            new_offset = int(patch['patch_text'].split('@@')[1].strip().split(',')[-1])
-            if patch['patch_text'].find('\n-') != -1:
+            old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+            old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
+            new_start = int(patch.patch_text.split('@@')[1].strip().split('+')[1].split(',')[0])
+            new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
+            if patch.patch_text.find('\n-') != -1:
                 # find the real patch start line, usually is 7
-                lines = patch['patch_text'].split('\n')
+                lines = patch.patch_text.split('\n')
                 for line in lines:
                     if line.startswith('-') and not line.startswith('---'):
                         real_patch_start_line = lines.index(line)
                         break
             if not real_patch_start_line:
-                raise ValueError(f'Cannot find real patch start line in {key}\n{patch["patch_text"]}')
+                raise ValueError(f'Cannot find real patch start line in {key}\n{patch.patch_text}')
             # will change code from bb_start to bb_end in the patch, to bb2 in new commit; 4 is patch header lines
             bb_start = real_patch_start_line + bb1_start_line - cfg1.signature_line
             bb_end = real_patch_start_line + bb1_end_line - cfg1.signature_line
             bb2_code_lines, bb2_code_length = get_code_from_file(target_repo_path, relative_file_path, next_commit, bb2_start_line, bb2_end_line)
-            patch_lines = patch['patch_text'].split('\n')
+            patch_lines = patch.patch_text.split('\n')
             patch_lines[bb_start:bb_end+1] = [f'-{line}' for line in bb2_code_lines]
             patch_lines[3] = f'@@ -{old_start},{old_offset-(bb_end-bb_start+1)+bb2_code_length} +{new_start},{new_offset} @@'
-            diff_results[key]['patch_text'] = '\n'.join(patch_lines)
+            patch.patch_text = '\n'.join(patch_lines)
             break
     return True
 
 
 def get_full_funsig(patch, target, commit, version:str):
     # version is either 'old' or 'new'
-    patch_file_path = patch[f'file_path_{version}']
-    patch_start_line = patch[f'{version}_start_line']
-    patch_end_line = patch[f'{version}_end_line']
+    patch_file_path = getattr(patch, f'file_path_{version}')
+    patch_start_line = getattr(patch, f'{version}_start_line')
+    patch_end_line = getattr(patch, f'{version}_end_line')
     parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -2841,8 +2767,8 @@ def analyze_def_use_chain(bb1s, bb2s, cfg1, cfg2):
 def get_file_path_pairs(diff_results):
     file_path_pairs = dict() # key: new file path; value: old file path
     for key, patch in diff_results.items():
-        if patch['file_path_old'] != patch['file_path_new'] and patch['file_path_new'] != '/dev/null' and patch['file_path_old'] != '/dev/null':
-            file_path_pairs[patch['file_path_new']] = patch['file_path_old']
+        if patch.file_path_old != patch.file_path_new and patch.file_path_new != '/dev/null' and patch.file_path_old != '/dev/null':
+            file_path_pairs[patch.file_path_new] = patch.file_path_old
     return file_path_pairs
 
 
@@ -2874,7 +2800,7 @@ def apply_and_test_patches(
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
-    logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key]['old_signature'] for key in patch_key_list]}')
+    logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key].old_signature for key in patch_key_list]} ')
     
     patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
     update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
@@ -2883,14 +2809,14 @@ def apply_and_test_patches(
     add_patch_for_trace_funcs(diff_results, patch_key_list, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     llvm_fuzzer_test_one_input_patch_update(diff_results, patch_key_list, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target, trace1)
     # Sort patch_key_list by new_start_line
-    patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
+    patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key].new_start_line, reverse=True)
     add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
     handle_file_change(diff_results, patch_key_list)
     with open(patch_file_path, 'w') as patch_file:
         for key in patch_key_list:
             patch = diff_results[key]   
             patches_without_context.update({key: patch})
-            patch_file.write(patch['patch_text'])
+            patch_file.write(patch.patch_text)
             patch_file.write('\n\n')  # Add separator between patches
     
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
@@ -3056,7 +2982,7 @@ def apply_and_test_patches(
                 if is_macro:
                     continue
                 # Treat as a signature/name change at call site; feed into process_function_signature_changes
-                function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
+                function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch), 'fake signature change'))
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 func_decl_line = dict()
@@ -3076,7 +3002,7 @@ def apply_and_test_patches(
         for key in new_patch_key_list:
             if key not in patch_key_list:
                 patch_key_list.append(key)
-        patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key]['new_start_line'], reverse=True)
+        patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key].new_start_line, reverse=True)
         add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
         handle_file_change(diff_results, patch_key_list)
         
@@ -3190,9 +3116,9 @@ def apply_and_test_patches(
                         var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
                 for key in patch_key_list:
                     patch = diff_results[key]
-                    if patch['file_path_new'] == file_path:
+                    if patch.file_path_new == file_path:
                         for identifier in ids:
-                            patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
+                            patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
 
             # need new version to get the context lines
             if enum_len+include_len+func_decl_len+var_len+union_len == 0:
@@ -3207,9 +3133,9 @@ def apply_and_test_patches(
             
             for key_f in patch_key_list:
                 patch_f = diff_results[key_f]
-                if patch_f['file_path_new'] != file_path:
+                if patch_f.file_path_new != file_path:
                     continue
-                lines = patch_f['patch_text'].split('\n')
+                lines = patch_f.patch_text.split('\n')
                 new_start_f = int(lines[3].strip().split('@@')[-2].strip().split('+')[1].split(',')[0])
                 new_offset_f = int(lines[3].strip().split('@@')[-2].strip().split('+')[1].split(',')[1])
                 old_start_f = int(lines[3].strip().split('@@')[-2].strip().split(',')[-1])
@@ -3219,41 +3145,40 @@ def apply_and_test_patches(
                     merge_flag = 1
                     gap_len = (new_start_f + 3) - (end - 3) - 1
                     _, gap_text, _, _ = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=gap_len)
-                    f_text = patch_f['patch_text'].split('\n', 7)[-1] # Remove the patch header and the front context
+                    f_text = patch_f.patch_text.split('\n', 7)[-1] # Remove the patch header and the front context
                     patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+insert_point-start+gap_len+old_offset_f-3} +{start},{insert_point-start+gap_len+new_offset_f-3} @@\n'
-                    patch = {
-                        'file_path_old': file_path,
-                        'file_path_new': file_path,
-                        'patch_text': patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + gap_text + f_text,
-                        'new_start_line': start,
-                        'new_end_line': patch_f['new_end_line'],
-                        'old_start_line': start,
-                        'old_end_line': start+enum_len+include_len+func_decl_len+var_len+union_len+insert_point-start+1+gap_len+old_offset_f-3-1,
-                        'old_signature': patch_f['old_signature'],
-                        'new_signature': patch_f['new_signature'],
-                        'patch_type': {'Enum or macro change', 'Function declaration change'},
-                        'extra_length': enum_len+include_len+func_decl_len+var_len+union_len,
-                    }
+                    patch = PatchInfo(
+                        file_path_old=file_path,
+                        file_path_new=file_path,
+                        patch_text=patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + gap_text + f_text,
+                        file_type='c',
+                        new_start_line=start,
+                        new_end_line=patch_f.new_end_line,
+                        old_start_line=start,
+                        old_end_line=start+enum_len+include_len+func_decl_len+var_len+union_len+insert_point-start+1+gap_len+old_offset_f-3-1,
+                        old_signature=patch_f.old_signature,
+                        new_signature=patch_f.new_signature,
+                        patch_type={'Enum or macro change', 'Function declaration change'},
+                    )
                     not_write_patches.add(key_f)
                     break
                 
             if not merge_flag:
-                patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
-                patch = {
-                    'file_path_old': file_path,
-                    'file_path_new': file_path,
-                    'patch_text': patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + context2,
-                    'new_start_line': start,
-                    'new_end_line': end,
-                    'old_start_line': start,
-                    'old_end_line': enum_len+include_len+func_decl_len+var_len+union_len+end,
-                    'old_signature': '',
-                    'new_signature': '',
-                    'patch_type': {'Enum or macro change', 'Function declaration change'},
-                    'extra_length': enum_len+include_len+func_decl_len+var_len+union_len,
-                }
-            extra_patches[file_path] = patch
-            
+                            patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
+                            patch = PatchInfo(
+                                file_path_old=file_path,
+                                file_path_new=file_path,
+                                patch_text=patch_header + context1 + include_text + enum_text + union_text + var_text + func_decl_text + context2,
+                                file_type='c',
+                                new_start_line=start,
+                                new_end_line=end,
+                                old_start_line=start,
+                                old_end_line=enum_len+include_len+func_decl_len+var_len+union_len+end,
+                                old_signature='',
+                                new_signature='',
+                                patch_type={'Enum or macro change', 'Function declaration change'},
+                            )
+                            extra_patches[file_path] = patch            
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3274,16 +3199,19 @@ def apply_and_test_patches(
             patch_header += f"+++ b/{delete_file_path}\n"
             patch_text = patch_header + f"@@ -{delete_start},{add_end_line-add_start_line+1} +{delete_start},{delete_end-delete_start+1} @@\n"
             patch_text += "\n".join(add_code_lines) + "\n".join(delete_code_lines)
-            patch = {
-                'file_path_old': delete_file_path,
-                'file_path_new': delete_file_path,
-                'patch_text': patch_text,
-                'new_start_line': delete_start,
-                'new_end_line': delete_end,
-                'old_signature': f'incomplete {incomplete_type}',
-                'new_signature': f'incomplete {type_used}',
-                'patch_type': {'Incomplete type'},
-            }
+            patch = PatchInfo(
+                file_path_old=delete_file_path,
+                file_path_new=delete_file_path,
+                patch_text=patch_text,
+                file_type='c',
+                old_start_line=delete_start,
+                old_end_line=delete_start + (add_end_line-add_start_line),
+                new_start_line=delete_start,
+                new_end_line=delete_end,
+                old_signature=f'incomplete {incomplete_type}',
+                new_signature=f'incomplete {type_used}',
+                patch_type={'Incomplete type'},
+            )
             key = f'{delete_file_path}-{delete_start}-{delete_end}'
             diff_results[key] = patch
             if key not in patch_key_list:
@@ -3293,22 +3221,23 @@ def apply_and_test_patches(
         for identifier in recreated_cons:
             for key in patch_key_list:
                 patch = diff_results[key]
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
             for patch in extra_patches.values():
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__revert_cons_{commit["commit_id"]}_{identifier}'))
         for identifier in recreated_var:
             for key in patch_key_list:
                 patch = diff_results[key]
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
             for patch in extra_patches.values():
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__revert_var_{commit["commit_id"]}_{identifier}'))
+        logger.info(f'recreated_functions: {recreated_functions}')
         # Sometimes, recreated function here call other recreate functions
         for fun_info in recreated_functions:
             for key in patch_key_list:
                 patch = diff_results[key]
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fun_info.name, commit['commit_id']))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, fun_info.name, commit['commit_id']))
             for patch in extra_patches.values():
-                patch['patch_text'] = '\n'.join(rename_func(patch['patch_text'], fun_info.name, commit['commit_id']))
+                patch.patch_text = '\n'.join(rename_func(patch.patch_text, fun_info.name, commit['commit_id']))
         
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
@@ -3317,12 +3246,12 @@ def apply_and_test_patches(
                 patches_without_context.update({key: patch})
                 if key in not_write_patches:
                     continue
-                patch_file.write(patch['patch_text'])
+                patch_file.write(patch.patch_text)
                 patch_file.write('\n\n')
             for patch in extra_patches.values():
-                patch_file.write(patch['patch_text'])
+                patch_file.write(patch.patch_text)
                 patch_file.write('\n\n')
-                patches_without_context[f'_extra_{patch['file_path_new']}'] = patch
+                patches_without_context[f'_extra_{patch.file_path_new}'] = patch
         # update length of con_to_add, var_del_to_add, union_to_add
         last_type_def_to_add = copy.deepcopy(type_def_to_add)
         
@@ -3380,6 +3309,16 @@ def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
         return f'trigger with confidence level: {confidence_level}'
     else:
         return 'not trigger'
+
+
+def update_type_set(patch_info):
+    """Update the patch_type set based on the patch content."""
+    if patch_info.old_signature and patch_info.new_signature and patch_info.old_signature != patch_info.new_signature:
+        patch_info.patch_type.add('Function signature change')
+    if patch_info.is_file_deletion:
+        patch_info.patch_type.add('File removed')
+    if patch_info.is_file_addition:
+        patch_info.patch_type.add('File added')
 
 
 def revert_patch_test(args):
@@ -3543,16 +3482,16 @@ def revert_patch_test(args):
             patch_func_new = ''
             patch_func_old = ''
             patch_file_path = ''
-            if 'new_signature' in diff_result:
-                logger.debug(f'newsignature{diff_result['new_signature']}')
-                patch_func_new = diff_result['new_signature'].split('(')[0].split(' ')[-1]
-            if 'old_signature' in diff_result:
-                logger.debug(f'oldsignature{diff_result['old_signature']}')
-                patch_func_old = diff_result['old_signature'].split('(')[0].split(' ')[-1]
-            if 'file_path_old' in diff_result:
-                patch_file_path = diff_result['file_path_old']
+            if diff_result.new_signature:
+                logger.debug(f'newsignature{diff_result.new_signature}')
+                patch_func_new = diff_result.new_function_name
+            if diff_result.old_signature:
+                logger.debug(f'oldsignature{diff_result.old_signature}')
+                patch_func_old = diff_result.old_function_name
+            if diff_result.file_path_old:
+                patch_file_path = diff_result.file_path_old
             else:
-                patch_file_path = diff_result['file_path_new']
+                patch_file_path = diff_result.file_path_new
             update_type_set(diff_result)
             
             # If both bug commit's and fix commit's trace contain this patched function,
@@ -3560,10 +3499,10 @@ def revert_patch_test(args):
             # revert it. 
             for trace_func, func_loc in trace_func_list:
                 if patch_file_path in func_loc and (trace_func == patch_func_old or trace_func == patch_func_new):
-                    if 'old_signature' not in diff_result:
-                        diff_result['old_signature'], diff_result['old_function_start_line'], diff_result['old_function_end_line'] = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
-                    if 'new_signature' not in diff_result:
-                        diff_result['new_signature'], _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
+                    if not diff_result.old_signature:
+                        diff_result.old_signature, diff_result.old_function_start_line, diff_result.old_function_end_line = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
+                    if not diff_result.new_signature:
+                        diff_result.new_signature, _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
                     patch_to_apply.append(key)
                     break
 
@@ -3574,14 +3513,14 @@ def revert_patch_test(args):
         mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
         for key in patch_to_apply[:]:
-            if 'new_signature' in diff_results[key]:
-                if not diff_results[key]['new_signature']:
+            if diff_results[key].new_signature:
+                if not diff_results[key].new_signature:
                     # Some special cases, dont know why now
                     patch_to_apply.remove(key)
                     continue
-                patch_by_func.setdefault(diff_results[key]['new_signature'], []).append(key)
+                patch_by_func.setdefault(diff_results[key].new_signature, []).append(key)
             else:
-                patch_by_func.setdefault(diff_results[key]['old_signature'], []).append(key)
+                patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
         patches_without_context = dict()
@@ -3623,47 +3562,6 @@ def revert_patch_test(args):
     return patches_without_contexts
 
 
-def merge_patches(args, patches_without_contexts: Dict[Tuple, Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Merge patches that come from different bugs
-    harness_patches = dict()
-    patches = dict()
-    csv_file_path = args.target_test_result
-    target = args.target
-    repo_path = os.getenv('REPO_PATH')
-    target_repo_path = os.path.join(repo_path, target)
-    target_commit_id = '4a7273'
-    patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
-    patch_file_path = os.path.join(patch_folder, f"all_{target_commit_id}_patches.diff")
-
-    for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
-        patches_for_one_harness = []
-        for key, patch in patch_dict.items():
-            if key.startswith('_extra_'):
-                # auxiliary patches
-                patches[f'{key}_{bug_id}_{commit_id}_{patch['file_path_new']}'] = patch
-            elif 'new_signature' in patch and 'LLVMFuzzerTestOneInput' in patch['new_signature']:
-                # harness function
-                fun_sig, _, _ = get_full_funsig(patch, target, target_commit_id, 'new')
-                patch['new_signature'] = fun_sig
-                patches_for_one_harness.append(patch)
-            else:
-                # recreated functions
-                patches[f'{key}_{bug_id}_{commit_id}_{patch['file_path_new']}'] = patch
-        harness_patches.setdefault(fuzzer, []).append(patches_for_one_harness)
-
-    key_list = list(patches.keys())
-    delete_patch_context_single_hunk(patches, key_list)
-    key_list = sorted(key_list, key=lambda key: patches[key]['new_start_line'], reverse=True)
-    for k in key_list:
-        patch = patches[k]
-    add_context(patches, key_list, target_commit_id, target_repo_path)
-    with open(patch_file_path, 'w') as f:
-        for key in key_list:
-            patch = patches[key]
-            f.write(patch['patch_text'])
-            f.write('\n\n')
-
-
 def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
     # use libclang to parse, and save results to files
     cmd = [
@@ -3697,10 +3595,10 @@ if __name__ == "__main__":
     for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
         logger.info(f'bug_id {bug_id}')
         for patch in patch_dict.values():
-            if 'new_signature' in patch:
-                logger.info(f'  new_signature {patch["new_signature"]}')
-            elif 'old_signature' in patch:
-                logger.info(f'  old_signature {patch["old_signature"]}')
+            if patch.new_signature:
+                logger.info(f'  new_signature {patch.new_signature}')
+            elif patch.old_signature:
+                logger.info(f'  old_signature {patch.old_signature}')
     
     # Save the patches to cache file
     save_patches_pickle(patches_without_contexts, cache_file)
@@ -3716,5 +3614,4 @@ if __name__ == "__main__":
         #         logger.info(f'new_signature: {patch['new_signature']}')
         #     elif 'old_signature' in patch:
         #         logger.info(f'old_signature: {patch['old_signature']}')
-    # merge_patches(args, need_merge)
     
