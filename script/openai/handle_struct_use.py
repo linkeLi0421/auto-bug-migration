@@ -339,4 +339,3 @@ struct blosc2_context_s {
     print("SOLUTION:")
     print("="*80)
     print(solution)
-    print(generate_diff(code, solution, filename="frame.c", start_line_old=470, start_line_new=470))
