@@ -384,7 +384,7 @@ def process_function_signature_changes(function_sig_changes, patch_key_list, dif
                 tail_code_len[def_file_path_old] = tail_code_len.get(def_file_path_old, 0) + func_length
                 tail_insert_point[def_file_path_old] = insert_point
                 tail_def_file_path_new[def_file_path_old] = def_file_path_new
-                recreated_functions.add(FunctionInfo(name=fname, signature=callee_sig, file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
+                recreated_functions.add(FunctionInfo(name=callee_sig.split('(')[0].split(' ')[-1], signature=callee_sig, file_path_old=def_file_path_old, keywords=['static'] if is_function_static(func_code) else []))
             tail_details.setdefault(def_file_path_old, set()).add((caller_sig, callee_sig))
             
         for def_file_path_old in tail_code:
@@ -1087,7 +1087,6 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "undefined reference to",
         "cannot find -l",
         "No such file or directory",
-        "error: command",
         "error: 'struct",
         "error: conflicting types",
         "error: invalid conversion",
@@ -1105,7 +1104,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
     if not re.search(pattern, combined) \
         and (not os.path.exists(fuzzer_path) \
-        or any(' ' + p in combined for p in build_error_patterns) \
+        or any(p in combined for p in build_error_patterns) \
         or result.returncode != 0):
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
         return False, combined
@@ -2379,7 +2378,7 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
         for node in ast_nodes:
             if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                 continue
-            if node['signature'] == old_function_signature and node['extent']['start']['file'] == diff_results[key_of_line_num]['file_path_old']:
+            if node['spelling'] == old_function_signature.split('(')[0].split(' ')[-1] and node['extent']['start']['file'] == diff_results[key_of_line_num]['file_path_old']:
                 # Found the function definition
                 start_line = node['extent']['start']['line']
                 return start_line + index_old_infun
@@ -2387,7 +2386,6 @@ def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_pa
     else:
         # must be code in LLVMFuzzerTestOneInput
         return line_num + add_num - new_start + old_start
-    return 0
 
 
 def check_if_in_fuzzer(line_num, cfgs):
@@ -2975,41 +2973,24 @@ def apply_and_test_patches(
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
             line_num_after_patch = int(location.split(':')[1])
-            relative_file_path = file_path.split('/', 3)[-1]
+            file_path_new = file_path.split('/', 3)[-1]
+            if file_path_new in file_path_pairs:
+                file_path_old = file_path_pairs[file_path_new]
+            else:
+                file_path_old = file_path_new
             if not func_name.startswith(f'__revert_{commit["commit_id"]}_'):
                 # Check if this function is a 'macro' function
-                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{relative_file_path}_analysis.json')
+                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{file_path_old}_analysis.json')
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 is_macro = False
                 for ast_node in ast_nodes:
                     if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
-                        type_def_to_add.setdefault(relative_file_path, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                        type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
                         is_macro = True
                         break
                 if is_macro:
                     continue
-                
-                # if the function is not a reverted function, means function name change here. (And it is not in the bug trace)
-                # So compiler cannot find the function, we need to call this function in the newer way, keep that basic block new version.
-                if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
-                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit['commit_id'], '--build_csv', args.build_csv,
-                                '--architecture', arch, '--target_file', relative_file_path, target]
-                    logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
-                    result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt')):
-                    get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit['commit_id'], '--build_csv', args.build_csv,
-                                '--architecture', arch, '--target_file', relative_file_path, target]
-                    logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
-                    result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                with open(os.path.join(data_path, f'cfg-{target}-{commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
-                    cfgs1 = parse_cfg_text(cfg_file.read())
-                with open(os.path.join(data_path, f'cfg-{target}-{next_commit['commit_id']}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
-                    cfgs2 = parse_cfg_text(cfg_file.read())
-                # line_num after patch -> line number before patch -> 
-                # find block start and end line in bug version -> get the part in patch need to be removed
-                line_num = get_correct_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches)
                 # Treat as a signature/name change at call site; feed into process_function_signature_changes
                 function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch)))
             else:
@@ -3017,12 +2998,12 @@ def apply_and_test_patches(
                 func_decl_line = dict()
                 for func_decl in function_declarations:
                     if func_name == func_decl.split('(')[0].split(' ')[-1]:
-                        old_line_num = get_old_line_num(relative_file_path, line_num_after_patch, patch_key_list, diff_results, extra_patches, target, commit['commit_id'])
-                        func_decl_to_add.setdefault(relative_file_path, set()).add(f'{func_decl}')
-                        if relative_file_path in func_decl_line:
-                            func_decl_line[relative_file_path] = min(old_line_num, func_decl_line[relative_file_path])
+                        old_line_num = get_old_line_num(file_path_new, line_num_after_patch, patch_key_list, diff_results, extra_patches, target, commit['commit_id'])
+                        func_decl_to_add.setdefault(file_path_new, set()).add(f'{func_decl}')
+                        if file_path_new in func_decl_line:
+                            func_decl_line[file_path_new] = min(old_line_num, func_decl_line[file_path_new])
                         else:
-                            func_decl_line[relative_file_path] = old_line_num
+                            func_decl_line[file_path_new] = old_line_num
                         break
 
         logger.info(f'function_sig_changes: {function_sig_changes}')
@@ -3563,6 +3544,12 @@ def revert_patch_test(args):
         #         else:
         #             logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
 
+        get_patched_traces, transitions, signature_change_list = mutable_args
+        if not os.path.exists(os.path.join(data_path, 'signature_change_list')):
+            os.makedirs(os.path.join(data_path, 'signature_change_list'))
+        with open(os.path.join(data_path, 'signature_change_list', f'{bug_id}_{next_commit['commit_id']}.json'), 'w') as f:
+            json.dump(signature_change_list, f, indent=4)
+        
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
     
