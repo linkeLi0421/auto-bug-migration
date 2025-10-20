@@ -27,6 +27,7 @@ HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
 from handle_struct_use import solve_code_migration
+from handle_func_sig_change import handle_func_sig_change
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -295,12 +296,12 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     return None
 
 
-def process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions):
+def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions):
     # From the error_log like "too few arguments in function call" get the caller and callee info;
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
-    for func_name, error_type, file_path, line_range, error_message in function_sig_changes:
+    for func_name, file_path, line_range in func_deled:
         def_file_path = None
         file_path_new = file_path.split('/', 3)[-1]
         if file_path_new in file_path_pairs:
@@ -2046,6 +2047,106 @@ def update_function_mappings(recreated_functions, signature_change_list, commit:
         signature_change_list.append((func_info.name, f'__revert_{commit}_{func_info.name}'))
 
 
+def handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, data_path, bug_id):
+    """
+    Handle function signature changes by using OpenAI API to fix caller functions.
+    
+    Args:
+        function_sig_changes: List of tuples containing (function_call_code, error_type, filepath, line_range_tuple, full_error_message)
+        patch_key_list: List of patch keys currently being applied
+        diff_results: Dictionary containing all patch information
+        extra_patches: Dictionary of extra patches
+        target: Target project name
+        commit_info: Dictionary with commit information (containing 'commit_id')
+        next_commit_info: Dictionary with next commit information (containing 'commit_id')
+        target_repo_path: Path to the target repository
+        data_path: Path to data directory
+        
+    Returns:
+        List of new patches created to fix function signature issues
+    """
+    callee_per_caller_dict = dict()  # caller_function_name -> set(callee_function_name)
+
+    # 1. Divide errors by caller functions
+    for callee_name, _, file_path, line_range, error_message in function_sig_changes:
+        relative_file_path = file_path.split('/', 3)[-1]
+        start_line, end_line = line_range
+        key_of_line_num, old_function_signature, func_start_index, func_end_index = get_error_patch(relative_file_path, start_line, patch_key_list, diff_results, extra_patches)
+        callee_per_caller_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), []).append((callee_name, error_message))
+
+    # 2. For each caller function, prepare arguments and call OpenAI API to get the fixed function code
+    for (caller_key, old_function_signature, func_start_index, func_end_index), callee_list in callee_per_caller_dict.items():
+        caller_patch = diff_results[caller_key]
+        function_lines = []
+        in_function = False
+        full_error_message = ''.join([error_message for _, error_message in callee_list])
+        callee_defA = dict()
+        callee_defB = dict()
+        caller_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num].patch_text.split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
+        caller_loc = caller_patch.recreated_function_locations[old_function_signature]
+        # 2.1 visit ast nodes in version A
+        parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{caller_loc.file_path}_analysis.json')
+        with open(parsing_path, 'r') as f:
+            ast_nodes = json.load(f)
+        for node in ast_nodes:
+            if node.get('kind') not in {'CALL_EXPR', 'CXX_METHOD_CALL_EXPR'}:
+                continue
+            if node['location']['file'] == caller_loc.file_path and caller_loc.start_line <= node['location']['line'] <= caller_loc.end_line and any(node['spelling'] == callee_name for callee_name, error_message in callee_list):
+                callee_loc = FunctionLocation(node['type_ref']['typedef_extent']['start']['file'],
+                                             node['type_ref']['typedef_extent']['start']['line'],
+                                             node['type_ref']['typedef_extent']['end']['line'])
+                if node['callee']['name'] not in callee_defA:
+                    callee_defA[node['callee']['name']] = get_code_from_file(target_repo_path, callee_loc.file_path, commit, callee_loc.start_line, callee_loc.end_line)
+
+        # 2.2 visit ast nodes in version B
+        parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{caller_patch.file_path_new}_analysis.json')
+        with open(parsing_path, 'r') as f:
+            ast_nodes = json.load(f)
+        for node in ast_nodes:
+            if node.get('kind') == 'FUNCTION_DEFI':
+                if node['spelling'] not in callee_defB and\
+                    node['extent']['start']['file'] == caller_patch.file_path_new and\
+                    node['spelling'] in [callee_name for callee_name, error_message in callee_list]:
+                    callee_defB[node['spelling']] = get_code_from_file(target_repo_path, node['extent']['start']['file'], next_commit, node['extent']['start']['line'], node['extent']['end']['line'])
+        for node in ast_nodes:
+            if node['spelling'] not in callee_defB and\
+                node['kind'] == 'FUNCTION_DECL' and\
+                node['extent']['start']['file'] == caller_patch.file_path_new and\
+                node['spelling'] in [callee_name for callee_name, error_message in callee_list]:
+                # Define in other file, find out the definition
+                def_parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{node['location']['file']}_analysis.json')
+                with open(def_parsing_path, 'r') as f:
+                    def_ast_nodes = json.load(f)
+                for def_ast_node in def_ast_nodes:
+                    if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == node['spelling']:
+                        callee_defB[node['spelling']] = get_code_from_file(target_repo_path, def_ast_node['extent']['start']['file'], next_commit, def_ast_node['extent']['start']['line'], def_ast_node['extent']['end']['line'])
+        assert len(callee_defA) == len(callee_defB), f'callee_defA and callee_defB should have same length, but got {len(callee_defA)} and {len(callee_defB)}'
+        calllee_defA_text = '\n'.join(callee_defA.values())
+        calllee_defB_text = '\n'.join(callee_defB.values())
+        
+        # 2.3 call OpenAI API to get the fixed function code
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{diff_results[caller_key].old_function_name}-sigchange.txt')
+        if not os.path.exists(solution_path):
+            logger.info(f'Create patch using open ai api for {diff_results[caller_key].old_function_name}')
+            logger.info(f'Error message: {error_message}')
+            logger.info(f'caller_code: {caller_code}')
+            logger.info(f'calllee_defA_text: {calllee_defA_text}')
+            logger.info(f'calllee_defB_text: {calllee_defB_text}')
+            solution_code = handle_func_sig_change(full_error_message, caller_code, calllee_defA_text, calllee_defB_text)
+            os.makedirs(os.path.dirname(solution_path), exist_ok=True)
+            with open(solution_path, 'w', encoding='utf-8') as f:
+                f.write(solution_code)
+        else:
+            with open(solution_path, 'r', encoding='utf-8') as f:
+                solution_code = f.read()
+        patch_text_lines = caller_patch.patch_text.split('\n')
+        patch_text_lines[4+func_start_index:4+func_end_index] = [f'-{line}' for line in solution_code.split('\n')]  # remove old function code
+        old_offset = len([line for line in patch_text_lines if line[0] in {'-', ' '} and not line.startswith('--')])
+        new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
+        patch_text_lines[3] = f'@@ -{start_line},{old_offset} +{start_line},{new_offset} @@'
+        diff_results[caller_key].patch_text = '\n'.join(patch_text_lines)
+
+
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
     # This is only used for LLVMFuzzerTestOneInput, to get the correct line number in the new commit
     # transform the line number after reverting patches, to the line number before reverting patches (in new commit)
@@ -2128,7 +2229,8 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
                 # this is the line we are looking for, we can get this line's index in the function
                 break
         func_start_index = front_context_num
-        func_end_index = len(diff_results[key_of_line_num].patch_text.split('\n'))
+        patch_lines = diff_results[key_of_line_num].patch_text.split('\n')
+        func_end_index = len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x[0] == '-'), -1) - 4
         old_function_signature = diff_results[key_of_line_num].old_signature
         if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = front_context_num
@@ -2960,6 +3062,7 @@ def apply_and_test_patches(
             else:
                 logger.error(f'Cannot find parsing_path: {parsing_path}!')
 
+        func_deled = [] # list of (function name, file path, start line, end line)
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
             line_num_after_patch = int(location.split(':')[1])
@@ -2981,8 +3084,7 @@ def apply_and_test_patches(
                         break
                 if is_macro:
                     continue
-                # Treat as a signature/name change at call site; feed into process_function_signature_changes
-                function_sig_changes.append((func_name, "undeclared_function", file_path, (line_num_after_patch, line_num_after_patch), 'fake signature change'))
+                func_deled.append((func_name, file_path, (line_num_after_patch, line_num_after_patch)))
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 func_decl_line = dict()
@@ -2997,7 +3099,9 @@ def apply_and_test_patches(
                         break
 
         logger.info(f'function_sig_changes: {function_sig_changes}')
-        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = process_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
+        if function_sig_changes:
+            handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id)
+        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
             if key not in patch_key_list:
