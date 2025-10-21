@@ -35,17 +35,15 @@ def main():
 
     trace1 = extract_function_calls(args.file1)
     trace2 = extract_function_calls(args.file2)
-    print(f'trace1: {trace1[:100]}')
-    print(f'trace2: {trace2[:100]}')
 
     common_part = compare_traces(trace1, trace2)
 
     if args.two_bug_mode:
         for _, func in common_part:
-            print(f"fun:{func}")
+            print(f"fun:{func[1].split(' ')[0]}")
     else:
         for func in common_part:
-            print(f'fun:{func}')
+            print(f'fun:{func[1].split(" ")[0]}')
     print(f"src:*")
 
 

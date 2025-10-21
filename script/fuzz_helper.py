@@ -640,6 +640,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='Specify if there are two buggy commits to analyze. False means buggy_commit2==base_commit and is not buggy')
   fuzz_one_parser.add_argument('--build_csv',
                             help='this file contains a target project commit id and corresponding commit id')
+  fuzz_one_parser.add_argument('--patch',
+                            help='a patch apply in base commit')
+  
   _add_architecture_args(fuzz_one_parser)
   _add_engine_args(fuzz_one_parser)
   _add_sanitizer_args(fuzz_one_parser)
@@ -2025,14 +2028,15 @@ def get_crash_log_bash(commit:str, args):
     cd -;
     export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
+    mkdir -p /data/crash;
     
     compile &> /dev/null;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/target_crash-{commit[:6]}-{args.test_input}.txt;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:6]}-{args.test_input}.txt;
   '''
   return bash_crash
 
 
-def get_trace_log_bash(commit:str, args):
+def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
   bash_trace = f'''
     # cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
     [ -f "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
@@ -2047,13 +2051,13 @@ def get_trace_log_bash(commit:str, args):
     cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
     git checkout -f {commit};
-    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''} 
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch and apply_patch else ''} 
     cd -;
     
     # Compile and collect trace
     compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input};
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
   '''
   return bash_trace
 
@@ -2061,22 +2065,24 @@ def get_trace_log_bash(commit:str, args):
 def get_allowlist_bash(args):
   if args.two_bug_mode:
     bash_allowlist = f'''
-    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    mkdir -p /data/allowlist;
+    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
     '''
   else:
     bash_allowlist = f'''
-    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt > /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    mkdir -p /data/allowlist;
+    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
     '''
   return bash_allowlist
 
 
 def get_runfuzzer_bash(args, allowlist_type):
   if allowlist_type == 'full':
-    allowlist_cmd = f'cp /data/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt /allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'diff':
-    allowlist_cmd = f'cp /data/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt /allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'noselect':
     allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > /allowlist.txt;'
   bash_runfuzzer = f'''
@@ -2088,12 +2094,15 @@ def get_runfuzzer_bash(args, allowlist_type):
     git checkout -f {args.base_commit}; 
     cd -;
     {allowlist_cmd}
+    python3 /script/add_revert_entries.py --commit {args.buggy_commit1} /allowlist.txt -o /allowlist.txt;
+    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
     
     compile &> /dev/null;
-    python3 /script/monitor_crash.py /data/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/{args.test_input}-{allowlist_type}-fuzzlog; 
+    mkdir -p /data/fuzz_result;
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
   '''
   return bash_runfuzzer
 
@@ -2219,27 +2228,10 @@ def fuzz_one(args):
     logger.error('Testcase path %s does not exist.', args.testcases)
     return False
   
-  test_input = args.test_input
-
   script_folder = os.path.join(HOME_DIR, 'script')
   Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
   LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
   result_dir = os.path.join(HOME_DIR, 'data')
-  run_args.extend([
-      '-v', f'{out_dir}:/out', 
-      '-v', f'{args.project.work}:/work', 
-      '-v', f'{script_folder}:/script', 
-      '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROJECT}:/llvm',
-      '-v', f'{result_dir}:/data',
-      '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', last_argument
-  ])
-  clean(args, out_dir)
-  docker_run(run_args, architecture=args.architecture)
-
-
-def fuzz_one(args):
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
@@ -2286,6 +2278,7 @@ def fuzz_one(args):
     ])
     
     docker_run(llvm_builder, architecture=args.architecture)
+  run_fuzzer_args = run_args.copy()
 
   # Prepare part. 
   # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
@@ -2294,34 +2287,47 @@ def fuzz_one(args):
       '-v', f'{args.project.work}:/work', 
       '-v', f'{script_folder}:/script', 
       '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROEJCT}:/llvm',
+      '-v', f'{LLVM_PROJECT}:/llvm',
       '-v', f'{result_dir}:/data',
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', get_crash_log_bash(args.buggy_commit1, args)
+      '/bin/bash', '-c'
   ])
-  clean(args, out_dir)
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name)
-  docker_run(run_args, architecture=args.architecture)
-
-  run_args.pop()
-  run_args.extend([get_trace_log_bash(args.buggy_commit1, args)])
-  clean(args, out_dir)
-  docker_run(run_args, architecture=args.architecture)
-  
-  if args.base_commit != args.buggy_commit2:
+  if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit1[:6]}-{args.test_input}.txt'):
+    run_args.extend([get_crash_log_bash(args.buggy_commit1, args)])
+    clean(args, out_dir)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name)
+    docker_run(run_args, architecture=args.architecture)
     run_args.pop()
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
-    run_args.extend([get_trace_log_bash(args.base_commit, args)])
+
+  if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit1[:6]}-{args.test_input}.txt'):
+    run_args.extend([get_trace_log_bash(args.buggy_commit1, args, apply_patch = False)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
+    run_args.pop()
 
-  run_args.pop()
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name)
-  run_args.extend([get_trace_log_bash(args.buggy_commit2, args) + get_allowlist_bash(args)])
-  clean(args, out_dir)
-  docker_run(run_args, architecture=args.architecture)
+  if not os.path.exists(f'{result_dir}/target_trace-{args.base_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt') and \
+    args.base_commit != args.buggy_commit2:
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
+    run_args.extend([get_trace_log_bash(args.base_commit, args, apply_patch = True)])
+    clean(args, out_dir)
+    docker_run(run_args, architecture=args.architecture)
+    run_args.pop()
+
+  if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit2[:6]}-{args.test_input}.txt') or \
+    not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-full-{args.test_input}.txt') or \
+    not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'):
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name)
+    run_args.extend([get_trace_log_bash(args.buggy_commit2, args, apply_patch = False) + get_allowlist_bash(args)])
+    clean(args, out_dir)
+    docker_run(run_args, architecture=args.architecture)
+    run_args.pop()
 
   # Fuzzing part
+  if args.patch:
+    run_fuzzer_args.extend([
+        '-v',
+        '%s:/patch' % args.patch,
+    ])
   run_fuzzer_args.extend([
       '-v', f'{out_dir}:/out', 
       '-v', f'{args.project.work}:/work', 
@@ -2333,17 +2339,17 @@ def fuzz_one(args):
   ])
   clean(args, out_dir)
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
-  allowlist_path = f'{result_dir}/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt'
+  allowlist_path = f'{result_dir}/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'
   # Check if allowlist only contains "src:*"
   with open(allowlist_path, 'r') as f:
     content = f.read().strip()
-    if 'fun:' in content:
-      docker_run(run_fuzzer_args, architecture=args.architecture)
+    # if 'fun:' in content:
+      # docker_run(run_fuzzer_args, architecture=args.architecture)
   
   run_fuzzer_args.pop()
   run_fuzzer_args.extend([get_runfuzzer_bash(args, 'full')])
   clean(args, out_dir)
-  allowlist_path = f'{result_dir}/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt'
+  allowlist_path = f'{result_dir}/allowlist/allowlist-{args.buggy_commit1[:6]}-full-{args.test_input}.txt'
   # Check if allowlist only contains "src:*"
   with open(allowlist_path, 'r') as f:
     content = f.read().strip()
@@ -2353,7 +2359,7 @@ def fuzz_one(args):
   run_fuzzer_args.pop()
   run_fuzzer_args.extend([get_runfuzzer_bash(args, 'noselect')])
   clean(args, out_dir)
-  docker_run(run_fuzzer_args, architecture=args.architecture)
+  # docker_run(run_fuzzer_args, architecture=args.architecture)
   
   return True
 

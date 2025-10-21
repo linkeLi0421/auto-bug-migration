@@ -44,7 +44,7 @@ if __name__ == '__main__':
     # Write functions to allowlist.txt
     allowlist_content = ""
     for func in function_set:
-        allowlist_content += f"fun:{func}\n"
+        allowlist_content += f"fun:{func.split(' ')[0]}\n"
     allowlist_content += "src:*\n"
 
     print(allowlist_content)

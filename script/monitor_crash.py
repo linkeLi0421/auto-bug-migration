@@ -275,6 +275,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Monitor fuzzing for specific crash patterns')
     parser.add_argument('stack_file', help='Path to a file containing a crash stack trace to extract reference stack')
     parser.add_argument('fuzzer', help='Path to the fuzzer binary to execute')
+    parser.add_argument('--run_times', type=int, default=10, help='Number of times to run the monitoring (default: 10)')
     args = parser.parse_args()
 
     # Set the reference stack trace
@@ -286,8 +287,8 @@ if __name__ == "__main__":
     if len(REFERENCE_STACK) == 0:
         print("Error: The reference stack trace is empty. Please provide a valid stack trace file.")
         exit(1)
-    
-    runs = 10
+
+    runs = args.run_times
     runtime_list = []
     
     print(f"Running main() {runs} times...")
@@ -320,7 +321,7 @@ if __name__ == "__main__":
     sorted_numbers = sorted(runtime_list)
 
     # Remove the first (smallest) and last (largest) elements
-    trimmed_list = sorted_numbers[1:-1]
+    trimmed_list = sorted_numbers[1:-1] if len(sorted_numbers) > 2 else sorted_numbers
 
     # Calculate the average of the trimmed list
     avg_time = sum(trimmed_list) / len(trimmed_list)
