@@ -297,7 +297,6 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
 
 
 def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions):
-    # From the error_log like "too few arguments in function call" get the caller and callee info;
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
@@ -309,50 +308,8 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         else:
             file_path_old = file_path_new
         
-        # Sometimes the caller function is in extra_patches, at this situation,
-        # we can't find function code using the line number
-        if file_path_new in extra_patches:
-            extra_patch = extra_patches[file_path_new]
-            if line_range[1] >= extra_patch.old_start_line and line_range[0] <= extra_patch.old_start_line + int(extra_patch.patch_text.split('@@')[1].split(',')[1].split(' ')[0]):
-                new_func = dict()
-                for key in type_def_to_add[file_path_new]: # the error should locate in one of them
-                    file_path = key.split(':')[0]
-                    parsing_path = os.path.join(
-                        data_path,
-                        f"{target_repo_path.split('/')[-1]}-{commit}",
-                        f"{file_path}_analysis.json",
-                    )
-                    with open(parsing_path, 'r') as f:
-                        ast_nodes = json.load(f)
-                    found = False
-                    for ast_node in ast_nodes:
-                        if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == func_name:
-                            found = True
-                            new_func[f'{ast_node["extent"]["start"]["file"]}:{ast_node["extent"]["start"]["line"]}:{ast_node["extent"]["end"]["line"]}'] = func_name
-                            break
-                    if found:
-                        break
-                    for ast_node in ast_nodes:
-                        if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == func_name:
-                            # Define in other file, find out the definition
-                            def_file_path = ast_node['location']['file']
-                            def_parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{ast_node["location"]["file"]}_analysis.json')
-                            with open(def_parsing_path, 'r') as f:
-                                def_ast_nodes = json.load(f)
-                            for def_ast_node in def_ast_nodes:
-                                if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == func_name:
-                                    found = True
-                                    new_func[f'{ast_node["extent"]["start"]["file"]}:{ast_node["extent"]["start"]["line"]}:{ast_node["extent"]["end"]["line"]}'] = func_name
-                                    break
-                            break
-                    if found:
-                        break
-                type_def_to_add[file_path_new] = {**type_def_to_add[file_path_new], **new_func}
-                continue
+        key_of_error_patch, caller_sig, func_start_index, func_end_index = get_error_patch(file_path_new, line_range[0], patch_key_list, diff_results, extra_patches)
         
-        old_line_list = []
-        for line_num in range(line_range[0], line_range[1] + 1):
-            old_line_list.append(get_old_line_num(file_path_new, line_num, patch_key_list, diff_results, extra_patches, target, commit))
         parsing_path = os.path.join(
             data_path,
             f"{target_repo_path.split('/')[-1]}-{commit}",
@@ -364,15 +321,24 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         def_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
         decl_kinds = {'FUNCTION_DECL'}
         callee_sig = None
-        caller_sig = None
         # 1 get caller and callee
+        if not func_start_index:
+            # not inside a recreated function, in harness function, get caller_loc here
+            for node in ast_nodes:
+                if node['kind'] in def_kinds and file_path_old == node['location']['file'] and node['signature'] == caller_sig:
+                    caller_loc = FunctionLocation(
+                        file_path=file_path_old,
+                        start_line=node['extent']['start']['line'],
+                        end_line=node['extent']['end']['line'],
+                    )
+        else:
+            caller_loc = diff_results[key_of_error_patch].recreated_function_locations[caller_sig]
+
         for node in ast_nodes:
-            if 'type_ref' in node and not callee_sig and node.get('kind') in call_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) >= min(old_line_list) \
-                and max(old_line_list) >= int(node['extent']['end']['line']):
+            if node['location']['file'] == caller_loc.file_path and\
+                caller_loc.start_line <= node['location']['line'] <= caller_loc.end_line and\
+                node['spelling'] == func_name:
                 callee_sig = node['callee']['signature']
-            if not caller_sig and node.get('kind') in def_kinds and file_path_old == node['location']['file'] and int(node['extent']['start']['line']) <= min(old_line_list) \
-                and max(old_line_list) <= int(node['extent']['end']['line']):
-                caller_sig = node['signature']
         if not callee_sig:
             logger.info(f'No callee sig found for {parsing_path}: {line_range} : {old_line_list}')
         fname = callee_sig.split('(')[0].split(' ')[-1]
@@ -471,7 +437,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         static_func_path = dict()
         for func_code, insert_point, func_length, def_file_path_old, def_file_path_new, caller_sig, callee_sig, need_recreate in tail_fun_info_list:
             if need_recreate:
-                tail_hiden_func_dict.setdefault(def_file_path_old, dict())[callee_sig] = tail_code.get(def_file_path_old, '').count('\n')
+                tail_hiden_func_dict.setdefault(def_file_path_old, dict())[callee_sig] = tail_code.get(def_file_path_old, '').count('\n')+1
                 tail_code[def_file_path_old] = tail_code.get(def_file_path_old, '') + func_code + '\n'
                 tail_code_len[def_file_path_old] = tail_code_len.get(def_file_path_old, 0) + func_length
                 tail_insert_point[def_file_path_old] = insert_point
@@ -2071,11 +2037,11 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
     for callee_name, _, file_path, line_range, error_message in function_sig_changes:
         relative_file_path = file_path.split('/', 3)[-1]
         start_line, end_line = line_range
-        key_of_line_num, old_function_signature, func_start_index, func_end_index = get_error_patch(relative_file_path, start_line, patch_key_list, diff_results, extra_patches)
-        callee_per_caller_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), []).append((callee_name, error_message))
+        key_of_line_num, caller_sig, func_start_index, func_end_index = get_error_patch(relative_file_path, start_line, patch_key_list, diff_results, extra_patches)
+        callee_per_caller_dict.setdefault((key_of_line_num, caller_sig, func_start_index, func_end_index), []).append((callee_name, error_message))
 
     # 2. For each caller function, prepare arguments and call OpenAI API to get the fixed function code
-    for (caller_key, old_function_signature, func_start_index, func_end_index), callee_list in callee_per_caller_dict.items():
+    for (caller_key, caller_sig, func_start_index, func_end_index), callee_list in callee_per_caller_dict.items():
         caller_patch = diff_results[caller_key]
         function_lines = []
         in_function = False
@@ -2083,7 +2049,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         callee_defA = dict()
         callee_defB = dict()
         caller_code = '\n'.join(line[1:] for line in diff_results[key_of_line_num].patch_text.split('\n')[4:][func_start_index:func_end_index] if line.startswith('-'))
-        caller_loc = caller_patch.recreated_function_locations[old_function_signature]
+        caller_loc = caller_patch.recreated_function_locations[caller_sig]
         # 2.1 visit ast nodes in version A
         parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{caller_loc.file_path}_analysis.json')
         with open(parsing_path, 'r') as f:
@@ -2141,6 +2107,11 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
                 solution_code = f.read()
         patch_text_lines = caller_patch.patch_text.split('\n')
         patch_text_lines[4+func_start_index:4+func_end_index] = [f'-{line}' for line in solution_code.split('\n')]  # remove old function code
+        # update hiden_func_dict
+        func_length_change = len(solution_code.split('\n')) - (func_end_index - func_start_index)
+        for fun_sig in caller_patch.hiden_func_dict:
+            if caller_patch.hiden_func_dict[fun_sig] > caller_patch.hiden_func_dict[caller_sig]:
+                hiden_func_dict[fun_sig] += func_length_change
         old_offset = len([line for line in patch_text_lines if line[0] in {'-', ' '} and not line.startswith('--')])
         new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
         patch_text_lines[3] = f'@@ -{start_line},{old_offset} +{start_line},{new_offset} @@'
@@ -2202,15 +2173,16 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
             old_offset = int(patch.patch_text.split('@@')[1].strip().split(' ')[0].split(',')[1])
             new_offset = int(patch.patch_text.split('@@')[1].strip().split(',')[-1])
             old_start = int(patch.patch_text.split('@@')[1].strip().split('-')[1].split(',')[0])
+            front_context_num = next((i for i, x in enumerate(patch.patch_text.split('\n')) if x == '-' and x != '---'), -1)
             add_num += new_offset - old_offset
-            if line_num + add_num <= old_start:
+            if line_num + add_num <= old_start + front_context_num:
                 key_of_line_num = key
                 add_num -= new_offset - old_offset
                 break
 
     index_old_infun = 0
-    front_context_num = 0 # should be less than 3
     patch_flag = False
+    old_function_signature = diff_results[key_of_line_num].old_signature
     if key_of_line_num and 'Recreated function' in diff_results[key_of_line_num].patch_type:
         for line in diff_results[key_of_line_num].patch_text.split('\n')[4:]:
             if line.startswith('-'):
@@ -2222,16 +2194,12 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
                     patch_flag = True
             else:
                 index_old_infun += 1
-                if not patch_flag:
-                    front_context_num += 1
-                    assert(front_context_num <= 3), f'front_context_num should be less than 3, but got {front_context_num}'
             if line_num + add_num  == old_start + index_old_infun:
                 # this is the line we are looking for, we can get this line's index in the function
                 break
         func_start_index = front_context_num
         patch_lines = diff_results[key_of_line_num].patch_text.split('\n')
         func_end_index = len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x[0] == '-'), -1) - 4
-        old_function_signature = diff_results[key_of_line_num].old_signature
         if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = front_context_num
             last_func_sig = old_function_signature
@@ -2249,8 +2217,11 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
                 # The code we want to find is in the last function
                 func_start_index = last_offset
                 old_function_signature = last_func_sig
-                func_end_index = len(diff_results[key_of_line_num].patch_text.split('\n'))
-    
+                func_end_index = len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x[0] == '-'), -1) - 4
+
+    if not 'Recreated function' in diff_results[key_of_line_num].patch_type:
+        return key_of_line_num, old_function_signature, None, None
+
     return key_of_line_num, old_function_signature, func_start_index, func_end_index
 
 
@@ -2394,13 +2365,24 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                     continue
                 solution_code = solution_code_dict[func_sig]
                 patch_text_lines[4+hiden_func_dict[func_sig]:last_offset] = [f'-{line}' for line in solution_code.split('\n')]
+                func_length_change = len(solution_code.split('\n')) - (last_offset - (4 + hiden_func_dict[func_sig]))
                 last_offset = 4 + hiden_func_dict[func_sig]
+                # update hiden_func_dict
+                for fun_sig, index in diff_results[key_of_line_num].hiden_func_dict.items():
+                    if index > hiden_func_dict[func_sig]:
+                        diff_results[key_of_line_num].hiden_func_dict[fun_sig] += func_length_change
         else:
             # There should be only one func_sig here
             assert(len(solution_code_dict) == 1)
             for func_sig in solution_code_dict:
                 solution_code = solution_code_dict[func_sig]
             patch_text_lines[4+front_context_len:len(patch_text_lines)-end_context_len] = [f'-{line}' for line in solution_code.split('\n')]
+            func_length_change = len(solution_code.split('\n')) - (len(patch_text_lines)-end_context_len - (4+front_context_len))
+            # update hiden_func_dict
+            for fun_sig, index in diff_results[key_of_line_num].hiden_func_dict.items():
+                if index > hiden_func_dict[func_sig]:
+                    diff_results[key_of_line_num].hiden_func_dict[fun_sig] += func_length_change
+        
         old_offset = len([line for line in patch_text_lines if line[0] in {'-', ' '} and not line.startswith('--')])
         new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
         patch_text_lines[3] = f'@@ -{start_line},{old_offset} +{start_line},{new_offset} @@'
@@ -2430,8 +2412,8 @@ def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, p
 
     # 2. read the definition
     def_file_path = def_loc.split(':')[0]
-    def_func_start = def_loc.split(':')[1]
-    def_func_end = def_loc.split(':')[2]
+    def_func_start = int(def_loc.split(':')[1])
+    def_func_end = int(def_loc.split(':')[2])
     def_loc = FunctionLocation(file_path=def_file_path, start_line=def_func_start, end_line=def_func_end)
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2460,6 +2442,8 @@ def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, p
     new_offset = int(patch_lines[3].split(',')[-1].split(' ')[0])
     patch_lines[3] = f'@@ -{old_start},{old_offset+len(func_def)} +{new_start},{new_offset} @@'
     patch.patch_text = '\n'.join(patch_lines[:4+front_context_len] + func_def + patch_lines[4+front_context_len+func_def.count('\n'):])
+    patch.patch_type.add('Merged functions')
+    patch.old_signature = patch.new_signature = func_sig
 
 
 def get_old_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches, target, commit):
@@ -2928,7 +2912,6 @@ def apply_and_test_patches(
     union_to_add = dict() # key: file path, value: set of union declarations
     type_def_to_add = dict() # key: file path, value: set of type definitions
     incomplete_type_to_add = dict() # key: file path, value: set of incomplete types
-    func_def_to_add = dict() # key: (file path, function def location), value: insert line numeber
     last_type_def_to_add = dict()
     recreated_cons = set()
     recreated_var = set()
@@ -2960,6 +2943,7 @@ def apply_and_test_patches(
         extra_patches_last_round = copy.deepcopy(extra_patches)
         last_round = (diff_results_last_round, patch_key_list_last_round, extra_patches_last_round)
         un_dec_vars_to_add = dict() # key: file path, value: set of undeclared variables
+        func_def_to_add = dict() # key: (file path, function def location), value: insert line numeber
         
         for type_name, error_location, forward_decl_location in incomplete_types:
             pure_type = type_name.split(' ')[-1]
