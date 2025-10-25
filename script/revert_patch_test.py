@@ -2376,7 +2376,6 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         patch_text_lines = [line for line in patch_text_lines if not line.startswith('\\')]
         front_context_len = len([line for line in patch_text_lines[4:7] if not line.startswith('-')]) # 6 in most cases
         end_context_len = len([line for line in patch_text_lines[-3:] if line.startswith(' ')]) # 3 in most cases
-        front_context_len = context_line_num - end_context_len # 3 in most cases
         if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = len(patch_text_lines)-end_context_len
             hiden_func_dict = dict(sorted(diff_results[key_of_line_num].hiden_func_dict.items(), key=lambda x: x[1], reverse=True)) # descending by offset
@@ -3127,7 +3126,6 @@ def apply_and_test_patches(
         logger.info(f'function_sig_changes: {function_sig_changes}')
         if function_sig_changes:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
-        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
             if key not in patch_key_list:
@@ -3306,21 +3304,21 @@ def apply_and_test_patches(
                     break
                 
             if not merge_flag:
-                            patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
-                            patch = PatchInfo(
-                                file_path_old=file_path,
-                                file_path_new=file_path,
-                                patch_text=patch_header + context1 + include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text + context2,
-                                file_type='c',
-                                new_start_line=start,
-                                new_end_line=end,
-                                old_start_line=start,
-                                old_end_line=enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+end,
-                                old_signature='',
-                                new_signature='',
-                                patch_type={'Enum or macro change', 'Function declaration change'},
-                            )
-                            extra_patches[file_path] = patch            
+                patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
+                patch = PatchInfo(
+                    file_path_old=file_path,
+                    file_path_new=file_path,
+                    patch_text=patch_header + context1 + include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text + context2,
+                    file_type='c',
+                    new_start_line=start,
+                    new_end_line=end,
+                    old_start_line=start,
+                    old_end_line=enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+end,
+                    old_signature='',
+                    new_signature='',
+                    patch_type={'Enum or macro change', 'Function declaration change'},
+                )
+            extra_patches[file_path] = patch
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
