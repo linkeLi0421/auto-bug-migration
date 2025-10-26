@@ -11,8 +11,28 @@ import queue
 import re
 import argparse
 
+from read_func_trace import load_signature_changes
+
+SIGNATURE_CACHE = {}
+SIGNATURE_DIR = Path(__file__).resolve().parent.parent / "data" / "signature_change_list"
+TARGET_CRASH_DIR = Path("/data/target_crashes")
+SIGNATURE_OVERRIDE = None
+REFERENCE_PATTERNS = []
+BUG_ID = "unknown"
+
 # Queue for new crash files that need to be analyzed
 crash_queue = queue.Queue()
+
+def _next_target_crash_path(directory, bug_id):
+    """Return a unique crash file path in the target directory for the given bug."""
+    base_name = f"crash-{bug_id}"
+    candidate = directory / base_name
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{base_name}-{counter}"
+        counter += 1
+    return candidate
+
 
 def analyze_crash_file(crash_file, target_crashes_dir):
     """Run the crash file through the fuzzer to get and analyze ASAN report."""
@@ -46,12 +66,12 @@ def analyze_crash_file(crash_file, target_crashes_dir):
         if check_stack_trace(log_file):
             print(f"\n[!] Found target crash: {crash_file}")
             
-            # Copy the crash file to target directory
-            target_file = target_crashes_dir / os.path.basename(crash_file)
-            shutil.copy2(crash_file, target_file)
+            # Move the crash file to target directory, renaming to include bug_id
+            target_file = _next_target_crash_path(target_crashes_dir, BUG_ID)
+            shutil.move(crash_file, target_file)
             
             # Also save the ASAN report
-            report_file = target_crashes_dir / f"{os.path.basename(crash_file)}.log"
+            report_file = Path(f"{target_file}.log")
             with open(report_file, 'w') as f:
                 f.write(result.stdout)
             
@@ -84,14 +104,6 @@ def crash_analyzer_thread(target_crashes_dir, stop_event):
         try:
             # Get a crash file from the queue with timeout
             crash_file = crash_queue.get(timeout=1)
-            # Also copy the crash to /data for persistence
-            try:
-                data_crash_file = Path("/data/all_crashes") / os.path.basename(crash_file)
-                shutil.copy2(crash_file, data_crash_file)
-                print(f"[+] Crash also copied to: {data_crash_file}")
-            except Exception as e:
-                print(f"[-] Failed to copy crash to /data/all_crashes: {e}")
-            
             # Analyze the crash
             if analyze_crash_file(crash_file, target_crashes_dir):
                 # If we found a target crash, signal to stop
@@ -127,41 +139,148 @@ def monitor_crashes_thread(artifacts_dir, stop_event):
         except Exception as e:
             print(f"[-] Error in crash monitor thread: {e}")
 
-def extract_function_stack(file_path):
-    stack = []
+def _resolve_signature_file(stack_file_path):
+    """Return the signature-change file that matches the OSV ID in the stack file."""
+    osv_match = re.search(r"(OSV-\d+-\d+)", stack_file_path)
+    if not osv_match or not SIGNATURE_DIR.exists():
+        return None
 
-    with open(file_path, 'r') as f:
-        for line in f:
-            if re.search(r"#\d+", line):
-                function_name = ''.join(line.split(' ')[7:-1])
-                stack.append(function_name)
-            if 'in LLVMFuzzerTestOneInput' in line:
+    osv_id = osv_match.group(1)
+    candidates = sorted(SIGNATURE_DIR.glob(f"{osv_id}_*.json"))
+
+    if not candidates:
+        fallback = SIGNATURE_DIR / f"{osv_id}.json"
+        if fallback.exists():
+            candidates = [fallback]
+
+    if not candidates:
+        return None
+
+    commit_tokens = [token.lower() for token in re.findall(r"[0-9a-fA-F]{6,}", stack_file_path)]
+    if commit_tokens:
+        for token in commit_tokens:
+            for candidate in candidates:
+                if token in candidate.stem.lower():
+                    return candidate
+
+    return candidates[0]
+
+def _clean_function_name(func):
+    """Normalize function names found in stack traces."""
+    return func.split('(')[0].split('+')[0].strip()
+
+
+def _apply_signature_mapping(stack, signature_map):
+    """Replace function names in stack using provided signature map."""
+    if not signature_map:
+        return stack
+
+    updated_stack = []
+    for func in stack:
+        clean_func = _clean_function_name(func)
+        replacements = signature_map.get(clean_func)
+        if replacements:
+            updated_stack.append(replacements[0])
+        else:
+            updated_stack.append(clean_func)
+    return updated_stack
+
+def _load_signature_map(normalized_path, signature_file=None):
+    """Load and cache the signature map for a given stack file."""
+    resolved_signature = signature_file or SIGNATURE_OVERRIDE
+    if resolved_signature:
+        signature_path = Path(resolved_signature).expanduser()
+    else:
+        signature_path = _resolve_signature_file(normalized_path)
+
+    if not signature_path:
+        return {}
+
+    signature_path = str(signature_path)
+    if signature_path not in SIGNATURE_CACHE:
+        SIGNATURE_CACHE[signature_path] = load_signature_changes(signature_path)
+    return SIGNATURE_CACHE.get(signature_path, {})
+
+
+def extract_function_stack(file_path, signature_file=None, apply_signatures=True, return_signature_map=False):
+    stack = []
+    normalized_path = os.path.expanduser(file_path[1:]) if file_path.startswith("@") else os.path.expanduser(file_path)
+    stack_pattern = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+([^\s]+)", re.IGNORECASE)
+
+    try:
+        with open(normalized_path, 'r') as f:
+            for line in f:
+                match = stack_pattern.search(line)
+                if match:
+                    stack.append(match.group(1))
+                if 'in LLVMFuzzerTestOneInput' in line:
+                    break
+    except FileNotFoundError:
+        print(f"[-] Stack trace file not found: {normalized_path}")
+        return stack
+
+    signature_map = _load_signature_map(normalized_path, signature_file)
+    processed_stack = _apply_signature_mapping(stack, signature_map) if apply_signatures else stack
+
+    if return_signature_map:
+        return processed_stack, signature_map
+    return processed_stack
+
+def build_stack_patterns(stack, signature_map):
+    """Build per-frame sets of acceptable function names based on signature mappings."""
+    patterns = []
+    for func in stack:
+        clean_func = _clean_function_name(func)
+        variants = set([clean_func])
+        for replacement in signature_map.get(clean_func, []):
+            variants.add(_clean_function_name(replacement))
+        patterns.append(variants)
+    return patterns
+
+
+def _stack_matches_patterns(stack, patterns):
+    """Check if a stack contains the sequence represented by the pattern list."""
+    if not patterns or len(stack) < len(patterns):
+        return False
+
+    cleaned_stack = [_clean_function_name(func) for func in stack]
+    window = len(patterns)
+
+    for start in range(len(cleaned_stack) - window + 1):
+        match = True
+        for offset, allowed in enumerate(patterns):
+            if cleaned_stack[start + offset] not in allowed:
+                match = False
                 break
-    return stack
+        if match:
+            return True
+    return False
+
 
 def check_stack_trace(log_file):
     """Check if the log content contains our reference stack trace."""
-    current_stack = extract_function_stack(log_file)
+    current_stack = extract_function_stack(log_file, apply_signatures=False)
     
     # Check if the stack matches the reference stack
     print('current_stack: ', current_stack)
-    if len(current_stack) >= len(REFERENCE_STACK):
-        for i in range(len(current_stack) - len(REFERENCE_STACK) + 1):
-            if current_stack[i:i+len(REFERENCE_STACK)] == REFERENCE_STACK:
-                return True
-    
-    return False
+    return _stack_matches_patterns(current_stack, REFERENCE_PATTERNS)
 
-def main(timeout_hours=12):
+def main(timeout_hours=10):
     print(f"Starting continuous fuzzer monitoring with {timeout_hours} hours timeout...\n")
     
     # Create a directory for crash artifacts
     artifacts_dir = Path(tempfile.mkdtemp())
     print(f"[+] Saving crash inputs to: {artifacts_dir}")
     
-    # Create a directory for target crashes
-    target_crashes_dir = Path(tempfile.mkdtemp())
+    # Create (or reuse) directory for target crashes
+    target_crashes_dir = TARGET_CRASH_DIR
+    try:
+        target_crashes_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[-] Warning: Could not create target crash directory {target_crashes_dir}: {e}")
     print(f"[+] Saving target crashes to: {target_crashes_dir}")
+
+    # No additional persistence directories needed; TARGET_CRASH_DIR handles storage
     
     # Start the fuzzer with -ignore_crashes=1 to keep it running
     fuzzer_cmd = [
@@ -257,18 +376,7 @@ def main(timeout_hours=12):
         print(f"[+] Crash inputs are in: {artifacts_dir}")
         print(f"[+] Target crashes are in: {target_crashes_dir}")
         
-        # Move target crashes to /out directory
-        out_target_dir = Path("/data/target_crashes")
-        out_target_dir.mkdir(exist_ok=True)
-        for target_file in target_crashes_dir.glob("*"):
-            dest_file = out_target_dir / target_file.name
-            try:
-                shutil.copy2(target_file, dest_file)
-                print(f"  - Moved target crash {target_file.name}")
-            except Exception as e:
-                print(f"  - Failed to move target crash {target_file.name}: {e}")
-        print(f"[+] All target crashes moved to: {out_target_dir}")
-        print("[*] Note: These directories were not deleted for your analysis.")
+        print("[*] Note: Artifact directories were not deleted for your analysis.")
 
 if __name__ == "__main__":
     # Parse command-line arguments
@@ -276,15 +384,24 @@ if __name__ == "__main__":
     parser.add_argument('stack_file', help='Path to a file containing a crash stack trace to extract reference stack')
     parser.add_argument('fuzzer', help='Path to the fuzzer binary to execute')
     parser.add_argument('--run_times', type=int, default=10, help='Number of times to run the monitoring (default: 10)')
+    parser.add_argument('--fuzz_time', type=float, default=10.0, help='Per-run fuzzing timeout in hours (default: 10)')
+    parser.add_argument('--signature-changes', dest='signature_changes', help='Path to JSON file that maps old function names to new ones')
     args = parser.parse_args()
+
+    SIGNATURE_OVERRIDE = args.signature_changes
+
+    bug_match = re.search(r"(OSV-\d+-\d+)", args.stack_file)
+    BUG_ID = bug_match.group(1) if bug_match else "unknown"
 
     # Set the reference stack trace
     print(f"Extracting function stack from: {args.stack_file}")
-    global REFERENCE_STACK
-    REFERENCE_STACK = extract_function_stack(args.stack_file)
-    print('Bug Stack:\n', REFERENCE_STACK)
+    raw_reference_stack, reference_signature_map = extract_function_stack(
+        args.stack_file, apply_signatures=False, return_signature_map=True
+    )
+    REFERENCE_PATTERNS = build_stack_patterns(raw_reference_stack, reference_signature_map)
+    print('Bug Stack (original functions):\n', raw_reference_stack)
     
-    if len(REFERENCE_STACK) == 0:
+    if len(raw_reference_stack) == 0 or len(REFERENCE_PATTERNS) == 0:
         print("Error: The reference stack trace is empty. Please provide a valid stack trace file.")
         exit(1)
 
@@ -296,26 +413,14 @@ if __name__ == "__main__":
     for i in range(runs):
         print(f"Run {i+1}/{runs}")
         start_time = time.time()
-        main()
+        main(timeout_hours=args.fuzz_time)
         run_time = time.time() - start_time
         if run_time > 43200:
             print("Time limit reached. Stopping runs.")
             break
         runtime_list.append(run_time)
         print(f"Run {i+1} completed in {run_time:.2f} seconds")
-        # Clean up files in /tmpfolder/ except testcase files
-        print("Cleaning up /tmpfolder/ directory...")
-        tmpfolder = Path("/tmpfolder/")
-        if tmpfolder.exists() and tmpfolder.is_dir():
-            for file_path in tmpfolder.glob("*"):
-                if file_path.is_file() and not file_path.name.startswith("testcase"):
-                    try:
-                        file_path.unlink()
-                    except Exception as e:
-                        print(f"Failed to remove {file_path}: {e}")
-            print("Cleanup completed")
-        else:
-            print("Warning: /tmpfolder/ directory not found")
+        # Skip cleanup so crash artifacts remain available for inspection
     
     # Sort the list to easily exclude the smallest and largest values
     sorted_numbers = sorted(runtime_list)
