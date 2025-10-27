@@ -11,7 +11,7 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-5-mini"):
+def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-4o"):
     """
     Solve code migration problems using OpenAI API
     
@@ -40,7 +40,7 @@ Related source code is:
 {source_code}
 
 Please fix only the function code to resolve the compilation error.
-If a struct field from version A is deleted in version B, not renamed. Please remove related codes or use NULL to replace it.
+If a struct field from version A is deleted (not renamed) in version B, remove or refactor the code that used that field instead of inventing a replacement. When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if it were a function.
 Note you should not change the number of function arguments and other codes' line number.
 Output only the corrected C function (no struct definitions, no explanations, no comments).
 Wrap it in ```c ... ``` so I can parse it easily.
