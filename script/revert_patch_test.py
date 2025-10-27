@@ -365,7 +365,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         if callee_sig and caller_sig:
             function_declarations.add(callee_sig.replace(fname, f'__revert_{commit}_{fname}'))
             func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, def_file_path_old, callee_sig)
-            cur_fun_info = FunctionInfo(name=fname, signature=callee_sig, file_path_old=def_file_path_old, func_used_file=file_path_new, keywords=['static'] if is_function_static(func_code) else [])
+            cur_fun_info = FunctionInfo(name=fname, signature=callee_sig, file_path_old=def_file_path_old, func_used_file=file_path_new, keywords=['static'])
             if cur_fun_info in recreated_functions:
                 continue
             else:
@@ -398,15 +398,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 )
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
-                for node in ast_nodes:
-                    if node['kind'] == 'CALL_EXPR':
-                        if start_line <= node['location']['line'] <= start_line + func_length and any(
-                            f"__revert_{commit}_{node['spelling']}(" in function_declaration
-                            for function_declaration in function_declarations
-                        ):
-                            # Replace the call with the recreated function
-                            func_code = '\n'.join(rename_func(func_code, node['spelling'], commit))
-                            
+
                 func_code = '\n'.join(rename_func(func_code, fname, commit))
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc))
             else:
@@ -453,6 +445,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         tail_hiden_func_dict = dict()
         static_func_path = dict()
         tail_recreated_function_locations = dict()
+        func_names = ''
         for func_code, insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc in tail_fun_info_list:
             tail_hiden_func_dict.setdefault(file_path_old, dict())[callee_sig] = tail_code.get(file_path_old, '').count('\n')
             tail_code[file_path_old] = tail_code.get(file_path_old, '') + func_code + '\n'
@@ -465,7 +458,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         for file_path_old in tail_code:
             insert_point = tail_insert_point[file_path_old]
             file_path_new = tail_file_path_new[file_path_old]
-            tail_key = f'{file_path_old}{file_path_new}-{insert_point},{tail_code_len[file_path_old]}+{insert_point},0'
+            tail_key = f'tail-{file_path_new}-{func_names}'
             patch_header = f'diff --git a/{file_path_new} b/{file_path_new}\n--- a/{file_path_new}\n+++ b/{file_path_new}\n'
             patch_header += f'@@ -{insert_point},{tail_code_len[file_path_old]} +{insert_point},0 @@\n'
             diff_results[tail_key] = PatchInfo(
@@ -1200,7 +1193,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     modified_lines = rename_func(diff_results[dep_key].patch_text, fname, commit)
                     diff_results[dep_key].patch_text = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
-                recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, func_used_file=patch.file_path_new, file_path_old=patch.file_path_old))
+                recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, func_used_file=patch.file_path_new, file_path_old=patch.file_path_old, keywords=['static'] if is_function_static(patch.patch_text) else []))
                 key_to_newkey[key] = key
             
             elif patch.old_signature and patch.new_signature:
@@ -1858,8 +1851,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
             for func_info in recreated_functions:
-                if func_info.is_static() and func_info.func_used_file != file_path:
-                    # This function is a static function, only can be seen in that file.
+                if func_info.func_used_file != file_path:
                     continue
                 recreated_fname = func_info.name
                 function_head_flag = False
@@ -2471,7 +2463,7 @@ def insert_func_def_before_error(file_path, func_sig, def_loc, error_line_num, p
     patch.patch_type.add('Recreated function')
     patch.old_signature = patch.new_signature = func_sig
     patch.old_end_line += len(func_def)
-    recreated_functions.add(FunctionInfo(name=fname, signature=func_sig, file_path_old=file_path, func_used_file=patch.file_path_new, keywords=['static'] if is_function_static('\n'.join(func_def)) else []))
+    recreated_functions.add(FunctionInfo(name=fname, signature=func_sig, file_path_old=file_path, func_used_file=patch.file_path_new, keywords=['static']))
     function_declarations.add(func_sig.replace(fname, f'__revert_{commit["commit_id"]}_{fname}'))
 
 
@@ -3121,8 +3113,9 @@ def apply_and_test_patches(
                             func_decl_to_add.setdefault(file_path_new, set()).add(f'{func_decl}')
                         break
 
+        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
         logger.info(f'function_sig_changes: {function_sig_changes}')
-        if function_sig_changes:
+        if function_sig_changes and len(func_deled) == 0:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
@@ -3166,9 +3159,9 @@ def apply_and_test_patches(
                     for func_info in recreated_functions:
                         if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
-                            func_decl_text += f'-static {func_decl};\n'
+                            func_decl_text += f'-{' '.join(func_info.keywords)} {func_decl};\n'
                     if not flag:
-                        func_decl_text += f'-{func_decl};\n'
+                        func_decl_text += f'-static {func_decl};\n'
                     func_decl_len += 1
             
             if file_path in func_decl_to_add_moveforward:
@@ -3182,7 +3175,7 @@ def apply_and_test_patches(
                             flag = True
                             func_decl_text_moveforward += f'-{' '.join(func_info.keywords)} {func_decl};\n'
                     if not flag:
-                        func_decl_text_moveforward += f'-{func_decl};\n'
+                        func_decl_text_moveforward += f'-static {func_decl};\n'
                     func_decl_len_moveforward += 1
 
             if file_path in union_to_add:

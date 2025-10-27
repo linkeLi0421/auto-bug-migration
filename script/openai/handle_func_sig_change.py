@@ -11,7 +11,7 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB, model="gpt-5-mini"):
+def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB, model="gpt-4o"):
     """
     Handle function signature change problems using OpenAI API
     
@@ -26,21 +26,43 @@ def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB,
         The AI's response with the solution
     """
     
-    prompt = f"""In my project, code around the caller function or the definition of the caller function {caller_defA} calls a callee function {callee_defA} in older version, and got a compilation error:
-{error_message}. This is because the definition of the callee function is changed to {callee_defB}.
-Please fix only the caller function code to resolve the compilation error.
-Output only the caller function definition (no callee function definitions, no explanations, no comments).
-Wrap it in ```c ... ``` so I can parse it easily.
+    # Extract specific error lines and function calls
+    # Create a more targeted prompt
+    prompt = f"""Fix ONLY the specific function calls that are causing compilation errors.
+
+CRITICAL INSTRUCTIONS:
+1. DO NOT modify any function calls starting with "__revert_" unless they are explicitly mentioned in the error
+2. DO NOT change any other lines or function calls not mentioned in the error message
+
+ERROR MESSAGE:
+{error_message}
+
+FUNCTION TO FIX:
+{caller_defA}
+
+OLD FUNCTION SIGNATURES (version A):
+{callee_defA}
+
+NEW FUNCTION SIGNATURES (version B):
+{callee_defB}
+
+REQUIREMENTS:
+- Only fix the exact function calls on ERROR MESSAGE
+- Keep all other code exactly the same
+- Do not modify __revert_ prefixed function calls unless they appear in the error
+- Return the complete corrected function code
+- Wrap your response in ```c ... ```
 """
     
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."},
+                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. You MUST follow the specific line requirements and only change what is explicitly requested."},
                 {"role": "user", "content": prompt}
             ],
         max_completion_tokens=4096,
+        temperature=0.1,  # Lower temperature for more precise following of instructions
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
