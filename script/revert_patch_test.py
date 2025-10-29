@@ -1135,6 +1135,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "error: conflicting types",
         "error: invalid conversion",
         "error: patch failed:",
+        "error: git",
         "error: corrupt patch",
         "make: *** [Makefile:",
         "ninja: build stopped:",
@@ -1179,6 +1180,11 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         
         if fname == 'LLVMFuzzerTestOneInput':
             # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
+            patch_lines = patch.patch_text.split('\n')
+            patch.old_end_line = patch.old_end_line + (patch.new_start_line - patch.old_start_line)
+            patch.old_start_line = patch.new_start_line
+            patch_lines[3] = f'@@ -{patch.old_start_line},{patch.old_end_line-patch.old_start_line} +{patch.new_start_line},{patch.new_end_line-patch.new_start_line} @@'
+            patch.patch_text = '\n'.join(patch_lines)
             new_patch_to_apply.append(key)
             continue
         if 'Function body change' in patch.patch_type:
@@ -1186,6 +1192,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 # TODO: remove this part
                 # add prefix to function being deleted
                 modified_lines = rename_func(patch.patch_text, fname, commit)
+                if patch.file_path_new == '/dev/null':
+                    # This file is deleted, can't handle now
+                    continue
                 function_declarations.add(patch.old_signature.replace(fname, f'__revert_{commit}_{fname}')) # do not use rename_func here, because it only change line starting with '-'
                 patch.patch_text = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
@@ -1851,8 +1860,6 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
             for func_info in recreated_functions:
-                if func_info.func_used_file != file_path:
-                    continue
                 recreated_fname = func_info.name
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
@@ -2111,6 +2118,10 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{diff_results[caller_key].old_function_name}-sigchange.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {diff_results[caller_key].old_function_name}')
+            logger.info(f'Error message: {full_error_message}')
+            logger.info(f'caller_code: {caller_code}')
+            logger.info(f'callee_defA_text: {callee_defA_text}')
+            logger.info(f'callee_defB_text: {callee_defB_text}')
             solution_code = handle_func_sig_change(full_error_message, caller_code, callee_defA_text, callee_defB_text)
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
@@ -2349,6 +2360,10 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
+            logger.info(f'Error message: {error_message}')
+            logger.info(f'struct_defs_v1: {struct_defs_v1}')
+            logger.info(f'struct_defs_v2: {struct_defs_v2}')
+            logger.info(f'func_code: {func_code}')
             solution_code = solve_code_migration(error_message, struct_defs_v1, struct_defs_v2, func_code)
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
@@ -3117,6 +3132,9 @@ def apply_and_test_patches(
         logger.info(f'function_sig_changes: {function_sig_changes}')
         if function_sig_changes and len(func_deled) == 0:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
+            for key in patch_key_list:
+                logger.info(f'patch text after handle_function_signature_changes: {diff_results[key].patch_text}')
+            
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
             if key not in patch_key_list:
@@ -3127,6 +3145,9 @@ def apply_and_test_patches(
         
         if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(incomplete_types) == 0 and len(function_sig_changes) == 0:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
+            for key in patch_key_list:
+                logger.info(f'patch text after func_deled handling: {diff_results[key].patch_text}')
+            exit(0)
             handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id)
             bb_change_pair = process_undeclared_identifiers([], miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
 
@@ -3492,6 +3513,8 @@ def revert_patch_test(args):
     
     flag = False
     for commit, next_commit, bug_id in transitions:
+        if bug_id != 'OSV-2022-511':
+            continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]

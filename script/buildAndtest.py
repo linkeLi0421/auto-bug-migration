@@ -215,6 +215,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 "undefined reference to",
                 "cannot find -l",
                 "No such file or directory",
+                "error: git",
                 "error: 'struct",
                 "error: conflicting types",
                 "error: invalid conversion",
