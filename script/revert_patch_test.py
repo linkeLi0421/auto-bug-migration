@@ -2115,9 +2115,11 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         callee_defB_text = '\n'.join('\n'.join(code_lines) for code_lines, _ in callee_defB.values())
 
         # 2.3 call OpenAI API to get the fixed function code
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{diff_results[caller_key].old_function_name}-sigchange.txt')
+        caller_name = caller_sig.split('(')[0].split(' ')[-1]
+        callee_str = ', '.join([name for name, _ in callee_list])
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{caller_name}-{hash(callee_str)}-sigchange.txt')
         if not os.path.exists(solution_path):
-            logger.info(f'Create patch using open ai api for {diff_results[caller_key].old_function_name}')
+            logger.info(f'Create patch using open ai api for {caller_name}')
             logger.info(f'Error message: {full_error_message}')
             logger.info(f'caller_code: {caller_code}')
             logger.info(f'callee_defA_text: {callee_defA_text}')
@@ -2357,7 +2359,8 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
             error_message += full_message
         
         # 2.4. get the solution code
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}.txt')
+        field_struct_list_str = ', '.join([f'{field_name} in {struct_name}' for field_name, struct_name, _, _, _ in field_struct_list])
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}-{hash(field_struct_list_str)}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
             logger.info(f'Error message: {error_message}')
@@ -3129,11 +3132,9 @@ def apply_and_test_patches(
                         break
 
         new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
-        logger.info(f'function_sig_changes: {function_sig_changes}')
+        logger.info(f'function_sig_changes: {[change[:-1] for change in function_sig_changes]}')
         if function_sig_changes and len(func_deled) == 0:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
-            for key in patch_key_list:
-                logger.info(f'patch text after handle_function_signature_changes: {diff_results[key].patch_text}')
             
         update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
         for key in new_patch_key_list:
@@ -3145,9 +3146,6 @@ def apply_and_test_patches(
         
         if len(undeclared_identifier) == 0 and len(undeclared_functions) == 0 and len(incomplete_types) == 0 and len(function_sig_changes) == 0:
             # Solve other declarations and definitions first; Because they may lead to miss_decls here
-            for key in patch_key_list:
-                logger.info(f'patch text after func_deled handling: {diff_results[key].patch_text}')
-            exit(0)
             handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id)
             bb_change_pair = process_undeclared_identifiers([], miss_decls, last_round, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, arch, signature_change_list)
 
@@ -3513,7 +3511,7 @@ def revert_patch_test(args):
     
     flag = False
     for commit, next_commit, bug_id in transitions:
-        if bug_id != 'OSV-2022-511':
+        if bug_id == 'OSV-2022-511':
             continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
