@@ -445,7 +445,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         tail_hiden_func_dict = dict()
         static_func_path = dict()
         tail_recreated_function_locations = dict()
-        func_names = ''
+        func_names = dict()
         for func_code, insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc in tail_fun_info_list:
             tail_hiden_func_dict.setdefault(file_path_old, dict())[callee_sig] = tail_code.get(file_path_old, '').count('\n')
             tail_code[file_path_old] = tail_code.get(file_path_old, '') + func_code + '\n'
@@ -454,11 +454,12 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             tail_file_path_new[file_path_old] = file_path_new
             tail_recreated_function_locations.setdefault(file_path_old, dict())[callee_sig] = def_loc
             tail_details.setdefault(file_path_old, set()).add((caller_sig, callee_sig))
-            
+            func_names[file_path_old] = func_names.setdefault(file_path_old, '') + f'{callee_sig.split("(")[0].split(" ")[-1]}_'
+
         for file_path_old in tail_code:
             insert_point = tail_insert_point[file_path_old]
             file_path_new = tail_file_path_new[file_path_old]
-            tail_key = f'tail-{file_path_new}-{func_names}'
+            tail_key = f'tail-{file_path_new}-{func_names[file_path_old]}'
             patch_header = f'diff --git a/{file_path_new} b/{file_path_new}\n--- a/{file_path_new}\n+++ b/{file_path_new}\n'
             patch_header += f'@@ -{insert_point},{tail_code_len[file_path_old]} +{insert_point},0 @@\n'
             diff_results[tail_key] = PatchInfo(
@@ -964,7 +965,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                     )
                     break
         
-        # checkout target repo to the new commit, and parse the code from that
+        # checkout target repo to the old commit, and parse the code from that
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', old_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1181,9 +1182,11 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         if fname == 'LLVMFuzzerTestOneInput':
             # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
             patch_lines = patch.patch_text.split('\n')
-            patch.old_end_line = patch.old_end_line + (patch.new_start_line - patch.old_start_line)
-            patch.old_start_line = patch.new_start_line
-            patch_lines[3] = f'@@ -{patch.old_start_line},{patch.old_end_line-patch.old_start_line} +{patch.new_start_line},{patch.new_end_line-patch.new_start_line} @@'
+            old_start = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
+            old_offset = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
+            new_start = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
+            new_offset = int(patch_lines[3].split('@@')[-2].strip().split(',')[-1])
+            patch_lines[3] = f'@@ -{new_start},{old_offset} +{new_start},{new_offset} @@'
             patch.patch_text = '\n'.join(patch_lines)
             new_patch_to_apply.append(key)
             continue
@@ -1687,6 +1690,64 @@ def handle_build_error(error_log):
             incomplete_types.append((type_name, error_location, forward_decl_location))
     
     return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes, incomplete_types
+
+
+def get_insert_line(file_path):
+    """
+    Returns the 0-based index of the last line that is actual code
+    (not empty, not a comment).
+    Returns -1 if no code line is found.
+    Searches backwards from the end of the file.
+    """
+    in_multiline_comment = False
+    idx = find_first_code_line(file_path)
+    with open(file_path, 'r', encoding="latin-1") as f:
+        lines = f.readlines()[:idx-1]
+    for idx in range(len(lines) - 1, -1, -1):
+        stripped = lines[idx].strip()
+        
+        # Handle multi-line comments (going backwards, so check for /* first)
+        if in_multiline_comment:
+            if "/*" in stripped:
+                in_multiline_comment = False
+                # Check if there's code before the /*
+                before_comment = stripped.split("/*", 1)[0].strip()
+                if before_comment and not before_comment.startswith("//"):
+                    return idx
+            continue
+        
+        # Check for */ (start of multi-line comment when going backwards)
+        if "*/" in stripped:
+            # Check if /* is also on the same line (single-line comment)
+            if "/*" in stripped:
+                # Find the positions to handle comment blocks on one line
+                comment_start = stripped.find("/*")
+                comment_end = stripped.rfind("*/")
+                
+                # Extract parts before and after the comment
+                before_comment = stripped[:comment_start].strip()
+                after_comment = stripped[comment_end + 2:].strip()
+                combined = (before_comment + " " + after_comment).strip()
+                
+                if combined and not combined.startswith("//"):
+                    return idx
+                continue
+            else:
+                # This is the end of a multi-line comment block
+                in_multiline_comment = True
+                after_comment = stripped.split("*/", 1)[-1].strip()
+                if after_comment and not after_comment.startswith("//"):
+                    return idx
+                continue
+        
+        # Skip empty lines and single-line comments
+        if not stripped or stripped.startswith("//"):
+            continue
+        
+        # Found actual code (including preprocessor directives)
+        return idx
+    
+    return -1  # No code found
 
 
 def find_first_code_line(file_path, skip_conditionals=False):
@@ -3277,7 +3338,7 @@ def apply_and_test_patches(
             os.chdir(target_repo_path)
             subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            insert_point = find_first_code_line(os.path.join(target_repo_path, file_path))
+            insert_point = get_insert_line(os.path.join(target_repo_path, file_path)) + 2
             context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
             merge_flag = 0
             
@@ -3511,7 +3572,7 @@ def revert_patch_test(args):
     
     flag = False
     for commit, next_commit, bug_id in transitions:
-        if bug_id == 'OSV-2022-511':
+        if bug_id not in {'OSV-2023-51'}:
             continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
@@ -3595,7 +3656,7 @@ def revert_patch_test(args):
         subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
         func_dict = dict()
-        for _, func in common_part: # may consume a lot of time
+        for _, func in trace1:
             if func in func_dict:
                 continue
             func_loc = func.split(' ')[-1]
@@ -3644,6 +3705,8 @@ def revert_patch_test(args):
             if diff_result.old_signature:
                 logger.debug(f'oldsignature{diff_result.old_signature}')
                 patch_func_old = diff_result.old_function_name
+            else:
+                continue
             if diff_result.file_path_old:
                 patch_file_path = diff_result.file_path_old
             else:
@@ -3664,7 +3727,7 @@ def revert_patch_test(args):
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
-        inmutable_args = (diff_results, trace1[:len(common_part)//2+1], target_repo_path, commit, next_commit, target,
+        inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
             sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
         mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
