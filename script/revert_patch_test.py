@@ -10,6 +10,7 @@ import gzip
 import pickle
 import copy
 import sys
+import hashlib
 from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Any, Optional
 from dataclasses import dataclass, field
@@ -163,6 +164,42 @@ class PatchInfo:
     def is_file_addition(self) -> bool:
         """Returns True if the patch represents a file addition."""
         return self.file_path_old == '/dev/null'
+
+    def __str__(self) -> str:
+        """Human-friendly representation used when printing the object."""
+        patch_types = ", ".join(sorted(self.patch_type)) if self.patch_type else "none"
+        dependent_funcs = ", ".join(sorted(self.dependent_func)) if self.dependent_func else "none"
+        preview_lines = [line.strip() for line in self.patch_text.strip().splitlines() if line.strip()]
+        if preview_lines:
+            preview = preview_lines[0]
+            if len(preview_lines) > 1:
+                preview += " ..."
+            if len(preview) > 80:
+                preview = f"{preview[:77]}..."
+        else:
+            preview = "<empty>"
+        return (
+            "PatchInfo("
+            f"{self.file_path_old} -> {self.file_path_new}, "
+            f"type={self.file_type}, "
+            f"old_lines={self.old_start_line}-{self.old_end_line}, "
+            f"new_lines={self.new_start_line}-{self.new_end_line}, "
+            f"patch_types={patch_types}, "
+            f"dependent_funcs={dependent_funcs}, "
+            f"old_sig={self.old_signature}, "
+            f"new_sig={self.new_signature}, "
+            f"preview='{preview}'"
+            ")"
+        )
+
+
+def stable_hash(s: str) -> int:
+    # Convert the string to bytes
+    data = s.encode('utf-8')
+    # Use SHA-256 to generate a deterministic hash
+    digest = hashlib.sha256(data).hexdigest()
+    # Optionally, convert part of it to an integer
+    return int(digest, 16) % (10 ** 12)  # shorter integer form
 
 
 def is_function_static(source_code: str) -> bool:
@@ -443,7 +480,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         tail_file_path_new = dict()
         tail_details = dict()
         tail_hiden_func_dict = dict()
-        static_func_path = dict()
         tail_recreated_function_locations = dict()
         func_names = dict()
         for func_code, insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc in tail_fun_info_list:
@@ -483,7 +519,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 fname = callee_sig.split('(')[0].split(' ')[-1]
                 for key in patch_key_list:
                     patch = diff_results[key]
-                    if callee_sig in static_func_path and patch.file_path_old != static_func_path[callee_sig]:
+                    if file_path_new != patch.file_path_new:
                         continue
                     if patch.old_signature and patch.old_signature == caller_sig:
                         depen_graph.setdefault(tail_key, set()).add(key)
@@ -1035,6 +1071,10 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                             if new_start_i == new_end_i:
                                 # this situation is handled in add_context()
                                 continue
+                            if sub_patch == '':
+                                # patch only add lines, no lines removed
+                                old_line_start = old_line_cursor = diff_result_begin-1
+                                new_line_start = new_line_cursor = new_end_i
                             # <= because line_start and line_cursor may be the same then subpatch only contains '+' or only '-'
                             if (max(old_start_i, old_line_start) <= min(old_end_i, old_line_cursor) and
                                 max(new_start_i, new_line_start) <= min(new_end_i, new_line_cursor)):
@@ -1422,9 +1462,9 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 # merge the patches that have overlap
                 patch_prev = diff_results[patch_prev_key[patch.file_path_new]]
                 patch_prev_lines = patch_prev.patch_text.split('\n')
-                connect_lines_end = patch.new_start_line
+                connect_lines_end = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 # In most cases, patch_prev.new_end_line is the actually line number+1, except patch_prev.new_end_line = patch_prev.new_start_line
-                connect_lines_begin = patch_prev.new_end_line
+                connect_lines_begin = int(patch_prev_lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0]) + int(patch_prev_lines[3].split('@@')[-2].strip().split(',')[-1])
                 if connect_lines_begin < connect_lines_end:
                     with open(os.path.join(target_repo_path, patch.file_path_new), 'r', encoding="latin-1") as f:
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
@@ -1461,15 +1501,18 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                     sorted(patch_prev.hiden_func_dict.items(), key=lambda x: x[1])  # ascending by offset
                 )
                 patch_prev.patch_text = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
-                patch_prev.new_start_line = patch.new_start_line
-                patch_prev.new_end_line = patch_prev.new_start_line + patch_old_offset+patch_prev_old_offset+connect_lines_end-connect_lines_begin
-                patch_prev.old_start_line = patch.old_start_line
-                patch_prev.old_end_line = patch_prev.old_start_line + patch_new_offset+patch_prev_new_offset+connect_lines_end-connect_lines_begin
+                logger.info(f'Merged patches:\n{patch_prev.patch_text}')
+                patch_prev.new_start_line = patch_prev_new_start
+                patch_prev.new_end_line = patch_prev_new_start + patch_prev_new_offset + patch_new_offset + max(0, connect_lines_end-connect_lines_begin)
+                patch_prev.old_start_line = patch_prev_old_start
+                patch_prev.old_end_line = patch_prev_old_start + patch_old_offset + patch_prev_old_offset + max(0, connect_lines_end-connect_lines_begin)
                 patch_prev.recreated_function_locations.update(patch.recreated_function_locations)
-                removed_patches.add(key)
-        prev_new_start_line[patch.file_path_new] = patch.new_start_line
-        prev_new_end_line[patch.file_path_new] = patch.new_end_line
-        patch_prev_key[patch.file_path_new] = key
+                # Use the merged patch, remove the previous patch
+                diff_results[key] = patch_prev
+                removed_patches.add(patch_prev_key[patch.file_path_new])
+        prev_new_start_line[diff_results[key].file_path_new] = diff_results[key].new_start_line
+        prev_new_end_line[diff_results[key].file_path_new] = diff_results[key].new_end_line
+        patch_prev_key[diff_results[key].file_path_new] = key
 
     for key in removed_patches:
         final_patches.remove(key)
@@ -1940,8 +1983,8 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                             file_path_new=file_path,
                             file_type='c',
                             patch_text=patch_text,
-                            old_signature=fname,
-                            new_signature=fname,
+                            old_signature='no change trace function',
+                            new_signature='no change trace function',
                             patch_type={'Function body change'},
                             dependent_func=set(),
                             new_start_line=start_line,
@@ -2120,6 +2163,8 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         relative_file_path = file_path.split('/', 3)[-1]
         start_line, end_line = line_range
         key_of_line_num, caller_sig, func_start_index, func_end_index = get_error_patch(relative_file_path, start_line, patch_key_list, diff_results, extra_patches)
+        if caller_sig == 'no change trace function':
+            continue
         callee_name = callee_line.split('(')[0].split(' ')[-1]
         callee_per_caller_dict.setdefault((key_of_line_num, caller_sig, func_start_index, func_end_index), []).append((callee_name, error_message))
 
@@ -2177,8 +2222,8 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
 
         # 2.3 call OpenAI API to get the fixed function code
         caller_name = caller_sig.split('(')[0].split(' ')[-1]
-        callee_str = ', '.join([name for name, _ in callee_list])
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{caller_name}-{hash(callee_str)}-sigchange.txt')
+        callee_str = caller_loc.file_path + ', '.join(sorted([name for name, _ in callee_list]))
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{caller_name}-{stable_hash(callee_str)}-sigchange.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {caller_name}')
             logger.info(f'Error message: {full_error_message}')
@@ -2420,8 +2465,8 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
             error_message += full_message
         
         # 2.4. get the solution code
-        field_struct_list_str = ', '.join([f'{field_name} in {struct_name}' for field_name, struct_name, _, _, _ in field_struct_list])
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}-{hash(field_struct_list_str)}.txt')
+        field_struct_list_str = relative_file_path + ', '.join(sorted([f'{field_name} in {struct_name}' for field_name, struct_name, _, _, _ in field_struct_list]))
+        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}-{stable_hash(field_struct_list_str)}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
             logger.info(f'Error message: {error_message}')
@@ -3251,7 +3296,7 @@ def apply_and_test_patches(
                     flag = False
                     prefix = f"__revert_{commit['commit_id']}_"
                     for func_info in recreated_functions:
-                        if func_info.signature == func_decl.replace(prefix, ""):
+                        if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
                             func_decl_text_moveforward += f'-{' '.join(func_info.keywords)} {func_decl};\n'
                     if not flag:
@@ -3572,8 +3617,6 @@ def revert_patch_test(args):
     
     flag = False
     for commit, next_commit, bug_id in transitions:
-        if bug_id not in {'OSV-2023-51'}:
-            continue
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -3720,7 +3763,7 @@ def revert_patch_test(args):
                 if patch_file_path in func_loc and (trace_func == patch_func_old or trace_func == patch_func_new):
                     if not diff_result.old_signature:
                         diff_result.old_signature, diff_result.old_function_start_line, diff_result.old_function_end_line = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
-                    if not diff_result.new_signature:
+                    if not diff_result.new_signature and diff_result.file_path_new != '/dev/null':
                         diff_result.new_signature, _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
                     patch_to_apply.append(key)
                     break
