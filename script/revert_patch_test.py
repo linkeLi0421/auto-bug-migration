@@ -20,7 +20,15 @@ from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from cfg_parser import CFGBlock, parse_cfg_text, find_block_by_line, compute_data_dependencies
-from utils import minimize_greedy, minimize_ddmin, apply_unified_diff_to_string, split_function_parts, diff_strings
+from utils import (
+    minimize_greedy,
+    minimize_ddmin,
+    apply_unified_diff_to_string,
+    split_function_parts,
+    diff_strings,
+    save_patches_pickle,
+    load_patches_pickle,
+)
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
 
@@ -393,7 +401,8 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         for node in ast_nodes:
             if (node.get('kind') in decl_kinds or node.get('kind') in def_kinds) and node['spelling'] == fname:
                 def_file_path = node['location']['file'].replace('.h', '.c')
-        
+                if not os.path.exists(os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{def_file_path}_analysis.json')):
+                    def_file_path = node['location']['file']
         def_file_path_new = def_file_path_old = def_file_path
         for file_path_new_, file_path_old_ in file_path_pairs.items():
             if file_path_old_ == def_file_path:
@@ -1501,7 +1510,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                     sorted(patch_prev.hiden_func_dict.items(), key=lambda x: x[1])  # ascending by offset
                 )
                 patch_prev.patch_text = '\n'.join(lines[:3] + [f'@@ -{patch_prev_old_start},{patch_old_offset+patch_prev_old_offset+max(0, connect_lines_end-connect_lines_begin)} +{patch_prev_new_start},{patch_prev_new_offset+patch_new_offset+max(0, connect_lines_end-connect_lines_begin)} @@'] + merged_lines)
-                logger.info(f'Merged patches:\n{patch_prev.patch_text}')
                 patch_prev.new_start_line = patch_prev_new_start
                 patch_prev.new_end_line = patch_prev_new_start + patch_prev_new_offset + patch_new_offset + max(0, connect_lines_end-connect_lines_begin)
                 patch_prev.old_start_line = patch_prev_old_start
@@ -2223,7 +2231,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         # 2.3 call OpenAI API to get the fixed function code
         caller_name = caller_sig.split('(')[0].split(' ')[-1]
         callee_str = caller_loc.file_path + ', '.join(sorted([name for name, _ in callee_list]))
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit}-{caller_name}-{stable_hash(callee_str)}-sigchange.txt')
+        solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit}-{stable_hash(caller_code)}-{stable_hash(callee_str)}-sigchange.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {caller_name}')
             logger.info(f'Error message: {full_error_message}')
@@ -2241,9 +2249,10 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         patch_text_lines[4+func_start_index:4+func_end_index] = [f'-{line}' for line in solution_code.split('\n')]  # remove old function code
         # update hiden_func_dict
         func_length_change = len(solution_code.split('\n')) - (func_end_index - func_start_index)
-        for fun_sig in caller_patch.hiden_func_dict:
-            if caller_patch.hiden_func_dict[fun_sig] > caller_patch.hiden_func_dict[caller_sig]:
-                hiden_func_dict[fun_sig] += func_length_change
+        if hasattr(caller_patch, "hiden_func_dict"):
+            for fun_sig in caller_patch.hiden_func_dict:
+                if caller_patch.hiden_func_dict[fun_sig] > caller_patch.hiden_func_dict[caller_sig]:
+                    caller_patch.hiden_func_dict[fun_sig] += func_length_change
         old_offset = len([line for line in patch_text_lines if line[0] in {'-', ' '} and not line.startswith('--')])
         new_offset = len([line for line in patch_text_lines if line[0] in {'+', ' '} and not line.startswith('++')])
         patch_text_lines[3] = f'@@ -{caller_patch.old_start_line},{old_offset} +{caller_patch.new_start_line},{new_offset} @@'
@@ -2466,7 +2475,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         
         # 2.4. get the solution code
         field_struct_list_str = relative_file_path + ', '.join(sorted([f'{field_name} in {struct_name}' for field_name, struct_name, _, _, _ in field_struct_list]))
-        solution_path = os.path.join(data_path, 'openai', f'{bug_id}-{next_commit["commit_id"]}-{fname}-{stable_hash(field_struct_list_str)}.txt')
+        solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit["commit_id"]}-{stable_hash(func_code)}-{stable_hash(field_struct_list_str)}.txt')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
             logger.info(f'Error message: {error_message}')
@@ -3040,6 +3049,7 @@ def apply_and_test_patches(
     add_patch_for_trace_funcs(diff_results, patch_key_list, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     llvm_fuzzer_test_one_input_patch_update(diff_results, patch_key_list, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target, trace1)
     # Sort patch_key_list by new_start_line
+    patch_key_list = list(set(patch_key_list))
     patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key].new_start_line, reverse=True)
     add_context(diff_results, patch_key_list, next_commit['commit_id'], target_repo_path)
     handle_file_change(diff_results, patch_key_list)
@@ -3111,6 +3121,8 @@ def apply_and_test_patches(
                     delete_file_path = node['extent']['start']['file']
                     delete_start = node['extent']['start']['line']
                     delete_end = node['extent']['end']['line']
+            if 'add_file_path' not in locals() or 'delete_file_path' not in locals():
+                continue
             incomplete_type_to_add[(delete_file_path, delete_start, delete_end)] = (add_file_path, add_start_line, add_end_line, pure_type, type_used)
         
         miss_decls = []
@@ -3194,13 +3206,13 @@ def apply_and_test_patches(
                     return False
                 return True
             if not search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
-                logger.info(f'Cannot find {identifier} in {parsing_path}')
+                logger.debug(f'Cannot find {identifier} in {parsing_path}')
                 key_of_line_num, caller_sig, func_start_index, func_end_index = get_error_patch(file_path_new, int(location.split(':')[1]), patch_key_list, diff_results, extra_patches)
                 for func_sig, func_loc in diff_results[key_of_line_num].recreated_function_locations.items():
                     parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{func_loc.file_path}_analysis.json')
-                    logger.info(f'Searching {identifier} in recreated function {func_sig} at {parsing_path}')
+                    logger.debug(f'Searching {identifier} in recreated function {func_sig} at {parsing_path}')
                     if search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
-                        logger.info(f'Found {identifier} in recreated function {func_sig} at {parsing_path}')
+                        logger.debug(f'Found {identifier} in recreated function {func_sig} at {parsing_path}')
                         break
         
         func_deled = [] # list of (function name, file path, start line, end line)
@@ -3786,18 +3798,18 @@ def revert_patch_test(args):
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
         patches_without_context = dict()
-        # tmp = copy.deepcopy(inmutable_args)
-        # if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
-        #     revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
-        # else:
-        #     revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-        #     logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-        #     # try to minimize the patch set
-        #     minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
-        #     logger.info(f'Minimal revert patch set after fast minimization: {len(minimal_fast)} {minimal_fast}')
+        tmp = copy.deepcopy(inmutable_args)
+        if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+            revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+        else:
+            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+            # try to minimize the patch set
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
+            logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
-        apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
-        patches_without_contexts[(bug_id, commit['commit_id'], fuzzer)] = patches_without_context
+        # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
+        patches_without_contexts[(bug_id, commit['commit_id'], fuzzer, [diff_results[key].old_function_name for key in keys for keys in minimal_fast])] = patches_without_context
         # # test if the local bugs is still there 
         # if 'patch_path' in patches_without_context: # if the bug trigger
         #     for bug_id_trigger in bug_ids_trigger:
@@ -3828,27 +3840,14 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
     if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}')):
         logger.info(' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
-
-
-def save_patches_pickle(patches: Dict[str, Dict[str, Any]], path: str | Path) -> None:
-    path = Path(path)
-    logger.info(path)
-    with gzip.open(path, "wb") if str(path).endswith(".gz") else open(path, "wb") as f:
-        pickle.dump(patches, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def load_patches_pickle(path: str | Path) -> Dict[str, Dict[str, Any]]:
-    path = Path(path)
-    with gzip.open(path, "rb") if str(path).endswith(".gz") else open(path, "rb") as f:
-        return pickle.load(f)
-
+        
 
 if __name__ == "__main__":
     args = parse_arguments()
     patches_without_contexts = revert_patch_test(args)
     # Use absolute path for the cache file
     cache_file = os.path.join(current_file_path, "patches.pkl.gz")
-    for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
+    for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
         logger.info(f'bug_id {bug_id}')
         for patch in patch_dict.values():
             if patch.new_signature:

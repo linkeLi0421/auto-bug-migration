@@ -2,9 +2,15 @@ from typing import List, Any, Callable, Dict, Tuple
 import copy
 import re
 import difflib
+import gzip
+import pickle
+import logging
+from pathlib import Path
 
 # Type: test_fn takes a list of patches (order preserved) and returns True/False
 TestFn = Callable[[List[Any]], bool]
+
+logger = logging.getLogger(__name__)
 
 def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
     """
@@ -36,6 +42,21 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
             else:
                 i += 1
     return cur
+
+
+def save_patches_pickle(patches: Dict[str, Dict[str, Any]], path: str | Path) -> None:
+    """Persist the patches dictionary to a pickle file (gzip-aware)."""
+    target_path = Path(path)
+    logger.info(target_path)
+    with gzip.open(target_path, "wb") if str(target_path).endswith(".gz") else open(target_path, "wb") as f:
+        pickle.dump(patches, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_patches_pickle(path: str | Path) -> Dict[str, Dict[str, Any]]:
+    """Load patches dictionary previously stored with `save_patches_pickle`."""
+    source_path = Path(path)
+    with gzip.open(source_path, "rb") if str(source_path).endswith(".gz") else open(source_path, "rb") as f:
+        return pickle.load(f)
 
 
 def minimize_ddmin(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], context: Tuple) -> List[Any]:
