@@ -3540,7 +3540,6 @@ def apply_and_test_patches(
         test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
         if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
-            patches_without_context['patch_path'] = patch_file_path
             if test_fuzzer_build(target, sanitizer, arch):
                 logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_and_fuzzer_build'
@@ -3809,8 +3808,11 @@ def revert_patch_test(args):
             logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
         # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
-        patches_without_contexts[(bug_id, commit['commit_id'], fuzzer, [diff_results[key].old_function_name for key in keys for keys in minimal_fast])] = patches_without_context
-        # # test if the local bugs is still there 
+        patches_without_contexts[
+            (bug_id, commit['commit_id'], fuzzer,
+            tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
+        ] = patches_without_context
+        # # test if the local bugs is still there
         # if 'patch_path' in patches_without_context: # if the bug trigger
         #     for bug_id_trigger in bug_ids_trigger:
         #         if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':

@@ -40,7 +40,7 @@ Related source code is:
 {source_code}
 
 Please fix only the function code to resolve the compilation error.
-If a struct field from version A is deleted (not renamed) in version B, remove or refactor the code that used that field instead of inventing a replacement. When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if it were a function.
+If a struct field from version A is deleted (not renamed) in version B, remove or refactor the code that used that field instead of inventing a replacement. If a field in version A appears to have been renamed or semantically replaced in version B, update the code to use the new field name instead of removing the logic. When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if it were a function.
 Note you should not change the number of function arguments and other codes' line number.
 Output only the corrected C function (no struct definitions, no explanations, no comments).
 Wrap it in ```c ... ``` so I can parse it easily.
