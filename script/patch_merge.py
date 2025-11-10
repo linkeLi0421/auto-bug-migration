@@ -62,7 +62,8 @@ patch_pair_dict = {
         ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',),
         ('blosc/blosc2.cblosc/blosc2.c-1576,18+1748,0',),
         ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)
+        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',),
+        ('blosc/frame.cblosc/frame.c-1172,72+1271,68', 'blosc/frame.cblosc/frame.c-1135,28+1236,24')
     ],
     'OSV-2021-369': [
         ('blosc/frame.cblosc/frame.c-1770,5+2022,21', 'blosc/frame.cblosc/frame.c-1730,3+1976,9', 'blosc/frame.cblosc/frame.c-1718,6+1963,7', 'blosc/frame.cblosc/frame.c-1710,2+1954,3', 'blosc/frame.cblosc/frame.c-1698,5+1939,8', 'blosc/frame.cblosc/frame.c-1662,26+1907,22', 'blosc/frame.cblosc/frame.c-1640,14+1882,17'),
@@ -113,6 +114,26 @@ patch_pair_dict = {
     ],
 }
 
+local_bug_compatibility = {
+ 'OSV-2022-34': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2023-51': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2021-897': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2021-213': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2022-511': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-487', 'OSV-2021-481'},
+ 'OSV-2021-404': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2021-429': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2022-4': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2022-1242': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2021-27': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2021-21': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
+ 'OSV-2022-486': {'OSV-2021-1791', 'OSV-2021-997', 'OSV-2021-526'},
+ 'OSV-2021-1589': {'OSV-2021-622', 'OSV-2021-526'},
+ 'OSV-2021-22': {'OSV-2021-622'},
+ 'OSV-2020-2184': {'OSV-2021-622'},
+}
+
+LOCAL_BUG_NODE_PREFIX = "__local_bug__"
+
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
@@ -161,6 +182,37 @@ class PatchCompatibilityGraph:
         """Return the total number of undirected edges."""
         return sum(len(neighbors) for neighbors in self._edges.values()) // 2
 
+    def fully_compatible_groups(self, min_size: int = 2) -> List[List[PatchSetKey]]:
+        """
+        Return groups where every node is compatible with every other node (cliques).
+
+        min_size controls the minimum number of nodes required for a group to be considered.
+        """
+
+        if min_size <= 0:
+            min_size = 1
+
+        nodes: Set[PatchSetKey] = set(self._nodes.keys())
+        adjacency: Dict[PatchSetKey, Set[PatchSetKey]] = {
+            node: set(self._edges.get(node, set())) & nodes for node in nodes
+        }
+        cliques: List[List[PatchSetKey]] = []
+
+        def bron_kerbosch(r: Set[PatchSetKey], p: Set[PatchSetKey], x: Set[PatchSetKey]) -> None:
+            if not p and not x:
+                if len(r) >= min_size:
+                    cliques.append(sorted(r, key=str))
+                return
+            for node in list(p):
+                bron_kerbosch(r | {node}, p & adjacency[node], x & adjacency[node])
+                p.remove(node)
+                x.add(node)
+
+        bron_kerbosch(set(), set(nodes), set())
+
+        cliques.sort(key=lambda group: (-len(group), [str(node) for node in group]))
+        return cliques
+
 
 def _format_node_label(identifier: PatchSetKey) -> str:
     """
@@ -187,6 +239,70 @@ def _format_node_label(identifier: PatchSetKey) -> str:
     return bug_id.replace("\\", "\\\\").replace("\"", "\\\"")
 
 
+def _format_local_node_label(bug_id: str) -> str:
+    """Return the label used for synthetic local bug nodes."""
+    safe_id = bug_id.replace("\\", "\\\\").replace("\"", "\\\"")
+    return f"{safe_id} (local)"
+
+
+def _is_local_bug_identifier(identifier: PatchSetKey) -> bool:
+    """True when the identifier represents a synthetic local bug node."""
+    return (
+        isinstance(identifier, tuple)
+        and len(identifier) >= 2
+        and identifier[0] == LOCAL_BUG_NODE_PREFIX
+        and isinstance(identifier[1], str)
+    )
+
+
+def attach_local_bug_nodes(graph: PatchCompatibilityGraph) -> Tuple[int, int]:
+    """
+    Add synthetic local bug nodes to the compatibility graph and connect edges.
+
+    Returns (nodes_added, edges_added).
+    """
+
+    bug_to_nodes: DefaultDict[str, List[PatchSetKey]] = defaultdict(list)
+    for identifier in list(graph.nodes.keys()):
+        if _is_local_bug_identifier(identifier):
+            continue
+        if isinstance(identifier, tuple) and identifier:
+            bug_id = identifier[0]
+            if isinstance(bug_id, str):
+                bug_to_nodes[bug_id].append(identifier)
+
+    nodes_added = 0
+    edges_added = 0
+    for bug_id, compatible_locals in local_bug_compatibility.items():
+        patch_nodes = bug_to_nodes.get(bug_id)
+        if not patch_nodes:
+            continue
+        for local_bug in sorted(compatible_locals):
+            local_identifier: PatchSetKey = (LOCAL_BUG_NODE_PREFIX, local_bug)
+            if local_identifier not in graph.nodes:
+                graph.add_patch(local_identifier, {"local_bug_id": local_bug, "remote_bug_id": bug_id})
+                nodes_added += 1
+            for patch_identifier in patch_nodes:
+                neighbors = graph.edges.get(local_identifier)
+                if neighbors is None:
+                    neighbors = set()
+                if patch_identifier not in neighbors:
+                    edges_added += 1
+                graph.add_compatibility(local_identifier, patch_identifier)
+
+    local_identifiers = [identifier for identifier in graph.nodes if _is_local_bug_identifier(identifier)]
+    for idx, lhs in enumerate(local_identifiers):
+        for rhs in local_identifiers[idx + 1 :]:
+            neighbors = graph.edges.get(lhs)
+            if neighbors is None:
+                neighbors = set()
+            if rhs not in neighbors:
+                edges_added += 1
+            graph.add_compatibility(lhs, rhs)
+
+    return nodes_added, edges_added
+
+
 def write_graphviz(graph: PatchCompatibilityGraph, output_path: Path) -> None:
     """Serialize the compatibility graph into a Graphviz DOT file."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -207,16 +323,31 @@ def write_graphviz(graph: PatchCompatibilityGraph, output_path: Path) -> None:
         graph_file.write("  graph [splines=true, overlap=false];\n")
         graph_file.write("  node [shape=box, style=filled, fillcolor=\"#f0f5ff\", fontsize=10];\n")
 
+        local_node_count = 0
         for identifier, node_name in node_names.items():
-            label = _format_node_label(identifier)
-            graph_file.write(f"  {node_name} [label=\"{label}\"];\n")
+            if _is_local_bug_identifier(identifier):
+                local_node_count += 1
+                bug_id = identifier[1]
+                label = _format_local_node_label(bug_id)
+                graph_file.write(
+                    f"  {node_name} [label=\"{label}\", style=filled, fillcolor=\"#ffd6d6\", color=\"#b30000\", fontcolor=\"#660000\"];\n"
+                )
+            else:
+                label = _format_node_label(identifier)
+                graph_file.write(f"  {node_name} [label=\"{label}\"];\n")
 
         for lhs_name, rhs_name in sorted(unique_edges):
             graph_file.write(f"  {lhs_name} -- {rhs_name};\n")
 
         graph_file.write("}\n")
 
-    logger.info("Wrote Graphviz representation with %d nodes and %d edges to %s", len(node_identifiers), len(unique_edges), output_path)
+    logger.info(
+        "Wrote Graphviz representation with %d nodes (%d local) and %d edges to %s",
+        len(node_identifiers),
+        local_node_count,
+        len(unique_edges),
+        output_path,
+    )
 
 
 def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Optional[List[Dict[str, Any]]] = None) -> bool:
@@ -266,11 +397,41 @@ def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_dis
         graph.add_patch(key_tuple, patch_dict)
 
     graph.connect_compatibilities(lambda a, b: is_compatiable(a, b, bug_distribution))
+    local_nodes_added, local_edges_added = attach_local_bug_nodes(graph)
 
     total_edges = graph.edge_count()
-    logger.info("Constructed compatibility graph: %d patch sets, %d edges", len(graph.nodes), total_edges)
+    logger.info(
+        "Constructed compatibility graph: %d nodes (%d local), %d edges (+%d local edges)",
+        len(graph.nodes),
+        sum(1 for identifier in graph.nodes if _is_local_bug_identifier(identifier)),
+        total_edges,
+        local_edges_added,
+    )
 
     return graph
+
+
+def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) -> None:
+    """Log all fully compatible bug groups with at least min_size members."""
+
+    def describe_identifier(identifier: PatchSetKey) -> str:
+        if _is_local_bug_identifier(identifier):
+            return f"{identifier[1]} (local)"
+        if isinstance(identifier, tuple) and identifier:
+            bug_id = identifier[0]
+            if isinstance(bug_id, str):
+                return bug_id
+        return str(identifier)
+
+    groups = graph.fully_compatible_groups(min_size=min_size)
+    if not groups:
+        logger.info("No fully compatible bug groups of size >= %d found.", min_size)
+        return
+
+    logger.info("Detected %d fully compatible bug groups (size >= %d):", len(groups), min_size)
+    for idx, group in enumerate(groups, start=1):
+        identifiers = [describe_identifier(identifier) for identifier in group]
+        logger.info("  Group %d (%d bugs): %s", idx, len(group), "; ".join(identifiers))
 
 
 def have_joint_trigger(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> str | None:
@@ -362,6 +523,7 @@ def main() -> None:
     if args.bug_distribution_csv:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
     graph = merge_patches(patches_without_contexts, bug_distribution)
+    report_compatible_groups(graph)
     if args.graphviz_output:
         write_graphviz(graph, args.graphviz_output)
 
