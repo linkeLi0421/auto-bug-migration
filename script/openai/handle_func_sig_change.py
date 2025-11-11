@@ -59,7 +59,7 @@ REQUIREMENTS:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. You MUST follow the specific line requirements and only change what is explicitly requested."},
+                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. You MUST follow the specific line requirements and only change what is explicitly requested."}, 
                 {"role": "user", "content": prompt}
             ],
         temperature=0.1,  # Lower temperature for more precise following of instructions
@@ -305,5 +305,3 @@ if __name__ == '__main__':
     fixed_code = handle_func_sig_change(error_msg, caller_defA, callee_defA, callee_defB)
     print("--- AI Generated Output ---")
     print(fixed_code)
-
-    

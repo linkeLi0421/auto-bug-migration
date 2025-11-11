@@ -7,7 +7,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def extract_code(text):
-    blocks = re.findall(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
+    blocks = re.findall(r"```(?:W)?\n(.*?)```", text, re.DOTALL)
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
@@ -50,7 +50,7 @@ Wrap it in ```c ... ``` so I can parse it easily.
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."},
+                {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."}, 
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,  # Lower temperature for more precise following of instructions
