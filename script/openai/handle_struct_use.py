@@ -53,7 +53,7 @@ Wrap it in ```c ... ``` so I can parse it easily.
                 {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
+            temperature=0.1,  # Lower temperature for more precise following of instructions
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
