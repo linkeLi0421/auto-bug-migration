@@ -133,6 +133,8 @@ local_bug_compatibility = {
 }
 
 LOCAL_BUG_NODE_PREFIX = "__local_bug__"
+PendingRefreshInfo = Dict[str, Any]
+pending_patch_refreshes: Dict[str, PendingRefreshInfo] = {}
 
 
 logger = logging.getLogger(__name__)
@@ -253,6 +255,40 @@ def _is_local_bug_identifier(identifier: PatchSetKey) -> bool:
         and identifier[0] == LOCAL_BUG_NODE_PREFIX
         and isinstance(identifier[1], str)
     )
+
+
+def _extract_commit_id(identifier: PatchSetKey) -> Optional[str]:
+    """Return commit id embedded in the identifier tuple, if available."""
+    if len(identifier) > 1 and isinstance(identifier[1], str):
+        return identifier[1]
+    return None
+
+
+def _commit_prefix(commit_id: Optional[str], length: int = 6) -> Optional[str]:
+    """Return the first `length` characters of a commit id, if available."""
+    if commit_id:
+        return commit_id[:length]
+    return None
+
+
+def request_new_patch_for_bug(bug_id: str, required_commit: str, current_commit: Optional[str], partner_bug_id: str) -> None:
+    """
+    Placeholder hook for refreshing a patch using required_commit.
+
+    Implementers should replace this with repo-specific logic that regenerates the patch.
+    """
+    info = pending_patch_refreshes.setdefault(
+        bug_id,
+        {
+            "required_commit": required_commit,
+            "current_commit": current_commit,
+            "partners": set(),
+        },
+    )
+    info["required_commit"] = required_commit
+    info["current_commit"] = current_commit
+    partners: Set[str] = info.setdefault("partners", set())
+    partners.add(partner_bug_id)
 
 
 def attach_local_bug_nodes(graph: PatchCompatibilityGraph) -> Tuple[int, int]:
@@ -377,9 +413,26 @@ def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Opt
         logger.debug("Cannot determine bug ids for keys %s and %s", key_a, key_b)
         return False
 
-    shared_commit = have_joint_trigger(bug_distribution, bug1, bug2)
-    if shared_commit:
-        logger.info("Bugs %s and %s share triggering commit %s; treating as compatible", bug1, bug2, shared_commit)
+    shared_commits = have_joint_triggers(bug_distribution, bug1, bug2)
+    if shared_commits:
+        commit_a = _extract_commit_id(key_a)
+        commit_b = _extract_commit_id(key_b)
+        shared_prefixes = {_commit_prefix(commit) for commit in shared_commits if commit}
+        prefix_a = _commit_prefix(commit_a)
+        prefix_b = _commit_prefix(commit_b)
+        needs_refresh_a = prefix_a not in shared_prefixes
+        needs_refresh_b = prefix_b not in shared_prefixes
+        representative_commit = next(iter(sorted(shared_commits))) if shared_commits else None
+        if needs_refresh_a:
+            request_new_patch_for_bug(bug1, representative_commit or "", commit_a, bug2)
+        if needs_refresh_b:
+            request_new_patch_for_bug(bug2, representative_commit or "", commit_b, bug1)
+        if not needs_refresh_a and not needs_refresh_b:
+            logger.info(
+                "Bugs %s and %s share at least one triggering commit with aligned patches; treating as compatible",
+                bug1,
+                bug2,
+            )
         return True
 
     return False
@@ -388,6 +441,7 @@ def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Opt
 def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_distribution: Optional[List[Dict[str, Any]]] = None) -> PatchCompatibilityGraph:
     """Build a compatibility graph where each node represents an entire patch dictionary."""
 
+    pending_patch_refreshes.clear()
     graph = PatchCompatibilityGraph()
 
     for key_tuple, patch_dict in patches_without_contexts.items():
@@ -411,8 +465,8 @@ def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_dis
     return graph
 
 
-def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) -> None:
-    """Log all fully compatible bug groups with at least min_size members."""
+def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) -> List[List[PatchSetKey]]:
+    """Log all fully compatible bug groups with at least min_size members, and return them."""
 
     def describe_identifier(identifier: PatchSetKey) -> str:
         if _is_local_bug_identifier(identifier):
@@ -426,17 +480,63 @@ def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) 
     groups = graph.fully_compatible_groups(min_size=min_size)
     if not groups:
         logger.info("No fully compatible bug groups of size >= %d found.", min_size)
-        return
+        return []
 
     logger.info("Detected %d fully compatible bug groups (size >= %d):", len(groups), min_size)
     for idx, group in enumerate(groups, start=1):
         identifiers = [describe_identifier(identifier) for identifier in group]
         logger.info("  Group %d (%d bugs): %s", idx, len(group), "; ".join(identifiers))
+    return groups
 
 
-def have_joint_trigger(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> str | None:
+def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]]) -> None:
     """
-    Return the commit id where both bugs are marked '1|1' or '0.5|1'.
+    Emit recorded patch refresh requirements scoped to the provided group (typically Group 1).
+    """
+
+    if not group:
+        return
+
+    relevant_bug_ids: Set[str] = set()
+    for identifier in group:
+        if _is_local_bug_identifier(identifier):
+            continue
+        if isinstance(identifier, tuple) and identifier:
+            bug_id = identifier[0]
+            if isinstance(bug_id, str):
+                relevant_bug_ids.add(bug_id)
+
+    if not relevant_bug_ids:
+        return
+
+    filtered = {bug: info for bug, info in pending_patch_refreshes.items() if bug in relevant_bug_ids}
+    if not filtered:
+        return
+
+    report_entries: List[Tuple[str, str, str, List[str]]] = []
+    for bug_id in sorted(filtered):
+        info = filtered[bug_id]
+        partners = sorted(info.get("partners", []))
+        partners_in_group = [partner for partner in partners if partner in relevant_bug_ids]
+        if not partners_in_group:
+            continue
+        required = (info.get("required_commit") or "unknown")[:6]
+        current = (info.get("current_commit") or "unknown")[:6]
+        report_entries.append((bug_id, required, current, partners_in_group))
+
+    if not report_entries:
+        logger.info("Pending patch refreshes impacting Group 1: none")
+        return
+
+    logger.info("Pending patch refreshes impacting Group 1 (%d bugs):", len(report_entries))
+    for bug_id, required, current, partners_in_group in report_entries:
+        partner_text = ", ".join(partners_in_group)
+        logger.info("  %s: requires %s (current %s) [shares commit with %s]", bug_id, required, current, partner_text)
+
+
+def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
+    """
+    Return the set of commit ids where both bugs are marked '1|1' or '0.5|1'.
 
     parsed_data follows the structure produced by prepare_transplant/parse_csv_file:
       [{'commit_id': 'abc123', 'osv_statuses': {'OSV-1': '1|1', ...}}, ...]
@@ -445,11 +545,14 @@ def have_joint_trigger(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) 
     def is_trigger(value: str | None) -> bool:
         return value in {'1|1', '0.5|1'}
 
+    commits: Set[str] = set()
     for row in parsed_data:
         statuses = row.get('osv_statuses', {})
         if is_trigger(statuses.get(bug1)) and is_trigger(statuses.get(bug2)):
-            return row.get('commit_id')
-    return None
+            commit_id = row.get('commit_id')
+            if commit_id:
+                commits.add(commit_id)
+    return commits
 
 
 def parse_csv_data(csv_content: str) -> list[dict[str, Any]]:
@@ -523,7 +626,9 @@ def main() -> None:
     if args.bug_distribution_csv:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
     graph = merge_patches(patches_without_contexts, bug_distribution)
-    report_compatible_groups(graph)
+    groups = report_compatible_groups(graph)
+    group_one = groups[0] if groups else None
+    report_pending_patch_refreshes(group_one)
     if args.graphviz_output:
         write_graphviz(graph, args.graphviz_output)
 
