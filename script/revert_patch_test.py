@@ -708,6 +708,11 @@ def parse_arguments():
                         help='this file contains a target project commit id and corresponding commit id')
     parser.add_argument('--target', required=True,
                         help='target project name')
+    parser.add_argument('--bug_id', 
+                        help='Optional: specific bug ID to process')
+    parser.add_argument('--buggy_commit', 
+                        help='Optional: specific buggy commit to process')
+    
     return parser.parse_args()
 
 
@@ -2232,6 +2237,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         caller_name = caller_sig.split('(')[0].split(' ')[-1]
         callee_str = caller_loc.file_path + ', '.join(sorted([name for name, _ in callee_list]))
         solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit}-{stable_hash(caller_code)}-{stable_hash(callee_str)}-sigchange.txt')
+        logger.info(f'Solution path: {solution_path}')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {caller_name}')
             logger.info(f'Error message: {full_error_message}')
@@ -2476,6 +2482,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         # 2.4. get the solution code
         field_struct_list_str = relative_file_path + ', '.join(sorted([f'{field_name} in {struct_name}' for field_name, struct_name, _, _, _ in field_struct_list]))
         solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit["commit_id"]}-{stable_hash(func_code)}-{stable_hash(field_struct_list_str)}.txt')
+        logger.info(f'Solution path: {solution_path}')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
             logger.info(f'Error message: {error_message}')
@@ -3040,6 +3047,8 @@ def apply_and_test_patches(
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
+
+    logger.info(f'Patch pair list: {patch_pair_list}')
     logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key].old_signature for key in patch_key_list]} ')
     
     patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
@@ -3538,6 +3547,7 @@ def apply_and_test_patches(
         ]
         logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
         test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
+        get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
         if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
             if test_fuzzer_build(target, sanitizer, arch):
@@ -3547,7 +3557,6 @@ def apply_and_test_patches(
                 logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_but_fuzzer_build_fail'
         else:
-            get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
             transitions.insert(0, (commit, next_commit, bug_id))
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             return 'not_trigger'
@@ -3627,7 +3636,12 @@ def revert_patch_test(args):
         transitions.append((commit, next_commit, bug_id))
     
     flag = False
+    test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
+        if args.bug_id and bug_id != args.bug_id:
+            continue
+        if args.buggy_commit:
+            commit['commit_id'] = args.buggy_commit[:6]
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -3795,6 +3809,66 @@ def revert_patch_test(args):
             else:
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
+        # if bug_id == 'OSV-2021-27':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        # if bug_id == 'OSV-2020-2184':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)'] 
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
+        # if bug_id == 'OSV-2021-22':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        # if bug_id == 'OSV-2021-21':
+        #     # ['int blosc_run_decompression_with_context(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)', 'int initialize_context_decompression(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)', 'uint8_t get_filter_flags(const uint8_t header_flags, const int32_t typesize)', 'int initialize_context_decompression(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)', 'int initialize_context_decompression(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'int serial_blosc(struct thread_context * thread_context)', 'int serial_blosc(struct thread_context * thread_context)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13'), ('blosc/blosc2.cblosc/blosc2.c-1272,2+1501,3', 'blosc/blosc2.cblosc/blosc2.c-1253,4+1483,3')]
+        # if bug_id == 'OSV-2021-274':
+        #     # ['blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)'] 
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1473,9+1682,7', 'blosc/frame.cblosc/frame.c-1461,4+1674,0', 'blosc/frame.cblosc/frame.c-1432,11+1641,15', 'blosc/frame.cblosc/frame.c-1416,10+1622,13', 'blosc/frame.cblosc/frame.c-1389,8+1592,11', 'blosc/frame.cblosc/frame.c-1368,4+1569,6', 'blosc/frame.cblosc/frame.c-1301,8+1500,10'), ('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
+        # if bug_id == 'OSV-2021-246':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        # if bug_id == 'OSV-2021-213':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame * frame, blosc2_schunk * schunk)'] 
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13'), ('blosc/frame.cblosc/frame.c-1148,51+1271,68', 'blosc/frame.cblosc/frame.c-1111,28+1236,24')]
+        # if bug_id == 'OSV-2021-247':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)]
+        # if bug_id == 'OSV-2021-404':
+        #     # ['int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)']
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1283,4+1241,6',)]
+        # if bug_id == 'OSV-2021-221':
+        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int64_t get_coffset(blosc2_frame * frame, int32_t header_len, int64_t cbytes, int32_t nchunk)', 'int blosc_getitem(const void * src, int start, int nitems, void * dest)', 'uint8_t get_filter_flags(const uint8_t header_flags, const int32_t typesize)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1816,8+2021,24', 'blosc/frame.cblosc/frame.c-1777,3+1976,9', 'blosc/frame.cblosc/frame.c-1744,27+1938,32', 'blosc/frame.cblosc/frame.c-1684,54+1877,55'), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-1576,18+1748,0',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1172,72+1271,68', 'blosc/frame.cblosc/frame.c-1135,28+1236,24')]
+        # if bug_id == 'OSV-2021-369':
+        #     # ['int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'uint8_t * get_coffsets(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t * off_cbytes)', 'uint8_t * get_coffsets(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t * off_cbytes)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)'] 
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1770,5+2022,21', 'blosc/frame.cblosc/frame.c-1730,3+1976,9', 'blosc/frame.cblosc/frame.c-1718,6+1963,7', 'blosc/frame.cblosc/frame.c-1710,2+1954,3', 'blosc/frame.cblosc/frame.c-1698,5+1939,8', 'blosc/frame.cblosc/frame.c-1662,26+1907,22', 'blosc/frame.cblosc/frame.c-1640,14+1882,17'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-1237,2+1277,2', 'blosc/frame.cblosc/frame.c-1203,4+1241,6'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
+        # if bug_id == 'OSV-2021-429':
+        #     # ['int get_coffset(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t nchunk, int64_t * offset)']
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1673,10+1707,11',)]
+        # if bug_id == 'OSV-2023-51':
+        #     # ['int blosc2_initialize_context_from_header(blosc2_context * context, blosc_header * header)', 'int blosc_run_decompression_with_context(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-771,1+771,0',), ('blosc/blosc2.cblosc/blosc2.c-2436,2+2342,12',)]
+        # if bug_id == 'OSV-2022-4':
+        #     # ['int initialize_context_decompression(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, void * dest, int32_t destsize)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
+        # if bug_id == 'OSV-2021-897':
+        #     # ['int blosc_run_decompression_with_context(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize)', 'int initialize_context_compression(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize, int clevel, const uint8_t * filters, const uint8_t * filters_meta, int32_t typesize, int compressor, int32_t blocksize, int new_nthreads, int nthreads, blosc2_btune * udbtune, void * btune_config, blosc2_schunk * schunk)', 'int initialize_context_compression(blosc2_context * context, const void * src, int32_t srcsize, void * dest, int32_t destsize, int clevel, const uint8_t * filters, const uint8_t * filters_meta, int32_t typesize, int compressor, int32_t blocksize, int new_nthreads, int nthreads, blosc2_btune * udbtune, void * btune_config, blosc2_schunk * schunk)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2466,2+2342,12',), ('blosc/blosc2.cblosc/blosc2.c-1888,9+1697,8', 'blosc/blosc2.cblosc/blosc2.c-1864,4+1675,2')]
+        # if bug_id == 'OSV-2022-34':
+        #     # ['int initialize_context_decompression(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, void * dest, int32_t destsize)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
+        # if bug_id == 'OSV-2021-1589':
+        #     # ['int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)']
+        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
+        # if bug_id == 'OSV-2022-486':
+        #     # ['blosc2_schunk * blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)']
+        #     patch_pair_list = [('blosc/schunk.cblosc/schunk.c-476,2+446,2',), ('blosc/frame.cblosc/frame.c-1761,2+1664,2', 'blosc/frame.cblosc/frame.c-1728,5+1631,5', 'blosc/frame.cblosc/frame.c-1695,20+1598,20', 'blosc/frame.cblosc/frame.c-1663,15+1572,9', 'blosc/frame.cblosc/frame.c-1644,2+1553,2', 'blosc/frame.cblosc/frame.c-1634,2+1543,2', 'blosc/frame.cblosc/frame.c-1617,11+1526,11', 'blosc/frame.cblosc/frame.c-1586,14+1497,12'), ('blosc/frame.cblosc/frame.c-1498,24+1428,17', 'blosc/frame.cblosc/frame.c-1478,3+1409,2'), ('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24'), ('blosc/frame.cblosc/frame.c-1321,20+1257,13', 'blosc/frame.cblosc/frame.c-1309,3+1246,2')]
+        # if bug_id == 'OSV-2022-1242':
+        #     # ['blosc2_schunk * blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)']
+        #     patch_pair_list = [('blosc/schunk.cblosc/schunk.c-468,8+446,8',), ('blosc/frame.cblosc/frame.c-1787,2+1664,2', 'blosc/frame.cblosc/frame.c-1754,5+1631,5', 'blosc/frame.cblosc/frame.c-1746,1+1624,0', 'blosc/frame.cblosc/frame.c-1714,26+1594,24', 'blosc/frame.cblosc/frame.c-1685,16+1572,9', 'blosc/frame.cblosc/frame.c-1666,2+1553,2', 'blosc/frame.cblosc/frame.c-1656,2+1543,2', 'blosc/frame.cblosc/frame.c-1639,11+1526,11', 'blosc/frame.cblosc/frame.c-1608,14+1497,12')]
+        # if bug_id == 'OSV-2022-511':
+        #     # ['int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'blosc2_schunk * blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)']
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-2250,27+2021,18', 'blosc/frame.cblosc/frame.c-2214,9+1987,7', 'blosc/frame.cblosc/frame.c-2204,2+1977,2', 'blosc/frame.cblosc/frame.c-2149,49+1950,21', 'blosc/frame.cblosc/frame.c-2102,36+1916,23', 'blosc/frame.cblosc/frame.c-2093,2+1907,2', 'blosc/frame.cblosc/frame.c-2073,9+1888,8'), ('blosc/frame.cblosc/frame.c-443,8+431,0', 'blosc/frame.cblosc/frame.c-413,22+410,13', 'blosc/frame.cblosc/frame.c-362,30+365,24'), ('blosc/schunk.cblosc/schunk.c-477,8+446,8',), ('blosc/frame.cblosc/frame.c-1817,20+1659,16', 'blosc/frame.cblosc/frame.c-1805,2+1646,3', 'blosc/frame.cblosc/frame.c-1761,37+1592,47', 'blosc/frame.cblosc/frame.c-1734,21+1572,14', 'blosc/frame.cblosc/frame.c-1715,2+1553,2', 'blosc/frame.cblosc/frame.c-1705,2+1543,2', 'blosc/frame.cblosc/frame.c-1688,11+1526,11', 'blosc/frame.cblosc/frame.c-1657,14+1497,12'), ('blosc/frame.cblosc/frame.c-1569,24+1428,17', 'blosc/frame.cblosc/frame.c-1549,3+1409,2'), ('blosc/frame.cblosc/frame.c-1392,20+1257,13', 'blosc/frame.cblosc/frame.c-1380,3+1246,2')]
         
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
@@ -3807,20 +3881,21 @@ def revert_patch_test(args):
             minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
             logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
-        # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
+        apply_and_test_patches(patch_pair_list, patches_without_context, *mutable_args, *inmutable_args)
         patches_without_contexts[
             (bug_id, commit['commit_id'], fuzzer,
             tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
         ] = patches_without_context
-        # # test if the local bugs is still there
-        # if 'patch_path' in patches_without_context: # if the bug trigger
-        #     for bug_id_trigger in bug_ids_trigger:
-        #         if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':
-        #             logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
-        #         else:
-        #             logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
 
         get_patched_traces, transitions, signature_change_list = mutable_args
+        # test if the local bugs is still there
+        for bug_id_trigger in bug_ids_trigger:
+            if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], get_patched_traces[bug_id][-1]) == 'not trigger':
+                logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
+            else:
+                logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger}')
+                test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
+
         if not os.path.exists(os.path.join(data_path, 'signature_change_list')):
             os.makedirs(os.path.join(data_path, 'signature_change_list'))
         with open(os.path.join(data_path, 'signature_change_list', f'{bug_id}_{next_commit['commit_id']}.json'), 'w') as f:
@@ -3829,7 +3904,7 @@ def revert_patch_test(args):
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
     
-    return patches_without_contexts
+    return patches_without_contexts, test_local_bug_after_patch
 
 
 def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
@@ -3846,9 +3921,11 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    patches_without_contexts = revert_patch_test(args)
+    patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
     # Use absolute path for the cache file
-    cache_file = os.path.join(current_file_path, "patches.pkl.gz")
+    cache_file = os.path.join(data_path, "patches", f"{args.target}_patches.pkl.gz")
+    # Create cache_file's folder if it doesn't exist
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
     for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
         logger.info(f'bug_id {bug_id}')
         for patch in patch_dict.values():
@@ -3857,6 +3934,9 @@ if __name__ == "__main__":
             elif patch.old_signature:
                 logger.info(f'  old_signature {patch.old_signature}')
     
+    for bug_id, affected_bugs in test_local_bug_after_patch.items():
+        logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
+
     # Save the patches to cache file
     save_patches_pickle(patches_without_contexts, cache_file)
     
