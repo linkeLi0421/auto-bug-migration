@@ -7,9 +7,11 @@ import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Tuple, Any, DefaultDict, Set, Callable, Iterable, Optional, List
+from contextlib import redirect_stdout, redirect_stderr
+from types import SimpleNamespace
 
 from utils import load_patches_pickle
-from revert_patch_test import PatchInfo, FunctionLocation
+from revert_patch_test import PatchInfo, FunctionLocation, revert_patch_test as execute_revert_patch_test
 
 patch_pair_dict = {
     'OSV-2021-27': [
@@ -135,6 +137,8 @@ local_bug_compatibility = {
 LOCAL_BUG_NODE_PREFIX = "__local_bug__"
 PendingRefreshInfo = Dict[str, Any]
 pending_patch_refreshes: Dict[str, PendingRefreshInfo] = {}
+REVERT_PATCH_CONFIG: Optional[Dict[str, Any]] = None
+REFRESH_ATTEMPTS: Set[Tuple[str, str]] = set()
 
 
 logger = logging.getLogger(__name__)
@@ -144,6 +148,51 @@ logger.setLevel(logging.INFO)
 
 PatchSetKey = Tuple[Any, ...]
 PatchSet = Dict[str, Any]
+
+
+def configure_revert_patch(config: Optional[Dict[str, Any]]) -> None:
+    """Register configuration used to invoke revert_patch_test when needed."""
+    global REVERT_PATCH_CONFIG
+    REVERT_PATCH_CONFIG = config
+
+
+def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -> bool:
+    """Invoke revert_patch_test for the given bug if configuration is present."""
+    if not REVERT_PATCH_CONFIG or not required_commit:
+        return False
+
+    attempt_key = (bug_id, required_commit[:6])
+    if attempt_key in REFRESH_ATTEMPTS:
+        return False
+    REFRESH_ATTEMPTS.add(attempt_key)
+
+    config = REVERT_PATCH_CONFIG
+    args = SimpleNamespace(
+        target_test_result=str(config["target_test_result"]),
+        bug_info=str(config["bug_info"]),
+        build_csv=str(config["build_csv"]),
+        target=str(config["target"]),
+        bug_id=bug_id,
+        buggy_commit=required_commit,
+    )
+
+    log_path: Optional[Path] = None
+    output_dir: Optional[Path] = config.get("output_dir")
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = output_dir / f"revert_{config['target']}_{bug_id}_{required_commit[:6]}.log"
+
+    try:
+        if log_path:
+            with log_path.open("w", encoding="utf-8") as handle, redirect_stdout(handle), redirect_stderr(handle):
+                execute_revert_patch_test(args)
+        else:
+            execute_revert_patch_test(args)
+        logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:6])
+        return True
+    except Exception:
+        logger.exception("Failed to trigger revert_patch_test for bug %s", bug_id)
+        return False
 
 
 class PatchCompatibilityGraph:
@@ -271,24 +320,36 @@ def _commit_prefix(commit_id: Optional[str], length: int = 6) -> Optional[str]:
     return None
 
 
-def request_new_patch_for_bug(bug_id: str, required_commit: str, current_commit: Optional[str], partner_bug_id: str) -> None:
-    """
-    Placeholder hook for refreshing a patch using required_commit.
-
-    Implementers should replace this with repo-specific logic that regenerates the patch.
-    """
+def _record_pending_refresh(
+    bug_id: str, required_commit: Optional[str], current_commit: Optional[str], partner_bug_id: str
+) -> Dict[str, Any]:
     info = pending_patch_refreshes.setdefault(
         bug_id,
         {
             "required_commit": required_commit,
             "current_commit": current_commit,
             "partners": set(),
+            "attempted": False,
+            "attempt_success": None,
         },
     )
     info["required_commit"] = required_commit
     info["current_commit"] = current_commit
     partners: Set[str] = info.setdefault("partners", set())
     partners.add(partner_bug_id)
+    return info
+
+
+def request_new_patch_for_bug(
+    bug_id: str, required_commit: Optional[str], current_commit: Optional[str], partner_bug_id: str
+) -> None:
+    """Invoke revert_patch_test for the given bug, recording attempt status."""
+    info = _record_pending_refresh(bug_id, required_commit, current_commit, partner_bug_id)
+    if info.get("attempted"):
+        return
+    success = _trigger_revert_patch_for_bug(bug_id, required_commit)
+    info["attempted"] = True
+    info["attempt_success"] = success
 
 
 def attach_local_bug_nodes(graph: PatchCompatibilityGraph) -> Tuple[int, int]:
@@ -424,9 +485,9 @@ def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Opt
         needs_refresh_b = prefix_b not in shared_prefixes
         representative_commit = next(iter(sorted(shared_commits))) if shared_commits else None
         if needs_refresh_a:
-            request_new_patch_for_bug(bug1, representative_commit or "", commit_a, bug2)
+            _record_pending_refresh(bug1, representative_commit or "", commit_a, bug2)
         if needs_refresh_b:
-            request_new_patch_for_bug(bug2, representative_commit or "", commit_b, bug1)
+            _record_pending_refresh(bug2, representative_commit or "", commit_b, bug1)
         if not needs_refresh_a and not needs_refresh_b:
             logger.info(
                 "Bugs %s and %s share at least one triggering commit with aligned patches; treating as compatible",
@@ -442,6 +503,7 @@ def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_dis
     """Build a compatibility graph where each node represents an entire patch dictionary."""
 
     pending_patch_refreshes.clear()
+    REFRESH_ATTEMPTS.clear()
     graph = PatchCompatibilityGraph()
 
     for key_tuple, patch_dict in patches_without_contexts.items():
@@ -531,7 +593,20 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]]) -> None:
     logger.info("Pending patch refreshes impacting Group 1 (%d bugs):", len(report_entries))
     for bug_id, required, current, partners_in_group in report_entries:
         partner_text = ", ".join(partners_in_group)
-        logger.info("  %s: requires %s (current %s) [shares commit with %s]", bug_id, required, current, partner_text)
+        info = filtered[bug_id]
+        attempt_note = ""
+        if info.get("attempted"):
+            attempt_status = "success" if info.get("attempt_success") else "failed"
+            attempt_note = f"; revert attempt {attempt_status}"
+        logger.info(
+            "  %s: requires %s (current %s) [shares commit with %s]%s",
+            bug_id,
+            required,
+            current,
+            partner_text,
+            attempt_note,
+        )
+        request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
 
 
 def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
@@ -615,6 +690,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Write the compatibility graph to this Graphviz DOT file for visualization.",
     )
+    parser.add_argument(
+        "--revert_target_test_result",
+        type=Path,
+        help="CSV file passed as target_test_result to revert_patch_test when fetching refreshed patches.",
+    )
+    parser.add_argument(
+        "--revert_bug_info",
+        type=Path,
+        help="JSON metadata passed as --bug_info to revert_patch_test.",
+    )
+    parser.add_argument(
+        "--revert_build_csv",
+        type=Path,
+        help="CSV with build mapping passed as --build_csv to revert_patch_test.",
+    )
+    parser.add_argument(
+        "--revert_target",
+        help="Target project name passed as --target to revert_patch_test.",
+    )
+    parser.add_argument(
+        "--revert_output_dir",
+        type=Path,
+        help="Directory where revert_patch_test stdout/stderr should be captured.",
+    )
     return parser.parse_args()
 
 
@@ -622,6 +721,28 @@ def main() -> None:
     args = parse_args()
     cache_file = args.cache_file
     patches_without_contexts = load_patches_pickle(cache_file)
+    revert_config: Optional[Dict[str, Any]] = None
+    revert_args_provided = [
+        args.revert_target_test_result,
+        args.revert_bug_info,
+        args.revert_build_csv,
+        args.revert_target,
+    ]
+    if all(revert_args_provided):
+        revert_config = {
+            "target_test_result": args.revert_target_test_result,
+            "bug_info": args.revert_bug_info,
+            "build_csv": args.revert_build_csv,
+            "target": args.revert_target,
+        }
+        if args.revert_output_dir:
+            revert_config["output_dir"] = args.revert_output_dir
+    elif any(revert_args_provided):
+        logger.warning(
+            "Incomplete revert_patch_test configuration supplied; automatic patch refresh disabled. "
+            "Provide all --revert_* flags to enable it."
+        )
+    configure_revert_patch(revert_config)
     bug_distribution = None
     if args.bug_distribution_csv:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
