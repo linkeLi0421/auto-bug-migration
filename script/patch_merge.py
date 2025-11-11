@@ -654,7 +654,7 @@ def parse_csv_data(csv_content: str) -> list[dict[str, Any]]:
             bug_id = headers[idx]
             value = values[idx] or None
             row["osv_statuses"][bug_id] = value
-            if value == "1|1":
+            if value == "1|1" or value == "0.5|1":
                 row["poc_count"] += 1
 
         parsed_rows.append(row)
