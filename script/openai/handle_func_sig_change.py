@@ -7,7 +7,7 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 def extract_code(text):
-    blocks = re.findall(r"```(?:")?\w+"?\n(.*?)```", text, re.DOTALL)
+    blocks = re.findall(r"```(?:\w+)?\n(.*?)```", text, re.DOTALL)
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
