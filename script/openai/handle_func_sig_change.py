@@ -33,6 +33,7 @@ def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB,
 CRITICAL INSTRUCTIONS:
 1. DO NOT modify any function calls starting with "__revert_" unless they are explicitly mentioned in the error
 2. DO NOT change any other lines or function calls not mentioned in the error message
+3. DO NOT redeclare existing variables; reuse them if already defined in the function
 
 ERROR MESSAGE:
 {error_message}
