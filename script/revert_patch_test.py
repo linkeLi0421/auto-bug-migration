@@ -3814,7 +3814,7 @@ def revert_patch_test(args):
         
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
-        if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        if not apply_and_test_patches(patch_pair_list, patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
@@ -3831,7 +3831,7 @@ def revert_patch_test(args):
         get_patched_traces, transitions, signature_change_list = mutable_args
         # test if the local bugs is still there
         for bug_id_trigger in bug_ids_trigger:
-            if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], get_patched_traces[bug_id][-1]) == 'not trigger':
+            if test_fuzzer(args, bug_id_trigger, target, next_commit['commit_id'], get_patched_traces[bug_id][-1]) == 'not trigger':
                 logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
             else:
                 logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger}')
@@ -3864,34 +3864,29 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
     # Use absolute path for the cache file
     cache_file = os.path.join(data_path, "patches", f"{args.target}_patches.pkl.gz")
     # Create cache_file's folder if it doesn't exist
     os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    if os.path.exists(cache_file):
+        patches_without_contexts = load_patches_pickle(cache_file)
+    else:
+        patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
+        # Save the patches to cache file
+        save_patches_pickle(patches_without_contexts, cache_file)
+    
+        for bug_id, affected_bugs in test_local_bug_after_patch.items():
+            logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
+
     for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
         logger.info(f'bug_id {bug_id}')
-        for patch in patch_dict.values():
-            if patch.new_signature:
-                logger.info(f'  new_signature {patch.new_signature}')
-            elif patch.old_signature:
-                logger.info(f'  old_signature {patch.old_signature}')
-    
-    for bug_id, affected_bugs in test_local_bug_after_patch.items():
-        logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
-
-    # Save the patches to cache file
-    save_patches_pickle(patches_without_contexts, cache_file)
-    
-    patches_without_contexts = load_patches_pickle(cache_file)
-    # need_merge = dict()
-    # for (bug_id, commit_id, fuzzer), patch_dict in patches_without_contexts.items():
-    #     if bug_id in {'OSV-2021-485', 'OSV-2021-622'}:
-    #         need_merge.setdefault((bug_id, commit_id, fuzzer), dict()).update(patch_dict)
-        # logger.info(f'bug_id {bug_id}')
-        # for patch in patch_dict.values():
-        #     if 'new_signature' in patch:
-        #         logger.info(f'new_signature: {patch['new_signature']}')
-        #     elif 'old_signature' in patch:
-        #         logger.info(f'old_signature: {patch['old_signature']}')
-    
+        for key in patch_dict:
+            patch = patch_dict[key]
+            if patch.hiden_func_dict:
+                for func_sig in patch.hiden_func_dict:
+                    logger.info(f'-->{func_sig}\n###{patch.hiden_func_dict[func_sig]}')
+            else:
+                if patch.new_signature:
+                    logger.info(f'-->{patch.new_signature}')
+                elif patch.old_signature:
+                    logger.info(f'-->{patch.old_signature}')
