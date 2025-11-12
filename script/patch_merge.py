@@ -152,8 +152,17 @@ def _integrate_refreshed_patches(bug_id: str, new_patches: Optional[Dict[PatchSe
         return
 
     removed_any = False
-    for key in list(CURRENT_PATCHES.keys()):
-        if isinstance(key, tuple) and key and key[0] == bug_id:
+    for key, patch in list(CURRENT_PATCHES.items()):
+        owner: Optional[str] = None
+        if isinstance(key, tuple) and key:
+            candidate = key[0]
+            if isinstance(candidate, str):
+                owner = candidate
+        if owner is None and isinstance(patch, dict):
+            candidate = patch.get("bug_id")
+            if isinstance(candidate, str):
+                owner = candidate
+        if owner == bug_id:
             del CURRENT_PATCHES[key]
             removed_any = True
 
@@ -391,14 +400,18 @@ def _record_pending_refresh(
             "required_commit": required_commit,
             "current_commit": current_commit,
             "partners": set(),
+            "partner_requirements": {},
             "attempted": False,
             "attempt_success": None,
         },
     )
-    info["required_commit"] = required_commit
+    if required_commit:
+        info["required_commit"] = required_commit
     info["current_commit"] = current_commit
     partners: Set[str] = info.setdefault("partners", set())
     partners.add(partner_bug_id)
+    partner_requirements: Dict[str, Optional[str]] = info.setdefault("partner_requirements", {})
+    partner_requirements[partner_bug_id] = required_commit
     return info
 
 
@@ -581,6 +594,18 @@ def is_compatiable(
                 bug1,
                 bug2,
             )
+        else:
+            refresh_notes = []
+            if needs_refresh_a:
+                refresh_notes.append(f"{bug1} needs {required_commit_a or 'unknown'}")
+            if needs_refresh_b:
+                refresh_notes.append(f"{bug2} needs {required_commit_b or 'unknown'}")
+            logger.info(
+                "Bugs %s and %s share at least one triggering commit but require refresh before alignment (%s)",
+                bug1,
+                bug2,
+                ", ".join(refresh_notes),
+            )
         return True
 
     return False
@@ -635,6 +660,15 @@ def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) 
         logger.info("No fully compatible bug groups of size >= %d found.", min_size)
         return []
 
+    def group_sort_key(group: List[PatchSetKey]) -> Tuple[int, int, Tuple[str, ...]]:
+        local_bug_count = sum(1 for identifier in group if _is_local_bug_identifier(identifier))
+        identifier_strings = tuple(str(identifier) for identifier in group)
+        # Sort primarily by group size (descending), then by local bug count (descending),
+        # and finally by identifier strings to keep ordering stable.
+        return (-len(group), -local_bug_count, identifier_strings)
+
+    groups.sort(key=group_sort_key)
+
     logger.info("Detected %d fully compatible bug groups (size >= %d):", len(groups), min_size)
     for idx, group in enumerate(groups, start=1):
         identifiers = [describe_identifier(identifier) for identifier in group]
@@ -666,25 +700,51 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int)
     if not filtered:
         return
 
-    report_entries: List[Tuple[str, str, str, List[str]]] = []
+    report_entries: List[Dict[str, Any]] = []
     for bug_id in sorted(filtered):
         info = filtered[bug_id]
         partners = sorted(info.get("partners", []))
         partners_in_group = [partner for partner in partners if partner in relevant_bug_ids]
         if not partners_in_group:
             continue
-        required = (info.get("required_commit") or "unknown")[:6]
-        current = (info.get("current_commit") or "unknown")[:6]
-        report_entries.append((bug_id, required, current, partners_in_group))
+        partner_requirements: Dict[str, Optional[str]] = info.get("partner_requirements", {})
+        partner_details = [
+            {
+                "partner": partner,
+                "commit": partner_requirements.get(partner),
+            }
+            for partner in partners_in_group
+        ]
+        report_entries.append(
+            {
+                "bug_id": bug_id,
+                "info": info,
+                "partner_details": partner_details,
+            }
+        )
 
     if not report_entries:
-        logger.info("Pending patch refreshes impacting Group 1: none")
+        logger.info("Pending patch refreshes impacting Group %d: none", idx)
         return
 
     logger.info("Pending patch refreshes impacting Group %d (%d bugs):", idx, len(report_entries))
-    for bug_id, required, current, partners_in_group in report_entries:
-        partner_text = ", ".join(partners_in_group)
-        info = filtered[bug_id]
+    for entry in report_entries:
+        bug_id = entry["bug_id"]
+        info = entry["info"]
+        partner_details = entry["partner_details"]
+        first_partner = partner_details[0]["partner"] if partner_details else None
+        required_full = partner_details[0]["commit"] if partner_details else None
+        if not required_full:
+            required_full = info.get("required_commit")
+        current_full = info.get("current_commit")
+        required_fragment = (required_full or "unknown")[:6]
+        current_fragment = (current_full or "unknown")[:6]
+        partner_text = ", ".join(
+            f"{detail['partner']}@{(detail['commit'] or 'unknown')[:6]}"
+            if detail.get("commit")
+            else detail["partner"]
+            for detail in partner_details
+        )
         attempt_note = ""
         if info.get("attempted"):
             attempt_status = "success" if info.get("attempt_success") else "failed"
@@ -692,12 +752,13 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int)
         logger.info(
             "  %s: requires %s (current %s) [shares commit with %s]%s",
             bug_id,
-            required,
-            current,
+            required_fragment,
+            current_fragment,
             partner_text,
             attempt_note,
         )
-        request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
+        if first_partner:
+            request_new_patch_for_bug(bug_id, required_full, current_full, first_partner)
 
 
 def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
@@ -848,6 +909,7 @@ def main() -> None:
         for idx, candidate in enumerate(groups):
             if len(groups[0]) == len(candidate):
                 report_pending_patch_refreshes(candidate, idx+1)
+            break
         if REANALYZE_PENDING:
             logger.info("Detected refreshed patches; re-running compatibility analysis.\n")
             REANALYZE_PENDING = False
