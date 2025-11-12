@@ -3566,8 +3566,9 @@ def apply_and_test_patches(
         return 'build_fail'
 
 
-def test_fuzzer(bug_info_path, bug_id, target, commit_id, patch_path):
+def test_fuzzer(args, bug_id, target, commit_id, patch_path):
     # Run the fuzzer to test if the bug is reproduced
+    bug_info_path = args.bug_info
     testcases_env = os.getenv('TESTCASES', '')
     bug_info_dataset = read_json_file(bug_info_path)
     bug_info = bug_info_dataset[bug_id]
@@ -3822,7 +3823,6 @@ def revert_patch_test(args):
             minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
             logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
-        apply_and_test_patches(patch_pair_list, patches_without_context, *mutable_args, *inmutable_args)
         patches_without_contexts[
             (bug_id, commit['commit_id'], fuzzer,
             tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
@@ -3838,13 +3838,6 @@ def revert_patch_test(args):
                 test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
 
         get_patched_traces, transitions, signature_change_list = mutable_args
-        # test if the local bugs is still there
-        for bug_id_trigger in bug_ids_trigger:
-            if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], get_patched_traces[bug_id][-1]) == 'not trigger':
-                logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
-            else:
-                logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger}')
-                test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
 
         if not os.path.exists(os.path.join(data_path, 'signature_change_list')):
             os.makedirs(os.path.join(data_path, 'signature_change_list'))

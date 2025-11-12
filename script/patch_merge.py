@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Tuple, Any, DefaultDict, Set, Callable, Iterable, Optional, List
 from contextlib import redirect_stdout, redirect_stderr
 from types import SimpleNamespace
 
-from utils import load_patches_pickle
+from utils import load_patches_pickle, save_patches_pickle
 from revert_patch_test import PatchInfo, FunctionLocation, revert_patch_test as execute_revert_patch_test
 
 patch_pair_dict = {
@@ -139,6 +140,34 @@ PendingRefreshInfo = Dict[str, Any]
 pending_patch_refreshes: Dict[str, PendingRefreshInfo] = {}
 REVERT_PATCH_CONFIG: Optional[Dict[str, Any]] = None
 REFRESH_ATTEMPTS: Set[Tuple[str, str]] = set()
+MAIN_CACHE_PATH: Optional[Path] = None
+CURRENT_PATCHES: Optional[Dict[PatchSetKey, PatchSet]] = None
+REANALYZE_PENDING = False
+
+
+def _integrate_refreshed_patches(bug_id: str, new_patches: Optional[Dict[PatchSetKey, PatchSet]]) -> None:
+    """Replace cached patches for a bug with refreshed patches and mark for reanalysis."""
+    global CURRENT_PATCHES, MAIN_CACHE_PATH, REANALYZE_PENDING
+    if CURRENT_PATCHES is None or MAIN_CACHE_PATH is None or not new_patches:
+        return
+
+    removed_any = False
+    for key in list(CURRENT_PATCHES.keys()):
+        if isinstance(key, tuple) and key and key[0] == bug_id:
+            del CURRENT_PATCHES[key]
+            removed_any = True
+
+    CURRENT_PATCHES.update(new_patches)
+    REANALYZE_PENDING = True
+    logger.info(
+        "Integrated refreshed patches for %s into %s%s",
+        bug_id,
+        MAIN_CACHE_PATH,
+        " (replaced prior entries)" if removed_any else "",
+    )
+current_file_path = os.path.dirname(os.path.abspath(__file__))
+ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
+data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
 
 
 logger = logging.getLogger(__name__)
@@ -183,16 +212,18 @@ def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -
         log_path = output_dir / f"revert_{config['target']}_{bug_id}_{required_commit[:6]}.log"
 
     try:
+        patches: Optional[Dict[str, Any]] = None
+        local_tests: Optional[Dict[str, Any]] = None
         if log_path:
             with log_path.open("w", encoding="utf-8") as handle, redirect_stdout(handle), redirect_stderr(handle):
-                execute_revert_patch_test(args)
+                patches, local_tests = execute_revert_patch_test(args)
         else:
-            execute_revert_patch_test(args)
+            patches, local_tests = execute_revert_patch_test(args)
         logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:6])
-        return True
+        return {"patches": patches, "local_tests": local_tests}
     except Exception:
         logger.exception("Failed to trigger revert_patch_test for bug %s", bug_id)
-        return False
+        return None
 
 
 class PatchCompatibilityGraph:
@@ -376,11 +407,29 @@ def request_new_patch_for_bug(
 ) -> None:
     """Invoke revert_patch_test for the given bug, recording attempt status."""
     info = _record_pending_refresh(bug_id, required_commit, current_commit, partner_bug_id)
-    if info.get("attempted"):
+    cache_dir = Path(data_path) / "patches"
+    target_name = (
+        REVERT_PATCH_CONFIG.get("target") if REVERT_PATCH_CONFIG and "target" in REVERT_PATCH_CONFIG else "target"
+    )
+    commit_fragment = (required_commit or "unknown")[:6]
+    cache_file = cache_dir / f"{target_name}_{bug_id}_{commit_fragment}_patches.pkl.gz"
+    logger.info("Checking for cached refreshed patches for %s at %s", bug_id, cache_file)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if cache_file.exists():
+        info["cached_patch"] = cache_file
+        patches = load_patches_pickle(cache_file)
+        _integrate_refreshed_patches(bug_id, patches)
         return
-    success = _trigger_revert_patch_for_bug(bug_id, required_commit)
-    info["attempted"] = True
-    info["attempt_success"] = success
+    else:
+        if info.get("attempted"):
+            return
+        result = _trigger_revert_patch_for_bug(bug_id, required_commit)
+        info["attempted"] = True
+        info["attempt_success"] = bool(result)
+        if result and result.get("patches"):
+            info["refresh_result"] = result
+            save_patches_pickle(result["patches"], cache_file)
+            _integrate_refreshed_patches(bug_id, result["patches"])
 
 
 def attach_local_bug_nodes(graph: PatchCompatibilityGraph) -> Tuple[int, int]:
@@ -648,7 +697,7 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int)
             partner_text,
             attempt_note,
         )
-        # request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
+        request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
 
 
 def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
@@ -761,8 +810,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    global MAIN_CACHE_PATH, CURRENT_PATCHES
     cache_file = args.cache_file
     patches_without_contexts = load_patches_pickle(cache_file)
+    MAIN_CACHE_PATH = cache_file
+    CURRENT_PATCHES = patches_without_contexts
     revert_config: Optional[Dict[str, Any]] = None
     revert_args_provided = [
         args.revert_target_test_result,
@@ -788,14 +840,21 @@ def main() -> None:
     bug_distribution = None
     if args.bug_distribution_csv:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
-    graph = merge_patches(patches_without_contexts, bug_distribution)
-    groups = report_compatible_groups(graph)
-    group_one = groups[0] if groups else None
-    for idx, candidate in enumerate(groups):
-        if len(groups[0]) == len(candidate):
-            report_pending_patch_refreshes(candidate, idx+1)
-    if args.graphviz_output:
-        write_graphviz(graph, args.graphviz_output)
+    global REANALYZE_PENDING
+    while True:
+        graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution)
+        groups = report_compatible_groups(graph)
+        group_one = groups[0] if groups else None
+        for idx, candidate in enumerate(groups):
+            if len(groups[0]) == len(candidate):
+                report_pending_patch_refreshes(candidate, idx+1)
+        if REANALYZE_PENDING:
+            logger.info("Detected refreshed patches; re-running compatibility analysis.\n")
+            REANALYZE_PENDING = False
+            continue
+        if args.graphviz_output:
+            write_graphviz(graph, args.graphviz_output)
+        break
 
 
 if __name__ == "__main__":
