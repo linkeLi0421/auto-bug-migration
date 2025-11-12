@@ -320,6 +320,37 @@ def _commit_prefix(commit_id: Optional[str], length: int = 6) -> Optional[str]:
     return None
 
 
+def _build_commit_index(parsed_data: Optional[List[Dict[str, Any]]]) -> Dict[str, int]:
+    """Return mapping from commit id to its order index in the CSV."""
+    if not parsed_data:
+        return {}
+    return {row.get("commit_id"): idx for idx, row in enumerate(parsed_data) if row.get("commit_id")}
+
+
+def _select_best_shared_commit(
+    shared_commits: Set[str], reference_commit: Optional[str], commit_index: Dict[str, int]
+) -> Optional[str]:
+    """Choose the shared commit closest to the reference commit in the CSV ordering."""
+    if not shared_commits:
+        return None
+    if not commit_index:
+        return next(iter(shared_commits))
+
+    def idx(commit: str) -> int:
+        return commit_index.get(commit, float("inf"))
+
+    if reference_commit and reference_commit in commit_index:
+        ref_idx = commit_index[reference_commit]
+        best_commit = min(shared_commits, key=lambda commit: abs(idx(commit) - ref_idx))
+        if idx(best_commit) != float("inf"):
+            return best_commit
+
+    best_commit = min(shared_commits, key=lambda commit: idx(commit))
+    if idx(best_commit) == float("inf"):
+        return next(iter(shared_commits))
+    return best_commit
+
+
 def _record_pending_refresh(
     bug_id: str, required_commit: Optional[str], current_commit: Optional[str], partner_bug_id: str
 ) -> Dict[str, Any]:
@@ -447,7 +478,12 @@ def write_graphviz(graph: PatchCompatibilityGraph, output_path: Path) -> None:
     )
 
 
-def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Optional[List[Dict[str, Any]]] = None) -> bool:
+def is_compatiable(
+    key_a: PatchSetKey,
+    key_b: PatchSetKey,
+    bug_distribution: Optional[List[Dict[str, Any]]] = None,
+    commit_index: Optional[Dict[str, int]] = None,
+) -> bool:
     """Return True when two patch sets are compatible based on touched functions and shared triggers."""
 
     def extract_functions(key: PatchSetKey) -> Set[str]:
@@ -483,11 +519,13 @@ def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Opt
         prefix_b = _commit_prefix(commit_b)
         needs_refresh_a = prefix_a not in shared_prefixes
         needs_refresh_b = prefix_b not in shared_prefixes
-        representative_commit = next(iter(sorted(shared_commits))) if shared_commits else None
+        commit_map = commit_index or {}
+        required_commit_a = _select_best_shared_commit(shared_commits, commit_a, commit_map)
+        required_commit_b = _select_best_shared_commit(shared_commits, commit_b, commit_map)
         if needs_refresh_a:
-            _record_pending_refresh(bug1, representative_commit or "", commit_a, bug2)
+            _record_pending_refresh(bug1, required_commit_a or "", commit_a, bug2)
         if needs_refresh_b:
-            _record_pending_refresh(bug2, representative_commit or "", commit_b, bug1)
+            _record_pending_refresh(bug2, required_commit_b or "", commit_b, bug1)
         if not needs_refresh_a and not needs_refresh_b:
             logger.info(
                 "Bugs %s and %s share at least one triggering commit with aligned patches; treating as compatible",
@@ -499,7 +537,10 @@ def is_compatiable(key_a: PatchSetKey, key_b: PatchSetKey, bug_distribution: Opt
     return False
 
 
-def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_distribution: Optional[List[Dict[str, Any]]] = None) -> PatchCompatibilityGraph:
+def merge_patches(
+    patches_without_contexts: Dict[PatchSetKey, PatchSet],
+    bug_distribution: Optional[List[Dict[str, Any]]] = None,
+) -> PatchCompatibilityGraph:
     """Build a compatibility graph where each node represents an entire patch dictionary."""
 
     pending_patch_refreshes.clear()
@@ -512,7 +553,8 @@ def merge_patches(patches_without_contexts: Dict[PatchSetKey, PatchSet], bug_dis
             continue
         graph.add_patch(key_tuple, patch_dict)
 
-    graph.connect_compatibilities(lambda a, b: is_compatiable(a, b, bug_distribution))
+    commit_index = _build_commit_index(bug_distribution)
+    graph.connect_compatibilities(lambda a, b: is_compatiable(a, b, bug_distribution, commit_index))
     local_nodes_added, local_edges_added = attach_local_bug_nodes(graph)
 
     total_edges = graph.edge_count()
@@ -551,7 +593,7 @@ def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) 
     return groups
 
 
-def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]]) -> None:
+def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int) -> None:
     """
     Emit recorded patch refresh requirements scoped to the provided group (typically Group 1).
     """
@@ -590,7 +632,7 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]]) -> None:
         logger.info("Pending patch refreshes impacting Group 1: none")
         return
 
-    logger.info("Pending patch refreshes impacting Group 1 (%d bugs):", len(report_entries))
+    logger.info("Pending patch refreshes impacting Group %d (%d bugs):", idx, len(report_entries))
     for bug_id, required, current, partners_in_group in report_entries:
         partner_text = ", ".join(partners_in_group)
         info = filtered[bug_id]
@@ -606,7 +648,7 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]]) -> None:
             partner_text,
             attempt_note,
         )
-        request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
+        # request_new_patch_for_bug(bug_id, info.get("required_commit"), info.get("current_commit"), partners_in_group[0])
 
 
 def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
@@ -749,7 +791,9 @@ def main() -> None:
     graph = merge_patches(patches_without_contexts, bug_distribution)
     groups = report_compatible_groups(graph)
     group_one = groups[0] if groups else None
-    report_pending_patch_refreshes(group_one)
+    for idx, candidate in enumerate(groups):
+        if len(groups[0]) == len(candidate):
+            report_pending_patch_refreshes(candidate, idx+1)
     if args.graphviz_output:
         write_graphviz(graph, args.graphviz_output)
 
