@@ -3639,6 +3639,10 @@ def revert_patch_test(args):
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
+        if args.bug_id and bug_id != args.bug_id:
+            continue
+        if args.buggy_commit:
+            commit['commit_id'] = args.buggy_commit[:6]
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -3807,7 +3811,6 @@ def revert_patch_test(args):
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
-        patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
         if not apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
@@ -3819,15 +3822,20 @@ def revert_patch_test(args):
             minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
             logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
-        # apply_and_test_patches(patch_pair_list, dict(), *mutable_args, *inmutable_args)
-        patches_without_contexts[(bug_id, commit['commit_id'], fuzzer, [diff_results[key].old_function_name for key in keys for keys in minimal_fast])] = patches_without_context
-        # # test if the local bugs is still there 
-        # if 'patch_path' in patches_without_context: # if the bug trigger
-        #     for bug_id_trigger in bug_ids_trigger:
-        #         if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], patches_without_context['patch_path']) == 'not trigger':
-        #             logger.info(f'\t{fuzzer} not trigger local bug {bug_id_trigger}')
-        #         else:
-        #             logger.info(f'\t{fuzzer} trigger local bug {bug_id_trigger}')
+        apply_and_test_patches(patch_pair_list, patches_without_context, *mutable_args, *inmutable_args)
+        patches_without_contexts[
+            (bug_id, commit['commit_id'], fuzzer,
+            tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
+        ] = patches_without_context
+
+        get_patched_traces, transitions, signature_change_list = mutable_args
+        # test if the local bugs is still there
+        for bug_id_trigger in bug_ids_trigger:
+            if test_fuzzer(args.bug_info, bug_id_trigger, target, next_commit['commit_id'], get_patched_traces[bug_id][-1]) == 'not trigger':
+                logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
+            else:
+                logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger}')
+                test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
 
         get_patched_traces, transitions, signature_change_list = mutable_args
         # test if the local bugs is still there
