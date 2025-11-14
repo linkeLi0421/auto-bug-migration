@@ -3,6 +3,7 @@ import argparse
 import subprocess
 import json
 import os
+import tempfile
 from git import Repo, GitCommandError
 import logging
 from pathlib import Path
@@ -20,9 +21,10 @@ from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from cfg_parser import CFGBlock, parse_cfg_text, find_block_by_line, compute_data_dependencies
+from monitor_crash import extract_function_stack, build_stack_patterns, _stack_matches_patterns
 from utils import (
     minimize_greedy,
-    minimize_ddmin,
+    minimize_func_list_greedy,
     apply_unified_diff_to_string,
     split_function_parts,
     diff_strings,
@@ -342,7 +344,7 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     return None
 
 
-def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions):
+def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions, func_list):
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
@@ -409,8 +411,12 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 def_file_path_new = file_path_new_
 
         if callee_sig and caller_sig:
-            function_declarations.add(callee_sig.replace(fname, f'__revert_{commit}_{fname}'))
-            func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, def_file_path_old, callee_sig)
+            if callee_sig in func_list:
+                callee_commit = next_commit
+            else:
+                callee_commit = commit
+            function_declarations.add(callee_sig.replace(fname, f'__revert_{callee_commit}_{fname}'))
+            func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, callee_commit, data_path, def_file_path_old, callee_sig)
             cur_fun_info = FunctionInfo(name=fname, signature=callee_sig, file_path_old=def_file_path_old, func_used_file=file_path_new, keywords=['static'])
             if cur_fun_info in recreated_functions:
                 continue
@@ -420,7 +426,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             if not func_code:
                 logger.error(f'No func code found for {def_file_path_old}: {callee_sig}')
                 for recreate_func, recreate_func_loc in diff_results[key_of_error_patch].recreated_function_locations.items():
-                    func_code, func_length, start_line = get_function_code_by_line(target_repo_path, commit, data_path, recreate_func_loc.file_path, recreate_func_loc.start_line)
+                    func_code, func_length, start_line = get_function_code_by_line(target_repo_path, callee_commit, data_path, recreate_func_loc.file_path, recreate_func_loc.start_line)
                     if func_code:
                         logger.info(f'Found func code for {def_file_path_old}: {callee_sig} in recreated function {recreate_func} at {recreate_func_loc}')
                         break
@@ -436,14 +442,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 with open(os.path.join(target_repo_path, file_path_new), 'r', encoding="latin-1") as f:
                     lines = f.readlines()
                 artificial_patch_insert_point = len(lines)+1
-                # Find call in this function, check if we need to replace them with recreated functions
-                parsing_path = os.path.join(
-                    data_path,
-                    f"{target_repo_path.split('/')[-1]}-{commit}",
-                    f"{def_file_path_old}_analysis.json",
-                )
-                with open(parsing_path, 'r') as f:
-                    ast_nodes = json.load(f)
 
                 func_code = '\n'.join(rename_func(func_code, fname, commit))
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc))
@@ -746,6 +744,66 @@ def parse_csv_data(csv_content):
             data.append(row)
     
     return data
+
+
+def select_crash_test_input(bug_id: str, testcases_dir: str) -> str:
+    """Return preferred testcase filename for crash collection."""
+    base_name = f'testcase-{bug_id}'
+    if not testcases_dir:
+        return base_name
+    original_candidate = f'{base_name}-original'
+    original_path = os.path.join(testcases_dir, original_candidate)
+    if os.path.exists(original_path):
+        return original_candidate
+    return base_name
+
+
+def crashes_match(test_output: str, baseline_path: str, signature_file: Optional[str]) -> bool:
+    """Compare crash logs using stack traces and optional signature mapping."""
+    if not os.path.exists(baseline_path):
+        logger.warning("Baseline crash log %s not found; skipping comparison.", baseline_path)
+        return True
+    signature_arg = signature_file if signature_file and os.path.exists(signature_file) else None
+    try:
+        baseline_stack, signature_map = extract_function_stack(
+            baseline_path,
+            signature_file=signature_arg,
+            apply_signatures=False,
+            return_signature_map=True,
+        )
+    except Exception:
+        logger.exception("Failed to parse baseline crash log %s", baseline_path)
+        return True
+    if not baseline_stack:
+        logger.warning("Baseline crash stack empty for %s; skipping comparison.", baseline_path)
+        return True
+
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".log") as tmp:
+            tmp.write(test_output.encode('utf-8', errors='ignore'))
+            tmp_path = tmp.name
+        current_stack = extract_function_stack(
+            tmp_path,
+            signature_file=signature_arg,
+            apply_signatures=False,
+        )
+    except Exception:
+        logger.exception("Failed to parse reproduced crash output.")
+        return False
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+    patterns = build_stack_patterns(baseline_stack, signature_map or {})
+    if not _stack_matches_patterns(current_stack, patterns):
+        logger.info(
+            "Crash stack mismatch detected.\nBaseline: %s\nCurrent: %s",
+            baseline_stack,
+            current_stack,
+        )
+        return False
+    return True
 
 
 def is_ancestor(repo_path: str, older_commit: str, newer_commit: str) -> bool:
@@ -1170,6 +1228,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch , target
     ]
 
+    cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     stdout = clean_log(result.stdout)
@@ -1453,6 +1512,63 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     return dependence_graph, new_patch_to_patch
 
 
+def remove_context(patches: Dict[str, PatchInfo]) -> Dict[str, PatchInfo]:
+    """
+    Strip context lines (those starting with a single space) from each patch hunk.
+    Updates both the hunk header and PatchInfo line metadata so the returned patches
+    describe only the modified lines.
+    """
+    header_pattern = re.compile(
+        r'@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? '
+        r'\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<suffix>.*)'
+    )
+    stripped_patches: Dict[str, PatchInfo] = {}
+    for key, patch in patches.items():
+        patch_copy = copy.deepcopy(patch)
+        lines = patch_copy.patch_text.split('\n')
+        try:
+            header_index = next(i for i, line in enumerate(lines) if line.startswith('@@'))
+        except StopIteration:
+            stripped_patches[key] = patch_copy
+            continue
+
+        header_line = lines[header_index]
+        match = header_pattern.match(header_line)
+        if not match:
+            stripped_patches[key] = patch_copy
+            continue
+
+        body_lines = lines[header_index + 1 :]
+        leading_context = 0
+        for line in body_lines:
+            if line.startswith(' '):
+                leading_context += 1
+            else:
+                break
+
+        body_without_context = [line for line in body_lines if not line.startswith(' ')]
+        # Ensure there is at least one actual diff line remaining; otherwise skip.
+        if not any(line.startswith(('+', '-')) for line in body_without_context):
+            stripped_patches[key] = patch_copy
+            continue
+
+        old_start = int(match.group('old_start')) + leading_context
+        new_start = int(match.group('new_start')) + leading_context
+        old_count = sum(1 for line in body_without_context if line.startswith('-'))
+        new_count = sum(1 for line in body_without_context if line.startswith('+'))
+        suffix = match.group('suffix') or ''
+
+        new_header = f'@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}'
+        patch_copy.patch_text = '\n'.join(lines[:header_index] + [new_header] + body_without_context)
+        patch_copy.old_start_line = old_start
+        patch_copy.old_end_line = old_start + old_count
+        patch_copy.new_start_line = new_start
+        patch_copy.new_end_line = new_start + new_count
+        stripped_patches[key] = patch_copy
+
+    return stripped_patches
+
+
 def add_context(diff_results, final_patches, new_commit, target_repo_path):
     patch_prev_key = None
     removed_patches = set()
@@ -1535,6 +1651,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         patch = diff_results[key]
         patch_text = patch.patch_text
         lines = patch_text.split('\n')
+        if lines[-1] == '':
+            lines = lines[:-1]
         if not patch.file_path_new or patch.file_path_new == '/dev/null':
             # a patch delete a file, skip now
             continue
@@ -1996,8 +2114,8 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                             file_path_new=file_path,
                             file_type='c',
                             patch_text=patch_text,
-                            old_signature='no change trace function',
-                            new_signature='no change trace function',
+                            old_signature=f'no change trace function {recreated_fname}',
+                            new_signature=f'no change trace function {recreated_fname}',
                             patch_type={'Function body change'},
                             dependent_func=set(),
                             new_start_line=start_line,
@@ -2176,7 +2294,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         relative_file_path = file_path.split('/', 3)[-1]
         start_line, end_line = line_range
         key_of_line_num, caller_sig, func_start_index, func_end_index = get_error_patch(relative_file_path, start_line, patch_key_list, diff_results, extra_patches)
-        if caller_sig == 'no change trace function':
+        if 'no change trace function' in caller_sig:
             continue
         callee_name = callee_line.split('(')[0].split(' ')[-1]
         callee_per_caller_dict.setdefault((key_of_line_num, caller_sig, func_start_index, func_end_index), []).append((callee_name, error_message))
@@ -3024,6 +3142,7 @@ def get_file_path_pairs(diff_results):
 
 def apply_and_test_patches(
     patch_pair_list,
+    func_list, # list of function signatures, use source code from next_commit
     patches_without_context,
     get_patched_traces,
     transitions,
@@ -3259,7 +3378,7 @@ def apply_and_test_patches(
                             func_decl_to_add.setdefault(file_path_new, set()).add(f'{func_decl}')
                         break
 
-        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions)
+        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions, func_list)
         logger.info(f'function_sig_changes: {[change[:-1] for change in function_sig_changes]}')
         if function_sig_changes and len(func_deled) == 0:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
@@ -3551,6 +3670,15 @@ def apply_and_test_patches(
         get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
         if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
+            combined_output = (test_result.stderr or '') + (test_result.stdout or '')
+            if not crashes_match(combined_output, baseline_crash_path, signature_file):
+                transitions.insert(0, (commit, next_commit, bug_id))
+                logger.info(
+                    "Crash for bug %s on commit %s does not match baseline stack; skipping.",
+                    bug_id,
+                    next_commit['commit_id'],
+                )
+                return 'crash_mismatch'
             if test_fuzzer_build(target, sanitizer, arch):
                 logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_and_fuzzer_build'
@@ -3617,6 +3745,10 @@ def revert_patch_test(args):
     if not repo_path:
         logger.info("REPO_PATH environment variable not set. Exiting.")
         exit(1)
+    testcases_env = os.getenv('TESTCASES', '')
+    if not testcases_env:
+        logger.info("TESTCASES environment variable not set. Exiting.")
+        exit(1)
 
     parsed_data = parse_csv_file(csv_file_path)
     target = args.target
@@ -3671,12 +3803,7 @@ def revert_patch_test(args):
         else:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
-        testcases_env = os.getenv('TESTCASES', '')
-        if testcases_env:
-            collect_trace_cmd.extend(['--testcases', testcases_env])
-        else:
-            logger.info("TESTCASES environment variable not set. Exiting.")
-            exit(1)
+        collect_trace_cmd.extend(['--testcases', testcases_env])
 
         collect_trace_cmd.extend(['--build_csv', args.build_csv])
 
@@ -3709,6 +3836,47 @@ def revert_patch_test(args):
         if not os.path.exists(trace_path2):
             logger.info(f"Trace file {trace_path2} does not exist, skipping bug {bug_id}")
             continue
+        crash_input_for_commit = select_crash_test_input(bug_id, testcases_env)
+        crash_log_path = os.path.join(
+            data_path,
+            'crash',
+            f'target_crash-{commit["commit_id"][:6]}-{crash_input_for_commit}.txt',
+        )
+        if not os.path.exists(crash_log_path):
+            collect_crash_cmd = [
+                py3,
+                f'{current_file_path}/fuzz_helper.py',
+                'collect_crash',
+                '--commit',
+                commit['commit_id'],
+                '--sanitizer',
+                sanitizer,
+                '--build_csv',
+                args.build_csv,
+                '--architecture',
+                arch,
+                '--testcases',
+                testcases_env,
+                '--test_input',
+                crash_input_for_commit,
+                target,
+                fuzzer,
+            ]
+            logger.info(
+                "Collecting crash log for bug %s using input %s: %s",
+                bug_id,
+                crash_input_for_commit,
+                " ".join(collect_crash_cmd),
+            )
+            try:
+                subprocess.run(
+                    collect_crash_cmd,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except subprocess.CalledProcessError as e:
+                logger.info(f"Collect crash command failed with exit code {e.returncode}")
         
         trace1 = extract_function_calls(trace_path1)
         trace2 = extract_function_calls(trace_path2)
@@ -3814,7 +3982,7 @@ def revert_patch_test(args):
         
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
-        if not apply_and_test_patches(patch_pair_list, patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        if not apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
@@ -3890,3 +4058,7 @@ if __name__ == "__main__":
                     logger.info(f'-->{patch.new_signature}')
                 elif patch.old_signature:
                     logger.info(f'-->{patch.old_signature}')
+        patch_not_context = remove_context(patch_dict)
+        for key in patch_not_context:
+            patch = patch_not_context[key]
+        patches_without_contexts[(bug_id, commit_id, fuzzer, input_functions)] = patch_not_context
