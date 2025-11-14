@@ -254,6 +254,8 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = get_poc_for_new_version(args)
   elif args.command == 'collect_trace':
     result = collect_trace(args)
+  elif args.command == 'collect_crash':
+    result = collect_crash(args)
   elif args.command == 'get_cfg':
     result = get_cfg(args)
   elif args.command == 'pull_images':
@@ -562,6 +564,31 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_sanitizer_args(collect_trace_parser)
   _add_environment_args(collect_trace_parser)
   _add_external_project_args(collect_trace_parser)
+
+  collect_crash_parser = subparsers.add_parser(
+      'collect_crash', help='run target inside container to capture crash log')
+  collect_crash_parser.add_argument('project',
+                            help='name of the project or path (external)')
+  collect_crash_parser.add_argument('source_path',
+                            help='path of local source',
+                            nargs='?')
+  collect_crash_parser.add_argument('fuzzer_name',
+                            help='name of the fuzzer')
+  collect_crash_parser.add_argument('--commit',
+                            help='commit hash to checkout in the builder')
+  collect_crash_parser.add_argument('--build_csv',
+                            help='this file contains a target project commit id and corresponding commit id')
+  collect_crash_parser.add_argument('--testcases',
+                            help='path to store testcases')
+  collect_crash_parser.add_argument('--test_input',
+                            help='test_input name')
+  collect_crash_parser.add_argument('--patch',
+                            help='patch file to apply in the builder')
+  _add_architecture_args(collect_crash_parser)
+  _add_engine_args(collect_crash_parser)
+  _add_sanitizer_args(collect_crash_parser)
+  _add_environment_args(collect_crash_parser)
+  _add_external_project_args(collect_crash_parser)
 
   get_cfg_parser = subparsers.add_parser(
       'get_cfg', help='get cfg for a project at a commit')
@@ -2654,6 +2681,10 @@ def get_dict(args):
 
 def collect_trace(args):
   """get traces about bug fix"""
+  if not args.commit:
+    logger.error('collect_trace requires --commit to be specified.')
+    return False
+  oss_fuzz_commit = args.commit
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
@@ -2737,6 +2768,103 @@ def collect_trace(args):
       '-t', f'gcr.io/{image_project}/{args.project.name}', 
       '/bin/bash', '-c', get_trace_log_bash(args.commit, args)
   ])
+  clean(args, out_dir)
+  docker_run(run_args, architecture=args.architecture)
+  return True
+
+
+def collect_crash(args):
+  """Collect crash logs by running the fuzzer inside the container."""
+  if not args.commit:
+    logger.error('collect_crash requires --commit to be specified.')
+    return False
+  if not args.testcases or not args.test_input:
+    logger.error('collect_crash requires both --testcases and --test_input.')
+    return False
+
+  oss_fuzz_commit = args.commit
+  if args.build_csv:
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+        if target_commit in args.commit or args.commit in target_commit:
+          logger.info(
+              'Found matching commit for base_commit in CSV: %s -> %s',
+              args.commit,
+              oss_fuzz_commit,
+          )
+          break
+
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  if not build_image_impl(args.project):
+    return False
+
+  env = [
+      'FUZZING_ENGINE=' + args.engine,
+      'SANITIZER=' + args.sanitizer,
+      'ARCHITECTURE=' + args.architecture,
+      'HELPER=True',
+  ]
+
+  if args.project.name != 'base-runner-debug':
+    env.append('FUZZING_LANGUAGE=' + args.project.language)
+
+  if args.e:
+    env += args.e
+
+  if is_base_image(args.project.name):
+    image_project = 'oss-fuzz-base'
+    out_dir = _get_out_dir()
+  else:
+    image_project = 'oss-fuzz'
+    out_dir = args.project.out
+
+  result_dir = os.path.join(HOME_DIR, 'data')
+  os.makedirs(result_dir, exist_ok=True)
+  crash_dir = os.path.join(result_dir, 'crash')
+  os.makedirs(crash_dir, exist_ok=True)
+
+  run_args = _env_to_docker_args(env)
+  if args.source_path:
+    workdir = _workdir_from_dockerfile(args.project)
+    run_args.extend([
+        '-v',
+        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
+    ])
+
+  testcases_path = _get_absolute_path(args.testcases)
+  if not os.path.exists(testcases_path):
+    logger.error('Testcase path %s does not exist.', args.testcases)
+    return False
+  run_args.extend([
+      '-v',
+      '%s:/corpus' % testcases_path,
+  ])
+
+  if args.patch:
+    run_args.extend([
+        '-v',
+        '%s:/patch' % args.patch,
+    ])
+
+  script_folder = os.path.join(HOME_DIR, 'script')
+  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
+  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
+  run_args.extend([
+      '-v', f'{out_dir}:/out',
+      '-v', f'{args.project.work}:/work',
+      '-v', f'{script_folder}:/script',
+      '-v', f'{Function_instrument}:/Function_instrument',
+      '-v', f'{LLVM_PROJECT}:/llvm',
+      '-v', f'{result_dir}:/data',
+      '-t', f'gcr.io/{image_project}/{args.project.name}',
+      '/bin/bash', '-c', get_crash_log_bash(args.commit, args)
+  ])
+
   clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   return True

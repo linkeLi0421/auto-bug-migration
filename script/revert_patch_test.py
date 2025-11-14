@@ -3884,7 +3884,7 @@ if __name__ == "__main__":
             patch = patch_dict[key]
             if patch.hiden_func_dict:
                 for func_sig in patch.hiden_func_dict:
-                    logger.info(f'-->{func_sig}\n###{patch.hiden_func_dict[func_sig]}')
+                    logger.info(f'-->{func_sig}\n')
             else:
                 if patch.new_signature:
                     logger.info(f'-->{patch.new_signature}')
