@@ -26,7 +26,7 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
         if key not in cache:
             items_copy = copy.deepcopy(items)
             ctx_copy   = copy.deepcopy(inmutable_args)
-            cache[key] = test_fn(items_copy, patches_without_context, *mutable_args, *ctx_copy)
+            cache[key] = test_fn(items_copy, [], patches_without_context, *mutable_args, *ctx_copy)
         return cache[key]
 
     while changed:
@@ -42,6 +42,39 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
             else:
                 i += 1
     return cur
+
+
+def minimize_func_list_greedy(func_list: List[Any], patch_pair_list: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
+    """
+    Variant of minimize_greedy that shrinks func_list while keeping patch_pair_list fixed.
+    Tests subsets of func_list with test_fn until no further removals keep the desired result.
+    """
+    cur_funcs = list(func_list)
+    cache: Dict[Tuple[int, ...], bool] = {}
+    baseline_patches = copy.deepcopy(patch_pair_list)
+
+    def cached_test(func_subset: List[Any]) -> bool:
+        key = tuple(id(x) for x in func_subset)
+        if key not in cache:
+            funcs_copy = copy.deepcopy(func_subset)
+            patches_copy = copy.deepcopy(baseline_patches)
+            ctx_copy = copy.deepcopy(inmutable_args)
+            cache[key] = test_fn(patches_copy, funcs_copy, patches_without_context, *mutable_args, *ctx_copy)
+        return cache[key]
+
+    changed = True
+    while changed:
+        changed = False
+        i = 0
+        while i < len(cur_funcs):
+            trial = cur_funcs[:i] + cur_funcs[i+1:]
+            if cached_test(trial) == 'trigger_and_fuzzer_build':
+                cur_funcs = trial
+                changed = True
+                break  # restart after successful removal
+            i += 1
+
+    return cur_funcs
 
 
 def save_patches_pickle(patches: Dict[str, Dict[str, Any]], path: str | Path) -> None:

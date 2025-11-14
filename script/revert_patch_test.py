@@ -3642,6 +3642,7 @@ def apply_and_test_patches(
                 patch = extra_patches[fun_info.func_used_file]
                 patch.patch_text = '\n'.join(rename_func(patch.patch_text, fun_info.name, commit['commit_id']))
 
+        patches_without_context = dict() # empty the dict before updating
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
                 # not_write_patches means the patch is merged with the extra patches
@@ -3659,6 +3660,20 @@ def apply_and_test_patches(
         last_type_def_to_add = copy.deepcopy(type_def_to_add)
         
     testcases_env = os.getenv('TESTCASES', '')
+    if not testcases_env:
+        logger.info("TESTCASES environment variable not set. Exiting.")
+        exit(1)
+    crash_test_input = select_crash_test_input(bug_id, testcases_env)
+    baseline_crash_path = os.path.join(
+        data_path,
+        'crash',
+        f'target_crash-{commit["commit_id"][:6]}-{crash_test_input}.txt',
+    )
+    signature_file = os.path.join(
+        data_path,
+        'signature_change_list',
+        f'{bug_id}_{next_commit["commit_id"]}.json',
+    )
     if build_success:
         # Run the fuzzer to test if the bug is reproduced
         testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
