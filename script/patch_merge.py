@@ -12,7 +12,13 @@ from contextlib import redirect_stdout, redirect_stderr
 from types import SimpleNamespace
 
 from utils import load_patches_pickle, save_patches_pickle
-from revert_patch_test import PatchInfo, FunctionLocation, revert_patch_test as execute_revert_patch_test
+from revert_patch_test import (
+    PatchInfo,
+    FunctionLocation,
+    revert_patch_test as execute_revert_patch_test,
+    add_context,
+    build_fuzzer,
+)
 
 patch_pair_dict = {
     'OSV-2021-27': [
@@ -177,6 +183,7 @@ def _integrate_refreshed_patches(bug_id: str, new_patches: Optional[Dict[PatchSe
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
+patch_path = os.path.join(os.path.join(current_file_path, '..', 'patch'))
 
 
 logger = logging.getLogger(__name__)
@@ -761,6 +768,91 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int)
             request_new_patch_for_bug(bug_id, required_full, current_full, first_partner)
 
 
+def finalize_patch_group(
+    group: Optional[List[PatchSetKey]],
+    patches: Optional[Dict[PatchSetKey, PatchSet]],
+    target_repo_path: Optional[str],
+    target_commit: Optional[str],
+) -> Optional[str]:
+    """Restore context lines for the selected group's patches by invoking add_context."""
+
+    if not group:
+        logger.info("No compatible group selected for finalization; skipping context restoration.")
+        return
+    if not patches:
+        logger.info("Patch cache is empty; nothing to finalize.")
+        return
+    if not target_repo_path:
+        logger.warning(
+            "Unable to finalize patches because target repository path is unknown; "
+            "set REPO_PATH and provide --revert_target."
+        )
+        return
+    if not os.path.isdir(target_repo_path):
+        logger.warning("Target repository path %s does not exist; skipping finalization.", target_repo_path)
+        return
+    if not target_commit:
+        logger.warning("target_commit not provided; cannot finalize merged patches.")
+        return
+
+    merged_patches: Dict[str, PatchInfo] = {}
+    key_list: List[str] = []
+
+    for identifier in group:
+        if _is_local_bug_identifier(identifier):
+            continue
+        patch_set = patches.get(identifier)
+        if not isinstance(patch_set, dict) or not patch_set:
+            continue
+        for patch_key, patch in patch_set.items():
+            if not isinstance(patch, PatchInfo):
+                continue
+            function_names = []
+            if patch.hiden_func_dict:
+                function_names = list(patch.hiden_func_dict.keys())
+            else:
+                function_names = [patch.old_signature]
+            merged_key = f"{identifier[1]}::{','.join(function_names)}"
+            merged_patches[merged_key] = patch
+            if merged_key not in key_list:
+                key_list.append(merged_key)
+
+    if not merged_patches:
+        logger.info("No PatchInfo entries found for the selected group; skipping finalization.")
+        return
+
+    sorted_keys = sorted(
+        key_list,
+        key=lambda key: getattr(merged_patches[key], "new_start_line", 0) or 0,
+        reverse=True,
+    )
+    
+    try:
+        add_context(merged_patches, sorted_keys, target_commit, target_repo_path)
+        logger.info(
+            "Restored context for commit %s using %d patches from %d identifiers.",
+            target_commit[:6],
+            len(sorted_keys),
+            len(group),
+        )
+    except Exception:
+        logger.exception("Failed to add context for commit %s.", target_commit)
+
+    final_path = os.path.join(
+        patch_path,
+        f"group_{target_commit[:6]}_final.diff",
+    )
+    os.makedirs(os.path.dirname(final_path), exist_ok=True)
+    with open(final_path, "w", encoding="utf-8") as handle:
+        for key in sorted_keys:
+            patch = merged_patches[key]
+            handle.write(patch.patch_text)
+            if not patch.patch_text.endswith("\n"):
+                handle.write("\n")
+    logger.info("Wrote merged finalized patches to %s", final_path)
+    return final_path
+
+
 def have_joint_triggers(parsed_data: list[dict[str, Any]], bug1: str, bug2: str) -> Set[str]:
     """
     Return the set of commit ids where both bugs are marked '1|1' or '0.5|1'.
@@ -866,6 +958,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Directory where revert_patch_test stdout/stderr should be captured.",
     )
+    parser.add_argument(
+        "--target_commit",
+        help="Commit hash to use as the base when re-adding context to merged patches.",
+    )
     return parser.parse_args()
 
 
@@ -917,6 +1013,15 @@ def main() -> None:
         if args.graphviz_output:
             write_graphviz(graph, args.graphviz_output)
         break
+
+    repo_base = os.getenv("REPO_PATH")
+    target_repo_path = (
+        os.path.join(repo_base, args.revert_target) if repo_base and args.revert_target else None
+    )
+    patch_file_path = finalize_patch_group(group_one, CURRENT_PATCHES, target_repo_path, args.target_commit)
+    build_success, error_log = build_fuzzer(args.revert_target, args.target_commit, 'address', '', str(patch_file_path), 'decompress_frame_fuzzer', args.revert_build_csv, 'x86')
+    if not build_success:
+        logger.error("Failed to build fuzzer with merged patches. See log:\n%s", error_log)
 
 
 if __name__ == "__main__":
