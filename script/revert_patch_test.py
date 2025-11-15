@@ -21,7 +21,12 @@ from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
 from cfg_parser import CFGBlock, parse_cfg_text, find_block_by_line, compute_data_dependencies
-from monitor_crash import extract_function_stack, build_stack_patterns, _stack_matches_patterns
+from monitor_crash import (
+    extract_function_stack,
+    build_stack_patterns,
+    _stack_matches_patterns,
+    _clean_function_name,
+)
 from utils import (
     minimize_greedy,
     minimize_func_list_greedy,
@@ -795,13 +800,49 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    patterns = build_stack_patterns(baseline_stack, signature_map or {})
-    if not _stack_matches_patterns(current_stack, patterns):
+    signature_map = signature_map or {}
+    baseline_variants: List[Set[str]] = []
+    for func in baseline_stack:
+        clean = _clean_function_name(func)
+        variants = {clean}
+        for mapped in signature_map.get(clean, []):
+            variants.add(_clean_function_name(mapped))
+        baseline_variants.append(variants)
+    current_clean = [_clean_function_name(func) for func in current_stack]
+
+    matches = 0
+    idx_current = 0
+    match_positions: List[Tuple[int, Optional[int]]] = []
+    for idx, variants in enumerate(baseline_variants):
+        pos: Optional[int] = None
+        for j in range(idx_current, len(current_clean)):
+            if current_clean[j] in variants:
+                pos = j
+                break
+        if pos is None:
+            match_positions.append((idx, None))
+            continue
+        matches += 1
+        match_positions.append((idx, pos))
+        idx_current = pos + 1
+
+    logger.info('signature_map: %s', signature_map)
+    required = max(1, int(len(baseline_variants) * 0.5))
+    if matches < required:
         logger.info(
-            "Crash stack mismatch detected.\nBaseline: %s\nCurrent: %s",
+            "Crash stack mismatch detected (matched %d/%d).\nBaseline: %s\nCurrent: %s",
+            matches,
+            len(baseline_variants),
             baseline_stack,
             current_stack,
         )
+        unmatched = []
+        for idx, pos in match_positions:
+            if pos is not None:
+                continue
+            observed = current_clean[idx_current] if idx_current < len(current_clean) else None
+            unmatched.append((list(baseline_variants[idx]), observed))
+        logger.info("Unmatched baseline frames (allowed variants, observed frame): %s", unmatched)
         return False
     return True
 
