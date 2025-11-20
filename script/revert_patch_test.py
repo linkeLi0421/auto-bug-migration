@@ -801,48 +801,59 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
             os.remove(tmp_path)
 
     signature_map = signature_map or {}
-    baseline_variants: List[Set[str]] = []
-    for func in baseline_stack:
-        clean = _clean_function_name(func)
-        variants = {clean}
-        for mapped in signature_map.get(clean, []):
-            variants.add(_clean_function_name(mapped))
-        baseline_variants.append(variants)
+    alias_adj: Dict[str, Set[str]] = defaultdict(set)
+    for base, mapped_list in signature_map.items():
+        base_clean = _clean_function_name(base)
+        alias_adj[base_clean].add(base_clean)
+        for mapped in mapped_list:
+            mapped_clean = _clean_function_name(mapped)
+            alias_adj[base_clean].add(mapped_clean)
+            alias_adj[mapped_clean].add(mapped_clean)
+            alias_adj[mapped_clean].add(base_clean)
+
+    def resolve_aliases(name: str) -> Set[str]:
+        clean = _clean_function_name(name)
+        visited: Set[str] = set()
+        stack = [clean]
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            stack.extend(alias_adj.get(current, []))
+        if not visited:
+            visited.add(clean)
+        return visited
+
+    baseline_clean = [_clean_function_name(func) for func in baseline_stack]
     current_clean = [_clean_function_name(func) for func in current_stack]
 
-    matches = 0
-    idx_current = 0
-    match_positions: List[Tuple[int, Optional[int]]] = []
-    for idx, variants in enumerate(baseline_variants):
-        pos: Optional[int] = None
-        for j in range(idx_current, len(current_clean)):
-            if current_clean[j] in variants:
-                pos = j
-                break
-        if pos is None:
-            match_positions.append((idx, None))
-            continue
-        matches += 1
-        match_positions.append((idx, pos))
-        idx_current = pos + 1
-
-    logger.info('signature_map: %s', signature_map)
-    required = max(1, int(len(baseline_variants) * 0.5))
-    if matches < required:
+    if len(baseline_clean) != len(current_clean):
         logger.info(
-            "Crash stack mismatch detected (matched %d/%d).\nBaseline: %s\nCurrent: %s",
-            matches,
-            len(baseline_variants),
+            "Crash stack depth mismatch (baseline %d vs current %d).\nBaseline: %s\nCurrent: %s",
+            len(baseline_clean),
+            len(current_clean),
             baseline_stack,
             current_stack,
         )
-        unmatched = []
-        for idx, pos in match_positions:
-            if pos is not None:
-                continue
-            observed = current_clean[idx_current] if idx_current < len(current_clean) else None
-            unmatched.append((list(baseline_variants[idx]), observed))
-        logger.info("Unmatched baseline frames (allowed variants, observed frame): %s", unmatched)
+        return False
+
+    for idx, (base_frame, current_frame) in enumerate(zip(baseline_clean, current_clean)):
+        allowed = resolve_aliases(base_frame)
+        if current_frame in allowed:
+            continue
+        # Check reverse mapping in case only current frame has alias info.
+        reverse_allowed = resolve_aliases(current_frame)
+        if base_frame in reverse_allowed:
+            continue
+        logger.info(
+            "Crash stack mismatch at frame %d: baseline '%s' vs current '%s'.\nBaseline stack: %s\nCurrent stack: %s",
+            idx,
+            base_frame,
+            current_frame,
+            baseline_stack,
+            current_stack,
+        )
         return False
     return True
 
@@ -3292,6 +3303,7 @@ def apply_and_test_patches(
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
     if not os.path.exists(patch_folder):
         os.makedirs(patch_folder, exist_ok=True)
+    logger.info(f'Patch_pair_list: {patch_pair_list}')
     logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key].old_signature for key in patch_key_list]} ')
     
     patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
