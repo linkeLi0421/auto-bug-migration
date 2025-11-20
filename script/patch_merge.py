@@ -18,6 +18,7 @@ from revert_patch_test import (
     FunctionLocation,
     revert_patch_test as execute_revert_patch_test,
     add_context,
+    remove_context,
     build_fuzzer,
     test_fuzzer,
 )
@@ -126,21 +127,17 @@ patch_pair_dict = {
 }
 
 local_bug_compatibility = {
- 'OSV-2022-34': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2023-51': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2021-897': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2021-213': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2022-511': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-487', 'OSV-2021-481'},
- 'OSV-2021-404': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2021-429': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2022-4': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2022-1242': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2021-27': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2021-21': {'OSV-2021-496', 'OSV-2021-485', 'OSV-2021-997', 'OSV-2021-1791', 'OSV-2021-622', 'OSV-2021-464', 'OSV-2021-498', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-526'},
- 'OSV-2022-486': {'OSV-2021-1791', 'OSV-2021-997', 'OSV-2021-526'},
+ 'OSV-2022-4': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-1791'},
+ 'OSV-2021-429': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-1791'},
+ 'OSV-2021-21': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-1791'},
+ 'OSV-2022-486': {'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-1791'},
+ 'OSV-2021-404': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-1791'},
+ 'OSV-2020-2184': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-1791'},
+ 'OSV-2021-27': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498', 'OSV-2021-1791'},
+ 'OSV-2022-34': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-464', 'OSV-2021-485', 'OSV-2021-622'},
  'OSV-2021-1589': {'OSV-2021-622', 'OSV-2021-526'},
  'OSV-2021-22': {'OSV-2021-622'},
- 'OSV-2020-2184': {'OSV-2021-622'},
+ 'OSV-2021-213': {'OSV-2021-496', 'OSV-2021-481', 'OSV-2021-526', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-622', 'OSV-2021-498'},
 }
 
 LOCAL_BUG_NODE_PREFIX = "__local_bug__"
@@ -193,7 +190,7 @@ logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
 
-PatchSetKey = Tuple[Any, ...]
+PatchSetKey = Tuple[Any, ...] # (e.g., (bug_id, commit_id, fuzzer, (func_a, func_b, ...)))
 PatchSet = Dict[str, Any]
 
 
@@ -446,6 +443,12 @@ def request_new_patch_for_bug(
         if info.get("attempted"):
             return
         result = _trigger_revert_patch_for_bug(bug_id, required_commit)
+        local_tests = result.get("local_tests")
+        compatible_locals = set()
+        for local_bug in local_tests:
+            compatible_locals.add(local_bug)
+        local_bug_compatibility[bug_id] = compatible_locals
+
         info["attempted"] = True
         info["attempt_success"] = bool(result)
         if result and result.get("patches"):
@@ -607,8 +610,14 @@ def is_compatiable(
         needs_refresh_a = prefix_a not in shared_prefixes
         needs_refresh_b = prefix_b not in shared_prefixes
         commit_map = commit_index or {}
-        required_commit_a = _select_best_shared_commit(shared_commits, commit_a, commit_map)
-        required_commit_b = _select_best_shared_commit(shared_commits, commit_b, commit_map)
+        if not needs_refresh_b:
+            required_commit_a = prefix_b
+        else:
+            required_commit_a = _select_best_shared_commit(shared_commits, commit_a, commit_map)
+        if not needs_refresh_a:
+            required_commit_b = prefix_a
+        else:
+            required_commit_b = _select_best_shared_commit(shared_commits, commit_b, commit_map)
         if needs_refresh_a:
             _record_pending_refresh(bug1, required_commit_a or "", commit_a, bug2)
         if needs_refresh_b:
@@ -822,12 +831,9 @@ def finalize_patch_group(
     for identifier in group:
         if _is_local_bug_identifier(identifier):
             continue
-        patch_set = patches.get(identifier)
-        if not isinstance(patch_set, dict) or not patch_set:
-            continue
-        for patch_key, patch in patch_set.items():
-            if not isinstance(patch, PatchInfo):
-                continue
+        patch_dict = patches.get(identifier)
+        patch_not_context = remove_context(patch_dict)
+        for patch_key, patch in patch_not_context.items():
             function_names = []
             if patch.hiden_func_dict:
                 function_names = list(patch.hiden_func_dict.keys())
@@ -1074,6 +1080,7 @@ def main() -> None:
             write_graphviz(graph, args.graphviz_output)
         break
 
+    # Merge and finalize patches for Group 1
     repo_base = os.getenv("REPO_PATH")
     target_repo_path = (
         os.path.join(repo_base, args.revert_target) if repo_base and args.revert_target else None
@@ -1127,6 +1134,7 @@ def main() -> None:
                         args.revert_target,
                         args.target_commit,
                         str(patch_file_path),
+                        need_build=False,
                     )
                     logger.info("Fuzzer test result for %s: %s", bug_id, result)
                 except Exception:
