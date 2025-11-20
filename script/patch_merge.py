@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Tuple, Any, DefaultDict, Set, Callable, Iterable, Optional, List
@@ -20,8 +21,10 @@ from revert_patch_test import (
     add_context,
     remove_context,
     build_fuzzer,
-    test_fuzzer,
+    select_crash_test_input,
+    crashes_match,
 )
+from run_fuzz_test import read_json_file, py3
 
 patch_pair_dict = {
     'OSV-2021-27': [
@@ -1018,6 +1021,63 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _stack_verification_for_bug(
+    bug_id: str,
+    bug_commit: str,
+    bug_info_dataset: Dict[str, Any],
+    target: str,
+    target_commit: str,
+) -> str:
+    """Run reproduce helper for `bug_id` and compare stack traces with the baseline."""
+    if not target_commit:
+        return "missing target commit"
+    bug_info = bug_info_dataset.get(bug_id)
+    if not bug_info:
+        return "bug info missing"
+    testcases_env = os.getenv("TESTCASES", "")
+    if not testcases_env:
+        return "TESTCASES not set"
+
+    reproduce_cfg = bug_info.get("reproduce", {})
+    fuzzer = reproduce_cfg.get("fuzz_target")
+    sanitizer = (reproduce_cfg.get("sanitizer") or "").split(" ")[0]
+    if not fuzzer or not sanitizer:
+        return "reproduce config incomplete"
+
+    testcase_path = os.path.join(testcases_env, f"testcase-{bug_id}")
+    reproduce_cmd = [
+        py3,
+        f"{current_file_path}/fuzz_helper.py",
+        "reproduce",
+        target,
+        fuzzer,
+        testcase_path,
+        "-e",
+        "ASAN_OPTIONS=detect_leaks=0",
+    ]
+    logger.info("Running reproduce command for %s: %s", bug_id, " ".join(reproduce_cmd))
+    test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
+    combined_output = (test_result.stderr or "") + (test_result.stdout or "")
+    lowered = combined_output.lower()
+    if "sanitizer" not in lowered or sanitizer.lower() not in lowered:
+        return "not triggered"
+
+    crash_input = select_crash_test_input(bug_id, testcases_env)
+    baseline_crash_path = os.path.join(
+        data_path,
+        "crash",
+        f"target_crash-{bug_commit[:6]}-{crash_input}.txt",
+    )
+    signature_file = os.path.join(
+        data_path,
+        "signature_change_list",
+        f"{bug_id}_{target_commit}.json",
+    )
+    if crashes_match(combined_output, baseline_crash_path, signature_file):
+        return "triggered (stack matches)"
+    return "triggered (stack mismatch)"
+
+
 def main() -> None:
     args = parse_args()
     global MAIN_CACHE_PATH, CURRENT_PATCHES
@@ -1061,6 +1121,14 @@ def main() -> None:
         except json.JSONDecodeError:
             logger.warning("Failed to parse signature change file %s; ignoring.", args.signature_change_file)
     bug_distribution = None
+    bug_info_dataset: Optional[Dict[str, Any]] = None
+    if args.revert_bug_info:
+        try:
+            bug_info_dataset = read_json_file(str(args.revert_bug_info))
+        except FileNotFoundError:
+            logger.warning("Bug info file %s not found; stack verification disabled.", args.revert_bug_info)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse bug info file %s; stack verification disabled.", args.revert_bug_info)
     if args.bug_distribution_csv:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
     global REANALYZE_PENDING
@@ -1109,16 +1177,14 @@ def main() -> None:
     if build_success and patch_file_path:
         if not group_one:
             logger.info("No compatible group to fuzz test after build.")
-        elif not (args.revert_bug_info and args.revert_build_csv and args.revert_target and args.target_commit):
+        elif not (args.revert_bug_info and args.revert_target and args.target_commit):
             logger.info(
-                "Missing --revert_bug_info/--revert_build_csv/--revert_target/--target_commit; "
-                "skipping fuzzer tests."
+                "Missing --revert_bug_info/--revert_target/--target_commit; "
+                "skipping stack verification."
             )
+        elif not bug_info_dataset:
+            logger.info("Bug info unavailable; skipping stack verification.")
         else:
-            fuzzer_args = SimpleNamespace(
-                bug_info=str(args.revert_bug_info),
-                build_csv=str(args.revert_build_csv),
-            )
             for identifier in group_one:
                 if _is_local_bug_identifier(identifier):
                     continue
@@ -1128,17 +1194,16 @@ def main() -> None:
                 if not isinstance(bug_id, str):
                     continue
                 try:
-                    result = test_fuzzer(
-                        fuzzer_args,
+                    result = _stack_verification_for_bug(
                         bug_id,
+                        identifier[1],
+                        bug_info_dataset,
                         args.revert_target,
                         args.target_commit,
-                        str(patch_file_path),
-                        need_build=False,
                     )
-                    logger.info("Fuzzer test result for %s: %s", bug_id, result)
+                    logger.info("Stack verification result for %s: %s", bug_id, result)
                 except Exception:
-                    logger.exception("Fuzzer test failed for %s.", bug_id)
+                    logger.exception("Stack verification failed for %s.", bug_id)
 
 if __name__ == "__main__":
     main()
