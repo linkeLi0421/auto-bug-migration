@@ -1555,56 +1555,138 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
 
 def remove_context(patches: Dict[str, PatchInfo]) -> Dict[str, PatchInfo]:
     """
-    Strip context lines (those starting with a single space) from each patch hunk.
-    Updates both the hunk header and PatchInfo line metadata so the returned patches
-    describe only the modified lines.
+    Remove context lines from every hunk while keeping the original structure
+    intact by splitting each hunk into the minimal set of context-free hunks.
+    The returned patches only contain +/- lines and updated headers that point
+    precisely to the affected ranges so that they can be reapplied without
+    relying on extra context.
     """
     header_pattern = re.compile(
         r'@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? '
         r'\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@(?P<suffix>.*)'
     )
+
+    def _flush_block(block_lines: List[str], block_old_start: int, block_new_start: int,
+                     block_old_count: int, block_new_count: int, suffix: str,
+                     output: List[str],
+                     span_tracker: Dict[str, Tuple[Optional[int], Optional[int]]]):
+        if not block_lines:
+            return
+        header = (
+            f'@@ -{block_old_start},{block_old_count} '
+            f'+{block_new_start},{block_new_count} @@{suffix}'
+        )
+        output.append(header)
+        output.extend(block_lines)
+        old_start, old_end = span_tracker['old']
+        new_start, new_end = span_tracker['new']
+        block_old_end = block_old_start + block_old_count
+        block_new_end = block_new_start + block_new_count
+        span_tracker['old'] = (
+            block_old_start if old_start is None else min(old_start, block_old_start),
+            block_old_end if old_end is None else max(old_end, block_old_end),
+        )
+        span_tracker['new'] = (
+            block_new_start if new_start is None else min(new_start, block_new_start),
+            block_new_end if new_end is None else max(new_end, block_new_end),
+        )
+
     stripped_patches: Dict[str, PatchInfo] = {}
     for key, patch in patches.items():
         patch_copy = copy.deepcopy(patch)
         lines = patch_copy.patch_text.split('\n')
-        try:
-            header_index = next(i for i, line in enumerate(lines) if line.startswith('@@'))
-        except StopIteration:
-            stripped_patches[key] = patch_copy
-            continue
+        output_lines: List[str] = []
+        span_tracker = {
+            'old': (None, None),
+            'new': (None, None),
+        }
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if not line.startswith('@@'):
+                output_lines.append(line)
+                i += 1
+                continue
 
-        header_line = lines[header_index]
-        match = header_pattern.match(header_line)
-        if not match:
-            stripped_patches[key] = patch_copy
-            continue
+            match = header_pattern.match(line)
+            if not match:
+                output_lines.append(line)
+                i += 1
+                continue
 
-        body_lines = lines[header_index + 1 :]
-        leading_context = 0
-        for line in body_lines:
-            if line.startswith(' '):
-                leading_context += 1
-            else:
-                break
+            suffix = match.group('suffix') or ''
+            old_start = int(match.group('old_start'))
+            new_start = int(match.group('new_start'))
 
-        body_without_context = [line for line in body_lines if not line.startswith(' ')]
-        # Ensure there is at least one actual diff line remaining; otherwise skip.
-        if not any(line.startswith(('+', '-')) for line in body_without_context):
-            stripped_patches[key] = patch_copy
-            continue
+            body_lines: List[str] = []
+            i += 1
+            hunk_terminators = ('@@', 'diff --', 'Index: ', 'index ', '+++ ', '--- ')
+            while i < len(lines):
+                next_line = lines[i]
+                if any(next_line.startswith(prefix) for prefix in hunk_terminators):
+                    break
+                body_lines.append(next_line)
+                i += 1
 
-        old_start = int(match.group('old_start')) + leading_context
-        new_start = int(match.group('new_start')) + leading_context
-        old_count = sum(1 for line in body_without_context if line.startswith('-'))
-        new_count = sum(1 for line in body_without_context if line.startswith('+'))
-        suffix = match.group('suffix') or ''
+            while body_lines and body_lines[0] == '':
+                body_lines.pop(0)
+            while body_lines and body_lines[-1] == '':
+                body_lines.pop()
 
-        new_header = f'@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}'
-        patch_copy.patch_text = '\n'.join(lines[:header_index] + [new_header] + body_without_context)
-        patch_copy.old_start_line = old_start
-        patch_copy.old_end_line = old_start + old_count
-        patch_copy.new_start_line = new_start
-        patch_copy.new_end_line = new_start + new_count
+            def _is_context_line(hunk_line: str) -> bool:
+                """Context lines in unified diffs start with a single space."""
+                return hunk_line.startswith(' ')
+
+            # Remove all leading context lines.
+            while body_lines and _is_context_line(body_lines[0]):
+                body_lines.pop(0)
+                old_start += 1
+                new_start += 1
+
+            # Remove all trailing context lines.
+            while body_lines and _is_context_line(body_lines[-1]):
+                body_lines.pop()
+
+            if not body_lines:
+                continue
+
+            old_count = 0
+            new_count = 0
+            for body_line in body_lines:
+                if body_line.startswith('-'):
+                    old_count += 1
+                elif body_line.startswith('+'):
+                    new_count += 1
+                elif body_line.startswith('\\'):
+                    # Metadata line; does not affect line counters.
+                    continue
+                else:
+                    # Context line affects both old and new positions.
+                    old_count += 1
+                    new_count += 1
+
+            _flush_block(
+                body_lines,
+                old_start,
+                new_start,
+                old_count,
+                new_count,
+                suffix,
+                output_lines,
+                span_tracker,
+            )
+
+        patch_copy.patch_text = '\n'.join(output_lines)
+        old_span_start, old_span_end = span_tracker['old']
+        new_span_start, new_span_end = span_tracker['new']
+        if old_span_start is not None:
+            patch_copy.old_start_line = old_span_start
+        if old_span_end is not None:
+            patch_copy.old_end_line = old_span_end
+        if new_span_start is not None:
+            patch_copy.new_start_line = new_span_start
+        if new_span_end is not None:
+            patch_copy.new_end_line = new_span_end
         stripped_patches[key] = patch_copy
 
     return stripped_patches
@@ -3683,7 +3765,7 @@ def apply_and_test_patches(
                 patch = extra_patches[fun_info.func_used_file]
                 patch.patch_text = '\n'.join(rename_func(patch.patch_text, fun_info.name, commit['commit_id']))
 
-        patches_without_context = dict() # empty the dict before updating
+        patches_without_context.clear() # empty the dict before updating
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
                 # not_write_patches means the patch is merged with the extra patches
@@ -3696,7 +3778,8 @@ def apply_and_test_patches(
             for patch in extra_patches.values():
                 patch_file.write(patch.patch_text)
                 patch_file.write('\n\n')
-                patches_without_context[f'_extra_{patch.file_path_new}'] = patch
+                patches_without_context.update({f'_extra_{patch.file_path_new}': patch})
+
         # update length of con_to_add, var_del_to_add, union_to_add
         last_type_def_to_add = copy.deepcopy(type_def_to_add)
         
@@ -3750,7 +3833,7 @@ def apply_and_test_patches(
         return 'build_fail'
 
 
-def test_fuzzer(args, bug_id, target, commit_id, patch_path):
+def test_fuzzer(args, bug_id, target, commit_id, patch_path, need_build = True):
     # Run the fuzzer to test if the bug is reproduced
     bug_info_path = args.bug_info
     testcases_env = os.getenv('TESTCASES', '')
@@ -3761,7 +3844,8 @@ def test_fuzzer(args, bug_id, target, commit_id, patch_path):
     sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
     arch = 'i386' if 'i386' in bug_info['reproduce']['job_type'] else 'x86_64'
     
-    build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch)
+    if need_build:
+        build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch)
     
     testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
     reproduce_cmd = [
@@ -3844,11 +3928,12 @@ def revert_patch_test(args):
             arch = job_type.split('_')[2]
         else:
             arch = 'x86_64'
-        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-testcase-{bug_id}.txt')
-        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}.txt')
+        crash_test_input = select_crash_test_input(bug_id, testcases_env)
+        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-{crash_test_input}.txt')
+        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-{crash_test_input}.txt')
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
-            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-testcase-{bug_id}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
+            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
@@ -3892,11 +3977,10 @@ def revert_patch_test(args):
         if not os.path.exists(trace_path2):
             logger.info(f"Trace file {trace_path2} does not exist, skipping bug {bug_id}")
             continue
-        crash_input_for_commit = select_crash_test_input(bug_id, testcases_env)
         crash_log_path = os.path.join(
             data_path,
             'crash',
-            f'target_crash-{commit["commit_id"][:6]}-{crash_input_for_commit}.txt',
+            f'target_crash-{commit["commit_id"][:6]}-{crash_test_input}.txt',
         )
         if not os.path.exists(crash_log_path):
             collect_crash_cmd = [
@@ -3914,14 +3998,14 @@ def revert_patch_test(args):
                 '--testcases',
                 testcases_env,
                 '--test_input',
-                crash_input_for_commit,
+                crash_test_input,
                 target,
                 fuzzer,
             ]
             logger.info(
                 "Collecting crash log for bug %s using input %s: %s",
                 bug_id,
-                crash_input_for_commit,
+                crash_test_input,
                 " ".join(collect_crash_cmd),
             )
             try:
