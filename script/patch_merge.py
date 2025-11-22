@@ -1135,7 +1135,7 @@ def main() -> None:
     while True:
         graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution, signature_change_map)
         groups = report_compatible_groups(graph)
-        group_one = groups[0] if groups else None
+        group_one = groups[1] if groups else None
         for idx, candidate in enumerate(groups):
             if len(groups[0]) == len(candidate):
                 report_pending_patch_refreshes(candidate, idx+1)
@@ -1186,17 +1186,20 @@ def main() -> None:
             logger.info("Bug info unavailable; skipping stack verification.")
         else:
             for identifier in group_one:
-                if _is_local_bug_identifier(identifier):
-                    continue
                 if not isinstance(identifier, tuple) or not identifier:
                     continue
-                bug_id = identifier[0]
+                if _is_local_bug_identifier(identifier):
+                    bug_id = identifier[1]
+                    buggy_commit = args.target_commit
+                else:
+                    bug_id = identifier[0]
+                    buggy_commit = identifier[1]
                 if not isinstance(bug_id, str):
                     continue
                 try:
                     result = _stack_verification_for_bug(
                         bug_id,
-                        identifier[1],
+                        buggy_commit,
                         bug_info_dataset,
                         args.revert_target,
                         args.target_commit,
