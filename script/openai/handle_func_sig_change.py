@@ -11,6 +11,89 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
+def handle_renaming_patch_sig_change(error_message: str, caller_code: str, callee_codes: str, model: str = "gpt-5"):
+    """
+    Use an LLM to fix compilation errors caused by function signature changes.
+    
+    Args:
+        error_message: The compiler error text (e.g. "too many arguments...")
+        caller_code: The full caller function definition (the part to fix)
+        callee_codes: The full definitions of callee functions (new version)
+        model: Model name
+    
+    Returns:
+        The updated caller function, as C code in a code block.
+    """
+
+    prompt = f"""
+You are an expert C systems programmer. You must FIX a compilation error
+caused by a callee function's signature changing.
+
+You will receive:
+1. CALLER CODE — the function that must be updated
+2. CALLEE CODES — definitions of callee functions (new version)
+3. ERROR MESSAGE — the compiler error
+
+========================  CRITICAL RULES  ========================
+
+1. ONLY modify the caller function.
+   - Do NOT modify callee definitions.
+   - Do NOT invent new fields, macros, or struct members.
+   - Change ONLY the call site(s) that directly appear in the error.
+
+2. Follow the new callee function signature exactly.
+   - If parameters were removed → delete them from the call.
+   - If parameters were added → use an existing variable if available,
+     otherwise use NULL or 0.
+   - Do NOT restructure logic beyond fixing the call.
+
+3. Do NOT rename variables, change indentation, change comments,
+   or alter unrelated lines.
+
+4. You MUST return ONLY the corrected caller function.
+   - Wrap the answer in a ```c ... ``` block.
+   - No explanations. No extra text.
+
+===============================================================
+
+--- CALLER CODE ---
+{caller_code}
+
+--- CALLEE CODES ---
+{callee_codes}
+
+--- ERROR MESSAGE ---
+{error_message}
+
+Now fix the caller function so it compiles using the NEW signature.
+Return ONLY the updated caller code inside:
+
+```c
+// code here
+"""
+
+    try:
+      response = client.chat.completions.create(
+          model=model,
+          messages=[
+              {
+                  "role": "system",
+                  "content": (
+                      "You are an expert C programmer. "
+                      "Rewrite only the caller function as requested. "
+                      "No explanations."
+                  ),
+              },
+              {"role": "user", "content": prompt},
+          ],
+      )
+      raw = response.choices[0].message.content
+      return extract_code(raw)
+
+    except Exception as e:
+        return f"Error calling OpenAI API: {str(e)}"
+
+
 def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB, model="gpt-4o"):
     """
     Handle function signature change problems using OpenAI API
