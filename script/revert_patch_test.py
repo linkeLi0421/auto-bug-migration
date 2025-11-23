@@ -43,7 +43,7 @@ HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
 from handle_struct_use import solve_code_migration
-from handle_func_sig_change import handle_func_sig_change
+from handle_func_sig_change import handle_func_sig_change, handle_renaming_patch_sig_change
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -2303,19 +2303,17 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                     continue
                 if node['extent']['start']['file'] == file_path and node['signature'].split('(')[0].split(' ')[-1] == fname:
                     # Found the function definition
-                    new_line_begin = node['extent']['start']['line']
-                    new_line_end = node['extent']['end']['line']
+                    old_line_begin = node['extent']['start']['line']
+                    old_line_end = node['extent']['end']['line']
                     break
 
-        if new_line_begin and new_line_end:
+        if old_line_begin and old_line_end:
             # Create a patch to add the function call
             patch_header = f"diff --git a/{file_path} b/{file_path}\n"
             patch_header += f"--- a/{file_path}\n+++ b/{file_path}\n"
-            if not os.path.exists(os.path.join(target_repo_path, file_path)):
-                # some path is not complete
-                logger.info(f'File path {file_path} does not exist in target repo, skip adding patch for trace function {fname}')
-                continue
-            function_lines = get_code_from_file(target_repo_path, file_path, next_commit, new_line_begin, new_line_end)[0]
+            with open(os.path.join(target_repo_path, file_path), 'r', encoding="latin-1") as f:
+                content = f.readlines()
+                function_lines = content[old_line_begin-1:old_line_end]
             for func_info in recreated_functions:
                 recreated_fname = func_info.name
                 function_head_flag = False
@@ -2327,7 +2325,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         continue
                     if re.search(r'(?<![\w.])' + re.escape(recreated_fname) + r'(?!\w)', line) is not None:
                         # If the function is recreated, add a call to it
-                        start_line = new_line_begin + i
+                        start_line = old_line_begin  + i
                         end_line = start_line + 1
                         patch_text = rename_func(f'-{line}', recreated_fname, commit)[0] + '\n+' + line[:-1]
                         patch_text = patch_header + f"@@ -{start_line},{1} +{start_line},{1} @@\n" + patch_text
@@ -2344,8 +2342,8 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                             new_end_line=end_line,
                             old_start_line=start_line,
                             old_end_line=end_line,
-                            new_function_start_line=new_line_begin,
-                            new_function_end_line=new_line_end,
+                            new_function_start_line=old_line_begin,
+                            new_function_end_line=old_line_end,
                         )
                         new_key = f'{file_path}{file_path}-{start_line},{1}+{start_line},{1}'
                         
@@ -2520,7 +2518,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         if 'no change trace function' in caller_sig:
             # For API Renaming Patches; 
             func_loc = FunctionLocation(diff_results[key_of_line_num].file_path_new, diff_results[key_of_line_num].new_function_start_line, diff_results[key_of_line_num].new_function_end_line)
-            renaming_patch_dict.setdefault((key_of_line_num, func_loc), []).append((caller_sig.split(' ')[-1], error_message))
+            renaming_patch_dict.setdefault((key_of_line_num, func_loc), set()).add((caller_sig.split(' ')[-1], error_message))
         else:
             # For recreate function patches
             callee_name = callee_line.split('(')[0].split(' ')[-1]
@@ -2611,24 +2609,40 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         diff_results[caller_key].patch_text = '\n'.join(patch_text_lines)
 
     # 3. For API Renaming Patches
-    for (key_of_line_num, func_loc), callee_list in renaming_patch_dict.items():
-        caller_code = '\n'.join(get_code_from_file(target_repo_path, func_loc.file_path, next_commit, func_loc.start_line, func_loc.end_line)[0])
+    for (key_of_line_num, func_loc), callee_set in renaming_patch_dict.items():
+        caller_code_original_lines = get_code_from_file(target_repo_path, func_loc.file_path, next_commit, func_loc.start_line, func_loc.end_line)[0]
+        caller_code = '\n'.join([f'-{line}' for line in caller_code_original_lines])
         callee_codes = '' # May be several callees
         full_error_message = ''
-        for callee_name, error_message in callee_list:
-            # Search callee code in the patches, because it is a recreating function patch
-            for key in patch_key_list:
-                patch = diff_results[key]
-                if patch.old_signature and callee_name == patch.old_function_name:
-                    callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
-                    break
-            new_name = f'__revert_{commit}_{callee_name}'
-            callee_codes += f'\n// Definition of {new_name}:\n{callee_code}\n'
-            full_error_message += error_message
-        logger.info(f'caller_code: {caller_code}')
-        logger.info(f'callee_codes: {callee_codes}')
-        logger.info(f'full_error_message: {full_error_message}')
-        exit((0))
+        solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit}-{stable_hash(key_of_line_num)}-apirenaming.txt')
+        logger.info(f'Solution path: {solution_path}')
+        if os.path.exists(solution_path):
+            with open(solution_path, 'r', encoding='utf-8') as f:
+                solution_code = f.read()
+        else:
+            for callee_name, error_message in callee_set:
+                # Search callee code in the patches, because it is a recreating function patch
+                caller_code = '\n'.join([line[1:] for line in rename_func(caller_code, callee_name, commit)])
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if 'Recreated function' in patch.patch_type:
+                        if patch.old_signature and callee_name == patch.old_function_name:
+                            callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
+                            break
+                        for func_sig in patch.hiden_func_dict:
+                            if callee_name == func_sig.split('(')[0].split(' ')[-1]:
+                                callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
+                                break
+ 
+                new_name = f'__revert_{commit}_{callee_name}'
+                callee_codes += f'\n// Definition of {new_name}:\n{callee_code}\n'
+                full_error_message += error_message
+            solution_code = handle_renaming_patch_sig_change(full_error_message, caller_code, callee_codes)
+            solution_code = '\n'.join(diff_strings(solution_code, func_loc.file_path, '\n'.join(caller_code_original_lines), func_loc.file_path, 3, func_loc.start_line)) + '\n'
+            os.makedirs(os.path.dirname(solution_path), exist_ok=True)
+            with open(solution_path, 'w', encoding='utf-8') as f:
+                f.write(solution_code)
+        diff_results[key_of_line_num].patch_text = solution_code
 
 
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):

@@ -349,14 +349,17 @@ def split_function_parts(code: str) -> Tuple[str, str, str]:
     return prefix, body, suffix
 
 
-def diff_strings(a_text: str, file_path_a: str, b_text: str, file_path_b: str, context_line = 3) -> List[str]:
+def diff_strings(a_text: str, file_path_a: str, b_text: str, file_path_b: str, context_line: int = 3, line_number: int = 1) -> List[str]:
     """
     Generate a git-style unified diff between two strings.
     
     Args:
         a_text: content of old file
         b_text: content of new file
-        path: relative file path (e.g., 'blosc/schunk.c')
+        file_path_a: relative path for the old file (e.g., 'blosc/schunk.c')
+        file_path_b: relative path for the new file
+        context_line: number of context lines around each hunk
+        line_number: 1-based line number where the snippet starts in the real file
     
     Returns:
         A unified diff string with 'diff --git' header.
@@ -380,22 +383,24 @@ def diff_strings(a_text: str, file_path_a: str, b_text: str, file_path_b: str, c
     patches = []
     fir_line = ''
     rest_line = ''
+    line_offset = max(line_number, 1) - 1
+    hunk_header_re = re.compile(r'^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@(?P<tail>.*)$')
+
     for line in diff[2:]:
         if line.startswith("@@"):
             if fir_line != '':
                 patches.append(git_header + "\n" + fir_line + rest_line[:-1])
                 rest_line = ''
-            old_line_info = line.split('@@')[1].strip().split(' ')[0]
-            if old_line_info.count(',') < 1:
-                # If old_line_info is not in the format 'old_start,old_end'
-                old_line_info += ',1'
-            new_line_info = line.split('@@')[1].strip().split(' ')[1]
-            if new_line_info.count(',') < 1:
-                # If new_line_info is not in the format 'new_start,new_end'
-                new_line_info += ',1'
-            old_offset = old_line_info.split(',')[1]
-            new_start = new_line_info.split(',')[0].split('+')[1]
-            fir_line = f'@@ -{new_start},{old_offset} {new_line_info} @@\n'
+            match = hunk_header_re.match(line)
+            if not match:
+                fir_line = line
+                continue
+            old_start = int(match.group('old_start')) + line_offset
+            new_start = int(match.group('new_start')) + line_offset
+            old_len = int(match.group('old_len')) if match.group('old_len') else 1
+            new_len = int(match.group('new_len')) if match.group('new_len') else 1
+            tail = match.group('tail')
+            fir_line = f'@@ -{old_start},{old_len} +{new_start},{new_len} @@{tail}\n'
         else:
             rest_line += line
     patches.append(git_header + "\n" + fir_line + rest_line[:-1])
