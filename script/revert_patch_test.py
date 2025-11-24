@@ -906,6 +906,7 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         reverse_allowed = resolve_aliases(current_frame)
         return base_frame in reverse_allowed
 
+    logger.info(f'signature_map: {signature_map}')
     top_match = frames_match(baseline_clean[0], current_clean[0])
     if not top_match:
         logger.info(
@@ -3451,6 +3452,7 @@ def apply_and_test_patches(
             patch_file.write(patch.patch_text)
             patch_file.write('\n\n')  # Add separator between patches
     
+    #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
     func_decl_to_add = dict() # key: file path, value: set of function declarations
     func_decl_to_add_moveforward = dict() # key: file path, value: set of function declarations that need to be added before function use in the extra patch
@@ -3493,6 +3495,13 @@ def apply_and_test_patches(
         un_dec_vars_to_add = dict() # key: file path, value: set of undeclared variables
         
         for type_name, error_location, forward_decl_location in incomplete_types:
+            add_file_path = None
+            add_start_line = None
+            add_end_line = None
+            delete_file_path = None
+            delete_start = None
+            delete_end = None
+            type_used = None
             pure_type = type_name.split(' ')[-1]
             error_file_path_new = error_location.split(':')[0].split('/', 3)[-1]
             parsing_path = os.path.join(
@@ -3512,7 +3521,31 @@ def apply_and_test_patches(
                     delete_file_path = node['extent']['start']['file']
                     delete_start = node['extent']['start']['line']
                     delete_end = node['extent']['end']['line']
-            if 'add_file_path' not in locals() or 'delete_file_path' not in locals():
+            if add_file_path is None:
+                ast_file_folder = os.path.join(data_path, f"{target_repo_path.split('/')[-1]}-{next_commit['commit_id']}")
+                if os.path.isdir(ast_file_folder):
+                    for dirpath, _, filenames in os.walk(ast_file_folder):
+                        for filename in filenames:
+                            if not filename.endswith('_analysis.json'):
+                                continue
+                            ast_file = os.path.join(dirpath, filename)
+                            if ast_file == parsing_path:
+                                continue
+                            with open(ast_file, 'r') as ast_file_handle:
+                                candidate_nodes = json.load(ast_file_handle)
+                            for candidate in candidate_nodes:
+                                if candidate.get('kind') == 'TYPEDEF_DECL' and candidate.get('spelling') == pure_type:
+                                    add_file_path = candidate['extent']['start']['file']
+                                    add_start_line = candidate['extent']['start']['line']
+                                    add_end_line = candidate['extent']['end']['line']
+                                    break
+                            if add_file_path is not None:
+                                break
+                        if add_file_path is not None:
+                            break
+                
+            if add_file_path is None or delete_file_path is None:
+                logger.info(f'Cannot find type {type_name} in {parsing_path}')
                 continue
             incomplete_type_to_add[(delete_file_path, delete_start, delete_end)] = (add_file_path, add_start_line, add_end_line, pure_type, type_used)
         
@@ -3713,10 +3746,10 @@ def apply_and_test_patches(
                 locs = list(union_to_add[file_path])
                 union_len = 0
                 union_text = ''
-                for log in reversed(locs):
-                    path = log.split(':')[0]
-                    start_line = int(log.split(':')[1])
-                    end_line = int(log.split(':')[2])
+                for loc in reversed(locs):
+                    path = loc.split(':')[0]
+                    start_line = int(loc.split(':')[1])
+                    end_line = int(loc.split(':')[2])
                     union_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
@@ -3730,9 +3763,9 @@ def apply_and_test_patches(
                 locs = list(con_to_add[file_path])
                 enum_len = 2
                 enum_text = '-enum {\n'
-                for log in reversed(locs):
+                for loc in reversed(locs):
                     enum_len += 1
-                    enum_text += f'-{log}'
+                    enum_text += f'-{loc}'
                 enum_text += '-};\n'
             else:
                 enum_text = ''
@@ -3744,10 +3777,10 @@ def apply_and_test_patches(
                         
             if file_path in type_def_to_add:
                 locs = list(type_def_to_add[file_path])
-                for log in reversed(locs):
-                    path = log.split(':')[0]
-                    start_line = int(log.split(':')[1])
-                    end_line = int(log.split(':')[2])
+                for loc in reversed(locs):
+                    path = loc.split(':')[0]
+                    start_line = int(loc.split(':')[1])
+                    end_line = int(loc.split(':')[2])
                     var_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
@@ -3756,9 +3789,9 @@ def apply_and_test_patches(
             if file_path in var_del_to_add:
                 # variable declaration patch
                 locs = list(var_del_to_add[file_path])
-                for log in reversed(locs):
-                    path = log.split(':')[0]
-                    identifier = var_del_to_add[file_path][log]
+                for loc in reversed(locs):
+                    path = loc.split(':')[0]
+                    identifier = var_del_to_add[file_path][loc]
                     ids.add(identifier)
                     if path.startswith('#include'):
                         # macro defined in header file from system include paths
@@ -3766,8 +3799,8 @@ def apply_and_test_patches(
                         include_text += f'-{path}\n'
                         include_len += 1
                         continue
-                    start_line = int(log.split(':')[1])
-                    end_line = int(log.split(':')[2])
+                    start_line = int(loc.split(':')[1])
+                    end_line = int(loc.split(':')[2])
                     var_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
@@ -3778,6 +3811,7 @@ def apply_and_test_patches(
                     if patch.file_path_new == file_path:
                         for identifier in ids:
                             patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
+                            var_text = '\n'.join(rename_func(var_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}')) + '\n'
 
             # need new version to get the context lines
             if enum_len+include_len+func_decl_len+var_len+union_len+func_decl_len_moveforward == 0:
@@ -3950,7 +3984,6 @@ def apply_and_test_patches(
             # trigger the bug
             combined_output = (test_result.stderr or '') + (test_result.stdout or '')
             if not crashes_match(combined_output, baseline_crash_path, signature_file):
-                transitions.insert(0, (commit, next_commit, bug_id))
                 logger.info(
                     "Crash for bug %s on commit %s does not match baseline stack; skipping.",
                     bug_id,
@@ -3964,7 +3997,6 @@ def apply_and_test_patches(
                 logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
                 return 'trigger_but_fuzzer_build_fail'
         else:
-            transitions.insert(0, (commit, next_commit, bug_id))
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             return 'not_trigger'
     else:
@@ -4058,8 +4090,6 @@ def revert_patch_test(args):
             continue
         if bug_id in {'OSV-2021-22', 'OSV-2020-2184'}:
             continue
-        if bug_id != "OSV-2021-21":
-            continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
@@ -4098,12 +4128,14 @@ def revert_patch_test(args):
 
         collect_trace_cmd.extend(['--build_csv', args.build_csv])
 
-        collect_trace_cmd.extend(['--test_input', 'testcase-' + bug_id])
+        collect_trace_cmd.extend(['--test_input', crash_test_input])
 
         collect_trace_cmd.append(target)
 
         collect_trace_cmd.append(fuzzer)
-    
+
+        collect_trace_cmd.extend(['-e', 'ASAN_OPTIONS=detect_leaks=0'])
+
         if not os.path.exists(trace_path1) or os.path.exists(trace_path1) and 'No such file or directory' in open(trace_path1).read():
             # logger.info the command being executed
             logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
@@ -4145,7 +4177,23 @@ def revert_patch_test(args):
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
         get_compile_commands(target, next_commit['commit_id'], sanitizer, args.build_csv, arch)
         get_compile_commands(target, commit['commit_id'], sanitizer, args.build_csv, arch)
-        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
+        diff_path = os.path.join(data_path, 'diff', f'revert_patch_{bug_id}_{commit["commit_id"]}_to_{next_commit["commit_id"]}.diff')
+        os.makedirs(os.path.dirname(diff_path), exist_ok=True)
+        diff_results = None
+        if os.path.exists(diff_path):
+            try:
+                diff_results = load_patches_pickle(diff_path)
+                logger.info(f"Loaded cached diff analysis from {diff_path}")
+            except (pickle.UnpicklingError, EOFError, OSError, gzip.BadGzipFile) as exc:
+                logger.warning(f"Failed to load cached diff from {diff_path}: {exc}")
+                diff_results = None
+        if diff_results is None:
+            diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
+            try:
+                save_patches_pickle(diff_results, diff_path)
+                logger.info(f"Saved diff analysis cache to {diff_path}")
+            except OSError as exc:
+                logger.warning(f"Failed to save diff analysis cache to {diff_path}: {exc}")
         file_path_pairs = get_file_path_pairs(diff_results)
 
         trace_func_list = []
@@ -4242,12 +4290,10 @@ def revert_patch_test(args):
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
-        # if bug_id == 'OSV-2021-21':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1658,24+1800,25', 'blosc/blosc2.cblosc/blosc2.c-1544,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1578,69+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1564,4+1748,0'), ('blosc/blosc2.cblosc/blosc2.c-1413,20+1671,0',), ('blosc/frame.cblosc/frame.c-1493,3+2021,20', 'blosc/frame.cblosc/frame.c-1454,3+1976,9', 'blosc/frame.cblosc/frame.c-1389,59+1877,93'), ('blosc/frame.cblosc/frame.c-1295,18+1706,58',), ('blosc/blosc2.cblosc/blosc2.c-2431,39+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2394,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2272,116+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1172,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1141,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1112,15+1368,24', 'blosc/blosc2.cblosc/blosc2.c-1087,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1004,58+1223,91', 'blosc/blosc2.cblosc/blosc2.c-994,2+1211,4'), ('blosc/frame.cblosc/frame.c-810,30+1031,13', 'blosc/frame.cblosc/frame.c-771,36+1012,19'), ('blosc/frame.cblosc/frame.c-454,8+472,7',), ('blosc/frame.cblosc/frame.c-442,5+453,12', 'blosc/frame.cblosc/frame.c-427,2+438,2', 'blosc/frame.cblosc/frame.c-379,32+365,51'), ('blosc/frame.cblosc/frame.c-42,37+41,0',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',), ('blosc/frame.cblosc/frame.c-1160,118+1554,135', 'blosc/frame.cblosc/frame.c-1132,21+1522,25', 'blosc/frame.cblosc/frame.c-1109,12+1497,13'), ('blosc/frame.cblosc/frame.c-910,60+1125,110',), ('blosc/frame.cblosc/frame.c-1060,47+1350,145', 'blosc/frame.cblosc/frame.c-972,79+1236,102'), ('blosc/shuffle.cblosc/shuffle.c-314,7+310,11',), ('blosc/blosc2.cblosc/blosc2.c-1364,2+1623,2',), ('blosc/blosc2.cblosc/blosc2.c-1299,7+1558,7',), ('blosc/blosc2.cblosc/blosc2.c-1243,2+1501,3', 'blosc/blosc2.cblosc/blosc2.c-1224,4+1483,3')]
-        
-        # if bug_id == 'OSV-2021-27':
+        if bug_id == 'OSV-2021-27':
         #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+            # patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',)]
         # if bug_id == 'OSV-2020-2184':1
         #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)'] 
         #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
