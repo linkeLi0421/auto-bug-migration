@@ -11,7 +11,91 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB, model="gpt-4o"):
+def handle_renaming_patch_sig_change(error_message: str, caller_code: str, callee_codes: str, model: str = "gpt-5.1"):
+    """
+    Use an LLM to fix compilation errors caused by function signature changes.
+    
+    Args:
+        error_message: The compiler error text (e.g. "too many arguments...")
+        caller_code: The full caller function definition (the part to fix)
+        callee_codes: The full definitions of callee functions (new version)
+        model: Model name
+    
+    Returns:
+        The updated caller function, as C code in a code block.
+    """
+
+    prompt = f"""
+You are an expert C systems programmer. You must FIX a compilation error
+caused by a callee function's signature changing.
+
+You will receive:
+1. CALLER CODE — the function that must be updated
+2. CALLEE CODES — definitions of callee functions (new version)
+3. ERROR MESSAGE — the compiler error
+
+========================  CRITICAL RULES  ========================
+
+1. ONLY modify the caller function.
+   - Do NOT modify callee definitions.
+   - Do NOT invent new fields, macros, or struct members.
+   - Change ONLY the call site(s) that directly appear in the error.
+
+2. Follow the new callee function signature exactly.
+   - If parameters were removed → delete them from the call.
+   - If parameters were added → use an existing variable if available,
+     otherwise use NULL or 0.
+   - Do NOT restructure logic beyond fixing the call.
+
+3. Do NOT rename variables, change indentation, change comments,
+   or alter unrelated lines.
+
+4. You MUST return ONLY the corrected caller function.
+   - Wrap the answer in a ```c ... ``` block.
+   - No explanations. No extra text.
+
+===============================================================
+
+--- CALLER CODE ---
+{caller_code}
+
+--- CALLEE CODES ---
+{callee_codes}
+
+--- ERROR MESSAGE ---
+{error_message}
+
+Now fix the caller function so it compiles using the NEW signature.
+Return ONLY the updated caller code inside:
+
+```c
+// code here
+"""
+
+    try:
+      response = client.chat.completions.create(
+          model=model,
+          messages=[
+              {
+                  "role": "system",
+                  "content": (
+                      "You are an expert C programmer. "
+                      "Rewrite only the caller function as requested. "
+                      "No explanations."
+                  ),
+              },
+              {"role": "user", "content": prompt},
+          ],
+          temperature=0,
+      )
+      raw = response.choices[0].message.content
+      return extract_code(raw)
+
+    except Exception as e:
+        return f"Error calling OpenAI API: {str(e)}"
+
+
+def handle_func_sig_change(error_message, caller_defA, callee_defA, callee_defB, model="gpt-5.1"):
     """
     Handle function signature change problems using OpenAI API
     
@@ -62,7 +146,7 @@ REQUIREMENTS:
                 {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. You MUST follow the specific line requirements and only change what is explicitly requested."}, 
                 {"role": "user", "content": prompt}
             ],
-        temperature=0.1,  # Lower temperature for more precise following of instructions
+        temperature=0,  # Lower temperature for more precise following of instructions
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
@@ -302,6 +386,262 @@ if __name__ == '__main__':
 
   return rc;
 }'''
-    fixed_code = handle_func_sig_change(error_msg, caller_defA, callee_defA, callee_defB)
+    # fixed_code = handle_func_sig_change(error_msg, caller_defA, callee_defA, callee_defB)
+    # print("--- AI Generated Output ---")
+    # print(fixed_code)
+    
+    
+    error_msg = '''/src/c-blosc2/blosc/frame.c:2427:57: error: too many arguments to function call, expected 12, have 13
+ 2425 |   int rc = __revert_3055a0_get_header_info(frame, &header_len, &frame_len, &nbytes, &cbytes,
+      |            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 2426 |                            &blocksize, &chunksize, &nchunks,
+ 2427 |                            &typesize, NULL, NULL, NULL, NULL);
+      |                                                         ^~~~                                   ^~~~~~~~
+    '''
+    caller_def = '''int frame_get_lazychunk(blosc2_frame_s *frame, int nchunk, uint8_t **chunk, bool *needs_free) {
+  int32_t header_len;
+  int64_t frame_len;
+  int64_t nbytes;
+  int64_t cbytes;
+  int32_t blocksize;
+  int32_t chunksize;
+  int32_t nchunks;
+  int32_t typesize;
+  int32_t lazychunk_cbytes;
+  int64_t offset;
+  FILE* fp = NULL;
+
+  *chunk = NULL;
+  *needs_free = false;
+  int rc = __revert_3055a0_get_header_info(frame, &header_len, &frame_len, &nbytes, &cbytes,
+                           &blocksize, &chunksize, &nchunks,
+                           &typesize, NULL, NULL, NULL, NULL);
+  if (rc < 0) {
+    BLOSC_TRACE_ERROR("Unable to get meta info from frame.");
+    return rc;
+  }
+
+  if (nchunk >= nchunks) {
+    BLOSC_TRACE_ERROR("nchunk ('%d') exceeds the number of chunks "
+                      "('%d') in frame.", nchunk, nchunks);
+    return BLOSC2_ERROR_INVALID_PARAM;
+  }
+
+  // Get the offset to nchunk
+  rc = get_coffset(frame, header_len, cbytes, nchunk, &offset);
+  if (rc < 0) {
+    BLOSC_TRACE_ERROR("Unable to get offset to chunk %d.", nchunk);
+    return rc;
+  }
+
+  if (offset < 0) {
+    // Special value
+    lazychunk_cbytes = BLOSC_EXTENDED_HEADER_LENGTH;
+    rc = frame_special_chunk(offset, chunksize, typesize, chunk,
+                             (int32_t)lazychunk_cbytes, needs_free);
+    goto end;
+  }
+
+  if (frame->cframe == NULL) {
+    // TODO: make this portable across different endianness
+    // Get info for building a lazy chunk
+    int32_t chunk_nbytes;
+    int32_t chunk_cbytes;
+    int32_t chunk_blocksize;
+    uint8_t header[BLOSC_MIN_HEADER_LENGTH];
+    if (frame->sframe) {
+      // The chunk is not in the frame
+      fp = sframe_open_chunk(frame->urlpath, offset, "rb");
+    }
+    else {
+      fp = fopen(frame->urlpath, "rb");
+      fseek(fp, header_len + offset, SEEK_SET);
+    }
+    size_t rbytes = fread(header, 1, BLOSC_MIN_HEADER_LENGTH, fp);
+    if (rbytes != BLOSC_MIN_HEADER_LENGTH) {
+      BLOSC_TRACE_ERROR("Cannot read the header for chunk in the frame.");
+      rc = BLOSC2_ERROR_FILE_READ;
+      goto end;
+    }
+    rc = blosc2_cbuffer_sizes(header, &chunk_nbytes, &chunk_cbytes, &chunk_blocksize);
+    if (rc < 0) {
+      goto end;
+    }
+    size_t nblocks = chunk_nbytes / chunk_blocksize;
+    size_t leftover_block = chunk_nbytes % chunk_blocksize;
+    nblocks = leftover_block ? nblocks + 1 : nblocks;
+    // Allocate space for the lazy chunk
+    size_t trailer_len = sizeof(int32_t) + sizeof(int64_t) + nblocks * sizeof(int32_t);
+    size_t trailer_offset = BLOSC_EXTENDED_HEADER_LENGTH + nblocks * sizeof(int32_t);
+    lazychunk_cbytes = trailer_offset + trailer_len;
+    *chunk = malloc(lazychunk_cbytes);
+    *needs_free = true;
+
+    // Read just the full header and bstarts section too (lazy partial length)
+    if (frame->sframe) {
+      fseek(fp, 0, SEEK_SET);
+    }
+    else {
+      fseek(fp, header_len + offset, SEEK_SET);
+    }
+
+    rbytes = fread(*chunk, 1, trailer_offset, fp);
+    if (rbytes != trailer_offset) {
+      BLOSC_TRACE_ERROR("Cannot read the (lazy) chunk out of the frame.");
+      rc = BLOSC2_ERROR_FILE_READ;
+      goto end;
+    }
+
+    // Mark chunk as lazy
+    uint8_t* blosc2_flags = *chunk + BLOSC2_CHUNK_BLOSC2_FLAGS;
+    *blosc2_flags |= 0x08U;
+
+    // Add the trailer (currently, nchunk + offset + block_csizes)
+    if (frame->sframe) {
+      *(int32_t*)(*chunk + trailer_offset) = offset;
+      *(int64_t*)(*chunk + trailer_offset + sizeof(int32_t)) = offset;
+    }
+    else {
+      *(int32_t*)(*chunk + trailer_offset) = nchunk;
+      *(int64_t*)(*chunk + trailer_offset + sizeof(int32_t)) = header_len + offset;
+    }
+
+    int32_t* block_csizes = malloc(nblocks * sizeof(int32_t));
+
+    int memcpyed = *(*chunk + BLOSC2_CHUNK_FLAGS) & (uint8_t)BLOSC_MEMCPYED;
+    if (memcpyed) {
+      // When memcpyed the blocksizes are trivial to compute
+      for (int i = 0; i < (int)nblocks; i++) {
+        block_csizes[i] = (int)chunk_blocksize;
+      }
+    }
+    else {
+      // In regular, compressed chunks, we need to sort the bstarts (they can be out
+      // of order because of multi-threading), and get a reverse index too.
+      memcpy(block_csizes, *chunk + BLOSC_EXTENDED_HEADER_LENGTH, nblocks * sizeof(int32_t));
+      // Helper structure to keep track of original indexes
+      struct csize_idx *csize_idx = malloc(nblocks * sizeof(struct csize_idx));
+      for (int n = 0; n < (int)nblocks; n++) {
+        csize_idx[n].val = block_csizes[n];
+        csize_idx[n].idx = n;
+      }
+      qsort(csize_idx, nblocks, sizeof(struct csize_idx), &sort_offset);
+      // Compute the actual csizes
+      int idx;
+      for (int n = 0; n < (int)nblocks - 1; n++) {
+        idx = csize_idx[n].idx;
+        block_csizes[idx] = csize_idx[n + 1].val - csize_idx[n].val;
+      }
+      idx = csize_idx[nblocks - 1].idx;
+      block_csizes[idx] = (int)chunk_cbytes - csize_idx[nblocks - 1].val;
+      free(csize_idx);
+    }
+    // Copy the csizes at the end of the trailer
+    void *trailer_csizes = *chunk + lazychunk_cbytes - nblocks * sizeof(int32_t);
+    memcpy(trailer_csizes, block_csizes, nblocks * sizeof(int32_t));
+    free(block_csizes);
+  } else {
+    // The chunk is in memory and just one pointer away
+    *chunk = frame->cframe + header_len + offset;
+    if ((int64_t)header_len + offset + BLOSC_MIN_HEADER_LENGTH > frame->len) {
+      BLOSC_TRACE_ERROR("Cannot read the header for chunk in the (contiguous) frame.");
+      rc = BLOSC2_ERROR_READ_BUFFER;
+    } else {
+      rc = blosc2_cbuffer_sizes(*chunk, NULL, &lazychunk_cbytes, NULL);
+    }
+  }
+
+  end:
+  if (fp != NULL) {
+    fclose(fp);
+  }
+  if (rc < 0) {
+    if (needs_free) {
+      free(*chunk);
+      *chunk = NULL;
+    }
+    return rc;
+  }
+
+  return (int)lazychunk_cbytes;
+}
+    '''
+    callee_def = '''
+    // Definition of __revert_3055a0_get_header_info:
+int __revert_3055a0_get_header_info(blosc2_frame *frame, int32_t *header_len, int64_t *frame_len, int64_t *nbytes,
+                    int64_t *cbytes, int32_t *chunksize, int32_t *nchunks, int32_t *typesize,
+                    uint8_t *compcode, uint8_t *clevel, uint8_t *filters, uint8_t *filters_meta) {
+  uint8_t* framep = frame->sdata;
+  uint8_t header[FRAME_HEADER_MINLEN];
+
+  if (frame->len <= 0) {
+    return -1;
+  }
+
+  if (frame->sdata == NULL) {
+    size_t rbytes = 0;
+    FILE* fp = fopen(frame->fname, "rb");
+    if (fp != NULL) {
+      rbytes = fread(header, 1, FRAME_HEADER_MINLEN, fp);
+      fclose(fp);
+    }
+    (void) rbytes;
+    if (rbytes != FRAME_HEADER_MINLEN) {
+      return -1;
+    }
+    framep = header;
+  }
+
+  // Fetch some internal lengths
+  __revert_3055a0_swap_store(header_len, framep + FRAME_HEADER_LEN, sizeof(*header_len));
+  __revert_3055a0_swap_store(frame_len, framep + FRAME_LEN, sizeof(*frame_len));
+  __revert_3055a0_swap_store(nbytes, framep + FRAME_NBYTES, sizeof(*nbytes));
+  __revert_3055a0_swap_store(cbytes, framep + FRAME_CBYTES, sizeof(*cbytes));
+  __revert_3055a0_swap_store(chunksize, framep + FRAME_CHUNKSIZE, sizeof(*chunksize));
+  if (typesize != NULL) {
+    __revert_3055a0_swap_store(typesize, framep + FRAME_TYPESIZE, sizeof(*typesize));
+  }
+
+  // Codecs
+  uint8_t frame_codecs = framep[FRAME_CODECS];
+  if (clevel != NULL) {
+    *clevel = frame_codecs >> 4u;
+  }
+  if (compcode != NULL) {
+    *compcode = frame_codecs & 0xFu;
+  }
+
+  // Filters
+  if (filters != NULL && filters_meta != NULL) {
+    uint8_t nfilters = framep[FRAME_FILTER_PIPELINE];
+    if (nfilters > BLOSC2_MAX_FILTERS) {
+      BLOSC_TRACE_ERROR("The number of filters in frame header are too large for Blosc2.");
+      return -1;
+    }
+    uint8_t *filters_ = framep + FRAME_FILTER_PIPELINE + 1;
+    uint8_t *filters_meta_ = framep + FRAME_FILTER_PIPELINE + 1 + FRAME_FILTER_PIPELINE_MAX;
+    for (int i = 0; i < nfilters; i++) {
+      filters[i] = filters_[i];
+      filters_meta[i] = filters_meta_[i];
+    }
+  }
+
+  if (*nbytes > 0 && *chunksize > 0) {
+    // We can compute the number of chunks only when the frame has actual data
+    *nchunks = (int32_t) (*nbytes / *chunksize);
+    if (*nbytes % *chunksize > 0) {
+      if (*nchunks == INT32_MAX) {
+        return -1;
+      }
+      *nchunks += 1;
+    }
+  } else {
+    *nchunks = 0;
+  }
+
+  return 0;
+}
+    '''
+    fixed_code = handle_renaming_patch_sig_change(error_msg, caller_def, callee_def)
     print("--- AI Generated Output ---")
     print(fixed_code)

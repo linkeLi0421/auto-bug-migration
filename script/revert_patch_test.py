@@ -334,7 +334,7 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
     return artificial_patch_insert_point
 
 
-def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
+def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path, signature_change_list):
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{next_commit}",
@@ -343,13 +343,18 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path):
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     def_kinds = {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}
+    new_funcs = set()
+    for old, new in signature_change_list:
+        if old == fname:
+            new_funcs.add(new)
     for node in ast_nodes:
-        if node['kind'] in def_kinds and node['spelling'] == fname:
+        if node['kind'] in def_kinds and node['spelling'] in new_funcs:
             return node['signature']
     return None
 
 
-def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions, func_list):
+def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions, func_list, signature_change_list):
+    logger.info(f'signature_change_list: {signature_change_list}')
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
@@ -403,7 +408,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 callee_sig = node['callee']['signature']
                 break
         if not callee_sig:
-            logger.info(f'No callee sig found for {parsing_path}: {func_name} {caller_loc}')
+            logger.error(f'No callee sig found for {parsing_path}: {func_name} {caller_loc}')
         fname = callee_sig.split('(')[0].split(' ')[-1]
         for node in ast_nodes:
             if (node.get('kind') in decl_kinds or node.get('kind') in def_kinds) and node['spelling'] == fname:
@@ -437,10 +442,10 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                         break
             func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
 
-            if file_path_new == def_file_path_new:
-                callee_sig_new = get_new_funcsig(fname, next_commit, def_file_path_new, target_repo_path)
-            if file_path_new != def_file_path_new or not callee_sig_new:
+            callee_sig_new = get_new_funcsig(fname, next_commit, def_file_path_new, target_repo_path, signature_change_list)
+            if not callee_sig_new:
                 # Function change name, so insert at an abbitray point
+                logger.info(f'Creating Artificial patch for {def_file_path_new} {fname}: by inserting at the end of the file')
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -451,37 +456,42 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 func_code = '\n'.join(rename_func(func_code, fname, commit))
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc))
             else:
-                artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
-                # Create the Artificial patch here
-                patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
-                patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
-                artificial_patch = PatchInfo(
-                    file_path_old=def_file_path_old,
-                    file_path_new=def_file_path_new,
-                    file_type='c',
-                    patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
-                    old_signature=callee_sig, # __revert_{commit}_{fname} is not added here
-                    patch_type={'Function removed', 'Function body change', 'Recreated function'},
-                    dependent_func=set(),
-                    new_start_line=artificial_patch_insert_point,
-                    new_end_line=artificial_patch_insert_point,
-                    old_start_line=artificial_patch_insert_point,
-                    old_end_line=artificial_patch_insert_point + func_length,
-                    recreated_function_locations={callee_sig: FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)},
-                )
-                new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
-                artificial_patch.patch_type.add('Static Function')
-                diff_results[new_key] = artificial_patch
-                new_patch_key_list.add(new_key)
-                # change the callsite, update depen_graph
-                for key in patch_key_list:
-                    patch = diff_results[key]
-                    if patch.file_path_old != def_file_path_old:
-                        continue
-                    if patch.old_signature and patch.old_signature == caller_sig:
-                        depen_graph.setdefault(new_key, set()).add(key)
-                        modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
-                        diff_results[key].patch_text = '\n'.join(modified_lines)
+                if 'LLVMFuzzerTestOneInput' in caller_sig:
+                    artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
+                    # Create the Artificial patch here
+                    patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
+                    patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
+                    artificial_patch = PatchInfo(
+                        file_path_old=def_file_path_old,
+                        file_path_new=def_file_path_new,
+                        file_type='c',
+                        patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                        old_signature=callee_sig, # __revert_{commit}_{fname} is not added here
+                        patch_type={'Function removed', 'Function body change', 'Recreated function'},
+                        dependent_func=set(),
+                        new_start_line=artificial_patch_insert_point,
+                        new_end_line=artificial_patch_insert_point,
+                        old_start_line=artificial_patch_insert_point,
+                        old_end_line=artificial_patch_insert_point + func_length,
+                        recreated_function_locations={callee_sig: FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)},
+                    )
+                    new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
+                    artificial_patch.patch_type.add('Static Function')
+                    diff_results[new_key] = artificial_patch
+                    new_patch_key_list.add(new_key)
+                    # change the callsite, update depen_graph
+                    for key in patch_key_list:
+                        patch = diff_results[key]
+                        if patch.file_path_old != def_file_path_old:
+                            continue
+                        if patch.old_signature and patch.old_signature == caller_sig:
+                            depen_graph.setdefault(new_key, set()).add(key)
+                            modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
+                            diff_results[key].patch_text = '\n'.join(modified_lines)
+                else:
+                    patch_text = diff_results[key_of_error_patch].patch_text
+                    modified_func_code = rename_func(patch_text, fname, None, replacement_string=callee_sig_new.split('(')[0].split(' ')[-1])
+                    diff_results[key_of_error_patch].patch_text = '\n'.join(modified_func_code)
         else:
             logger.error(f"-{file_path_old}+{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
@@ -1208,7 +1218,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         new_function_start_line=int(node['extent']['start']['line']),
                         new_function_end_line=int(node['extent']['end']['line']),
                     )
-                    break
         
         # checkout target repo to the old commit, and parse the code from that
         os.chdir(target_repo_path)
@@ -2615,20 +2624,35 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         caller_code = '\n'.join(get_code_from_file(target_repo_path, func_loc.file_path, next_commit, func_loc.start_line, func_loc.end_line)[0])
         callee_codes = '' # May be several callees
         full_error_message = ''
-        for callee_name, error_message in callee_list:
-            # Search callee code in the patches, because it is a recreating function patch
-            for key in patch_key_list:
-                patch = diff_results[key]
-                if patch.old_signature and callee_name == patch.old_function_name:
-                    callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
-                    break
-            new_name = f'__revert_{commit}_{callee_name}'
-            callee_codes += f'\n// Definition of {new_name}:\n{callee_code}\n'
-            full_error_message += error_message
-        logger.info(f'caller_code: {caller_code}')
-        logger.info(f'callee_codes: {callee_codes}')
-        logger.info(f'full_error_message: {full_error_message}')
-        exit((0))
+        solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{bug_id}-{next_commit}-{stable_hash(commit+key_of_line_num)}-apirenaming.txt')
+        logger.info(f'Solution path: {solution_path}')
+        if os.path.exists(solution_path):
+            with open(solution_path, 'r', encoding='utf-8') as f:
+                solution_code = f.read()
+        else:
+            for callee_name, error_message in callee_set:
+                # Search callee code in the patches, because it is a recreating function patch
+                caller_code = '\n'.join([line[1:] for line in rename_func(caller_code, callee_name, commit)])
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if 'Recreated function' in patch.patch_type:
+                        if patch.old_signature and callee_name == patch.old_function_name:
+                            callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
+                            break
+                        for func_sig in patch.hiden_func_dict:
+                            if callee_name == func_sig.split('(')[0].split(' ')[-1]:
+                                callee_code = '\n'.join(line[1:] for line in patch.patch_text.split('\n')[4:] if line.startswith('-'))
+                                break
+ 
+                new_name = f'__revert_{commit}_{callee_name}'
+                callee_codes += f'\n// Definition of {new_name}:\n{callee_code}\n'
+                full_error_message += error_message
+            solution_code = handle_renaming_patch_sig_change(full_error_message, caller_code, callee_codes)
+            solution_code = '\n'.join(diff_strings(solution_code, func_loc.file_path, '\n'.join(caller_code_original_lines), func_loc.file_path, 3, func_loc.start_line)) + '\n'
+            os.makedirs(os.path.dirname(solution_path), exist_ok=True)
+            with open(solution_path, 'w', encoding='utf-8') as f:
+                f.write(solution_code)
+        diff_results[key_of_line_num].patch_text = solution_code
 
 
 def get_correct_line_num(file_path, line_num, patch_key_list, diff_results, extra_patches):
@@ -3626,7 +3650,7 @@ def apply_and_test_patches(
                             func_decl_to_add.setdefault(file_path_new, set()).add(f'{func_decl}')
                         break
 
-        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions, func_list)
+        new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions, func_list, signature_change_list)
         logger.info(f'function_sig_changes: {[change[:-1] for change in function_sig_changes]}')
         if function_sig_changes and len(func_deled) == 0:
             handle_function_signature_changes(function_sig_changes, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, data_path, bug_id, file_path_pairs)
@@ -3923,6 +3947,8 @@ def apply_and_test_patches(
         'signature_change_list',
         f'{bug_id}_{next_commit["commit_id"]}.json',
     )
+    with open(signature_file, 'w') as sig_file:
+        json.dump(signature_change_list, sig_file, indent=2)
     if build_success:
         # Run the fuzzer to test if the bug is reproduced
         testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
@@ -3931,7 +3957,6 @@ def apply_and_test_patches(
         ]
         logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
         test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
-        get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
         if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
             # trigger the bug
             combined_output = (test_result.stderr or '') + (test_result.stdout or '')
@@ -3945,6 +3970,7 @@ def apply_and_test_patches(
                 return 'crash_mismatch'
             if test_fuzzer_build(target, sanitizer, arch):
                 logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
+                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
                 return 'trigger_and_fuzzer_build'
             else:
                 logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
@@ -4042,10 +4068,6 @@ def revert_patch_test(args):
     for commit, next_commit, bug_id in transitions:
         if bug_id in {'OSV-2023-51', 'OSV-2021-897', 'OSV-2021-639', 'OSV-2022-1242', 'OSV-2022-511'}:
             continue
-        if bug_id in {'OSV-2021-22', 'OSV-2020-2184'}:
-            continue
-        if bug_id != "OSV-2021-21":
-            continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
@@ -4131,7 +4153,27 @@ def revert_patch_test(args):
         diffs = get_diff_unified(target_repo_path, commit['commit_id'], next_commit['commit_id'], '') # every file get a diff
         get_compile_commands(target, next_commit['commit_id'], sanitizer, args.build_csv, arch)
         get_compile_commands(target, commit['commit_id'], sanitizer, args.build_csv, arch)
-        diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_list)
+        diff_path = os.path.join(data_path, 'diff', f'revert_patch_{bug_id}_{commit["commit_id"]}_to_{next_commit["commit_id"]}.diff')
+        os.makedirs(os.path.dirname(diff_path), exist_ok=True)
+        diff_results = None
+        if os.path.exists(diff_path):
+            try:
+                diff_results = load_patches_pickle(diff_path)
+                logger.info(f"Loaded cached diff analysis from {diff_path}")
+            except (pickle.UnpicklingError, EOFError, OSError, gzip.BadGzipFile) as exc:
+                logger.warning(f"Failed to load cached diff from {diff_path}: {exc}")
+                diff_results = None
+            with open(os.path.join(data_path, 'signature_change_list', f'{bug_id}_{next_commit['commit_id']}.json'), 'r') as f:
+                signature_change_dict[bug_id] = json.load(f)
+        if diff_results is None:
+            diff_results = analyze_diffindex(diffs, target_repo_path, next_commit['commit_id'], commit['commit_id'], target, signature_change_dict[bug_id])
+            with open(os.path.join(data_path, 'signature_change_list', f'{bug_id}_{next_commit['commit_id']}.json'), 'w') as f:
+                json.dump(signature_change_dict[bug_id], f)
+            try:
+                save_patches_pickle(diff_results, diff_path)
+                logger.info(f"Saved diff analysis cache to {diff_path}")
+            except OSError as exc:
+                logger.warning(f"Failed to save diff analysis cache to {diff_path}: {exc}")
         file_path_pairs = get_file_path_pairs(diff_results)
 
         trace_func_list = []
@@ -4228,54 +4270,37 @@ def revert_patch_test(args):
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
-        # if bug_id == 'OSV-2021-21':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1658,24+1800,25', 'blosc/blosc2.cblosc/blosc2.c-1544,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1578,69+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1564,4+1748,0'), ('blosc/blosc2.cblosc/blosc2.c-1413,20+1671,0',), ('blosc/frame.cblosc/frame.c-1493,3+2021,20', 'blosc/frame.cblosc/frame.c-1454,3+1976,9', 'blosc/frame.cblosc/frame.c-1389,59+1877,93'), ('blosc/frame.cblosc/frame.c-1295,18+1706,58',), ('blosc/blosc2.cblosc/blosc2.c-2431,39+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2394,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2272,116+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1172,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1141,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1112,15+1368,24', 'blosc/blosc2.cblosc/blosc2.c-1087,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1004,58+1223,91', 'blosc/blosc2.cblosc/blosc2.c-994,2+1211,4'), ('blosc/frame.cblosc/frame.c-810,30+1031,13', 'blosc/frame.cblosc/frame.c-771,36+1012,19'), ('blosc/frame.cblosc/frame.c-454,8+472,7',), ('blosc/frame.cblosc/frame.c-442,5+453,12', 'blosc/frame.cblosc/frame.c-427,2+438,2', 'blosc/frame.cblosc/frame.c-379,32+365,51'), ('blosc/frame.cblosc/frame.c-42,37+41,0',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',), ('blosc/frame.cblosc/frame.c-1160,118+1554,135', 'blosc/frame.cblosc/frame.c-1132,21+1522,25', 'blosc/frame.cblosc/frame.c-1109,12+1497,13'), ('blosc/frame.cblosc/frame.c-910,60+1125,110',), ('blosc/frame.cblosc/frame.c-1060,47+1350,145', 'blosc/frame.cblosc/frame.c-972,79+1236,102'), ('blosc/shuffle.cblosc/shuffle.c-314,7+310,11',), ('blosc/blosc2.cblosc/blosc2.c-1364,2+1623,2',), ('blosc/blosc2.cblosc/blosc2.c-1299,7+1558,7',), ('blosc/blosc2.cblosc/blosc2.c-1243,2+1501,3', 'blosc/blosc2.cblosc/blosc2.c-1224,4+1483,3')]
-        
         # if bug_id == 'OSV-2021-27':
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
+        #     # patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-1470,18+1706,58',), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        # if bug_id == 'OSV-2020-2184':
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',), ('blosc/frame.cblosc/frame.c-1160,118+1554,135', 'blosc/frame.cblosc/frame.c-1132,21+1522,25', 'blosc/frame.cblosc/frame.c-1109,13+1497,15'), ('blosc/frame.cblosc/frame.c-442,5+453,12', 'blosc/frame.cblosc/frame.c-427,2+438,2', 'blosc/frame.cblosc/frame.c-379,33+365,58')]
+        # if bug_id == 'OSV-2021-22':
         #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2020-2184':1
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)'] 
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
-        # if bug_id == 'OSV-2021-22':1
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # # if bug_id == 'OSV-2021-21':
-        # #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-1470,18+1706,58',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13')]
+        # if bug_id == 'OSV-2021-21':
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13')]
         # if bug_id == 'OSV-2021-274':
-        #     # ['blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)'] 
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1473,9+1682,7', 'blosc/frame.cblosc/frame.c-1461,4+1674,0', 'blosc/frame.cblosc/frame.c-1432,11+1641,15', 'blosc/frame.cblosc/frame.c-1416,10+1622,13', 'blosc/frame.cblosc/frame.c-1389,8+1592,11', 'blosc/frame.cblosc/frame.c-1368,4+1569,6', 'blosc/frame.cblosc/frame.c-1301,8+1500,10'), ('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
         # if bug_id == 'OSV-2021-246':
         #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1453,86+1612,77', 'blosc/frame.cblosc/frame.c-1402,42+1559,44', 'blosc/frame.cblosc/frame.c-1386,4+1545,2', 'blosc/frame.cblosc/frame.c-1365,5+1522,7', 'blosc/frame.cblosc/frame.c-1342,12+1497,13'), ('blosc/frame.cblosc/frame.c-1055,86+1125,110',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/frame.cblosc/frame.c-1180,72+1271,68', 'blosc/frame.cblosc/frame.c-1143,28+1236,24')]
         # if bug_id == 'OSV-2021-213':
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'blosc2_schunk * blosc2_frame_to_schunk(blosc2_frame * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame * frame, blosc2_schunk * schunk)'] 
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
         # if bug_id == 'OSV-2021-247':
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/frame.cblosc/frame.c-1782,8+2021,24', 'blosc/frame.cblosc/frame.c-1743,3+1976,9', 'blosc/frame.cblosc/frame.c-1724,13+1955,15', 'blosc/frame.cblosc/frame.c-1710,6+1938,9', 'blosc/frame.cblosc/frame.c-1650,54+1877,55'), ('blosc/frame.cblosc/frame.c-1506,17+1706,20',), ('blosc/frame.cblosc/frame.c-963,2+1037,2', 'blosc/frame.cblosc/frame.c-912,43+964,65'), ('blosc/frame.cblosc/frame.c-472,2+462,2', 'blosc/frame.cblosc/frame.c-464,2+454,2', 'blosc/frame.cblosc/frame.c-448,2+438,2', 'blosc/frame.cblosc/frame.c-414,19+391,32', 'blosc/frame.cblosc/frame.c-386,18+365,14'), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',), ('blosc/frame.cblosc/frame.c-1289,15+1271,15', 'blosc/frame.cblosc/frame.c-1253,28+1236,27')]
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/frame.cblosc/frame.c-1782,8+2021,24', 'blosc/frame.cblosc/frame.c-1743,3+1976,9', 'blosc/frame.cblosc/frame.c-1724,13+1955,15', 'blosc/frame.cblosc/frame.c-1710,6+1938,9', 'blosc/frame.cblosc/frame.c-1650,54+1877,55'), ('blosc/frame.cblosc/frame.c-1506,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2632,43+2561,19',), ('blosc/frame.cblosc/frame.c-963,2+1037,2', 'blosc/frame.cblosc/frame.c-912,43+964,65'), ('blosc/frame.cblosc/frame.c-472,2+462,2', 'blosc/frame.cblosc/frame.c-464,2+454,2', 'blosc/frame.cblosc/frame.c-448,2+438,2', 'blosc/frame.cblosc/frame.c-414,19+391,32', 'blosc/frame.cblosc/frame.c-386,18+365,14'), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)]
         # if bug_id == 'OSV-2021-404':
-        #     # ['int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)']
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-2018,5+2022,21', 'blosc/frame.cblosc/frame.c-1978,3+1976,9', 'blosc/frame.cblosc/frame.c-1966,6+1963,7', 'blosc/frame.cblosc/frame.c-1958,2+1954,3', 'blosc/frame.cblosc/frame.c-1946,5+1939,8', 'blosc/frame.cblosc/frame.c-1910,26+1907,22', 'blosc/frame.cblosc/frame.c-1888,14+1882,17'), ('blosc/frame.cblosc/frame.c-1057,10+1014,11', 'blosc/frame.cblosc/frame.c-1043,2+992,10', 'blosc/frame.cblosc/frame.c-1026,11+965,21'), ('blosc/frame.cblosc/frame.c-479,8+409,9', 'blosc/frame.cblosc/frame.c-437,2+366,0'), ('blosc/frame.cblosc/frame.c-1698,1+1674,0', 'blosc/frame.cblosc/frame.c-1669,11+1641,15', 'blosc/frame.cblosc/frame.c-1653,10+1622,13', 'blosc/frame.cblosc/frame.c-1626,8+1592,11', 'blosc/frame.cblosc/frame.c-1605,4+1569,6', 'blosc/frame.cblosc/frame.c-1538,8+1500,10'), ('blosc/frame.cblosc/frame.c-1444,4+1404,6',), ('blosc/frame.cblosc/frame.c-1283,4+1241,6',)]
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1732,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-1057,10+1014,11', 'blosc/frame.cblosc/frame.c-1043,2+992,10', 'blosc/frame.cblosc/frame.c-1026,11+965,21')]
         # if bug_id == 'OSV-2021-221':
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int64_t get_coffset(blosc2_frame * frame, int32_t header_len, int64_t cbytes, int32_t nchunk)', 'int blosc_getitem(const void * src, int start, int nitems, void * dest)', 'uint8_t get_filter_flags(const uint8_t header_flags, const int32_t typesize)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1816,8+2021,24', 'blosc/frame.cblosc/frame.c-1777,3+1976,9', 'blosc/frame.cblosc/frame.c-1744,27+1938,32', 'blosc/frame.cblosc/frame.c-1684,54+1877,55'), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-1576,18+1748,0',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1172,72+1271,68', 'blosc/frame.cblosc/frame.c-1135,28+1236,24')]
+        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2580,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2451,123+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1204,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1173,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1151,8+1384,8', 'blosc/blosc2.cblosc/blosc2.c-1137,4+1370,4', 'blosc/blosc2.cblosc/blosc2.c-1110,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1006,79+1223,91', 'blosc/blosc2.cblosc/blosc2.c-996,2+1211,4'), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
         # if bug_id == 'OSV-2021-369':
-        #     # ['int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'int frame_get_lazychunk(blosc2_frame_s * frame, int nchunk, uint8_t ** chunk, _Bool * needs_free)', 'uint8_t * get_coffsets(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t * off_cbytes)', 'uint8_t * get_coffsets(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t * off_cbytes)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_frame_s * frame_from_cframe(uint8_t * cframe, int64_t len, _Bool copy)'] 
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1770,5+2022,21', 'blosc/frame.cblosc/frame.c-1730,3+1976,9', 'blosc/frame.cblosc/frame.c-1718,6+1963,7', 'blosc/frame.cblosc/frame.c-1710,2+1954,3', 'blosc/frame.cblosc/frame.c-1698,5+1939,8', 'blosc/frame.cblosc/frame.c-1662,26+1907,22', 'blosc/frame.cblosc/frame.c-1640,14+1882,17'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-1237,2+1277,2', 'blosc/frame.cblosc/frame.c-1203,4+1241,6'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1484,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
         # if bug_id == 'OSV-2021-429':
-        #     # ['int get_coffset(blosc2_frame_s * frame, int32_t header_len, int64_t cbytes, int32_t nchunk, int64_t * offset)']
         #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1673,10+1707,11',)]
         # if bug_id == 'OSV-2022-4':
-        #     # ['int initialize_context_decompression(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, void * dest, int32_t destsize)']
         #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
         # if bug_id == 'OSV-2022-34':
-        #     # ['int initialize_context_decompression(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, void * dest, int32_t destsize)']
-        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
-        # if bug_id == 'OSV-2021-1589':
-        #     # ['int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)', 'int _blosc_getitem(blosc2_context * context, blosc_header * header, const void * src, int32_t srcsize, int start, int nitems, void * dest, int32_t destsize)']
         #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
         # if bug_id == 'OSV-2022-486':
-        #     # ['blosc2_schunk * blosc2_schunk_from_buffer(uint8_t * cframe, int64_t len, _Bool copy)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'blosc2_schunk * frame_to_schunk(blosc2_frame_s * frame, _Bool copy, const blosc2_io * udio)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_vlmetalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int get_header_info(blosc2_frame_s * frame, int32_t * header_len, int64_t * frame_len, int64_t * nbytes, int64_t * cbytes, int32_t * blocksize, int32_t * chunksize, int32_t * nchunks, int32_t * typesize, uint8_t * compcode, uint8_t * compcode_meta, uint8_t * clevel, uint8_t * filters, uint8_t * filters_meta, const blosc2_io * io)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)', 'int frame_get_metalayers(blosc2_frame_s * frame, blosc2_schunk * schunk)']
-        #     patch_pair_list = [('blosc/schunk.cblosc/schunk.c-476,2+446,2',), ('blosc/frame.cblosc/frame.c-1761,2+1664,2', 'blosc/frame.cblosc/frame.c-1728,5+1631,5', 'blosc/frame.cblosc/frame.c-1695,20+1598,20', 'blosc/frame.cblosc/frame.c-1663,15+1572,9', 'blosc/frame.cblosc/frame.c-1644,2+1553,2', 'blosc/frame.cblosc/frame.c-1634,2+1543,2', 'blosc/frame.cblosc/frame.c-1617,11+1526,11', 'blosc/frame.cblosc/frame.c-1586,14+1497,12'), ('blosc/frame.cblosc/frame.c-1498,24+1428,17', 'blosc/frame.cblosc/frame.c-1478,3+1409,2'), ('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24'), ('blosc/frame.cblosc/frame.c-1321,20+1257,13', 'blosc/frame.cblosc/frame.c-1309,3+1246,2')]
+        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24')]
         
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
@@ -4302,45 +4327,51 @@ def revert_patch_test(args):
 
         get_patched_traces, transitions, signature_change_list = mutable_args
         # test if the local bugs is still there using crash stack comparison
-        # for bug_id_trigger in bug_ids_trigger:
-        #     result, crash_output = test_fuzzer(
-        #         args,
-        #         bug_id_trigger,
-        #         target,
-        #         next_commit['commit_id'],
-        #         get_patched_traces[bug_id][-1],
-        #     )
-        #     if result == 'not trigger':
-        #         logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
-        #         continue
+        patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+        for i in range(len(get_patched_traces[bug_id])):
+            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
+            need_build = True
+            for bug_id_trigger in bug_ids_trigger:
+                result, crash_output = test_fuzzer(
+                    args,
+                    bug_id_trigger,
+                    target,
+                    next_commit['commit_id'],
+                    patch_file_path,
+                    need_build=need_build,
+                )
+                need_build = False  # only build once for multiple local bug tests
+                if result == 'not trigger':
+                    logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
+                    continue
 
-        #     trigger_info = bug_info_dataset[bug_id_trigger]
-        #     trigger_fuzzer = trigger_info['reproduce']['fuzz_target']
-        #     trigger_sanitizer = trigger_info['reproduce']['sanitizer'].split(' ')[0]
-        #     trigger_job_type = trigger_info['reproduce']['job_type']
-        #     trigger_arch = trigger_job_type.split('_')[2] if len(trigger_job_type.split('_')) > 3 else 'x86_64'
-        #     trigger_input = select_crash_test_input(bug_id_trigger, testcases_env)
-        #     baseline_crash_path = get_crash_stack(
-        #         bug_id=bug_id_trigger,
-        #         commit_id=next_commit['commit_id'],
-        #         crash_test_input=trigger_input,
-        #         sanitizer=trigger_sanitizer,
-        #         build_csv=args.build_csv,
-        #         arch=trigger_arch,
-        #         testcases_env=testcases_env,
-        #         target=target,
-        #         fuzzer=trigger_fuzzer,
-        #     )
-        #     signature_file_trigger = os.path.join(
-        #         data_path,
-        #         'signature_change_list',
-        #         f'{bug_id}_{next_commit["commit_id"]}.json',
-        #     )
-        #     if crashes_match(crash_output, baseline_crash_path, signature_file_trigger):
-        #         logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} (stack match)\n')
-        #         test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
-        #     else:
-        #         logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
+                trigger_info = bug_info_dataset[bug_id_trigger]
+                trigger_fuzzer = trigger_info['reproduce']['fuzz_target']
+                trigger_sanitizer = trigger_info['reproduce']['sanitizer'].split(' ')[0]
+                trigger_job_type = trigger_info['reproduce']['job_type']
+                trigger_arch = trigger_job_type.split('_')[2] if len(trigger_job_type.split('_')) > 3 else 'x86_64'
+                trigger_input = select_crash_test_input(bug_id_trigger, testcases_env)
+                baseline_crash_path = get_crash_stack(
+                    bug_id=bug_id_trigger,
+                    commit_id=next_commit['commit_id'],
+                    crash_test_input=trigger_input,
+                    sanitizer=trigger_sanitizer,
+                    build_csv=args.build_csv,
+                    arch=trigger_arch,
+                    testcases_env=testcases_env,
+                    target=target,
+                    fuzzer=trigger_fuzzer,
+                )
+                signature_file_trigger = os.path.join(
+                    data_path,
+                    'signature_change_list',
+                    f'{bug_id}_{next_commit["commit_id"]}.json',
+                )
+                if crashes_match(crash_output, baseline_crash_path, signature_file_trigger):
+                    logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} (stack match)\n')
+                    test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
+                else:
+                    logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
 
         
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
