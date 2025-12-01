@@ -11,7 +11,7 @@ def extract_code(text):
     return "\n\n".join(blocks).strip() if blocks else text.strip()
 
 
-def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-4o"):
+def solve_code_migration(error_message, data_structureA, data_structureB, source_code, model="gpt-5.1"):
     """
     Solve code migration problems using OpenAI API
     
@@ -31,19 +31,60 @@ def solve_code_migration(error_message, data_structureA, data_structureB, source
 {error_message}
 
 Related data structure in version A is:
+
 {data_structureA}
 
 Related data structure in version B is:
+
 {data_structureB}
 
 Related source code is:
+
 {source_code}
 
-Please fix only the function code to resolve the compilation error.
-If a struct field from version A is deleted (not renamed) in version B, remove or refactor the code that used that field instead of inventing a replacement. If a field in version A appears to have been renamed or semantically replaced in version B, update the code to use the new field name instead of removing the logic. When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if it were a function.
-Note you should not change the number of function arguments and other codes' line number.
-Output only the corrected C function (no struct definitions, no explanations, no comments).
-Wrap it in ```c ... ``` so I can parse it easily.
+Your job:
+
+1. First, compare the version A and version B struct definitions and infer a mapping between fields
+   (based on names, types, *and comments*).
+2. Then, update ONLY the body of the given function so that it compiles against version B
+   **while preserving the original behavior as much as possible.**
+
+Migration rules:
+
+- For every struct field used in the function that does not exist in version B:
+  * If there is ANY reasonable candidate field in version B that appears to represent the same concept
+    (same or compatible type, similar comment, or similar role), treat it as a **rename / semantic replacement**
+    and update the code to use that field.
+  * ONLY remove or greatly simplify logic when there is clearly no suitable replacement field.
+
+- Prefer **updating** code to use renamed / replacement fields over deleting code. Err on the side of mapping
+  to a new field rather than removing functionality, unless the types clearly do not match.
+
+- If version B introduces new ownership / flag fields (for example booleans that say whether a buffer
+  can be freed or whether a frame is sparse), set them consistently with the function's behavior:
+  * If the function allocates a new buffer, mark the frame as owning that buffer (so it can be freed).
+  * If the function just aliases a caller-provided buffer, mark the frame as NOT owning it.
+  * If there is a flag indicating the frame is “sparse” or similar, set it to true/false as implied by the
+    function's name and logic.
+
+- If a struct field from version A is genuinely deleted (not renamed or replaced), refactor or remove only
+  the minimal amount of code that depends on it. Do NOT invent arbitrary new fields.
+
+- When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if
+  it were a function.
+
+Constraints:
+
+- Modify only the function code shown in the input.
+- Do NOT change the function signature or the number of arguments.
+- Do NOT change line numbers outside the function.
+- Do NOT add new functions, global variables, or struct definitions.
+- Do NOT add comments or explanations.
+
+Output format:
+
+- Output only the **full corrected C function** (no struct definitions, no explanations, no comments).
+- Wrap it in ```c ... ``` so I can parse it easily.
 """
     
     try:
@@ -53,7 +94,7 @@ Wrap it in ```c ... ``` so I can parse it easily.
                 {"role": "system", "content": "You are an expert C programmer who fixes compilation errors. Respond only with code when asked."}, 
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,  # Lower temperature for more precise following of instructions
+            temperature=0,
         )
         raw = response.choices[0].message.content
         return extract_code(raw)
