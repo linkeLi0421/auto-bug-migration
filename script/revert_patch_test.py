@@ -456,42 +456,37 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
                 func_code = '\n'.join(rename_func(func_code, fname, commit))
                 tail_fun_info_list.append((func_code, artificial_patch_insert_point, func_length, def_file_path_old, file_path_old, file_path_new, caller_sig, callee_sig, def_loc))
             else:
-                if 'LLVMFuzzerTestOneInput' in caller_sig:
-                    artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
-                    # Create the Artificial patch here
-                    patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
-                    patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
-                    artificial_patch = PatchInfo(
-                        file_path_old=def_file_path_old,
-                        file_path_new=def_file_path_new,
-                        file_type='c',
-                        patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
-                        old_signature=callee_sig, # __revert_{commit}_{fname} is not added here
-                        patch_type={'Function removed', 'Function body change', 'Recreated function'},
-                        dependent_func=set(),
-                        new_start_line=artificial_patch_insert_point,
-                        new_end_line=artificial_patch_insert_point,
-                        old_start_line=artificial_patch_insert_point,
-                        old_end_line=artificial_patch_insert_point + func_length,
-                        recreated_function_locations={callee_sig: FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)},
-                    )
-                    new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
-                    artificial_patch.patch_type.add('Static Function')
-                    diff_results[new_key] = artificial_patch
-                    new_patch_key_list.add(new_key)
-                    # change the callsite, update depen_graph
-                    for key in patch_key_list:
-                        patch = diff_results[key]
-                        if patch.file_path_old != def_file_path_old:
-                            continue
-                        if patch.old_signature and patch.old_signature == caller_sig:
-                            depen_graph.setdefault(new_key, set()).add(key)
-                            modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
-                            diff_results[key].patch_text = '\n'.join(modified_lines)
-                else:
-                    patch_text = diff_results[key_of_error_patch].patch_text
-                    modified_func_code = rename_func(patch_text, fname, None, replacement_string=callee_sig_new.split('(')[0].split(' ')[-1])
-                    diff_results[key_of_error_patch].patch_text = '\n'.join(modified_func_code)
+                artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
+                # Create the Artificial patch here
+                patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
+                patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
+                artificial_patch = PatchInfo(
+                    file_path_old=def_file_path_old,
+                    file_path_new=def_file_path_new,
+                    file_type='c',
+                    patch_text='\n'.join(rename_func(patch_header + func_code, fname, commit)),
+                    old_signature=callee_sig, # __revert_{commit}_{fname} is not added here
+                    patch_type={'Function removed', 'Function body change', 'Recreated function'},
+                    dependent_func=set(),
+                    new_start_line=artificial_patch_insert_point,
+                    new_end_line=artificial_patch_insert_point,
+                    old_start_line=artificial_patch_insert_point,
+                    old_end_line=artificial_patch_insert_point + func_length,
+                    recreated_function_locations={callee_sig: FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)},
+                )
+                new_key = f'{def_file_path_old}{def_file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
+                artificial_patch.patch_type.add('Static Function')
+                diff_results[new_key] = artificial_patch
+                new_patch_key_list.add(new_key)
+                # change the callsite, update depen_graph
+                for key in patch_key_list:
+                    patch = diff_results[key]
+                    if patch.file_path_old != def_file_path_old:
+                        continue
+                    if patch.old_signature and patch.old_signature == caller_sig:
+                        depen_graph.setdefault(new_key, set()).add(key)
+                        modified_lines = rename_func(diff_results[key].patch_text, fname, commit)
+                        diff_results[key].patch_text = '\n'.join(modified_lines)
         else:
             logger.error(f"-{file_path_old}+{file_path_new}: {line_range} cannot find caller or callee in parsing files.")
             
@@ -4097,16 +4092,12 @@ def revert_patch_test(args):
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
-        if bug_id in {'OSV-2023-51', 'OSV-2021-897', 'OSV-2021-639', 'OSV-2022-1242', 'OSV-2022-511'}:
-            continue
-        if bug_id in {'OSV-2021-22', 'OSV-2020-2184'}:
+        if bug_id in {'OSV-2023-51', 'OSV-2021-897', 'OSV-2021-639', 'OSV-2022-1242', 'OSV-2022-511', 'OSV-2021-1589'}:
             continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
             commit['commit_id'] = args.buggy_commit[:6]
-        if bug_id == 'OSV-2021-21':
-            commit["commit_id"] = '3055a0'
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
@@ -4302,38 +4293,35 @@ def revert_patch_test(args):
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
         
         if bug_id == 'OSV-2021-27':
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)']
-            # patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',)]
-        # if bug_id == 'OSV-2020-2184':1
-        #     # ['int LLVMFuzzerTestOneInput(const uint8_t * data, size_t size)', 'blosc2_schunk * blosc2_schunk_open_sframe(uint8_t * sframe, int64_t len)'] 
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
-        # if bug_id == 'OSV-2021-22':1
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # # if bug_id == 'OSV-2021-21':
-        # #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-1470,18+1706,58',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13')]
-        # if bug_id == 'OSV-2021-274':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
-        # if bug_id == 'OSV-2021-246':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1453,86+1612,77', 'blosc/frame.cblosc/frame.c-1402,42+1559,44', 'blosc/frame.cblosc/frame.c-1386,4+1545,2', 'blosc/frame.cblosc/frame.c-1365,5+1522,7', 'blosc/frame.cblosc/frame.c-1342,12+1497,13'), ('blosc/frame.cblosc/frame.c-1055,86+1125,110',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/frame.cblosc/frame.c-1180,72+1271,68', 'blosc/frame.cblosc/frame.c-1143,28+1236,24')]
-        # if bug_id == 'OSV-2021-213':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2021-247':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/frame.cblosc/frame.c-1782,8+2021,24', 'blosc/frame.cblosc/frame.c-1743,3+1976,9', 'blosc/frame.cblosc/frame.c-1724,13+1955,15', 'blosc/frame.cblosc/frame.c-1710,6+1938,9', 'blosc/frame.cblosc/frame.c-1650,54+1877,55'), ('blosc/frame.cblosc/frame.c-1506,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2632,43+2561,19',), ('blosc/frame.cblosc/frame.c-963,2+1037,2', 'blosc/frame.cblosc/frame.c-912,43+964,65'), ('blosc/frame.cblosc/frame.c-472,2+462,2', 'blosc/frame.cblosc/frame.c-464,2+454,2', 'blosc/frame.cblosc/frame.c-448,2+438,2', 'blosc/frame.cblosc/frame.c-414,19+391,32', 'blosc/frame.cblosc/frame.c-386,18+365,14'), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)]
-        # if bug_id == 'OSV-2021-404':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1732,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-1057,10+1014,11', 'blosc/frame.cblosc/frame.c-1043,2+992,10', 'blosc/frame.cblosc/frame.c-1026,11+965,21')]
-        # if bug_id == 'OSV-2021-221':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2580,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2451,123+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1204,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1173,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1151,8+1384,8', 'blosc/blosc2.cblosc/blosc2.c-1137,4+1370,4', 'blosc/blosc2.cblosc/blosc2.c-1110,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1006,79+1223,91', 'blosc/blosc2.cblosc/blosc2.c-996,2+1211,4'), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2021-369':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1484,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
-        # if bug_id == 'OSV-2021-429':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1673,10+1707,11',)]
-        # if bug_id == 'OSV-2022-4':
-        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
-        # if bug_id == 'OSV-2022-34':
-        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
-        # if bug_id == 'OSV-2022-486':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24')]
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-1470,18+1706,58',), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        if bug_id == 'OSV-2020-2184':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
+        if bug_id == 'OSV-2021-22':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        if bug_id == 'OSV-2021-21':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13')]
+        if bug_id == 'OSV-2021-274':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
+        if bug_id == 'OSV-2021-246':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1453,86+1612,77', 'blosc/frame.cblosc/frame.c-1402,42+1559,44', 'blosc/frame.cblosc/frame.c-1386,4+1545,2', 'blosc/frame.cblosc/frame.c-1365,5+1522,7', 'blosc/frame.cblosc/frame.c-1342,12+1497,13'), ('blosc/frame.cblosc/frame.c-1055,86+1125,110',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/frame.cblosc/frame.c-1180,72+1271,68', 'blosc/frame.cblosc/frame.c-1143,28+1236,24')]
+        if bug_id == 'OSV-2021-213':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        if bug_id == 'OSV-2021-247':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/frame.cblosc/frame.c-1782,8+2021,24', 'blosc/frame.cblosc/frame.c-1743,3+1976,9', 'blosc/frame.cblosc/frame.c-1724,13+1955,15', 'blosc/frame.cblosc/frame.c-1710,6+1938,9', 'blosc/frame.cblosc/frame.c-1650,54+1877,55'), ('blosc/frame.cblosc/frame.c-1506,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2632,43+2561,19',), ('blosc/frame.cblosc/frame.c-963,2+1037,2', 'blosc/frame.cblosc/frame.c-912,43+964,65'), ('blosc/frame.cblosc/frame.c-472,2+462,2', 'blosc/frame.cblosc/frame.c-464,2+454,2', 'blosc/frame.cblosc/frame.c-448,2+438,2', 'blosc/frame.cblosc/frame.c-414,19+391,32', 'blosc/frame.cblosc/frame.c-386,18+365,14'), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)]
+        if bug_id == 'OSV-2021-404':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1732,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-1057,10+1014,11', 'blosc/frame.cblosc/frame.c-1043,2+992,10', 'blosc/frame.cblosc/frame.c-1026,11+965,21')]
+        if bug_id == 'OSV-2021-221':
+            patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2580,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2451,123+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1204,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1173,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1151,8+1384,8', 'blosc/blosc2.cblosc/blosc2.c-1137,4+1370,4', 'blosc/blosc2.cblosc/blosc2.c-1110,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1006,79+1223,91', 'blosc/blosc2.cblosc/blosc2.c-996,2+1211,4'), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
+        if bug_id == 'OSV-2021-369':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1484,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
+        if bug_id == 'OSV-2021-429':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-1673,10+1707,11',), ('blosc/blosc2.cblosc/blosc2.c-2570,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2559,2+2561,2')]
+        if bug_id == 'OSV-2022-4':
+            patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
+        if bug_id == 'OSV-2022-34':
+            patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
+        if bug_id == 'OSV-2022-486':
+            patch_pair_list = [('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24')]
         
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
@@ -4364,6 +4352,7 @@ def revert_patch_test(args):
         for i in range(len(get_patched_traces[bug_id])):
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
             need_build = True
+            count = 0
             for bug_id_trigger in bug_ids_trigger:
                 result, crash_output = test_fuzzer(
                     args,
@@ -4402,11 +4391,12 @@ def revert_patch_test(args):
                 )
                 if crashes_match(crash_output, baseline_crash_path, signature_file_trigger):
                     logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} (stack match)\n')
+                    count += 1
                     test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
                 else:
                     logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
+            logger.info(f'\t{bug_id} total local bugs triggered: {count}\n')
 
-        
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
     
@@ -4441,19 +4431,19 @@ if __name__ == "__main__":
         for bug_id, affected_bugs in test_local_bug_after_patch.items():
             logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
 
-    # for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
-    #     logger.info(f'bug_id {bug_id}')
-    #     for key in patch_dict:
-    #         patch = patch_dict[key]
-    #         if patch.hiden_func_dict:
-    #             for func_sig in patch.hiden_func_dict:
-    #                 logger.info(f'-->{func_sig}\n')
-    #         else:
-    #             if patch.new_signature:
-    #                 logger.info(f'-->{patch.new_signature}')
-    #             elif patch.old_signature:
-    #                 logger.info(f'-->{patch.old_signature}')
-    #     patch_not_context = remove_context(patch_dict)
-    #     for key in patch_not_context:
-    #         patch = patch_not_context[key]
-        # patches_without_contexts[(bug_id, commit_id, fuzzer, input_functions)] = patch_not_context
+    for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
+        logger.info(f'bug_id {bug_id}')
+        for key in patch_dict:
+            patch = patch_dict[key]
+            if patch.hiden_func_dict:
+                for func_sig in patch.hiden_func_dict:
+                    logger.info(f'-->{func_sig}\n')
+            else:
+                if patch.new_signature:
+                    logger.info(f'-->{patch.new_signature}')
+                elif patch.old_signature:
+                    logger.info(f'-->{patch.old_signature}')
+        patch_not_context = remove_context(patch_dict)
+        for key in patch_not_context:
+            patch = patch_not_context[key]
+        patches_without_contexts[(bug_id, commit_id, fuzzer, input_functions)] = patch_not_context
