@@ -354,7 +354,6 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path, signatu
 
 
 def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions, func_list, signature_change_list):
-    logger.info(f'signature_change_list: {signature_change_list}')
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
     tail_fun_info_list = []
@@ -458,6 +457,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             else:
                 artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
                 # Create the Artificial patch here
+                logger.info(f'Creating Artificial patch for {def_file_path_new} {fname}: inserting at line {artificial_patch_insert_point}')
                 patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
                 patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
                 artificial_patch = PatchInfo(
@@ -1439,7 +1439,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             patch_lines = patch.patch_text.split('\n')
             old_start = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
             old_offset = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
-            new_start = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
+            new_start = int(patch_lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
             new_offset = int(patch_lines[3].split('@@')[-2].strip().split(',')[-1])
             patch_lines[3] = f'@@ -{new_start},{old_offset} +{new_start},{new_offset} @@'
             patch.patch_text = '\n'.join(patch_lines)
@@ -2759,6 +2759,22 @@ def get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, 
     return key_of_line_num, old_function_signature, func_start_index, func_end_index
 
 
+def correct_hiden_func_dict(patch: PatchInfo) -> dict:
+    patch_text_lines = patch.patch_text.split('\n')
+    for sig, offset in patch.hiden_func_dict.items():
+        if 'no change trace function' in sig:
+            continue
+        if not patch_text_lines[offset+4].startswith('-'):
+            # The offset is imprecise, need to correct it
+            new_offset = offset
+            for i in range(offset+4, len(patch_text_lines)):
+                if patch_text_lines[i].startswith('-'):
+                    new_offset = i - 4
+                    break
+            patch.hiden_func_dict[sig] = new_offset
+    return patch.hiden_func_dict
+
+
 def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id):
     logger.info(f'enter handle miss member structs {len(miss_member_structs)}')
     struct_error_dict = dict()
@@ -2895,6 +2911,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         end_context_len = len([line for line in patch_text_lines[-3:] if line.startswith(' ')]) # 3 in most cases
         if 'Merged functions' in diff_results[key_of_line_num].patch_type or 'Tail function' in diff_results[key_of_line_num].patch_type:
             last_offset = len(patch_text_lines)-end_context_len
+            correct_hiden_func_dict(diff_results[key_of_line_num])
             hiden_func_dict = dict(sorted(diff_results[key_of_line_num].hiden_func_dict.items(), key=lambda x: x[1], reverse=True)) # descending by offset
             for func_sig in hiden_func_dict:
                 if func_sig not in solution_code_dict:
@@ -4092,8 +4109,6 @@ def revert_patch_test(args):
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
-        if bug_id in {'OSV-2023-51', 'OSV-2021-897', 'OSV-2021-639', 'OSV-2022-1242', 'OSV-2022-511', 'OSV-2021-1589'}:
-            continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
@@ -4349,6 +4364,8 @@ def revert_patch_test(args):
         get_patched_traces, transitions, signature_change_list = mutable_args
         # test if the local bugs is still there using crash stack comparison
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+        if bug_id not in get_patched_traces:
+            continue
         for i in range(len(get_patched_traces[bug_id])):
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
             need_build = True
