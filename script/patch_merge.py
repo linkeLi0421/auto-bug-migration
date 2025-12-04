@@ -9,7 +9,7 @@ import os
 import subprocess
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Tuple, Any, DefaultDict, Set, Callable, Iterable, Optional, List
+from typing import Dict, Tuple, Any, DefaultDict, Set, Callable, Iterable, Optional, List, Sequence
 from contextlib import redirect_stdout, redirect_stderr
 from types import SimpleNamespace
 
@@ -25,6 +25,7 @@ from revert_patch_test import (
     crashes_match,
 )
 from run_fuzz_test import read_json_file, py3
+from tabulate import tabulate as _tabulate
 
 patch_pair_dict = {
     'OSV-2021-27': [
@@ -130,14 +131,36 @@ patch_pair_dict = {
 }
 
 local_bug_compatibility = {
-    'OSV-2021-27': {'OSV-2021-496', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-1791', 'OSV-2021-481'},
-    'OSV-2021-21': {'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-481'},
-    'OSV-2021-404': {'OSV-2021-496', 'OSV-2021-498', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-1791', 'OSV-2021-481', 'OSV-2021-622'},
-    'OSV-2021-213': {'OSV-2021-496', 'OSV-2021-498', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-481'},
-    'OSV-2020-2184': {'OSV-2021-496', 'OSV-2021-498', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-481'},
-    'OSV-2021-429': {'OSV-2021-496', 'OSV-2021-498', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-1791', 'OSV-2021-481', 'OSV-2021-622'},
-    'OSV-2022-34': {'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-487', 'OSV-2021-481', 'OSV-2021-622'},
-    'OSV-2022-4': {'OSV-2021-496', 'OSV-2021-498', 'OSV-2021-997', 'OSV-2021-526', 'OSV-2021-485', 'OSV-2021-1791', 'OSV-2021-481', 'OSV-2021-622'},
+    'OSV-2022-4': {
+        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-485', 'OSV-2021-496', 
+        'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 'OSV-2021-622'
+    },
+    'OSV-2021-21': {
+        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
+        'OSV-2021-526'
+    },
+    'OSV-2021-404': {
+        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
+        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 
+        'OSV-2021-622'
+    },
+    'OSV-2022-34': {
+        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
+        'OSV-2021-526', 'OSV-2021-622'
+    },
+    'OSV-2021-27': {
+        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
+        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791'
+    },
+    'OSV-2021-429': {
+        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
+        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 
+        'OSV-2021-622'
+    },
+    'OSV-2021-213': {
+        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
+        'OSV-2021-526', 'OSV-2021-498'
+    }
 }
 
 LOCAL_BUG_NODE_PREFIX = "__local_bug__"
@@ -226,19 +249,15 @@ def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -
         output_dir.mkdir(parents=True, exist_ok=True)
         log_path = output_dir / f"revert_{config['target']}_{bug_id}_{required_commit[:6]}.log"
 
-    try:
-        patches: Optional[Dict[str, Any]] = None
-        local_tests: Optional[Dict[str, Any]] = None
-        if log_path:
-            with log_path.open("w", encoding="utf-8") as handle, redirect_stdout(handle), redirect_stderr(handle):
-                patches, local_tests = execute_revert_patch_test(args)
-        else:
+    patches: Optional[Dict[str, Any]] = None
+    local_tests: Optional[Dict[str, Any]] = None
+    if log_path:
+        with log_path.open("w", encoding="utf-8") as handle, redirect_stdout(handle), redirect_stderr(handle):
             patches, local_tests = execute_revert_patch_test(args)
-        logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:6])
-        return {"patches": patches, "local_tests": local_tests}
-    except Exception:
-        logger.exception("Failed to trigger revert_patch_test for bug %s", bug_id)
-        return None
+    else:
+        patches, local_tests = execute_revert_patch_test(args)
+    logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:6])
+    return {"patches": patches, "local_tests": local_tests}
 
 
 class PatchCompatibilityGraph:
@@ -713,6 +732,112 @@ def report_compatible_groups(graph: PatchCompatibilityGraph, min_size: int = 2) 
     return groups
 
 
+def _render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Return a formatted ASCII table using tabulate when available."""
+
+    if _tabulate:
+        column_alignments = ["left"] + ["center"] * (len(headers) - 1)
+        return _tabulate(
+            rows,
+            headers=headers,
+            tablefmt="psql",
+            colalign=column_alignments,
+            stralign="center",
+            disable_numparse=True,
+        )
+
+    return _render_ascii_table(headers, rows)
+
+
+def _render_ascii_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    """Fallback pure-Python table formatter that keeps separators aligned."""
+
+    data = [list(map(str, headers))] + [list(map(str, row)) for row in rows]
+    column_widths: List[int] = []
+    for column_values in zip(*data):
+        column_widths.append(max(len(value) for value in column_values))
+
+    def format_row(row: Sequence[str]) -> str:
+        padded_cells: List[str] = []
+        for idx, (value, width) in enumerate(zip(row, column_widths)):
+            if idx == 0:
+                cell = value.ljust(width)
+            else:
+                pad = width - len(value)
+                left = pad // 2
+                right = pad - left
+                cell = f"{' ' * left}{value}{' ' * right}"
+            padded_cells.append(f" {cell} ")
+        return "|" + "|".join(padded_cells) + "|"
+
+    divider = "+" + "+".join("-" * (width + 2) for width in column_widths) + "+"
+    lines = [divider, format_row(headers), divider]
+    for row in rows:
+        lines.append(format_row(row))
+    lines.append(divider)
+    return "\n".join(lines)
+
+
+def log_patch_function_table(graph: PatchCompatibilityGraph) -> None:
+    """Emit a readable table outlining which bugs touch which functions."""
+
+    bug_to_functions: DefaultDict[str, Set[str]] = defaultdict(set)
+    all_functions: Set[str] = set()
+
+    for identifier in graph.nodes:
+        if _is_local_bug_identifier(identifier):
+            continue
+        if not isinstance(identifier, tuple) or not identifier:
+            continue
+        bug_id = identifier[0]
+        if not isinstance(bug_id, str):
+            continue
+        raw_functions = identifier[3] if len(identifier) > 3 else ()
+        if isinstance(raw_functions, (list, tuple, set)):
+            functions = raw_functions
+        elif raw_functions:
+            functions = (raw_functions,)
+        else:
+            functions = ()
+        for func in functions:
+            if not func:
+                continue
+            func_name = str(func)
+            bug_to_functions[bug_id].add(func_name)
+            all_functions.add(func_name)
+
+    if not bug_to_functions or not all_functions:
+        logger.info("Function coverage table: no function metadata available.")
+        return
+
+    bug_ids = sorted(bug_to_functions.keys())
+    function_list = sorted(all_functions)
+
+    def _shorten_bug_id(bug_id: str) -> str:
+        if bug_id.startswith("OSV-"):
+            return bug_id[4:]
+        return bug_id
+
+    display_bug_ids = [_shorten_bug_id(bug_id) for bug_id in bug_ids]
+    headers = ["Function"] + display_bug_ids
+    rows: List[List[str]] = []
+    for func_name in function_list:
+        row = [func_name]
+        for bug_id in bug_ids:
+            marker = "✓" if func_name in bug_to_functions.get(bug_id, set()) else ""
+            row.append(marker)
+        rows.append(row)
+
+    table = _render_table(headers, rows)
+    logger.info("Function coverage table (✓ indicates the bug touches the function):")
+    for line in table.splitlines():
+        logger.info(line)
+    if not _tabulate:
+        logger.info("  (Install 'tabulate' for enhanced table formatting.)")
+    if any(bug_id.startswith("OSV-") for bug_id in bug_ids):
+        logger.info("  (Bug headers omit the shared 'OSV-' prefix for readability.)")
+
+
 def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int) -> None:
     """
     Emit recorded patch refresh requirements scoped to the provided group (typically Group 1).
@@ -1131,6 +1256,7 @@ def main() -> None:
     global REANALYZE_PENDING
     while True:
         graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution, signature_change_map)
+        log_patch_function_table(graph)
         groups = report_compatible_groups(graph)
         group_one = groups[1] if groups else None
         for idx, candidate in enumerate(groups):
