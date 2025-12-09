@@ -2167,179 +2167,15 @@ def handle_build_error(error_log):
     return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes, incomplete_types
 
 
-def get_insert_line(file_path):
-    """
-    Returns the 0-based index of the last line that is actual code
-    (not empty, not a comment).
-    Returns -1 if no code line is found.
-    Searches backwards from the end of the file.
-    """
-    in_multiline_comment = False
-    idx = find_first_code_line(file_path)
-    with open(file_path, 'r', encoding="latin-1") as f:
-        lines = f.readlines()[:idx-1]
-    for idx in range(len(lines) - 1, -1, -1):
-        stripped = lines[idx].strip()
-        
-        # Handle multi-line comments (going backwards, so check for /* first)
-        if in_multiline_comment:
-            if "/*" in stripped:
-                in_multiline_comment = False
-                # Check if there's code before the /*
-                before_comment = stripped.split("/*", 1)[0].strip()
-                if before_comment and not before_comment.startswith("//"):
-                    return idx
-            continue
-        
-        # Check for */ (start of multi-line comment when going backwards)
-        if "*/" in stripped:
-            # Check if /* is also on the same line (single-line comment)
-            if "/*" in stripped:
-                # Find the positions to handle comment blocks on one line
-                comment_start = stripped.find("/*")
-                comment_end = stripped.rfind("*/")
-                
-                # Extract parts before and after the comment
-                before_comment = stripped[:comment_start].strip()
-                after_comment = stripped[comment_end + 2:].strip()
-                combined = (before_comment + " " + after_comment).strip()
-                
-                if combined and not combined.startswith("//"):
-                    return idx
-                continue
-            else:
-                # This is the end of a multi-line comment block
-                in_multiline_comment = True
-                after_comment = stripped.split("*/", 1)[-1].strip()
-                if after_comment and not after_comment.startswith("//"):
-                    return idx
-                continue
-        
-        # Skip empty lines and single-line comments
-        if not stripped or stripped.startswith("//"):
-            continue
-        
-        # Found actual code (including preprocessor directives)
-        return idx
-    
-    return -1  # No code found
-
-
-def find_first_code_line_new(parsing_path: str) -> int:
+def find_first_code_line(target: str, commit: str, file_path: str) -> int:
+    parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{file_path}_analysis.json')
     with open(parsing_path, 'r', encoding="utf-8") as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
-        if node['kind'] == 'FUNCTION_DEFI' and '#include' not in node['location']['file']:
-            return node['location']['line']
+        if node['kind'] == 'FUNCTION_DEFI' and file_path == node['location']['file']:
+            return node['extent']['start']['line']
     # No function code here
     return -1
-
-
-def find_first_code_line(file_path, skip_conditionals=False):
-    """
-    Returns the 1-based line number where actual C code starts.
-    Skips:
-      - blank lines
-      - single-line and multi-line comments
-      - preprocessor directives (including multi-line #define macros)
-      - (optionally) code inside conditional preprocessor blocks like #ifdef/#ifndef/#if ... #endif
-
-    Set skip_conditionals=True to also skip code inside #ifdef blocks.
-    """
-    with open(file_path, 'r', encoding="latin-1") as f:
-        lines = f.readlines()
-
-    in_multiline_comment = False
-    in_multiline_preprocessor = False  # Track multi-line macros / continued preprocessor lines
-    conditional_stack = []  # store 1-based line numbers of #if/#ifdef/#ifndef entries
-
-    for idx, line in enumerate(lines):
-        stripped = line.strip()
-
-        # If previous line started a multi-line preprocessor directive, handle continuation
-        if in_multiline_preprocessor:
-            if stripped.endswith('\\'):
-                continue  # still in a continued preprocessor
-            else:
-                in_multiline_preprocessor = False
-                continue  # this was the last continued preprocessor line
-
-        # Handle multi-line comments
-        if in_multiline_comment:
-            if "*/" in stripped:
-                in_multiline_comment = False
-                after_comment = stripped.split("*/", 1)[1].strip()
-                if after_comment and not after_comment.startswith("//"):
-                    if not after_comment.startswith("#"):
-                        # Found code after a closing comment: determine appropriate insertion point
-                        if not skip_conditionals and conditional_stack:
-                            # prefer to insert before outermost conditional
-                            return conditional_stack[0]
-                        return idx + 1
-            continue
-
-        # Check for /* - handle inline closing
-        if "/*" in stripped:
-            before_comment = stripped.split("/*", 1)[0].strip()
-
-            if "*/" in stripped:
-                after_comment = stripped.split("*/", 1)[-1].strip()
-                combined = (before_comment + " " + after_comment).strip()
-                stripped = combined
-            else:
-                in_multiline_comment = True
-                if before_comment:
-                    stripped = before_comment
-                else:
-                    continue
-
-        # Skip blank or single-line comment
-        if not stripped or stripped.startswith("//"):
-            continue
-
-        # Track preprocessor conditional depth / stack
-        is_if = (
-            stripped.startswith("#if ") or
-            stripped.startswith("#ifdef ") or
-            stripped.startswith("#ifndef ") or
-            stripped == "#if" or
-            stripped == "#ifdef" or
-            stripped == "#ifndef"
-        )
-        if is_if:
-            # record the 1-based line number where this conditional starts
-            conditional_stack.append(idx + 1)
-            # check for continued preprocessor line
-            if stripped.endswith('\\'):
-                in_multiline_preprocessor = True
-            continue
-
-        if stripped.startswith("#endif"):
-            if conditional_stack:
-                conditional_stack.pop()
-            continue
-
-        if stripped.startswith("#else") or stripped.startswith("#elif"):
-            # keep conditional stack as-is; we don't change stack height
-            continue
-
-        # Skip ALL other preprocessor lines (including #define, #include, etc.)
-        if stripped.startswith("#"):
-            if stripped.endswith('\\'):
-                in_multiline_preprocessor = True
-            continue
-
-        # If we reach here, we've found an actual code line.
-        # If it's inside a conditional and the caller did NOT request skipping conditionals,
-        # prefer to insert before the outermost conditional start so we don't end up inside.
-        if not skip_conditionals and conditional_stack:
-            return conditional_stack[0]
-
-        # Otherwise return this line (1-based)
-        return idx + 1
-
-    # No code found -> return line after last line
-    return len(lines) + 1
 
 
 def get_line_context(file_path, line_number, context=3):
@@ -3774,6 +3610,8 @@ def apply_and_test_patches(
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 for func_decl in function_declarations:
+                    if 'sc_lock' in func_decl:
+                        logger.info(f'func_decl: {func_decl}')
                     if func_name == func_decl.split('(')[0].split(' ')[-1]:
                         if file_path_new in extra_patches and func_decl in extra_patches[file_path_new].patch_text:
                             # Suggest that we need to reorder function declarations
@@ -3936,11 +3774,7 @@ def apply_and_test_patches(
             os.chdir(target_repo_path)
             subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            insert_point = get_insert_line(os.path.join(target_repo_path, file_path)) + 2
-            logger.info(f'old: {insert_point}')
-            parsing_path = os.path.join(data_path, f'{target}-{next_commit['commit_id']}', f'{file_path}_analysis.json')
-            insert_point = find_first_code_line_new(parsing_path) + 2
-            logger.info(f'new: {insert_point}')
+            insert_point = find_first_code_line(target, next_commit['commit_id'], file_path)
             context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
             merge_flag = 0
             
