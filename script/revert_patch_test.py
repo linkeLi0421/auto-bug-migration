@@ -462,7 +462,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         is_macro = False
         for node in ast_nodes:
             if node['spelling'] == func_name and node['kind'] == 'MACRO_DEFINITION':
-                logger.info(f'Function {func_name} is a macro, skipping recreation.')
                 is_macro = True
                 break
             if node['spelling'] == func_name and \
@@ -521,7 +520,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             callee_sig_new = get_new_funcsig(func_name, next_commit, def_file_path_new, target_repo_path, signature_change_list)
             if not callee_sig_new:
                 # Function change name, so insert at an abbitray point
-                logger.info(f'Creating Artificial patch for {def_file_path_new} {func_name}: by inserting at the end of the file')
                 os.chdir(target_repo_path)
                 subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -534,7 +532,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             else:
                 artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, def_file_path_new, callee_sig_new)
                 # Create the Artificial patch here
-                logger.info(f'Creating Artificial patch for {def_file_path_new} {func_name}: inserting at line {artificial_patch_insert_point}')
                 patch_header = f'diff --git a/{def_file_path_new} b/{def_file_path_new}\n--- a/{def_file_path_new}\n+++ b/{def_file_path_new}\n'
                 patch_header += f'@@ -{artificial_patch_insert_point},{func_length} +{artificial_patch_insert_point},0 @@\n'
                 artificial_patch = PatchInfo(
@@ -1579,7 +1576,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                         old_function_end_line=artificial_patch_insert_point + func_length,
                         recreated_function_locations={patch.old_signature: func_loc},
                     )
-                    new_key = f'{patch.file_path_old}{patch.file_path_new}-{artificial_patch_insert_point},{func_length}+{artificial_patch_insert_point},0'
+                    new_key = stable_hash(artificial_patch.patch_text)
                     return artificial_patch, new_key
                 artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code, func_loc)
                 recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch.old_signature, file_path_old=artificial_patch.file_path_old, func_used_file=patch.file_path_new, keywords=['static'] if is_function_static(func_code) else []))
@@ -1888,7 +1885,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     for key in reversed(final_patches):
         patch = diff_results[key]
         patch_text = patch.patch_text
-        # logger.info(f'Processing patch for add_context: {key}\n{patch_text}')
         lines = patch_text.split('\n')
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
@@ -1930,7 +1926,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                             break
                         patch_front_context_len += 1
                     patch.hiden_func_dict.setdefault(patch.old_signature, patch_front_context_len)
-                patch_prev.hiden_func_dict.update({key: offset+patch_prev_old_offset for key, offset in patch.hiden_func_dict.items()})
+                patch_prev.hiden_func_dict.update({key: offset+ len(patch_prev_lines[4:]) for key, offset in patch.hiden_func_dict.items()})
                 patch_prev.hiden_func_dict[patch_prev.old_signature] = prev_front_context_len
                 patch_prev.hiden_func_dict = dict(
                     sorted(patch_prev.hiden_func_dict.items(), key=lambda x: x[1])  # ascending by offset
@@ -2384,7 +2380,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
         old_line_end = None
         flag = False # flag to indicate if the function is changed between commit and next_commit
         for key in final_patches:
-            if diff_results[key].old_signature and fname == diff_results[key].old_function_name:
+            if diff_results[key].old_signature and fname == diff_results[key].old_function_name and file_path == diff_results[key].file_path_old:
                 flag = True
                 break
         if flag:
@@ -2410,6 +2406,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
             for func_info in recreated_functions:
+                if func_info.is_static() and func_info.file_path_old != file_path:
+                    # Static functions are used in the same file
+                    continue                    
                 recreated_fname = func_info.name
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
@@ -3658,7 +3657,6 @@ def apply_and_test_patches(
                             break
                 
             if add_file_path is None or delete_file_path is None:
-                logger.info(f'Cannot find type {type_name} in {parsing_path}')
                 continue
             incomplete_type_to_add[(delete_file_path, delete_start, delete_end)] = (add_file_path, add_start_line, add_end_line, pure_type, type_used)
         
@@ -3750,7 +3748,6 @@ def apply_and_test_patches(
                     if search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
                         logger.debug(f'Found {identifier} in recreated function {func_sig} at {parsing_path}')
                         break
-        logger.info(f'type_def_to_add: {type_def_to_add}')
         func_deled = [] # list of (function name, file path, start line, end line)
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
@@ -3810,7 +3807,6 @@ def apply_and_test_patches(
                 if file_path not in type_def_to_add:
                     type_def_to_add[file_path] = {}
                 type_def_to_add[file_path].update(vars_to_add)
-        logger.info(f'type_def_to_add: {type_def_to_add}')
         # front patch part
         path_set = set(con_to_add.keys()) | set(func_decl_to_add.keys()) | set(var_del_to_add.keys()) | set(union_to_add.keys()) | set(type_def_to_add.keys())
 
@@ -3913,16 +3909,16 @@ def apply_and_test_patches(
                 for loc in reversed(locs):
                     path = loc.split(':')[0]
                     identifier = var_del_to_add[file_path][loc]
-                    ids.add(identifier)
                     if path.startswith('#include'):
                         # macro defined in header file from system include paths
                         include_text += f'-{path}\n'
                         include_len += 1
                         continue
+                    ids.add(identifier)
                     start_line = int(loc.split(':')[1])
                     end_line = int(loc.split(':')[2])
                     var_len += end_line - start_line + 1
-                    with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
+                    with open(os.path.join(target_repo_path, path), 'r', encoding="utf-8", errors="strict") as f:
                         file_content = f.readlines()
                         new_identifier = f'__rervert_var_{commit['commit_id']}_{identifier}'
                         var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
@@ -4064,8 +4060,6 @@ def apply_and_test_patches(
                 patch.patch_text = '\n'.join(rename_func(patch.patch_text, fun_info.name, commit['commit_id']))
 
         patches_without_context.clear() # empty the dict before updating
-        # if "tail-src/libopensc/card-myeid.c-myeid_enc_dec_sym_" in diff_results:
-        #     logger.info(f'{diff_results["tail-src/libopensc/card-myeid.c-myeid_enc_dec_sym_"].patch_text}')
         with open(patch_file_path, 'w') as patch_file:
             for key in patch_key_list:
                 # not_write_patches means the patch is merged with the extra patches
