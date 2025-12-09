@@ -2154,6 +2154,16 @@ def get_insert_line(file_path):
     return -1  # No code found
 
 
+def find_first_code_line_new(parsing_path: str) -> int:
+    with open(parsing_path, 'r', encoding="utf-8") as f:
+        ast_nodes = json.load(f)
+    for node in ast_nodes:
+        if node['kind'] == 'FUNCTION_DEFI' and '#include' not in node['location']['file']:
+            return node['location']['line']
+    # No function code here
+    return -1
+
+
 def find_first_code_line(file_path, skip_conditionals=False):
     """
     Returns the 1-based line number where actual C code starts.
@@ -3830,6 +3840,10 @@ def apply_and_test_patches(
             subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             insert_point = get_insert_line(os.path.join(target_repo_path, file_path)) + 2
+            logger.info(f'old: {insert_point}')
+            parsing_path = os.path.join(data_path, f'{target}-{next_commit['commit_id']}', f'{file_path}_analysis.json')
+            insert_point = find_first_code_line_new(parsing_path) + 2
+            logger.info(f'new: {insert_point}')
             context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
             merge_flag = 0
             
