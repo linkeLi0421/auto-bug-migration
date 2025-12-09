@@ -99,7 +99,6 @@ def analyze_file(directory, src_file, args, defs_by_usr):
                                CursorKind.UNION_DECL,
                                CursorKind.ENUM_DECL,
                                CursorKind.ENUM_CONSTANT_DECL,
-                            #    CursorKind.CALL_EXPR,
                                CursorKind.DECL_REF_EXPR,
                                CursorKind.MACRO_DEFINITION,
                                CursorKind.TYPEDEF_DECL,
