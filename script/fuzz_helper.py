@@ -2156,8 +2156,8 @@ def get_runfuzzer_bash(args, allowlist_type):
     python3 /script/add_revert_entries.py --commit {args.buggy_commit1} /allowlist.txt -o /allowlist.txt;
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     
-    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
-    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
@@ -2396,10 +2396,10 @@ def get_poc_for_new_version(args):
     cd -;
     cp /data/allowlist/allowlist-{args.buggy_commit}-{args.test_input}.txt /allowlist.txt;
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
-    
-    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
-    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt";
-    
+
+    export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
+    export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
+
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
     python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
