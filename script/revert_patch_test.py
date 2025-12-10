@@ -208,13 +208,12 @@ class PatchInfo:
         )
 
 
-def stable_hash(s: str) -> int:
+def stable_hash(s: str) -> str:
     # Convert the string to bytes
     data = s.encode('utf-8')
     # Use SHA-256 to generate a deterministic hash
     digest = hashlib.sha256(data).hexdigest()
-    # Optionally, convert part of it to an integer
-    return int(digest, 16) % (10 ** 12)  # shorter integer form
+    return str(int(digest, 16) % (10 ** 12))
 
 
 def is_function_static(source_code: str) -> bool:
@@ -252,6 +251,38 @@ def normalize_function_pointer_params(signature: str) -> str:
     pattern = r'(\w[\w\s\*]*?)\s*\(\*\)\s*\((.*?)\)\s+(\w+)'
     repl = r'\1 (*\3)(\2)'
     return re.sub(pattern, repl, signature)
+
+
+def sanitize_function_declaration(signature: str) -> str:
+    """Fix libclang quirks (e.g. `char[64] word`) so declarations are valid C."""
+    sig = signature.strip()
+    if sig.endswith(';'):
+        sig = sig[:-1].rstrip()
+
+    if '(' not in sig or ')' not in sig:
+        return sig
+
+    prefix, _, remainder = sig.partition('(')
+    params, _, suffix = remainder.rpartition(')')
+    fixed_params = []
+    for param in params.split(','):
+        p = param.strip()
+        if not p:
+            continue
+        match = re.match(r'^(.+?)\s*\[([^\]]+)\]\s+(\w+)$', p)
+        if match:
+            # libclang sometimes emits array size before the name, move it to the end
+            base_type = match.group(1).strip()
+            array_size = match.group(2).strip()
+            name = match.group(3).strip()
+            p = f'{base_type} {name}[{array_size}]'
+        fixed_params.append(p)
+
+    joined_params = ', '.join(fixed_params)
+    new_sig = f"{prefix.strip()}({joined_params})"
+    if suffix:
+        new_sig += suffix
+    return new_sig
 
 
 def replace_function_header(func_code: str, signature: str) -> str:
@@ -3420,8 +3451,6 @@ def apply_and_test_patches(
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
-        if count > 20:
-            break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
@@ -3610,8 +3639,6 @@ def apply_and_test_patches(
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 for func_decl in function_declarations:
-                    if 'sc_lock' in func_decl:
-                        logger.info(f'func_decl: {func_decl}')
                     if func_name == func_decl.split('(')[0].split(' ')[-1]:
                         if file_path_new in extra_patches and func_decl in extra_patches[file_path_new].patch_text:
                             # Suggest that we need to reorder function declarations
@@ -3620,7 +3647,6 @@ def apply_and_test_patches(
                             func_decl_to_add.setdefault(file_path_new, set()).add(f'{func_decl}')
                         break
 
-        logger.info(f'func_deled: {func_deled}')
         new_patch_key_list, function_declarations, depen_graph, type_def_to_add = handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit['commit_id'], next_commit['commit_id'], target_repo_path, function_declarations, file_path_pairs, depen_graph, type_def_to_add, recreated_functions, func_list, signature_change_list)
         logger.info(f'function_sig_changes: {[change[:-1] for change in function_sig_changes]}')
         if function_sig_changes and len(func_deled) == 0:
@@ -3666,13 +3692,14 @@ def apply_and_test_patches(
                 func_decls = func_decl_to_add[file_path]
                 for func_decl in func_decls:
                     flag = False
+                    safe_func_decl = sanitize_function_declaration(func_decl)
                     prefix = f"__revert_{commit['commit_id']}_"
                     for func_info in recreated_functions:
                         if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
-                            func_decl_text += f'-{' '.join(func_info.keywords)} {func_decl};\n'
+                            func_decl_text += f'-{' '.join(func_info.keywords)} {safe_func_decl};\n'
                     if not flag:
-                        func_decl_text += f'-static {func_decl};\n'
+                        func_decl_text += f'-static {safe_func_decl};\n'
                     func_decl_len += 1
             
             if file_path in func_decl_to_add_moveforward:
@@ -3680,13 +3707,14 @@ def apply_and_test_patches(
                 func_decls = func_decl_to_add_moveforward[file_path]
                 for func_decl in func_decls:
                     flag = False
+                    safe_func_decl = sanitize_function_declaration(func_decl)
                     prefix = f"__revert_{commit['commit_id']}_"
                     for func_info in recreated_functions:
                         if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
-                            func_decl_text_moveforward += f'-{' '.join(func_info.keywords)} {func_decl};\n'
+                            func_decl_text_moveforward += f'-{' '.join(func_info.keywords)} {safe_func_decl};\n'
                     if not flag:
-                        func_decl_text_moveforward += f'-static {func_decl};\n'
+                        func_decl_text_moveforward += f'-static {safe_func_decl};\n'
                     func_decl_len_moveforward += 1
 
             if file_path in union_to_add:
@@ -4240,48 +4268,31 @@ def revert_patch_test(args):
             else:
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
-        
-        # if bug_id == 'OSV-2021-27':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-1470,18+1706,58',), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2020-2184':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)]
-        # if bug_id == 'OSV-2021-22':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2021-21':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'), ('blosc/frame.cblosc/frame.c-459,10+454,10', 'blosc/frame.cblosc/frame.c-443,2+438,2', 'blosc/frame.cblosc/frame.c-409,19+391,32', 'blosc/frame.cblosc/frame.c-381,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13')]
-        # if bug_id == 'OSV-2021-274':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'), ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'), ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')]
-        # if bug_id == 'OSV-2021-246':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',), ('blosc/frame.cblosc/frame.c-1453,86+1612,77', 'blosc/frame.cblosc/frame.c-1402,42+1559,44', 'blosc/frame.cblosc/frame.c-1386,4+1545,2', 'blosc/frame.cblosc/frame.c-1365,5+1522,7', 'blosc/frame.cblosc/frame.c-1342,12+1497,13'), ('blosc/frame.cblosc/frame.c-1055,86+1125,110',), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/frame.cblosc/frame.c-1180,72+1271,68', 'blosc/frame.cblosc/frame.c-1143,28+1236,24')]
-        # if bug_id == 'OSV-2021-213':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2021-247':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',), ('blosc/frame.cblosc/frame.c-1782,8+2021,24', 'blosc/frame.cblosc/frame.c-1743,3+1976,9', 'blosc/frame.cblosc/frame.c-1724,13+1955,15', 'blosc/frame.cblosc/frame.c-1710,6+1938,9', 'blosc/frame.cblosc/frame.c-1650,54+1877,55'), ('blosc/frame.cblosc/frame.c-1506,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2632,43+2561,19',), ('blosc/frame.cblosc/frame.c-963,2+1037,2', 'blosc/frame.cblosc/frame.c-912,43+964,65'), ('blosc/frame.cblosc/frame.c-472,2+462,2', 'blosc/frame.cblosc/frame.c-464,2+454,2', 'blosc/frame.cblosc/frame.c-448,2+438,2', 'blosc/frame.cblosc/frame.c-414,19+391,32', 'blosc/frame.cblosc/frame.c-386,18+365,14'), ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)]
-        # if bug_id == 'OSV-2021-404':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1732,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-1057,10+1014,11', 'blosc/frame.cblosc/frame.c-1043,2+992,10', 'blosc/frame.cblosc/frame.c-1026,11+965,21')]
-        # if bug_id == 'OSV-2021-221':
-        #     patch_pair_list = [('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',), ('blosc/frame.cblosc/frame.c-1540,17+1706,20',), ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',), ('blosc/blosc2.cblosc/blosc2.c-2580,17+2524,20', 'blosc/blosc2.cblosc/blosc2.c-2451,123+2445,73'), ('blosc/blosc2.cblosc/blosc2.c-1204,7+1431,7', 'blosc/blosc2.cblosc/blosc2.c-1173,6+1406,0', 'blosc/blosc2.cblosc/blosc2.c-1151,8+1384,8', 'blosc/blosc2.cblosc/blosc2.c-1137,4+1370,4', 'blosc/blosc2.cblosc/blosc2.c-1110,17+1339,21', 'blosc/blosc2.cblosc/blosc2.c-1006,79+1223,91', 'blosc/blosc2.cblosc/blosc2.c-996,2+1211,4'), ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'), ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)]
-        # if bug_id == 'OSV-2021-369':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1484,13+1707,18',), ('blosc/blosc2.cblosc/blosc2.c-2572,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2561,2+2561,2'), ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'), ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'), ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'), ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')]
-        # if bug_id == 'OSV-2021-429':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-1673,10+1707,11',), ('blosc/blosc2.cblosc/blosc2.c-2570,2+2572,2', 'blosc/blosc2.cblosc/blosc2.c-2559,2+2561,2')]
-        # if bug_id == 'OSV-2022-4':
-        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)]
-        # if bug_id == 'OSV-2022-34':
-        #     patch_pair_list = [('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')]
-        # if bug_id == 'OSV-2022-486':
-        #     patch_pair_list = [('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24')]
-        
+
+        if bug_id == 'OSV-2023-578':
+            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
+        if bug_id == 'OSV-2023-560':
+            patch_pair_list = [('src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1663,6+1662,8', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1631,2+1626,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1621,2+1612,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1590,2+1570,3', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1542,3+1525,0')]
+        if bug_id == 'OSV-2023-993':
+            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
+        if bug_id == 'OSV-2023-586':
+            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
+        if bug_id == 'OSV-2023-899':
+            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
+        if bug_id == 'OSV-2023-1169':
+            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
+            
+
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
         if not apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-            # logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-            # # try to minimize the patch set
-            # minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
-            # logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
+            logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+            # try to minimize the patch set
+            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
+            logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
 
         patches_without_contexts[
             (bug_id, commit['commit_id'], fuzzer,
