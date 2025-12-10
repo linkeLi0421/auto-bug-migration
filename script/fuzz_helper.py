@@ -2085,8 +2085,8 @@ def get_crash_log_bash(commit:str, args):
 
     # Compile and run with crash input
     cd -;
-    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions";
+    export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -Wno-error";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-error";
     mkdir -p /data/crash;
     
     compile &> /dev/null;

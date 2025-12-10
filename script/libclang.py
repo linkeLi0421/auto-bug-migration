@@ -93,7 +93,7 @@ def analyze_file(directory, src_file, args, defs_by_usr):
         if file.startswith('/src'):
             file = file.split('/', 3)[-1]
         elif any(path in str(cursor.extent.start.file) for path in include_paths):
-            file = '#include <' + file.split('/')[-1] + '>'
+            file = '#include <' + file + '>'
         if cursor.kind not in {CursorKind.FUNCTION_DECL,
                                CursorKind.STRUCT_DECL,
                                CursorKind.UNION_DECL,
@@ -218,7 +218,7 @@ def analyze_file(directory, src_file, args, defs_by_usr):
                 file = file.split('/', 3)[-1]
             elif any(path in str(cursor.extent.start.file) for path in include_paths):
                 # header file from system include paths
-                file = '#include <' + file.split('/')[-1] + '>'
+                file = '#include <' + file + '>'
             info["extent"] = {
                 "start": {
                     "file": file,
