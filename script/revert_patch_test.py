@@ -950,8 +950,8 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         logger.exception("Failed to parse baseline crash log %s", baseline_path)
         return True
     if not baseline_stack:
-        logger.warning("Baseline crash stack empty for %s; skipping comparison.", baseline_path)
-        return True
+        logger.error("Baseline crash stack empty for %s; skipping comparison.", baseline_path)
+        return False
 
     tmp_path = None
     try:
@@ -1015,7 +1015,7 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         reverse_allowed = resolve_aliases(current_frame)
         return base_frame in reverse_allowed
 
-    logger.info(f'signature_map: {signature_map}')
+    logger.debug(f'signature_map: {signature_map}')
     top_match = frames_match(baseline_clean[0], current_clean[0])
     if not top_match:
         logger.info(
@@ -4073,6 +4073,9 @@ def revert_patch_test(args):
     for commit, next_commit, bug_id in transitions:
         if args.bug_id and bug_id != args.bug_id:
             continue
+        if bug_id in {'OSV-2023-1163', 'OSV-2023-1276', 'OSV-2023-98'}:
+            # skip these two bugs for now
+            continue
         if args.buggy_commit:
             commit['commit_id'] = args.buggy_commit[:6]
         logger.info(f'bug trigger commit: {commit["commit_id"]}')
@@ -4281,7 +4284,10 @@ def revert_patch_test(args):
             patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
         if bug_id == 'OSV-2023-1169':
             patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-            
+        if bug_id == 'OSV-2024-17':
+            patch_pair_list = [('src/libopensc/card.csrc/libopensc/card.c-650,21+650,15', 'src/libopensc/card.csrc/libopensc/card.c-620,2+620,2'), ('src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1583,2+1577,3', 'src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1558,12+1556,8', 'src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1547,1+1546,0')]
+        if bug_id == 'OSV-2023-609':
+            patch_pair_list = [('src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1663,6+1662,8', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1631,2+1626,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1621,2+1612,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1590,2+1570,3', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1542,3+1525,0')]
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)

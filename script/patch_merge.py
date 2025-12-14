@@ -27,141 +27,7 @@ from revert_patch_test import (
 from run_fuzz_test import read_json_file, py3
 from tabulate import tabulate as _tabulate
 
-patch_pair_dict = {
-    'OSV-2021-27': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)
-    ],
-    'OSV-2020-2184': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',),
-        ('blosc/schunk.cblosc/schunk.c-258,10+440,11',)
-    ],
-    'OSV-2021-22': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)
-    ],
-    'OSV-2021-21': [
-        ('blosc/blosc2.cblosc/blosc2.c-2201,22+2331,30',),
-        ('blosc/blosc2.cblosc/blosc2.c-1693,16+1800,18', 'blosc/blosc2.cblosc/blosc2.c-1573,18+1748,0', 'blosc/blosc2.cblosc/blosc2.c-1607,75+1760,29', 'blosc/blosc2.cblosc/blosc2.c-1593,4+1748,0'),
-        ('blosc/frame.cblosc/frame.c-1690,3+2021,20', 'blosc/frame.cblosc/frame.c-1651,3+1976,9', 'blosc/frame.cblosc/frame.c-1618,27+1938,32', 'blosc/frame.cblosc/frame.c-1570,42+1877,55'),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',),
-        ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13'),
-        ('blosc/blosc2.cblosc/blosc2.c-1272,2+1501,3', 'blosc/blosc2.cblosc/blosc2.c-1253,4+1483,3')
-    ],
-    'OSV-2021-274': [
-        ('blosc/frame.cblosc/frame.c-1473,9+1682,7', 'blosc/frame.cblosc/frame.c-1461,4+1674,0', 'blosc/frame.cblosc/frame.c-1432,11+1641,15', 'blosc/frame.cblosc/frame.c-1416,10+1622,13', 'blosc/frame.cblosc/frame.c-1389,8+1592,11', 'blosc/frame.cblosc/frame.c-1368,4+1569,6', 'blosc/frame.cblosc/frame.c-1301,8+1500,10'),
-        ('blosc/frame.cblosc/frame.c-1247,8+1271,8', 'blosc/frame.cblosc/frame.c-1234,5+1261,2', 'blosc/frame.cblosc/frame.c-1216,4+1241,6'),
-        ('blosc/frame.cblosc/frame.c-419,9+396,22', 'blosc/frame.cblosc/frame.c-400,5+380,2', 'blosc/frame.cblosc/frame.c-387,2+366,0'),
-        ('blosc/frame.cblosc/frame.c-720,2+816,2', 'blosc/frame.cblosc/frame.c-704,2+799,3')
-    ],
-    'OSV-2021-246': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',)
-    ],
-    'OSV-2021-213': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',),
-        ('blosc/frame.cblosc/frame.c-1367,86+1612,77', 'blosc/frame.cblosc/frame.c-1312,46+1554,49', 'blosc/frame.cblosc/frame.c-1301,4+1545,2', 'blosc/frame.cblosc/frame.c-1280,5+1522,7', 'blosc/frame.cblosc/frame.c-1257,12+1497,13'),
-        ('blosc/frame.cblosc/frame.c-1148,51+1271,68', 'blosc/frame.cblosc/frame.c-1111,28+1236,24')
-    ],
-    'OSV-2021-247': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,2+23,2',),
-        ('blosc/schunk.cblosc/schunk.c-291,9+440,11',)
-    ],
-    'OSV-2021-404': [
-        ('blosc/frame.cblosc/frame.c-1283,4+1241,6',)
-    ],
-    'OSV-2021-221': [
-        ('tests/fuzz/fuzz_decompress_frame.ctests/fuzz/fuzz_decompress_frame.c-23,7+23,12',),
-        ('blosc/frame.cblosc/frame.c-1816,8+2021,24', 'blosc/frame.cblosc/frame.c-1777,3+1976,9', 'blosc/frame.cblosc/frame.c-1744,27+1938,32', 'blosc/frame.cblosc/frame.c-1684,54+1877,55'),
-        ('blosc/frame.cblosc/frame.c-1540,17+1706,20',),
-        ('blosc/blosc2.cblosc/blosc2.c-2617,43+2561,19',),
-        ('blosc/blosc2.cblosc/blosc2.c-1576,18+1748,0',),
-        ('blosc/frame.cblosc/frame.c-469,2+462,2', 'blosc/frame.cblosc/frame.c-461,2+454,2', 'blosc/frame.cblosc/frame.c-445,2+438,2', 'blosc/frame.cblosc/frame.c-411,19+391,32', 'blosc/frame.cblosc/frame.c-383,18+365,14'),
-        ('blosc/schunk.cblosc/schunk.c-285,10+440,11',),
-        ('blosc/frame.cblosc/frame.c-1172,72+1271,68', 'blosc/frame.cblosc/frame.c-1135,28+1236,24')
-    ],
-    'OSV-2021-369': [
-        ('blosc/frame.cblosc/frame.c-1770,5+2022,21', 'blosc/frame.cblosc/frame.c-1730,3+1976,9', 'blosc/frame.cblosc/frame.c-1718,6+1963,7', 'blosc/frame.cblosc/frame.c-1710,2+1954,3', 'blosc/frame.cblosc/frame.c-1698,5+1939,8', 'blosc/frame.cblosc/frame.c-1662,26+1907,22', 'blosc/frame.cblosc/frame.c-1640,14+1882,17'),
-        ('blosc/frame.cblosc/frame.c-884,17+992,33', 'blosc/frame.cblosc/frame.c-867,11+965,21'),
-        ('blosc/frame.cblosc/frame.c-431,8+409,9', 'blosc/frame.cblosc/frame.c-389,2+366,0'),
-        ('blosc/frame.cblosc/frame.c-1457,9+1682,7', 'blosc/frame.cblosc/frame.c-1445,4+1674,0', 'blosc/frame.cblosc/frame.c-1416,11+1641,15', 'blosc/frame.cblosc/frame.c-1400,10+1622,13', 'blosc/frame.cblosc/frame.c-1373,8+1592,11', 'blosc/frame.cblosc/frame.c-1352,4+1569,6', 'blosc/frame.cblosc/frame.c-1285,8+1500,10'),
-        ('blosc/frame.cblosc/frame.c-1237,2+1277,2', 'blosc/frame.cblosc/frame.c-1203,4+1241,6'),
-        ('blosc/frame.cblosc/frame.c-722,2+816,2', 'blosc/frame.cblosc/frame.c-706,2+799,3')
-    ],
-    'OSV-2021-429': [
-        ('blosc/frame.cblosc/frame.c-1673,10+1707,11',)
-    ],
-    'OSV-2023-51': [
-        ('blosc/blosc2.cblosc/blosc2.c-771,1+771,0',),
-        ('blosc/blosc2.cblosc/blosc2.c-2436,2+2342,12',)
-    ],
-    'OSV-2022-4': [
-        ('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)
-    ],
-    'OSV-2021-897': [
-        ('blosc/blosc2.cblosc/blosc2.c-2466,2+2342,12',),
-        ('blosc/blosc2.cblosc/blosc2.c-1888,9+1697,8', 'blosc/blosc2.cblosc/blosc2.c-1864,4+1675,2')
-    ],
-    'OSV-2022-34': [
-        ('blosc/blosc2.cblosc/blosc2.c-1969,24+1777,6',)
-    ],
-    'OSV-2021-1589': [
-        ('blosc/blosc2.cblosc/blosc2.c-2719,2+2554,3', 'blosc/blosc2.cblosc/blosc2.c-2699,13+2521,26', 'blosc/blosc2.cblosc/blosc2.c-2608,64+2487,7', 'blosc/blosc2.cblosc/blosc2.c-2594,2+2463,12', 'blosc/blosc2.cblosc/blosc2.c-2578,1+2448,0')
-    ],
-    'OSV-2022-486': [
-        ('blosc/schunk.cblosc/schunk.c-476,2+446,2',),
-        ('blosc/frame.cblosc/frame.c-1761,2+1664,2', 'blosc/frame.cblosc/frame.c-1728,5+1631,5', 'blosc/frame.cblosc/frame.c-1695,20+1598,20', 'blosc/frame.cblosc/frame.c-1663,15+1572,9', 'blosc/frame.cblosc/frame.c-1644,2+1553,2', 'blosc/frame.cblosc/frame.c-1634,2+1543,2', 'blosc/frame.cblosc/frame.c-1617,11+1526,11', 'blosc/frame.cblosc/frame.c-1586,14+1497,12'),
-        ('blosc/frame.cblosc/frame.c-1498,24+1428,17', 'blosc/frame.cblosc/frame.c-1478,3+1409,2'),
-        ('blosc/frame.cblosc/frame.c-434,8+431,0', 'blosc/frame.cblosc/frame.c-415,9+414,7', 'blosc/frame.cblosc/frame.c-360,30+365,24'),
-        ('blosc/frame.cblosc/frame.c-1321,20+1257,13', 'blosc/frame.cblosc/frame.c-1309,3+1246,2')
-    ],
-    'OSV-2022-1242': [
-        ('blosc/schunk.cblosc/schunk.c-468,8+446,8',),
-        ('blosc/frame.cblosc/frame.c-1787,2+1664,2', 'blosc/frame.cblosc/frame.c-1754,5+1631,5', 'blosc/frame.cblosc/frame.c-1746,1+1624,0', 'blosc/frame.cblosc/frame.c-1714,26+1594,24', 'blosc/frame.cblosc/frame.c-1685,16+1572,9', 'blosc/frame.cblosc/frame.c-1666,2+1553,2', 'blosc/frame.cblosc/frame.c-1656,2+1543,2', 'blosc/frame.cblosc/frame.c-1639,11+1526,11', 'blosc/frame.cblosc/frame.c-1608,14+1497,12')
-    ],
-    'OSV-2022-511': [
-        ('blosc/frame.cblosc/frame.c-2250,27+2021,18', 'blosc/frame.cblosc/frame.c-2214,9+1987,7', 'blosc/frame.cblosc/frame.c-2204,2+1977,2', 'blosc/frame.cblosc/frame.c-2149,49+1950,21', 'blosc/frame.cblosc/frame.c-2102,36+1916,23', 'blosc/frame.cblosc/frame.c-2093,2+1907,2', 'blosc/frame.cblosc/frame.c-2073,9+1888,8'),
-        ('blosc/frame.cblosc/frame.c-443,8+431,0', 'blosc/frame.cblosc/frame.c-413,22+410,13', 'blosc/frame.cblosc/frame.c-362,30+365,24'),
-        ('blosc/schunk.cblosc/schunk.c-477,8+446,8',),
-        ('blosc/frame.cblosc/frame.c-1817,20+1659,16', 'blosc/frame.cblosc/frame.c-1805,2+1646,3', 'blosc/frame.cblosc/frame.c-1761,37+1592,47', 'blosc/frame.cblosc/frame.c-1734,21+1572,14', 'blosc/frame.cblosc/frame.c-1715,2+1553,2', 'blosc/frame.cblosc/frame.c-1705,2+1543,2', 'blosc/frame.cblosc/frame.c-1688,11+1526,11', 'blosc/frame.cblosc/frame.c-1657,14+1497,12'),
-        ('blosc/frame.cblosc/frame.c-1569,24+1428,17', 'blosc/frame.cblosc/frame.c-1549,3+1409,2'),
-        ('blosc/frame.cblosc/frame.c-1392,20+1257,13', 'blosc/frame.cblosc/frame.c-1380,3+1246,2')
-    ],
-}
-
-local_bug_compatibility = {
-    'OSV-2022-4': {
-        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-485', 'OSV-2021-496', 
-        'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 'OSV-2021-622'
-    },
-    'OSV-2021-21': {
-        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
-        'OSV-2021-526'
-    },
-    'OSV-2021-404': {
-        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
-        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 
-        'OSV-2021-622'
-    },
-    'OSV-2022-34': {
-        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
-        'OSV-2021-526', 'OSV-2021-622'
-    },
-    'OSV-2021-27': {
-        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
-        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791'
-    },
-    'OSV-2021-429': {
-        'OSV-2021-481', 'OSV-2021-997', 'OSV-2021-487', 'OSV-2021-485', 
-        'OSV-2021-496', 'OSV-2021-526', 'OSV-2021-1791', 'OSV-2021-498', 
-        'OSV-2021-622'
-    },
-    'OSV-2021-213': {
-        'OSV-2021-481', 'OSV-2021-487', 'OSV-2021-485', 'OSV-2021-496', 
-        'OSV-2021-526', 'OSV-2021-498'
-    }
-}
+local_bug_compatibility: Dict[str, Set[str]] = {}
 
 LOCAL_BUG_NODE_PREFIX = "__local_bug__"
 PendingRefreshInfo = Dict[str, Any]
@@ -1090,6 +956,40 @@ def load_signature_change_map(file_path: Path) -> Dict[str, Set[str]]:
     return {key: set(values) for key, values in equivalence.items()}
 
 
+def load_local_bug_compatibility(target: Optional[str]) -> None:
+    """Populate local_bug_compatibility from data/local_compatibility/{target}.json."""
+    global local_bug_compatibility
+    local_bug_compatibility = {}
+    if not target:
+        return
+
+    compatibility_file = Path(data_path) / "local_compatibility" / f"{target}.json"
+    try:
+        with compatibility_file.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        logger.info("Local compatibility file %s not found; continuing without local bugs.", compatibility_file)
+        return
+    except json.JSONDecodeError:
+        logger.warning("Local compatibility file %s is not valid JSON; ignoring.", compatibility_file)
+        return
+
+    if not isinstance(data, dict):
+        logger.warning("Local compatibility file %s must contain an object mapping.", compatibility_file)
+        return
+
+    parsed: Dict[str, Set[str]] = {}
+    for bug_id, compatibles in data.items():
+        if not isinstance(bug_id, str):
+            continue
+        if not isinstance(compatibles, (list, tuple, set)):
+            continue
+        compat_set = {item for item in compatibles if isinstance(item, str)}
+        if compat_set:
+            parsed[bug_id] = compat_set
+    local_bug_compatibility = parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Merge patches generated by revert_patch_test.")
     parser.add_argument(
@@ -1108,9 +1008,8 @@ def parse_args() -> argparse.Namespace:
         help="Write the compatibility graph to this Graphviz DOT file for visualization.",
     )
     parser.add_argument(
-        "--revert_target_test_result",
-        type=Path,
-        help="CSV file passed as target_test_result to revert_patch_test when fetching refreshed patches.",
+        "--fuzz_target",
+        help="Name of the fuzz target to build and verify after merging patches.",
     )
     parser.add_argument(
         "--revert_bug_info",
@@ -1209,14 +1108,14 @@ def main() -> None:
     CURRENT_PATCHES = patches_without_contexts
     revert_config: Optional[Dict[str, Any]] = None
     revert_args_provided = [
-        args.revert_target_test_result,
+        args.bug_distribution_csv,
         args.revert_bug_info,
         args.revert_build_csv,
         args.revert_target,
     ]
     if all(revert_args_provided):
         revert_config = {
-            "target_test_result": args.revert_target_test_result,
+            "target_test_result": args.bug_distribution_csv,
             "bug_info": args.revert_bug_info,
             "build_csv": args.revert_build_csv,
             "target": args.revert_target,
@@ -1226,9 +1125,10 @@ def main() -> None:
     elif any(revert_args_provided):
         logger.warning(
             "Incomplete revert_patch_test configuration supplied; automatic patch refresh disabled. "
-            "Provide all --revert_* flags to enable it."
+            "Provide --bug_distribution_csv and all --revert_* flags to enable it."
         )
     configure_revert_patch(revert_config)
+    load_local_bug_compatibility(args.revert_target)
     signature_change_map: Optional[Dict[str, Set[str]]] = None
     if args.signature_change_file:
         try:
@@ -1258,7 +1158,7 @@ def main() -> None:
         graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution, signature_change_map)
         log_patch_function_table(graph)
         groups = report_compatible_groups(graph)
-        group_one = groups[1] if groups else None
+        group_one = groups[0] if groups else None
         for idx, candidate in enumerate(groups):
             if len(groups[0]) == len(candidate):
                 report_pending_patch_refreshes(candidate, idx+1)
@@ -1279,14 +1179,14 @@ def main() -> None:
     patch_file_path = finalize_patch_group(group_one, CURRENT_PATCHES, target_repo_path, args.target_commit)
     build_success = False
     error_log = ""
-    if patch_file_path and args.revert_target and args.target_commit and args.revert_build_csv:
+    if patch_file_path and args.revert_target and args.target_commit and args.revert_build_csv and args.fuzz_target:
         build_success, error_log = build_fuzzer(
             args.revert_target,
             args.target_commit,
             "address",
             "",
             str(patch_file_path),
-            "decompress_frame_fuzzer",
+            args.fuzz_target,
             str(args.revert_build_csv),
             "x86_64",
         )
@@ -1295,7 +1195,10 @@ def main() -> None:
         else:
             logger.error("Failed to build fuzzer with merged patches. See log:\n%s", error_log)
     else:
-        logger.info("Skipping post-merge build step due to missing patch path or required arguments.")
+        logger.info(
+            "Skipping post-merge build step due to missing patch path or required arguments "
+            "(requires --revert_target, --target_commit, --revert_build_csv, and --fuzz_target)."
+        )
 
     if build_success and patch_file_path:
         if not group_one:
@@ -1308,6 +1211,7 @@ def main() -> None:
         elif not bug_info_dataset:
             logger.info("Bug info unavailable; skipping stack verification.")
         else:
+            verification_results: List[Tuple[str, str, bool]] = []
             for identifier in group_one:
                 if not isinstance(identifier, tuple) or not identifier:
                     continue
@@ -1328,8 +1232,23 @@ def main() -> None:
                         args.target_commit,
                     )
                     logger.info("Stack verification result for %s: %s", bug_id, result)
+                    success = result == "triggered (stack matches)"
+                    verification_results.append((bug_id, result, success))
                 except Exception:
                     logger.exception("Stack verification failed for %s.", bug_id)
+                    verification_results.append((bug_id, "verification failed", False))
+
+            if verification_results:
+                headers = ["Bug", "Post-merge status", "Success"]
+                rows = [[bug, status, "True" if success else "False"] for bug, status, success in verification_results]
+                table = _render_table(headers, rows)
+                logger.info("Post-merge trigger summary:")
+                for line in table.splitlines():
+                    logger.info(line)
+                if not _tabulate:
+                    logger.info("  (Install 'tabulate' for enhanced table formatting.)")
+            else:
+                logger.info("No stack verification results collected.")
 
 if __name__ == "__main__":
     main()
