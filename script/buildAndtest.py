@@ -530,7 +530,7 @@ def find_matching_commit(repo1_path: str,
 
 
 if __name__ == "__main__":
-    # python3 script/buildAndtest.py --bug  ~/tasks-simple/c-blosc2/ --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
+    # python3 script/buildAndtest.py --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", help="Path to the repository")
     parser.add_argument("--target", help="Name of the target")
