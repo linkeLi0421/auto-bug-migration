@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import subprocess
 import csv
 import logging
+import sys
 
 sanitizer_mapping = {
     'address (ASAN)': 'address'
@@ -529,6 +530,44 @@ def find_matching_commit(repo1_path: str,
     return False
 
 
+def get_commits_for_bug_windows(repo_path, bug_ids, bug_infos):
+    """
+    Collect all commits that lie between each bug's introduced and fixed commits.
+
+    Returns a chronologically sorted list with duplicates removed.
+    """
+    repo = git.Repo(repo_path)
+    commit_times = {}
+
+    for bug_id in bug_ids:
+        bug_info = bug_infos.get(bug_id, {})
+        introduced = bug_info.get("introduced")
+        fixed = bug_info.get("fixed")
+
+        if not introduced or not fixed:
+            logger.info(f"Skip bug {bug_id}: missing introduced/fixed info.")
+            continue
+
+        try:
+            bug_commits = get_commits_between(repo_path, introduced, fixed)
+            logger.info(f"Collected {len(bug_commits)} commits between introduced/fixed windows for bug {bug_id}.")
+        except ValueError as exc:
+            logger.info(f"Skip bug {bug_id}: {exc}")
+            continue
+
+        if fixed not in bug_commits:
+            bug_commits.append(fixed)
+        if introduced not in bug_commits:
+            bug_commits.insert(0, introduced)
+
+        for sha in bug_commits:
+            if sha not in commit_times:
+                commit_times[sha] = repo.commit(sha).committed_datetime
+
+    commits = [sha for sha, _ in sorted(commit_times.items(), key=lambda item: item[1])]
+    return commits
+
+
 if __name__ == "__main__":
     # python3 script/buildAndtest.py --repo /home/user/tasks-git/c-blosc2/ --target c-blosc2 --mode test &> /home/user/log/c-blosc2_test_log
     parser = argparse.ArgumentParser()
@@ -575,16 +614,15 @@ if __name__ == "__main__":
             continue
         filter_bug_ids.append(bug_id)
     
-    first_commit, lastest_commit = git_first_last_commit(filter_bug_ids, bug_infos)
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
     
-    first_build_commit = first_commit
-    last_build_commit = lastest_commit
-
-    commits = get_commits_between(repo_path, first_build_commit, last_build_commit)
-    logger.info(f'from {commits[0]} to {commits[-1]}')
-    logger.info(len(commits))
+    commits = get_commits_for_bug_windows(repo_path, filter_bug_ids, bug_infos)
+    if not commits:
+        logger.error("No commits found between introduced and fixed for the selected bugs.")
+        sys.exit(1)
+    logger.info(f'Collected {len(commits)} commits between introduced/fixed windows.')
+    logger.info(f'Range preview: {commits[0]} -> {commits[-1]}')
 
     if args.mode in ["build", "both"]:
         # Save build information to CSV
