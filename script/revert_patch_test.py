@@ -340,8 +340,37 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
         if compare_function_signatures(ast_node['signature'], func_sig, True):
             with open(os.path.join(target_repo_path, ast_node['extent']['start']['file']), 'r', encoding="utf-8", errors="strict") as f:
                 file_content = f.readlines()
+
+            start_line = ast_node['extent']['start']['line']
+            end_line = ast_node['extent']['end']['line']
+
+            # If there is an unmatched #endif relative to the current start_line,
+            # walk upward to include its matching #if/#ifdef/#ifndef. This avoids
+            # expanding when the #endif is already balanced within the span.
+            block_depth = 0
+            min_depth = 0
+            for line in file_content[start_line-1:end_line]:
+                stripped = line.lstrip()
+                if stripped.startswith(('#if', '#ifdef', '#ifndef')):
+                    block_depth += 1
+                elif stripped.startswith('#endif'):
+                    block_depth -= 1
+                min_depth = min(min_depth, block_depth)
+
+            if min_depth < 0:
+                unmatched = -min_depth
+                for idx in range(start_line - 2, -1, -1):
+                    stripped = file_content[idx].lstrip()
+                    if stripped.startswith('#endif'):
+                        unmatched += 1
+                    elif stripped.startswith(('#if', '#ifdef', '#ifndef')):
+                        unmatched -= 1
+                        if unmatched == 0:
+                            start_line = idx + 1
+                            break
+
             func_code = ''.join(
-                file_content[ast_node['extent']['start']['line']-1 : ast_node['extent']['end']['line']]
+                file_content[start_line-1 : end_line]
             )
 
             # Replace header using the AST canonical function signature
@@ -352,7 +381,7 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
             if func_code and func_code[-1] != '\n':
                 func_length += 1
 
-            return func_code, func_length, ast_node['extent']['start']['line']
+            return func_code, func_length, start_line
     return None, 0, 0
 
 
@@ -2544,11 +2573,11 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
         logger.info(f'Solution path: {solution_path}')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {caller_name}')
-            logger.info(f'solution_path: {solution_path}')
-            logger.info(f'Error message: {full_error_message}')
-            logger.info(f'caller_code: {caller_code}')
-            logger.info(f'callee_defA_text: {callee_defA_text}')
-            logger.info(f'callee_defB_text: {callee_defB_text}')
+            # logger.info(f'solution_path: {solution_path}')
+            # logger.info(f'Error message: {full_error_message}')
+            # logger.info(f'caller_code: {caller_code}')
+            # logger.info(f'callee_defA_text: {callee_defA_text}')
+            # logger.info(f'callee_defB_text: {callee_defB_text}')
             solution_code = handle_func_sig_change(full_error_message, caller_code, callee_defA_text, callee_defB_text)
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
@@ -2843,13 +2872,13 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         logger.info(f'Solution path: {solution_path}')
         if not os.path.exists(solution_path):
             logger.info(f'Create patch using open ai api for {fname}')
-            logger.info(f'solution_path: {solution_path}')
-            logger.info(f'Error message: {error_message}')
-            logger.info(f'struct_defs_v1: {struct_defs_v1}')
-            logger.info(f'struct_defs_v2: {struct_defs_v2}')
-            logger.info(f'func_code: {func_code}')
+            # logger.info(f'solution_path: {solution_path}')
+            # logger.info(f'Error message: {error_message}')
+            # logger.info(f'struct_defs_v1: {struct_defs_v1}')
+            # logger.info(f'struct_defs_v2: {struct_defs_v2}')
+            # logger.info(f'func_code: {func_code}')
             solution_code = solve_code_migration(error_message, struct_defs_v1, struct_defs_v2, func_code)
-            logger.info(f'solution_code for {fname}:\n{solution_code}')
+            # logger.info(f'solution_code for {fname}:\n{solution_code}')
             os.makedirs(os.path.dirname(solution_path), exist_ok=True)
             with open(solution_path, 'w', encoding='utf-8') as f:
                 f.write(solution_code)
@@ -3569,7 +3598,18 @@ def apply_and_test_patches(
                             break
                         if ast_node['kind'] in {'TYPEDEF_DECL'} and ast_node['spelling'] == identifier:
                             found = True
-                            type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                            if 'typedef' in ast_node and ast_node['typedef'] != identifier:
+                                for node1 in ast_nodes:
+                                    if node1['kind'] in {'TYPE_REF'} and 'type_ref' in node1 and node1['type_ref']['target_name'] == identifier:
+                                        add_file_path = node1['type_ref']['underlying']['extent']['start']['file']
+                                        add_start = node1['type_ref']['underlying']['extent']['start']['line']
+                                        add_end = node1['type_ref']['underlying']['extent']['end']['line']
+                                        pure_type = node1['type_ref']['underlying']['name']
+                                        type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                                        type_def_to_add.setdefault(file_path_new, dict())[f'{add_file_path}:{add_start}:{add_end}'] = pure_type
+                                        break
+                            else:
+                                type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
                             break
                         if ast_node['kind'] in {'TYPE_REF'} and ast_node['spelling'] == identifier:
                             found = True
@@ -3874,6 +3914,7 @@ def apply_and_test_patches(
             patch_header += f"+++ b/{delete_file_path}\n"
             patch_text = patch_header + f"@@ -{delete_start},{add_end_line-add_start_line+1} +{delete_start},{delete_end-delete_start+1} @@\n"
             patch_text += "\n".join(add_code_lines) + "\n".join(delete_code_lines)
+            logger.info(f'Incomplete type patch:\n{patch_text}')
             patch = PatchInfo(
                 file_path_old=delete_file_path,
                 file_path_new=delete_file_path,
@@ -3980,6 +4021,7 @@ def apply_and_test_patches(
                 return 'trigger_and_fuzzer_build'
             else:
                 logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
+                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
                 return 'trigger_but_fuzzer_build_fail'
         else:
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
@@ -4039,6 +4081,7 @@ def revert_patch_test(args):
     revert_and_trigger_set = set()
     patches_without_contexts = dict()
     revert_and_trigger_fail_set = set()
+    min_path_dict = dict()
     # Get repo path from environment variable
     repo_path = os.getenv('REPO_PATH')
     if not repo_path:
@@ -4189,23 +4232,9 @@ def revert_patch_test(args):
             if func in func_dict:
                 continue
             func_loc = func.split(' ')[-1]
-            file_path = os.path.join(target_repo_path, func_loc.split(':')[0])
-            line_num = func_loc.split(':')[1]
-            col_num = func_loc.split(':')[2]
-            relative_path = func_loc.split(':')[0]
-            parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{relative_path}_analysis.json')
-            if os.path.exists(file_path):
-                with open(parsing_path, 'r') as f:
-                    ast_nodes = json.load(f)
-                for node in ast_nodes:
-                    if node['extent']['start']['line']+1 <= int(line_num) <= node['extent']['end']['line']:
-                        func_dict[func] = node['signature']
-                        break
-                trace_func_list.append((func_dict[func], func_loc))
-            else:
-                func_dict[func] = func.split(' ')[0]
-                trace_func_list.append((func_dict[func], func_loc))
-                
+            func_dict[func] = func.split(' ')[0]
+            trace_func_list.append((func_dict[func], func_loc))
+            
         logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
@@ -4231,7 +4260,7 @@ def revert_patch_test(args):
             if diff_result.new_signature:
                 logger.debug(f'newsignature{diff_result.new_signature}')
                 patch_func_new = diff_result.new_function_name
-            if diff_result.old_signature:
+            elif diff_result.old_signature:
                 logger.debug(f'oldsignature{diff_result.old_signature}')
                 patch_func_old = diff_result.old_function_name
             else:
@@ -4263,31 +4292,17 @@ def revert_patch_test(args):
         patch_by_func = dict()
         for key in patch_to_apply[:]:
             if diff_results[key].new_signature:
-                if not diff_results[key].new_signature:
-                    # Some special cases, dont know why now
-                    patch_to_apply.remove(key)
-                    continue
                 patch_by_func.setdefault(diff_results[key].new_signature, []).append(key)
             else:
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
 
-        if bug_id == 'OSV-2023-578':
-            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-        if bug_id == 'OSV-2023-560':
-            patch_pair_list = [('src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1663,6+1662,8', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1631,2+1626,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1621,2+1612,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1590,2+1570,3', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1542,3+1525,0')]
-        if bug_id == 'OSV-2023-993':
-            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-        if bug_id == 'OSV-2023-586':
-            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-        if bug_id == 'OSV-2023-899':
-            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-        if bug_id == 'OSV-2023-1169':
-            patch_pair_list = [('src/tests/fuzzing/fuzz_pkcs15init.csrc/tests/fuzzing/fuzz_pkcs15init.c-203,2+202,2',)]
-        if bug_id == 'OSV-2024-17':
-            patch_pair_list = [('src/libopensc/card.csrc/libopensc/card.c-650,21+650,15', 'src/libopensc/card.csrc/libopensc/card.c-620,2+620,2'), ('src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1583,2+1577,3', 'src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1558,12+1556,8', 'src/libopensc/card-iasecc.csrc/libopensc/card-iasecc.c-1547,1+1546,0')]
-        if bug_id == 'OSV-2023-609':
-            patch_pair_list = [('src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1663,6+1662,8', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1631,2+1626,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1621,2+1612,6', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1590,2+1570,3', 'src/pkcs15init/pkcs15-lib.csrc/pkcs15init/pkcs15-lib.c-1542,3+1525,0')]
+        min_patch_file_path = os.path.join(data_path, 'min_patch', f'{target}.json')
+        if not os.path.exists(os.path.dirname(min_patch_file_path)):
+            os.makedirs(os.path.dirname(min_patch_file_path))
+        if os.path.exists(min_patch_file_path):
+            with open(min_patch_file_path, 'r') as f:
+                patch_pair_list = json.load(f)[bug_id]
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
@@ -4299,6 +4314,8 @@ def revert_patch_test(args):
             # try to minimize the patch set
             minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
             logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
+            
+        min_path_dict[bug_id] = minimal_fast
 
         patches_without_contexts[
             (bug_id, commit['commit_id'], fuzzer,
@@ -4317,6 +4334,7 @@ def revert_patch_test(args):
         patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
         if bug_id not in get_patched_traces:
             continue
+        logger.info('-' * 20)
         for i in range(len(get_patched_traces[bug_id])):
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
             need_build = True
@@ -4365,6 +4383,8 @@ def revert_patch_test(args):
                     logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
             logger.info(f'\t{bug_id} total local bugs triggered: {count}\n')
 
+    with open(min_patch_file_path, 'w') as f:
+        json.dump(min_path_dict, f, indent=4)
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
     

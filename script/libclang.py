@@ -330,7 +330,8 @@ def load_compile_commands(path="compile_commands.json"):
         directory = entry["directory"]
         file = entry["file"]
         args = entry.get("arguments") or entry["command"].split()
-        commands[file] = (directory, args)
+        abs_path = os.path.abspath(os.path.join(directory, file))
+        commands[abs_path] = (directory, args)
     return commands
 
 
