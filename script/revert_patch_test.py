@@ -324,64 +324,107 @@ def replace_function_header(func_code: str, signature: str) -> str:
     return new_header + body
 
 
+def looks_like_real_function(code: str) -> bool:
+    return '{' in code and '}' in code
+
+
+def find_macro_block(file_content, start_line):
+    define_line = None
+    undef_line = None
+
+    # Search upward for #define XML_OP
+    for i in range(start_line - 2, -1, -1):
+        if '#define XML_OP' in file_content[i]:
+            define_line = i + 1
+            break
+
+    # Search downward for #undef XML_OP
+    if define_line is not None:
+        for i in range(start_line - 1, len(file_content)):
+            if '#undef XML_OP' in file_content[i]:
+                undef_line = i + 1
+                break
+
+    if define_line and undef_line:
+        return define_line, undef_line
+    return None
+
+
 def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_path, func_sig):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["git", "checkout", '-f', commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "checkout", "-f", commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    parsing_path = os.path.join(data_path, f'{target_repo_path.split("/")[-1]}-{commit}', f'{file_path}_analysis.json')
-    with open(parsing_path, 'r') as f:
+    parsing_path = os.path.join(
+        data_path,
+        f'{target_repo_path.split("/")[-1]}-{commit}',
+        f'{file_path}_analysis.json'
+    )
+    with open(parsing_path, "r") as f:
         ast_nodes = json.load(f)
 
     for ast_node in ast_nodes:
-        if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+        if ast_node.get("kind") not in {"FUNCTION_DEFI", "CXX_METHOD", "FUNCTION_TEMPLATE"}:
             continue
 
-        if compare_function_signatures(ast_node['signature'], func_sig, True):
-            with open(os.path.join(target_repo_path, ast_node['extent']['start']['file']), 'r', encoding="utf-8", errors="strict") as f:
-                file_content = f.readlines()
+        if not compare_function_signatures(ast_node["signature"], func_sig, True):
+            continue
 
-            start_line = ast_node['extent']['start']['line']
-            end_line = ast_node['extent']['end']['line']
+        src_path = os.path.join(target_repo_path, ast_node["extent"]["start"]["file"])
+        with open(src_path, "r", encoding="utf-8", errors="strict") as f:
+            file_content = f.readlines()
 
-            # If there is an unmatched #endif relative to the current start_line,
-            # walk upward to include its matching #if/#ifdef/#ifndef. This avoids
-            # expanding when the #endif is already balanced within the span.
-            block_depth = 0
-            min_depth = 0
-            for line in file_content[start_line-1:end_line]:
-                stripped = line.lstrip()
-                if stripped.startswith(('#if', '#ifdef', '#ifndef')):
-                    block_depth += 1
-                elif stripped.startswith('#endif'):
-                    block_depth -= 1
-                min_depth = min(min_depth, block_depth)
+        start_line = ast_node["extent"]["start"]["line"]
+        end_line = ast_node["extent"]["end"]["line"]
 
-            if min_depth < 0:
-                unmatched = -min_depth
-                for idx in range(start_line - 2, -1, -1):
-                    stripped = file_content[idx].lstrip()
-                    if stripped.startswith('#endif'):
-                        unmatched += 1
-                    elif stripped.startswith(('#if', '#ifdef', '#ifndef')):
-                        unmatched -= 1
-                        if unmatched == 0:
-                            start_line = idx + 1
-                            break
+        # -------- original #if / #endif balancing logic --------
+        block_depth = 0
+        min_depth = 0
+        for line in file_content[start_line - 1:end_line]:
+            stripped = line.lstrip()
+            if stripped.startswith(("#if", "#ifdef", "#ifndef")):
+                block_depth += 1
+            elif stripped.startswith("#endif"):
+                block_depth -= 1
+            min_depth = min(min_depth, block_depth)
 
-            func_code = ''.join(
-                file_content[start_line-1 : end_line]
-            )
+        if min_depth < 0:
+            unmatched = -min_depth
+            for idx in range(start_line - 2, -1, -1):
+                stripped = file_content[idx].lstrip()
+                if stripped.startswith("#endif"):
+                    unmatched += 1
+                elif stripped.startswith(("#if", "#ifdef", "#ifndef")):
+                    unmatched -= 1
+                    if unmatched == 0:
+                        start_line = idx + 1
+                        break
 
-            # Replace header using the AST canonical function signature
-            func_code = replace_function_header(func_code, ast_node['signature'])
+        func_code = "".join(file_content[start_line - 1:end_line])
 
-            # Compute length as before
-            func_length = func_code.count('\n')
-            if func_code and func_code[-1] != '\n':
-                func_length += 1
+        # -------- NEW: handle macro-generated “functions” --------
+        # If the extracted code doesn't look like a real function AND
+        # the reported line is inside a '#define XML_OP' / '#undef XML_OP' block,
+        # grab that whole macro block instead.
+        if not looks_like_real_function(func_code):
+            macro_block = find_macro_block(file_content, start_line)
+            if macro_block is not None:
+                block_start, block_end = macro_block
+                func_code = "".join(file_content[block_start - 1:block_end])
+                start_line = block_start
+                end_line = block_end
 
-            return func_code, func_length, start_line
+        # Only try to rewrite the header if this really looks like a function.
+        if looks_like_real_function(func_code):
+            func_code = replace_function_header(func_code, ast_node["signature"])
+
+        # Compute length
+        func_length = func_code.count("\n")
+        if func_code and func_code[-1] != "\n":
+            func_length += 1
+
+        return func_code, func_length, start_line
+
     return None, 0, 0
 
 
@@ -430,10 +473,14 @@ def get_function_code_by_line(target_repo_path, commit, data_path, file_path, li
 
 def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_path, func_sig):
     """Get patch insert line number from new commit for the Artificial patch"""
-    os.chdir(target_repo_path)
-    subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    
+    if not func_sig:
+        # return the last line of that file
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with open(os.path.join(target_repo_path, file_path), 'r') as fsrc:
+            file_content = fsrc.readlines()
+            return len(file_content)+1
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{next_commit}",
@@ -523,6 +570,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         for node in ast_nodes:
             if node['spelling'] == func_name and node['kind'] == 'MACRO_DEFINITION':
                 is_macro = True
+                type_def_to_add.setdefault(file_path_new, dict())[f'{node['extent']['start']['file']}:{node['extent']['start']['line']}:{node['extent']['end']['line']}'] = func_name
                 break
             if node['spelling'] == func_name and \
                 node['kind'] in call_kinds and 'callee' in node and\
@@ -568,13 +616,6 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
             else:
                 recreated_functions.add(cur_fun_info)
             def_loc = FunctionLocation(file_path=def_file_path_old, start_line=start_line, end_line=start_line + func_length - 1)
-            if not func_code:
-                logger.error(f'No func code found for {def_file_path_old}: {callee_sig}')
-                for recreate_func, recreate_func_loc in diff_results[key_of_error_patch].recreated_function_locations.items():
-                    func_code, func_length, start_line = get_function_code_by_line(target_repo_path, callee_commit, data_path, recreate_func_loc.file_path, recreate_func_loc.start_line)
-                    if func_code:
-                        logger.info(f'Found func code for {def_file_path_old}: {callee_sig} in recreated function {recreate_func} at {recreate_func_loc}')
-                        break
             func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
 
             callee_sig_new = get_new_funcsig(func_name, next_commit, def_file_path_new, target_repo_path, signature_change_list)
@@ -1567,7 +1608,6 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         patch = diff_results[key]
         if not patch.old_signature:
             # skip for a added function
-            new_patch_to_apply.append(key)
             continue
         fname = patch.old_function_name
         
@@ -1600,7 +1640,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, func_used_file=patch.file_path_new, file_path_old=patch.file_path_old, keywords=['static'] if is_function_static(patch.patch_text) else []))
                 key_to_newkey[key] = key
             
-            elif patch.old_signature and patch.new_signature:
+            elif patch.old_signature:
                 if (patch.old_signature, patch.file_path_old) in handle_func_signature_change:
                     continue
                 # Delete all other patches that have the same signature
@@ -1647,8 +1687,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 key_to_newkey[key] = new_key
                 
         else:
-            new_patch_to_apply.append(key)
-            logger.debug(f"Skipping non-function body change for {key}")
+            logger.info(f"Skipping non-function body change for {key}")
             
     # Rename the function by dependency graph, find the caller of the recreated function
     for key in key_to_newkey:
@@ -1948,7 +1987,7 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         lines = patch_text.split('\n')
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
-        if lines[4][0] == '-': # meaning this patch has no context
+        if lines[4][0] in {'-', '+'}: # meaning this patch has no context
             if patch.file_path_new in patch_prev_key and patch.new_start_line <= prev_new_end_line[patch.file_path_new]+3:
                 # merge the patches that have overlap
                 patch_prev = diff_results[patch_prev_key[patch.file_path_new]]
@@ -1967,7 +2006,11 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 
                 patch_prev_old_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
                 patch_prev_old_offset = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
-                patch_prev_new_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
+                if not any(line[0] != '+' for line in patch_prev.patch_text.split('\n')[4:]):
+                    patch_prev_new_start = int(patch_prev_lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
+                else:
+                    patch_prev_new_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
+                patch_prev_new_start = int(patch_prev_lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 patch_prev_new_offset = int(patch_prev_lines[3].split('@@')[-2].strip().split(',')[-1])
                 
                 prev_front_context_len = 0
@@ -2022,10 +2065,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
         file_path = os.path.join(target_repo_path, patch.file_path_new)
         with open(file_path, 'r', encoding="latin-1") as f:
             content = [line.rstrip('\n') for line in f.readlines()]
-        try:
-            old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
-        except (ValueError, IndexError):
-            logger.error(f'Failed to parse patch hunk header: {lines[3]} in patch {patch_text}')
+        
+        old_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('-')[1].split(',')[0])
         old_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
         new_line_begin_nocontext = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
         new_offset_nocontext = int(lines[3].split('@@')[-2].strip().split(',')[-1])
@@ -2266,8 +2307,11 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     # Assume target_repo in new commit
     new_patch_to_apply = set()
     trace_set = set() # avoid duplicate functions in loop
+    recreated_names = {func.name for func in recreated_functions}
     for index, func in trace1:
         fname = func.split(' ')[0]
+        if fname in recreated_names:
+            continue
         location = func.split(' ')[1]
         file_path = location.split(':')[0][1:]  # remove leading /
         trace_set.add((fname, file_path))
@@ -2298,6 +2342,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             # Create a patch to add the function call
             patch_header = f"diff --git a/{file_path} b/{file_path}\n"
             patch_header += f"--- a/{file_path}\n+++ b/{file_path}\n"
+            os.chdir(target_repo_path)
+            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             with open(os.path.join(target_repo_path, file_path), 'r', encoding="latin-1") as f:
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
