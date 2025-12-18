@@ -2834,6 +2834,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         file_path_v1 = patch.file_path_old
         parsing_path = os.path.join(data_path, f'{target}-{commit["commit_id"]}', f'{file_path_v1}_analysis.json')
         deduplicate_struct = set()
+        found_v1 = set()
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
         for node in ast_nodes:
@@ -2841,6 +2842,7 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                 continue
             if node['spelling'] in struct_set:
                 # Found the struct definition
+                found_v1.add(node['spelling'])
                 struct_file_path = node['extent']['start']['file']
                 start_line = node['extent']['start']['line']
                 end_line = node['extent']['end']['line']
@@ -2864,7 +2866,46 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                     if struct_code not in deduplicate_struct:
                         deduplicate_struct.add(struct_code)
                         struct_defs_v1 += struct_code
+
+        # If a struct is not found, search in all files
+        missing_structs = struct_set - found_v1
+        if missing_structs:
+            ast_file_folder = os.path.join(data_path, f"{target}-{commit['commit_id']}")
+            for dirpath, _, filenames in os.walk(ast_file_folder):
+                for filename in filenames:
+                    if not filename.endswith('_analysis.json'):
+                        continue
+                    ast_file = os.path.join(dirpath, filename)
+                    if ast_file == parsing_path:
+                        continue
+                    with open(ast_file, 'r') as ast_file_handle:
+                        candidate_nodes = json.load(ast_file_handle)
+                    for candidate in candidate_nodes:
+                        if candidate['spelling'] in missing_structs:
+                            # Found the struct definition
+                            struct_file_path = candidate['extent']['start']['file']
+                            start_line = candidate['extent']['start']['line']
+                            end_line = candidate['extent']['end']['line']
         
+                            if node.get('kind') == 'TYPE_REF':
+                                if node['type_ref']['underlying']['kind'] == 'NO_DECL_FOUND':
+                                    struct_file_path = node['type_ref']['typedef_extent']['start']['file']
+                                    start_line = node['type_ref']['typedef_extent']['start']['line']
+                                    end_line = node['type_ref']['typedef_extent']['end']['line']
+                                else:
+                                    struct_file_path = node['type_ref']['underlying']['extent']['start']['file']
+                                    start_line = node['type_ref']['underlying']['extent']['start']['line']
+                                    end_line = node['type_ref']['underlying']['extent']['end']['line']
+                            os.chdir(target_repo_path)
+                            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            subprocess.run(["git", "checkout", '-f', commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            with open(os.path.join(target_repo_path, struct_file_path), 'r', encoding="latin-1") as f:
+                                file_content = f.readlines()
+                                struct_code = ''.join(line for line in file_content[start_line-1:end_line])
+                                if struct_code not in deduplicate_struct:
+                                    deduplicate_struct.add(struct_code)
+                                    struct_defs_v1 += struct_code
+                    
         for key in patch_key_list:
             patch = diff_results[key]
             if 'Incomplete type' not in patch.patch_type:
@@ -2880,11 +2921,13 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         with open(parsing_path, 'r') as f:
             ast_nodes = json.load(f)
         deduplicate_struct = set()
+        found_v2 = set()
         for node in ast_nodes:
             if node.get('kind') not in {'STRUCT_DECL', 'TYPEDEF_DECL', 'TYPE_REF'}:
                 continue
             if node['spelling'] in struct_set:
                 # Found the struct definition
+                found_v2.add(node['spelling'])
                 struct_file_path = node['extent']['start']['file']
                 start_line = node['extent']['start']['line']
                 end_line = node['extent']['end']['line']
@@ -2908,6 +2951,47 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
                     if struct_code not in deduplicate_struct:
                         deduplicate_struct.add(struct_code)
                         struct_defs_v2 += struct_code
+        
+        # If a struct is not found, search in all files
+        missing_structs_v2 = struct_set - found_v2
+        logger.info(f'missing_structs_v2: {missing_structs_v2}')
+        if missing_structs_v2:
+            ast_file_folder = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
+            for dirpath, _, filenames in os.walk(ast_file_folder):
+                for filename in filenames:
+                    if not filename.endswith('_analysis.json'):
+                        continue
+                    ast_file = os.path.join(dirpath, filename)
+                    if ast_file == parsing_path:
+                        continue
+                    with open(ast_file, 'r') as ast_file_handle:
+                        candidate_nodes = json.load(ast_file_handle)
+                    for candidate in candidate_nodes:
+                        if candidate['spelling'] in missing_structs_v2:
+                            # Found the struct definition
+                            struct_file_path = candidate['extent']['start']['file']
+                            start_line = candidate['extent']['start']['line']
+                            end_line = candidate['extent']['end']['line']
+        
+                            if node.get('kind') == 'TYPE_REF':
+                                if node['type_ref']['underlying']['kind'] == 'NO_DECL_FOUND':
+                                    struct_file_path = node['type_ref']['typedef_extent']['start']['file']
+                                    start_line = node['type_ref']['typedef_extent']['start']['line']
+                                    end_line = node['type_ref']['typedef_extent']['end']['line']
+                                else:
+                                    struct_file_path = node['type_ref']['underlying']['extent']['start']['file']
+                                    start_line = node['type_ref']['underlying']['extent']['start']['line']
+                                    end_line = node['type_ref']['underlying']['extent']['end']['line']
+                            os.chdir(target_repo_path)
+                            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            with open(os.path.join(target_repo_path, struct_file_path), 'r', encoding="latin-1") as f:
+                                file_content = f.readlines()
+                                struct_code = ''.join(line for line in file_content[start_line-1:end_line])
+                                if struct_code not in deduplicate_struct:
+                                    deduplicate_struct.add(struct_code)
+                                    struct_defs_v2 += struct_code
+        
         # 2.3. get the error message
         error_message = ''
         for field_name, struct_name, relative_file_path, line_num, full_message in field_struct_list:
@@ -4162,9 +4246,6 @@ def revert_patch_test(args):
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
         if args.bug_id and bug_id != args.bug_id:
-            continue
-        if bug_id in {'OSV-2023-1163', 'OSV-2023-1276', 'OSV-2023-98'}:
-            # skip these two bugs for now
             continue
         if args.buggy_commit:
             commit['commit_id'] = args.buggy_commit[:6]
