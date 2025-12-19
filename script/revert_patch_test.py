@@ -519,6 +519,53 @@ def get_new_funcsig(fname, next_commit, file_path_new, target_repo_path, signatu
     return None
 
 
+_AST_NODES_CACHE: Dict[str, List[dict]] = {}
+_AST_FILE_CACHE: Dict[str, List[str]] = {}
+
+
+def _load_ast_nodes(parsing_path: str) -> List[dict]:
+    """Load AST nodes from disk with simple caching."""
+    if parsing_path not in _AST_NODES_CACHE:
+        with open(parsing_path, 'r') as f:
+            _AST_NODES_CACHE[parsing_path] = json.load(f)
+    return _AST_NODES_CACHE[parsing_path]
+
+
+def _get_ast_files(ast_root: str) -> List[str]:
+    """Return list of analysis json files under ast_root with caching."""
+    if ast_root not in _AST_FILE_CACHE:
+        files = []
+        for root, _, filenames in os.walk(ast_root):
+            for filename in filenames:
+                if filename.endswith('_analysis.json'):
+                    files.append(os.path.join(root, filename))
+        _AST_FILE_CACHE[ast_root] = files
+    return _AST_FILE_CACHE[ast_root]
+
+
+def find_def_file_path_from_ast(target_repo_path: str, commit: str, func_name: str, def_kinds: Set[str], signature: Optional[str]) -> Optional[str]:
+    """
+    Traverse all AST files for the given repo/commit and find the definition file for func_name.
+    Prefer matching by signature when available for accuracy.
+    """
+    repo_name = target_repo_path.split('/')[-1]
+    ast_root = os.path.join(data_path, f"{repo_name}-{commit}")
+    if not os.path.isdir(ast_root):
+        return None
+    for analysis_path in _get_ast_files(ast_root):
+        try:
+            ast_nodes = _load_ast_nodes(analysis_path)
+        except FileNotFoundError:
+            continue
+        for node in ast_nodes:
+            if node.get('kind') not in def_kinds or node.get('spelling') != func_name:
+                continue
+            if signature and node.get('signature') != signature:
+                continue
+            return node['location']['file']
+    return None
+
+
 def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, target, commit, next_commit, target_repo_path, function_declarations, file_path_pairs, depen_graph: dict, type_def_to_add: dict, recreated_functions, func_list, signature_change_list):
     # Recreate the callee function, change the callsite
     new_patch_key_list = set()
@@ -587,13 +634,20 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         is_include = False
         for node in ast_nodes:
             if (node.get('kind') in decl_kinds or node.get('kind') in def_kinds) and node['spelling'] == func_name:
-                def_file_path = node['location']['file'].replace('.h', '.c')
-                if not os.path.exists(os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{commit}', f'{def_file_path}_analysis.json')):
+                if node['location']['file'].endswith('.h'):
+                    def_file_path = find_def_file_path_from_ast(target_repo_path, commit, func_name, def_kinds, callee_sig)
+                    if not def_file_path:
+                        logger.error(f'No definition found for {func_name} {callee_sig} in repo {target_repo_path} {commit}')
+                        continue
+                    break
+                else:
                     def_file_path = node['location']['file']
-                if '#include' in def_file_path: 
-                    is_include = True
-                    type_def_to_add.setdefault(file_path_new, dict())[f'{node["extent"]["start"]["file"]}:{node["extent"]["start"]["line"]}:{node["extent"]["end"]["line"]}'] = func_name
-                break
+                    if '#include' in def_file_path: 
+                        is_include = True
+                        type_def_to_add.setdefault(file_path_new, dict())[f'{node["extent"]["start"]["file"]}:{node["extent"]["start"]["line"]}:{node["extent"]["end"]["line"]}'] = func_name
+                    break
+        if not def_file_path:
+            continue
         if is_include:
             # add the #include later, outside this function
             continue
@@ -2000,8 +2054,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                         connect_lines = [f' {line[:-1]}' for line in f.readlines()[connect_lines_begin-1:connect_lines_end-1]]
                 else:
                     connect_lines = []
-                if patch_prev_lines[-1] == '\\ No newline at end of file':
-                    patch_prev_lines = patch_prev_lines[:-1]
                 merged_lines = patch_prev_lines[4:] + connect_lines + lines[4:]
                 
                 patch_prev_old_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
@@ -2098,8 +2150,6 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 context_lines2 = []
             else:
                 context_lines2 = [f' {line}' for line in content[new_line_begin_nocontext+new_offset_nocontext-1: new_line_begin + new_offset-1]]
-            if new_offset - new_offset_nocontext < 3:
-                context_lines2.append('\\ No newline at end of file')
 
         lines = lines[:3] + [f'@@ -{old_line_begin},{old_offset} +{new_line_begin},{new_offset} @@']\
             + context_lines1 + lines[4:] + context_lines2
@@ -2808,6 +2858,22 @@ def correct_hiden_func_dict(patch: PatchInfo) -> dict:
     return patch.hiden_func_dict
 
 
+def get_correct_struct_name(type_spelling: str) -> str:
+    """
+    Extract parent struct name from libclang anonymous nested struct spelling.
+    Example input:
+        'struct ndpi_flow_struct::(unnamed at ...)' -> 'ndpi_flow_struct'
+        'struct plain_struct' -> 'plain_struct'
+    """
+    # 1. Strip the suffix if "::" is present
+    if "::" in type_spelling:
+        type_spelling = type_spelling.split("::", 1)[0]
+
+    # 2. Remove "struct " prefix if present
+    # Using split(' ')[-1] is robust for "struct X", "union X", or just "X"
+    return type_spelling.split(' ')[-1].strip()
+
+
 def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results, extra_patches, target, next_commit, commit, target_repo_path, bug_id):
     logger.info(f'enter handle miss member structs {len(miss_member_structs)}')
     struct_error_dict = dict()
@@ -2818,8 +2884,8 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
     for (field_name, struct_name, file_path, line_num), full_message in miss_member_structs.items():
         relative_file_path = file_path.split('/', 3)[-1]
         key_of_line_num, old_function_signature, func_start_index, func_end_index = get_error_patch(relative_file_path, line_num, patch_key_list, diff_results, extra_patches)
-        struct_error_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), []).append((field_name, struct_name.split(' ')[-1], relative_file_path, line_num, full_message))
-        struct_per_fuc_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), set()).add(struct_name.split(' ')[-1])
+        struct_error_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), []).append((field_name, get_correct_struct_name(struct_name), relative_file_path, line_num, full_message))
+        struct_per_fuc_dict.setdefault((key_of_line_num, old_function_signature, func_start_index, func_end_index), set()).add(get_correct_struct_name(struct_name))
     # 2. Handle each group of errors, prepare function source code and struct defination
     for (key_of_line_num, old_function_signature, func_start_index, func_end_index), field_struct_list in struct_error_dict.items():
         relative_file_path = field_struct_list[0][2]
@@ -2954,7 +3020,6 @@ def handle_miss_member_structs(miss_member_structs, patch_key_list, diff_results
         
         # If a struct is not found, search in all files
         missing_structs_v2 = struct_set - found_v2
-        logger.info(f'missing_structs_v2: {missing_structs_v2}')
         if missing_structs_v2:
             ast_file_folder = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
             for dirpath, _, filenames in os.walk(ast_file_folder):
@@ -3889,7 +3954,7 @@ def apply_and_test_patches(
                     func_decl_len_moveforward += 1
 
             if file_path in union_to_add:
-                if file_path in con_to_add and union_to_add_len != len(union_to_add):
+                if file_path in con_to_add:
                     del con_to_add[file_path]
                 # union patch
                 locs = list(union_to_add[file_path])
@@ -3936,6 +4001,9 @@ def apply_and_test_patches(
                     start_line = int(loc.split(':')[1])
                     end_line = int(loc.split(':')[2])
                     var_len += end_line - start_line + 1
+                    if not os.path.exists(os.path.join(target_repo_path, path)):
+                        # I think this will work for most projects...
+                        path = path + '.in'
                     with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
                         var_text += ''.join(f'-{line}' for line in file_content[start_line-1:end_line])
