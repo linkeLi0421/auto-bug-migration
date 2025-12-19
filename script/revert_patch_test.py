@@ -3871,6 +3871,22 @@ def apply_and_test_patches(
                         type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
                         is_macro = True
                         break
+                if not is_macro:
+                    # Try to find in all files
+                    ast_file_folder = os.path.join(data_path, f"{target}-{commit['commit_id']}")
+                    for dirpath, _, filenames in os.walk(ast_file_folder):
+                        for filename in filenames:
+                            if not filename.endswith('_analysis.json'):
+                                continue
+                            ast_file = os.path.join(dirpath, filename)
+                            with open(ast_file, 'r') as f:
+                                ast_nodes = json.load(f)
+                            for ast_node in ast_nodes:
+                                if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
+                                    type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                                    is_macro = True
+                                    breakrue
+                        break
                 if is_macro:
                     continue
                 func_deled.append((func_name, file_path, (line_num_after_patch, line_num_after_patch)))
