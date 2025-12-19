@@ -12,13 +12,16 @@ def _extent_dict(cur, include_paths):
     if not cur or not cur.extent or not cur.extent.start or not cur.extent.end:
         return None
     def _disp(p):
+        p = str(p)
         if not p:
             return ""
-        real = os.path.realpath(str(p))
+        real = os.path.realpath(p)
         if real.startswith("/src"):
             return real.split("/", 3)[-1]
-        if any(ip in str(p) for ip in include_paths):
-            return "#include <" + os.path.basename(real) + ">"
+        if any(ip in p for ip in include_paths):
+            for include_path in include_paths:
+                if p in include_path:
+                    return f"#include <{p[len(include_path)+1:]}>"
         return real
     s = cur.extent.start
     e = cur.extent.end
