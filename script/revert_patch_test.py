@@ -3676,6 +3676,8 @@ def apply_and_test_patches(
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
+        if count == 30:
+            break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
@@ -3875,6 +3877,7 @@ def apply_and_test_patches(
             else:
                 # Add declaration for the "__revert_commit_bug_id_*" function
                 for func_decl in function_declarations:
+                    func_decl = normalize_function_pointer_params(func_decl)
                     if func_name == func_decl.split('(')[0].split(' ')[-1]:
                         if file_path_new in extra_patches and func_decl in extra_patches[file_path_new].patch_text:
                             # Suggest that we need to reorder function declarations
