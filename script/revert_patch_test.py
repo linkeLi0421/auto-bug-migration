@@ -44,6 +44,7 @@ OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
 from handle_struct_use import solve_code_migration
 from handle_func_sig_change import handle_func_sig_change, handle_renaming_patch_sig_change
+from check_patch_order import fix_patch_order
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -3669,6 +3670,8 @@ def apply_and_test_patches(
     last_type_def_to_add = dict()
     recreated_cons = set()
     recreated_var = set()
+    error_last_round = ''
+    check_patch_using_llm = False
     # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
     error_log = 'undeclared identifier'
     count = 0
@@ -3684,6 +3687,12 @@ def apply_and_test_patches(
         with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
             f.write(error_log)
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
+        with open(patch_file_path, 'r') as f:
+            patch_text = f.read()
+        if error_last_round != stable_hash(patch_text):
+            error_last_round = stable_hash(patch_text)
+        else:
+            check_patch_using_llm = True
         logger.info(f'undeclared_identifier: {len(undeclared_identifier)} {undeclared_identifier}')
         logger.info(f'undeclared_functions: {undeclared_functions}')
         logger.info(f'miss_member_structs: {len(miss_member_structs)} {[item for item in miss_member_structs]}')
@@ -4052,6 +4061,19 @@ def apply_and_test_patches(
                         for identifier in ids:
                             patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
                             var_text = '\n'.join(rename_func(var_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}')) + '\n'
+            
+            # solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{file_path}-{stable_hash(include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text)}-check.txt')
+            # checked_code = include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text
+            # if file_path in type_def_to_add and not os.path.exists(os.path.join(patch_folder, solution_path)) and check_patch_using_llm:
+            #     logger.info(f'checking patch order for {file_path} {solution_path}')
+            #     logger.info(f'checked code: {checked_code}')
+            #     checked_code = fix_patch_order(checked_code)
+            #     with open(os.path.join(patch_folder, solution_path), 'w') as f:
+            #         f.write(checked_code)
+            #     checked_code = '\n'.join(f'-{line}' for line in checked_code.split('\n')) + '\n'
+            # elif os.path.exists(os.path.join(patch_folder, solution_path)):
+            #     with open(os.path.join(patch_folder, solution_path), 'r') as f:
+            #         checked_code = '\n'.join(f'-{line}' for line in f.read().split('\n')) + '\n'
 
             # need new version to get the context lines
             if enum_len+include_len+func_decl_len+var_len+union_len+func_decl_len_moveforward == 0:
@@ -4080,10 +4102,11 @@ def apply_and_test_patches(
                     _, gap_text, _, _ = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=gap_len)
                     f_text = patch_f.patch_text.split('\n', 7)[-1] # Remove the patch header and the front context
                     patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+insert_point-start+gap_len+old_offset_f-3} +{start},{insert_point-start+gap_len+new_offset_f-3} @@\n'
+                    extra_text = checked_code
                     patch = PatchInfo(
                         file_path_old=file_path,
                         file_path_new=file_path,
-                        patch_text=patch_header + context1 + include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text + gap_text + f_text,
+                        patch_text=patch_header + context1 + extra_text + gap_text + f_text,
                         file_type='c',
                         new_start_line=start,
                         new_end_line=patch_f.new_end_line,
@@ -4098,10 +4121,11 @@ def apply_and_test_patches(
                 
             if not merge_flag:
                 patch_header += f'@@ -{start},{enum_len+include_len+func_decl_len+func_decl_len_moveforward+var_len+union_len+end-start+1} +{start},{end-start+1} @@\n'
+                extra_text = checked_code
                 patch = PatchInfo(
                     file_path_old=file_path,
                     file_path_new=file_path,
-                    patch_text=patch_header + context1 + include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text + context2,
+                    patch_text=patch_header + context1 + extra_text + context2,
                     file_type='c',
                     new_start_line=start,
                     new_end_line=end,
@@ -4495,7 +4519,8 @@ def revert_patch_test(args):
                         diff_result.old_signature, diff_result.old_function_start_line, diff_result.old_function_end_line = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
                     if not diff_result.new_signature and diff_result.file_path_new != '/dev/null':
                         diff_result.new_signature, _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
-                    patch_to_apply.append(key)
+                    if diff_result.old_signature:
+                        patch_to_apply.append(key)
                     break
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
