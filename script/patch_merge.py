@@ -436,42 +436,25 @@ def write_graphviz(graph: PatchCompatibilityGraph, output_path: Path) -> None:
         output_path,
     )
 
-
-def _expand_function_set(funcs: Set[str], commit: str,signature_map: Optional[Dict[str, Set[str]]]) -> Set[str]:
-    """Return function names plus any equivalents defined in the signature map."""
-    if not signature_map:
-        return funcs
-    expanded: Set[str] = set()
-    for func in funcs:
-        revert_func = f"revert_{commit}_{func}"
-        expanded.add(func)
-        equivalents = signature_map.get(revert_func)
-        if equivalents:
-            expanded.update(equivalents)
-    return expanded
-
-
 def is_compatiable(
     key_a: PatchSetKey,
     key_b: PatchSetKey,
     bug_distribution: Optional[List[Dict[str, Any]]] = None,
     commit_index: Optional[Dict[str, int]] = None,
-    signature_map: Optional[Dict[str, Set[str]]] = None,
 ) -> bool:
     """Return True when two patch sets are compatible based on touched functions and shared triggers."""
 
     def extract_functions(key: PatchSetKey) -> Set[str]:
         if len(key) < 4:
             return set()
-        commit = key[1]
         funcs = key[3]
         if isinstance(funcs, (list, tuple, set)):
-            return {str(name) for name in funcs}, commit
+            return {str(name) for name in funcs}
         logger.debug("Unexpected function list type for key %s: %s", key, type(funcs).__name__)
-        return set(), commit
+        return set()
 
-    funcs_a = _expand_function_set(*extract_functions(key_a), signature_map)
-    funcs_b = _expand_function_set(*extract_functions(key_b), signature_map)
+    funcs_a = extract_functions(key_a)
+    funcs_b = extract_functions(key_b)
 
     if funcs_a.isdisjoint(funcs_b):
         return True
@@ -533,7 +516,6 @@ def is_compatiable(
 def merge_patches(
     patches_without_contexts: Dict[PatchSetKey, PatchSet],
     bug_distribution: Optional[List[Dict[str, Any]]] = None,
-    signature_map: Optional[Dict[str, Set[str]]] = None,
 ) -> PatchCompatibilityGraph:
     """Build a compatibility graph where each node represents an entire patch dictionary."""
 
@@ -549,7 +531,7 @@ def merge_patches(
 
     commit_index = _build_commit_index(bug_distribution)
     graph.connect_compatibilities(
-        lambda a, b: is_compatiable(a, b, bug_distribution, commit_index, signature_map)
+        lambda a, b: is_compatiable(a, b, bug_distribution, commit_index)
     )
     local_nodes_added, local_edges_added = attach_local_bug_nodes(graph)
 
@@ -938,24 +920,6 @@ def parse_bug_distribution_csv(csv_path: Path) -> list[dict[str, Any]]:
     return parse_csv_file(str(csv_path))
 
 
-def load_signature_change_map(file_path: Path) -> Dict[str, Set[str]]:
-    """Load signature equivalence mappings from JSON file containing [new, old] pairs."""
-    with open(file_path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-
-    equivalence: DefaultDict[str, Set[str]] = defaultdict(set)
-    if isinstance(data, list):
-        for pair in data:
-            if not isinstance(pair, list) or len(pair) != 2:
-                continue
-            new_name, old_name = pair
-            if not isinstance(new_name, str) or not isinstance(old_name, str):
-                continue
-            equivalence[old_name].add(new_name)
-
-    return {key: set(values) for key, values in equivalence.items()}
-
-
 def load_local_bug_compatibility(target: Optional[str]) -> None:
     """Populate local_bug_compatibility from data/local_compatibility/{target}.json."""
     global local_bug_compatibility
@@ -1034,11 +998,6 @@ def parse_args() -> argparse.Namespace:
         "--target_commit",
         help="Commit hash to use as the base when re-adding context to merged patches.",
     )
-    parser.add_argument(
-        "--signature_change_file",
-        type=Path,
-        help="JSON file containing signature mappings [[version2, version1], ...] used for compatibility checks.",
-    )
     return parser.parse_args()
 
 
@@ -1048,6 +1007,7 @@ def _stack_verification_for_bug(
     bug_info_dataset: Dict[str, Any],
     target: str,
     target_commit: str,
+    signature_file: Optional[str] = None,
 ) -> str:
     """Run reproduce helper for `bug_id` and compare stack traces with the baseline."""
     if not target_commit:
@@ -1089,14 +1049,89 @@ def _stack_verification_for_bug(
         "crash",
         f"target_crash-{bug_commit[:6]}-{crash_input}.txt",
     )
-    signature_file = os.path.join(
-        data_path,
-        "signature_change_list",
-        f"{bug_id}_{target_commit}.json",
-    )
     if crashes_match(combined_output, baseline_crash_path, signature_file):
         return "triggered (stack matches)"
     return "triggered (stack mismatch)"
+
+
+def _load_signature_pairs(path: Path) -> List[Tuple[str, str]]:
+    """Load [[old, new], ...] signature pairs from a JSON file."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return []
+    except json.JSONDecodeError:
+        logger.warning("Signature change list %s is not valid JSON; skipping.", path)
+        return []
+
+    if not isinstance(data, list):
+        logger.warning("Signature change list %s must contain a JSON list; skipping.", path)
+        return []
+
+    pairs: List[Tuple[str, str]] = []
+    for entry in data:
+        if not isinstance(entry, list) or len(entry) < 2:
+            continue
+        old_name, new_name = entry[0], entry[1]
+        if isinstance(old_name, str) and isinstance(new_name, str):
+            pairs.append((old_name, new_name))
+    return pairs
+
+
+def build_merged_signature_change_list(
+    bug_ids: Iterable[str],
+    target_commit: str,
+    output_path: Optional[Path] = None,
+) -> Optional[str]:
+    """
+    Merge per-bug signature change lists into a single JSON file.
+
+    Per-bug signature lists are expected at `data/signature_change_list/{bug_id}_{target_commit}.json`
+    and contain JSON like `[[old, new], ...]`.
+    """
+    if not target_commit:
+        return None
+
+    signature_dir = Path(data_path) / "signature_change_list"
+    if not signature_dir.exists():
+        return None
+
+    merged_pairs: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    files_used: List[str] = []
+
+    for bug_id in sorted(set(bug_ids)):
+        if not bug_id:
+            continue
+        signature_path = signature_dir / f"{bug_id}_{target_commit}.json"
+        pairs = _load_signature_pairs(signature_path)
+        if not pairs:
+            continue
+        files_used.append(str(signature_path))
+        for pair in pairs:
+            if pair in seen:
+                continue
+            seen.add(pair)
+            merged_pairs.append(pair)
+
+    if not merged_pairs:
+        return None
+
+    if output_path is None:
+        output_path = signature_dir / f"merged_{target_commit}.json"
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump([[old, new] for old, new in merged_pairs], handle, indent=2)
+
+    logger.info(
+        "Wrote merged signature change list with %d pairs from %d files to %s",
+        len(merged_pairs),
+        len(files_used),
+        output_path,
+    )
+    return str(output_path)
 
 
 def main() -> None:
@@ -1129,19 +1164,6 @@ def main() -> None:
         )
     configure_revert_patch(revert_config)
     load_local_bug_compatibility(args.revert_target)
-    signature_change_map: Optional[Dict[str, Set[str]]] = None
-    if args.signature_change_file:
-        try:
-            signature_change_map = load_signature_change_map(args.signature_change_file)
-            logger.info(
-                "Loaded %d signature mapping entries from %s",
-                len(signature_change_map),
-                args.signature_change_file,
-            )
-        except FileNotFoundError:
-            logger.warning("Signature change file %s not found; ignoring.", args.signature_change_file)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse signature change file %s; ignoring.", args.signature_change_file)
     bug_distribution = None
     bug_info_dataset: Optional[Dict[str, Any]] = None
     if args.revert_bug_info:
@@ -1155,7 +1177,7 @@ def main() -> None:
         bug_distribution = parse_bug_distribution_csv(args.bug_distribution_csv)
     global REANALYZE_PENDING
     while True:
-        graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution, signature_change_map)
+        graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution)
         log_patch_function_table(graph)
         groups = report_compatible_groups(graph)
         group_one = groups[0] if groups else None
@@ -1211,6 +1233,14 @@ def main() -> None:
         elif not bug_info_dataset:
             logger.info("Bug info unavailable; skipping stack verification.")
         else:
+            bug_ids_for_signatures: Set[str] = set()
+            for identifier in group_one:
+                if _is_local_bug_identifier(identifier):
+                    continue
+                if isinstance(identifier, tuple) and identifier and isinstance(identifier[0], str):
+                    bug_ids_for_signatures.add(identifier[0])
+            merged_signature_file = build_merged_signature_change_list(bug_ids_for_signatures, args.target_commit)
+
             verification_results: List[Tuple[str, str, bool]] = []
             for identifier in group_one:
                 if not isinstance(identifier, tuple) or not identifier:
@@ -1223,6 +1253,14 @@ def main() -> None:
                     buggy_commit = identifier[1]
                 if not isinstance(bug_id, str):
                     continue
+                signature_file = merged_signature_file
+                if signature_file is None:
+                    candidate = os.path.join(
+                        data_path,
+                        "signature_change_list",
+                        f"{bug_id}_{args.target_commit}.json",
+                    )
+                    signature_file = candidate if os.path.exists(candidate) else None
                 try:
                     result = _stack_verification_for_bug(
                         bug_id,
@@ -1230,6 +1268,7 @@ def main() -> None:
                         bug_info_dataset,
                         args.revert_target,
                         args.target_commit,
+                        signature_file=signature_file,
                     )
                     logger.info("Stack verification result for %s: %s", bug_id, result)
                     success = result == "triggered (stack matches)"
