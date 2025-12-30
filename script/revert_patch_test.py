@@ -44,7 +44,6 @@ OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
 sys.path.insert(0, OPENAI_DIR)
 from handle_struct_use import solve_code_migration
 from handle_func_sig_change import handle_func_sig_change, handle_renaming_patch_sig_change
-from check_patch_order import fix_patch_order
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -3813,7 +3812,8 @@ def apply_and_test_patches(
                                         add_end = node1['type_ref']['underlying']['extent']['end']['line']
                                         pure_type = node1['type_ref']['underlying']['name']
                                         type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
-                                        type_def_to_add.setdefault(file_path_new, dict())[f'{add_file_path}:{add_start}:{add_end}'] = pure_type
+                                        if pure_type:
+                                            type_def_to_add.setdefault(file_path_new, dict())[f'{add_file_path}:{add_start}:{add_end}'] = pure_type
                                         break
                             else:
                                 type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
@@ -3860,6 +3860,7 @@ def apply_and_test_patches(
                     if search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
                         logger.debug(f'Found {identifier} in recreated function {func_sig} at {parsing_path}')
                         break
+        logger.info(f'type_def_to_add: {type_def_to_add}')
         func_deled = [] # list of (function name, file path, start line, end line)
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
@@ -4051,7 +4052,7 @@ def apply_and_test_patches(
                     start_line = int(loc.split(':')[1])
                     end_line = int(loc.split(':')[2])
                     var_len += end_line - start_line + 1
-                    with open(os.path.join(target_repo_path, path), 'r', encoding="utf-8", errors="strict") as f:
+                    with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
                         new_identifier = f'__rervert_var_{commit['commit_id']}_{identifier}'
                         var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
@@ -4063,7 +4064,7 @@ def apply_and_test_patches(
                             var_text = '\n'.join(rename_func(var_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}')) + '\n'
             
             # solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{file_path}-{stable_hash(include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text)}-check.txt')
-            # checked_code = include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text
+            checked_code = include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text
             # if file_path in type_def_to_add and not os.path.exists(os.path.join(patch_folder, solution_path)) and check_patch_using_llm:
             #     logger.info(f'checking patch order for {file_path} {solution_path}')
             #     logger.info(f'checked code: {checked_code}')
