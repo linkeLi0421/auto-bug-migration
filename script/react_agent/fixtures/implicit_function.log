@@ -1,0 +1,5 @@
+clang -c -o foo.o foo.c
+/src/project/foo.c:10:3: error: implicit declaration of function 'bar' is invalid in C99 [-Werror,-Wimplicit-function-declaration]
+    bar();
+    ^
+

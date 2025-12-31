@@ -1602,8 +1602,6 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     logger.info(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
     stdout = clean_log(result.stdout)
-    stderr = clean_log(result.stderr)
-    combined = stderr + stdout
 
     build_error_patterns = [
         "Building fuzzers failed",
@@ -1631,16 +1629,16 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
 
     pattern = r"ERROR:.*Sanitizer"
     fuzzer_path = os.path.join(ossfuzz_path, 'build/out', target, fuzzer)
-    sanitizer_error_seen = bool(re.search(pattern, combined))
+    sanitizer_error_seen = bool(re.search(pattern, stdout))
     fuzzer_exists = os.path.exists(fuzzer_path)
-    has_build_error = any(p in combined for p in build_error_patterns)
+    has_build_error = any(p in stdout for p in build_error_patterns)
     if ((not sanitizer_error_seen and not fuzzer_exists) or has_build_error or
             result.returncode != 0):
         if sanitizer_error_seen:
             logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
             return True, ''
         logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
-        return False, combined
+        return False, stdout
 
     logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
     return True, ''
@@ -3903,7 +3901,7 @@ def apply_and_test_patches(
                                 if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
                                     type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
                                     is_macro = True
-                                    breakrue
+                                    break
                         break
                 if is_macro:
                     continue
