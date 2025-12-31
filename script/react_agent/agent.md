@@ -1,0 +1,121 @@
+# Agent Task: Build Tools for C/C++ Migration Agent
+
+## Context and Objective
+I am building an automated agent to migrate C/C++ code from an older version (V1) to a newer version (V2).
+I have already generated static analysis data using `libclang`. The data is stored in many scattered JSON files.
+Your task is to write the **Python Tooling Layer** that allows an LLM Agent to query this data and read the corresponding source code from the disk.
+
+## Input Data Format
+The input is a directory of JSON files (`*_analysis.json`). You can check example in /home/user/oss-fuzz-build/data/libxml2-e11519
+Each JSON file contains a list of dictionaries. The structure of a single entry is strictly based on this schema:
+
+```jsonc
+{
+  "kind": "FUNCTION_DECL",  // or STRUCT_DECL, TYPEDEF_DECL, etc.
+  "spelling": "my_function",
+  "usr": "c:@F@my_function",
+  "location": {
+    "file": "/src/path/to/file.c",
+    "line": 10,
+    "column": 5
+  },
+  "extent": {
+    "start": { "file": "/src/path/to/file.c", "line": 10, "column": 1 },
+    "end":   { "file": "/src/path/to/file.c", "line": 25, "column": 1 }
+  },
+  // If it's a struct, it might have basic field info if captured
+  // If it's a function, it might contain callee info embedded as children nodes
+}
+```
+
+## Required Python Implementation
+Please generate a Python module containing the following three classes.
+
+1. Class: KbIndex (The Knowledge Base)
+Goal: Aggregate scattered JSON files into an efficient in-memory index.
+
+__init__(self, v1_root_dir, v2_root_dir):
+
+Recursively find all *.json files in both directories.
+
+Parse them and build a lookup table: self.index[usr] = { 'v1': [nodes], 'v2': [nodes] }.
+
+Also maintain a name-based index: self.name_index[spelling] = ... (handle name collisions by prioritizing definitions over declarations).
+
+Note: The file paths in JSON might start with /src/ or #include <.... Store them as-is; the SourceManager will handle the resolution.
+
+query_symbol(self, name_or_usr):
+
+Accepts a symbol name or a USR string.
+
+Returns a dict: {'v1': node, 'v2': node}.
+
+If multiple definitions exist, prioritize the one where kind ends in _DEFI or is_definition is implicit.
+
+get_callers_callees(self, name, version='v1'):
+
+Finds the function definition node.
+
+Iterates through its children (if your JSON structure captured CALL_EXPR or DECL_REF_EXPR) to return a list of dependencies.
+
+2. Class: SourceManager (The File Reader)
+Goal: Map the abstract JSON paths to the local filesystem and read code.
+
+__init__(self, local_v1_path, local_v2_path):
+
+local_v1_path: The real path on your disk where Version 1 code resides.
+
+local_v2_path: The real path on your disk where Version 2 code resides.
+
+_resolve_path(self, json_path, version):
+
+Logic:
+
+If json_path starts with /src, strip it and append to the corresponding local_vX_path.
+
+If json_path looks like #include <foo.h>, try to find foo.h in the include directories of the local repo.
+
+Return the absolute OS path.
+
+get_code_segment(self, file_path, start_line, end_line, version):
+
+Reads the file.
+
+Returns the string content between start_line and end_line.
+
+Handle encoding errors (use errors='replace').
+
+get_function_code(self, kb_node, version):
+
+Convenience wrapper. extract start.line and end.line from kb_node['extent'] and call get_code_segment.
+
+3. Class: AgentTools (The Interface)
+Goal: High-level tools that the ReAct agent will call.
+
+inspect_symbol(self, symbol_name):
+
+Uses KbIndex to find the symbol in V1 and V2.
+
+Uses SourceManager to fetch the source code for both.
+
+Returns a formatted string:
+
+Plaintext
+
+=== Version 1 ===
+File: ...
+Code:
+... code ...
+
+=== Version 2 ===
+Status: [Missing / Changed / Same]
+File: ...
+Code:
+... code ...
+
+## Implementation Details
+Use pathlib for path manipulation.
+
+Assume the JSON files might contain duplicates; the KbIndex must handle this gracefully.
+
+Include docstrings for all methods.
