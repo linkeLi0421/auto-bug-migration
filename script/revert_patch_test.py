@@ -3854,13 +3854,21 @@ def apply_and_test_patches(
             if not search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
                 logger.debug(f'Cannot find {identifier} in {parsing_path}')
                 key_of_line_num, caller_sig, func_start_index, func_end_index = get_error_patch(file_path_new, int(location.split(':')[1]), patch_key_list, diff_results, extra_patches)
-                for func_sig, func_loc in diff_results[key_of_line_num].recreated_function_locations.items():
-                    parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{func_loc.file_path}_analysis.json')
-                    logger.debug(f'Searching {identifier} in recreated function {func_sig} at {parsing_path}')
-                    if search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
-                        logger.debug(f'Found {identifier} in recreated function {func_sig} at {parsing_path}')
-                        break
-        logger.info(f'type_def_to_add: {type_def_to_add}')
+                ast_file_folder = os.path.join(data_path, f"{target}-{commit['commit_id']}")
+                found_in_ast = False
+                if os.path.isdir(ast_file_folder):
+                    for dirpath, _, filenames in os.walk(ast_file_folder):
+                        for filename in filenames:
+                            if not filename.endswith('_analysis.json'):
+                                continue
+                            parsing_path = os.path.join(dirpath, filename)
+                            logger.debug(f'Searching {identifier} in ast file {parsing_path}')
+                            if search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
+                                logger.debug(f'Found {identifier} in ast file {parsing_path}')
+                                found_in_ast = True
+                                break
+                        if found_in_ast:
+                            break
         func_deled = [] # list of (function name, file path, start line, end line)
         for func_name, location in undeclared_functions:
             file_path = location.split(':')[0]
