@@ -59,11 +59,14 @@ def _select_best(nodes: List[dict]) -> Optional[dict]:
         extent = node.get("extent", {})
         start = extent.get("start", {})
         end = extent.get("end", {})
-        if start.get("line") and end.get("line"):
-            return 5
+        start_line = int(start.get("line", 0) or 0)
+        end_line = int(end.get("line", 0) or 0)
+        if start_line and end_line:
+            length = max(end_line - start_line, 0)
+            return 5 + min(length, 200)
         return 0
 
-    def rank(node: dict) -> Tuple[int, int, int, int]:
+    def rank(node: dict) -> Tuple[int, int, int, int, int, int]:
         kind = str(node.get("kind", ""))
         file_path = str(node.get("location", {}).get("file", ""))
         loc = node.get("location", {}) or {}
@@ -242,7 +245,16 @@ class SourceManager:
         """Resolve a JSON path to a local file path."""
         if json_path.startswith("/src"):
             rel = json_path[len("/src") :].lstrip("/")
-            return self._repo_root(version) / rel
+            repo_root = self._repo_root(version)
+            repo_name = repo_root.name
+            if repo_name:
+                rel_norm = rel.replace("\\", "/")
+                prefix = f"{repo_name}/"
+                if rel_norm == repo_name:
+                    rel = ""
+                elif rel_norm.startswith(prefix):
+                    rel = rel_norm[len(prefix) :]
+            return repo_root if not rel else (repo_root / rel)
         if json_path.lstrip().startswith("#include") or "#include" in json_path:
             after = json_path.split("#include", 1)[-1].strip()
             header = (
@@ -313,4 +325,47 @@ class AgentTools:
             f"File: {v2_file}\n"
             "Code:\n"
             f"{v2_code}"
+        )
+
+    def read_file_context(
+        self, file_path: str, line_number: int, context: int = 5, version: str = "v2"
+    ) -> str:
+        """Return source context around a line number."""
+        if not file_path or line_number <= 0:
+            return ""
+        start_line = max(line_number - max(context, 0), 1)
+        end_line = max(line_number + max(context, 0), start_line)
+        resolved = self.source_manager._resolve_path(file_path, version)
+        if not resolved or not resolved.exists():
+            return ""
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        if not lines:
+            return ""
+        end_line = min(end_line, len(lines))
+
+        numbered: List[str] = []
+        for ln in range(start_line, end_line + 1):
+            prefix = ">>" if ln == line_number else "  "
+            numbered.append(f"{prefix}{ln:6d}: {lines[ln - 1]}")
+
+        return (
+            f"File: {file_path}\n"
+            f"Resolved: {resolved}\n"
+            f"Context: line {line_number} (±{context})\n"
+            + "\n".join(numbered)
+        )
+
+    def search_definition_in_v1(self, symbol_name: str) -> str:
+        """Return V1 code for the best matching symbol definition."""
+        node = self.kb_index.query_symbol(symbol_name).get("v1")
+        if not node:
+            return ""
+        file_path = node.get("location", {}).get("file") or "Unknown"
+        code = self.source_manager.get_function_code(node, "v1")
+        return (
+            "=== Version 1 ===\n"
+            f"File: {file_path}\n"
+            "Code:\n"
+            f"{code}"
         )

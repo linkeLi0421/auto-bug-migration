@@ -5,14 +5,14 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_tools import AgentTools, KbIndex, SourceManager  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Tiny CLI wrapper for react_agent tooling."
+        description="Smoke-test CLI for react_agent tooling."
     )
     parser.add_argument("symbol", help="Symbol name or USR to inspect")
     parser.add_argument(
