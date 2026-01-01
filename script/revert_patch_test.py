@@ -38,6 +38,7 @@ from utils import (
 )
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
+from migration_tools.types import FunctionLocation, PatchInfo
 
 HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
@@ -55,21 +56,6 @@ logger.addHandler(stream_handler)
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
 data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
-
-
-@dataclass(frozen=True)
-class FunctionLocation:
-    """
-    Represents the location of a function in source code.
-    """
-    file_path: str
-    start_line: int
-    end_line: int
-    
-    def __post_init__(self):
-        """Validate that start_line <= end_line."""
-        if self.start_line > self.end_line:
-            raise ValueError(f"start_line ({self.start_line}) must be <= end_line ({self.end_line})")
 
 
 @dataclass(frozen=True)
@@ -104,108 +90,6 @@ class FunctionInfo:
     def is_async(self) -> bool:
         """Check if function is async."""
         return 'async' in self.keywords
-
-
-@dataclass
-class PatchInfo:
-    """
-    Represents a single code patch, encapsulating its metadata and content.
-    """
-    # Core patch information
-    file_path_old: str
-    file_path_new: str
-    patch_text: str
-    file_type: str
-
-    # Line number information for the patch hunk
-    old_start_line: int
-    old_end_line: int
-    new_start_line: int
-    new_end_line: int
-
-    # Metadata about the patch content and type, initialized with a default
-    patch_type: Set[str] = field(default_factory=set)
-
-    # Optional: Information about the function this patch modifies
-    old_signature: Optional[str] = None
-    new_signature: Optional[str] = None
-    old_function_start_line: Optional[int] = None
-    old_function_end_line: Optional[int] = None
-    new_function_start_line: Optional[int] = None
-    new_function_end_line: Optional[int] = None
-
-    # Optional: For dependency tracking and complex patch generation
-    dependent_func: Set[str] = field(default_factory=set)
-    hiden_func_dict: Dict[str, int] = field(default_factory=dict)
-    # Stores original source locations for functions recreated in this patch
-    # Maps function signature to FunctionLocation containing file_path, start_line, end_line
-    recreated_function_locations: Dict[str, FunctionLocation] = field(default_factory=dict)
-
-    def has_type(self, patch_type: str) -> bool:
-        """Checks if the patch has a specific type."""
-        return patch_type in self.patch_type
-
-    @property
-    def is_function_modification(self) -> bool:
-        """Returns True if the patch modifies a function."""
-        return bool(self.old_signature or self.new_signature)
-
-    def _get_function_name_from_sig(self, signature: Optional[str]) -> Optional[str]:
-        """Helper to extract function name from a signature string."""
-        if not signature:
-            return None
-        try:
-            # Extracts the last word before the first parenthesis, e.g., "int my_func(int)" -> "my_func"
-            return signature.split('(')[0].split()[-1]
-        except IndexError:
-            return None
-
-    @property
-    def old_function_name(self) -> Optional[str]:
-        """Returns the name of the function from the old signature."""
-        return self._get_function_name_from_sig(self.old_signature)
-
-    @property
-    def new_function_name(self) -> Optional[str]:
-        """Returns the name of the function from the new signature."""
-        return self._get_function_name_from_sig(self.new_signature)
-
-    @property
-    def is_file_deletion(self) -> bool:
-        """Returns True if the patch represents a file deletion."""
-        return self.file_path_new == '/dev/null'
-
-    @property
-    def is_file_addition(self) -> bool:
-        """Returns True if the patch represents a file addition."""
-        return self.file_path_old == '/dev/null'
-
-    def __str__(self) -> str:
-        """Human-friendly representation used when printing the object."""
-        patch_types = ", ".join(sorted(self.patch_type)) if self.patch_type else "none"
-        dependent_funcs = ", ".join(sorted(self.dependent_func)) if self.dependent_func else "none"
-        preview_lines = [line.strip() for line in self.patch_text.strip().splitlines() if line.strip()]
-        if preview_lines:
-            preview = preview_lines[0]
-            if len(preview_lines) > 1:
-                preview += " ..."
-            if len(preview) > 80:
-                preview = f"{preview[:77]}..."
-        else:
-            preview = "<empty>"
-        return (
-            "PatchInfo("
-            f"{self.file_path_old} -> {self.file_path_new}, "
-            f"type={self.file_type}, "
-            f"old_lines={self.old_start_line}-{self.old_end_line}, "
-            f"new_lines={self.new_start_line}-{self.new_end_line}, "
-            f"patch_types={patch_types}, "
-            f"dependent_funcs={dependent_funcs}, "
-            f"old_sig={self.old_signature}, "
-            f"new_sig={self.new_signature}, "
-            f"preview='{preview}'"
-            ")"
-        )
 
 
 def stable_hash(s: str) -> str:
@@ -3680,7 +3564,7 @@ def apply_and_test_patches(
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
-        if count == 2:
+        if count == 30:
             break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:

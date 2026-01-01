@@ -14,7 +14,8 @@ from langgraph.graph import END, StateGraph  # type: ignore
 from build_log import find_first_fatal, load_build_log
 from agent_tools import AgentTools, KbIndex, SourceManager
 from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
-from tools_wrapper import ALLOWED_TOOLS, TOOL_SPECS, ToolObservation, ToolRunner
+from tools.registry import ALLOWED_TOOLS, TOOL_SPECS
+from tools.runner import ToolObservation, ToolRunner
 
 
 class Decision(TypedDict, total=False):
@@ -162,7 +163,11 @@ def _render_final_text(final: Dict[str, Any]) -> str:
             err = str(observation.get("error", "") or "").strip()
             if err:
                 lines.append(textwrap.indent(f"error: {err}", "  "))
-            out = str(observation.get("output", "") or "").rstrip("\n")
+            out_val = observation.get("output", "")
+            if isinstance(out_val, (dict, list)):
+                out = json.dumps(out_val, ensure_ascii=False, indent=2)
+            else:
+                out = str(out_val or "").rstrip("\n")
             if out:
                 lines.append(textwrap.indent("output:", "  "))
                 lines.append(textwrap.indent(out, "    "))
@@ -199,6 +204,10 @@ def _emit(obj: Dict[str, Any], output_format: str) -> None:
         return
 
     sys.stdout.write(_render_final_text(obj))
+
+
+def _argv_has_output_format(argv: List[str]) -> bool:
+    return any(a == "--output-format" or a.startswith("--output-format=") for a in argv)
 
 
 def _system_prompt() -> str:
@@ -347,7 +356,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: List[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.list_tools:
-        _emit({"type": "tools", "tools": TOOL_SPECS}, args.output_format)
+        output_format = args.output_format
+        if not _argv_has_output_format(argv):
+            output_format = "text" if sys.stdout.isatty() else "json-pretty"
+        _emit({"type": "tools", "tools": TOOL_SPECS}, output_format)
         return 0
     cfg = AgentConfig(
         max_steps=max(args.max_steps, 1),

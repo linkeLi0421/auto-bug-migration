@@ -29,7 +29,20 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
 ## LLM + LangGraph agent
 
 `script/react_agent/agent_langgraph.py` is an LLM-driven agent loop that can call:
-`inspect_symbol`, `read_file_context`, and `search_definition_in_v1`.
+
+- Symbol/code tools:
+  - `inspect_symbol(symbol_name)`
+  - `read_file_context(file_path, line_number, context, version)`
+  - `search_definition(symbol_name, version)` (use `version=v1|v2`)
+  - `search_definition_in_v1(symbol_name)` (deprecated alias)
+- Patch-bundle tools (read-only, from `data/tmp_patch/*.patch2`):
+  - `list_patch_bundle(patch_path, filter_file?, filter_patch_type?, limit?)`
+  - `get_patch(patch_path, patch_key, include_text?, max_lines?)`
+  - `search_patches(patch_path, query, limit?)`
+  - `get_error_patch(patch_path, file_path, line_number)`
+  - `parse_build_errors(build_log_path?|build_log_text?)`
+
+All agent-callable tool specs + dispatch live under `script/react_agent/tools/`.
 
 Install dependencies:
 ```bash
@@ -56,3 +69,9 @@ Output format:
 
 - Default: `--output-format auto` (prints human-friendly text when stdout is a TTY; otherwise prints JSON)
 - Force JSON: `--output-format json` or `--output-format json-pretty`
+
+List tools:
+```bash
+python3 script/react_agent/agent_langgraph.py --list-tools
+python3 script/react_agent/agent_langgraph.py --list-tools --output-format json-pretty
+```
