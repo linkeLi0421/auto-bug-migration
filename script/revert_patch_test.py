@@ -3653,6 +3653,10 @@ def apply_and_test_patches(
             patches_without_context.update({key: patch})
             patch_file.write(patch.patch_text)
             patch_file.write('\n\n')  # Add separator between patches
+    if not os.path.exists(os.path.join(data_path, "tmp_patch")):
+        os.makedirs(os.path.join(data_path, "tmp_patch"), exist_ok=True)
+    patch_file_binary = os.path.join(data_path, "tmp_patch", f"{target}.patch2")
+    save_patches_pickle(patches_without_context, patch_file_binary)
     
     #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
@@ -3676,7 +3680,7 @@ def apply_and_test_patches(
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
-        if count == 30:
+        if count == 2:
             break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
@@ -4225,6 +4229,8 @@ def apply_and_test_patches(
                 patch_file.write(patch.patch_text)
                 patch_file.write('\n\n')
                 patches_without_context.update({f'_extra_{patch.file_path_new}': patch})
+        patch_file_binary = os.path.join(data_path, "tmp_patch", f"{target}.patch2")
+        save_patches_pickle(patches_without_context, patch_file_binary)
 
         # update length of con_to_add, var_del_to_add, union_to_add
         last_type_def_to_add = copy.deepcopy(type_def_to_add)
