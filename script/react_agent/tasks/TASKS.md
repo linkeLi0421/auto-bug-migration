@@ -62,57 +62,104 @@ Back-compat:
 
 ### 1) Extract stable types (PatchInfo, FunctionLocation)
 
-- [ ] Move `PatchInfo` + `FunctionLocation` into a small importable module (e.g. `script/migration_tools/types.py`).
-- [ ] Update `script/revert_patch_test.py` to import these types instead of defining them inline (future pickles won’t reference `__main__`).
-- [ ] Keep backward compatibility in loaders for existing `__main__.PatchInfo` pickles.
+- [x] Move `PatchInfo` + `FunctionLocation` into a small importable module (e.g. `script/migration_tools/types.py`).
+- [x] Update `script/revert_patch_test.py` to import these types instead of defining them inline (future pickles won’t reference `__main__`).
+- [x] Keep backward compatibility in loaders for existing `__main__.PatchInfo` pickles.
 
 ### 2) Implement safe patch-bundle loader
 
-- [ ] Add `script/migration_tools/patch_bundle.py`:
+- [x] Add `script/migration_tools/patch_bundle.py`:
   - restricted unpickler (allow only basic builtins + the known dataclasses)
   - optional auto-detection of gzip (`.gz`) vs raw pickle
   - path allowlist (default: only `data/tmp_patch/`)
-- [ ] Provide a normalized in-memory representation:
+- [x] Provide a normalized in-memory representation:
   - `patches: dict[str, PatchInfo]`
   - helper indexes: by file, by signature, by patch_type
 
 ### 3) Implement the curated tools (pure/read-only)
 
-- [ ] Add `script/migration_tools/tools.py` implementing the tool surface above.
-- [ ] Re-implement/adapt `get_error_patch` so it works from only `{patch_path, file_path, line_number}`:
+- [x] Add `script/migration_tools/tools.py` implementing the tool surface above.
+- [x] Re-implement/adapt `get_error_patch` so it works from only `{patch_path, file_path, line_number}`:
   - derive `patch_key_list` deterministically (e.g. `new_start_line` descending, then key)
   - handle both `file.c` and `/src/.../file.c` forms
   - treat `_extra_...` patches specially (optional)
 
 ### 4) Wire into the LLM agent (but keep it optional)
 
-- [ ] Add tool specs to `script/react_agent/tools_wrapper.py` and dispatch in `ToolRunner`.
-- [ ] Update `script/react_agent/agent_langgraph.py` prompt/tool registry to include the new tools.
-- [ ] Enforce output-size limits (truncate patch text; return summaries by default).
+- [x] Add tool specs to `script/react_agent/tools_wrapper.py` and dispatch in `ToolRunner`.
+- [x] Update `script/react_agent/agent_langgraph.py` prompt/tool registry to include the new tools.
+- [x] Enforce output-size limits (truncate patch text; return summaries by default).
 
 ### 5) Add `search_definition(..., version)`
 
-- [ ] Update `script/react_agent/agent_tools.py`:
+- [x] Update `script/react_agent/agent_tools.py`:
   - add `search_definition(symbol_name, version="v1")`
   - keep `search_definition_in_v1` as an alias (mark deprecated in docstring)
-- [ ] Update `script/react_agent/tools_wrapper.py`:
+- [x] Update `script/react_agent/tools_wrapper.py`:
   - add `search_definition` to `TOOL_SPECS` + `ALLOWED_TOOLS`
   - dispatch in `ToolRunner.call` with validation for `version in {"v1","v2"}`
-- [ ] Update `script/react_agent/models.py` stub behavior to use `search_definition` (version-aware) instead of the V1-only tool.
-- [ ] Update `script/react_agent/test_langgraph_agent.sh` allowlist to include `search_definition` (keep the old one allowed during transition).
-- [ ] Update docs/examples if needed (`script/react_agent/README.md` and `--list-tools` output).
+- [x] Update `script/react_agent/models.py` stub behavior to use `search_definition` (version-aware) instead of the V1-only tool.
+- [x] Update `script/react_agent/test_langgraph_agent.sh` allowlist to include `search_definition` (keep the old one allowed during transition).
+- [x] Update docs/examples if needed (`script/react_agent/README.md` and `--list-tools` output).
 
 ### 6) Tests + fixtures
 
-- [ ] Add a tiny synthetic patch-bundle fixture (small pickle) under `script/migration_tools/fixtures/`.
-- [ ] Add tests validating:
+- [x] Add a tiny synthetic patch-bundle fixture (small pickle) under `script/migration_tools/fixtures/`.
+- [x] Add tests validating:
   - loader backward compatibility with `__main__.PatchInfo`
   - `get_error_patch` returns stable results for a known file/line
   - outputs are JSON-serializable and bounded in size
 
 ## Success criteria
 
-- [ ] `python3 script/react_agent/agent_langgraph.py --list-tools` lists the new migration tools.
-- [ ] Running `get_error_patch` against `data/tmp_patch/libxml2.patch2` returns a patch key + signature for an error location from `tmp1`.
-- [ ] No tool can load pickles from outside the allowed patch directory by default.
-- [ ] `search_definition` can retrieve code from both V1 and V2 via `version=v1|v2`.
+- [x] `python3 script/react_agent/agent_langgraph.py --list-tools` lists the new migration tools.
+- [x] Running `get_error_patch` against `data/tmp_patch/libxml2.patch2` returns a patch key + signature for an error location from `tmp1`.
+- [x] No tool can load pickles from outside the allowed patch directory by default.
+- [x] `search_definition` can retrieve code from both V1 and V2 via `version=v1|v2`.
+
+## Next: Repository organization (tools in one place)
+
+### Goal
+
+Make the agent-facing tool surface easy to find and maintain by putting **all LLM-callable tools** (specs + dispatch) under a single directory, while keeping reusable backend code separated.
+
+### Proposed structure (target)
+
+- `script/react_agent/tools/` (agent-facing tool API)
+  - tool specs/registry (`TOOL_SPECS`, `ALLOWED_TOOLS`)
+  - tool dispatch (`ToolRunner`, `ToolObservation`)
+  - symbol/code tools (currently in `script/react_agent/agent_tools.py`)
+  - migration/patch-bundle tools (currently in `script/migration_tools/tools.py`, likely re-exported/wrapped here)
+- `script/react_agent/core/` (non-tool backends)
+  - KB indexing + source resolution (currently `KbIndex`, `SourceManager`)
+- `script/migration_tools/` stays as a reusable backend library (loader/parsers), but the agent imports it only via `script/react_agent/tools/`.
+
+### Plan
+
+1) Create a single tool registry + dispatcher package
+- [x] Add `script/react_agent/tools/__init__.py`
+- [x] Move `TOOL_SPECS` + `ALLOWED_TOOLS` from `script/react_agent/tools_wrapper.py` into `script/react_agent/tools/registry.py`
+- [x] Move `ToolRunner` + `ToolObservation` from `script/react_agent/tools_wrapper.py` into `script/react_agent/tools/runner.py`
+- [x] Keep `script/react_agent/tools_wrapper.py` as a compatibility shim (re-export symbols) until downstream callers are updated
+
+2) Separate “symbol backend” from “symbol tools”
+- [x] Create `script/react_agent/core/kb_index.py` (move `KbIndex`)
+- [x] Create `script/react_agent/core/source_manager.py` (move `SourceManager`)
+- [x] Create `script/react_agent/tools/symbol_tools.py` (move `AgentTools` / tool methods here)
+- [x] Keep `script/react_agent/agent_tools.py` as a compatibility shim that re-exports `KbIndex`, `SourceManager`, `AgentTools`
+
+3) Expose migration tools in the same agent tool namespace
+- [x] Add `script/react_agent/tools/migration_tools.py` that wraps/re-exports the curated read-only functions from `script/migration_tools/tools.py`
+- [x] Ensure `agent_langgraph.py` only imports tools via `script/react_agent/tools/*` (no direct dependency on `script/migration_tools/*`)
+
+4) Update imports + docs + tests
+- [x] Update `script/react_agent/agent_langgraph.py` to import tool registry/runner from `script/react_agent/tools/`
+- [x] Update `script/react_agent/models.py` and `script/react_agent/tests/tool_cli.py` imports (or rely on shims)
+- [x] Update `script/react_agent/README.md` to point at the new “tools live here” location
+- [x] Run: `bash script/react_agent/test_langgraph_agent.sh` and `bash script/migration_tools/test_migration_tools.sh`
+
+### Success criteria
+
+- [x] There is exactly one obvious place to add/modify tools: `script/react_agent/tools/`
+- [x] Existing entrypoints still work (shims preserve `from agent_tools import ...` and `from tools_wrapper import ...`)
+- [x] Tool listing, stub tests, and migration-tools tests still pass

@@ -94,8 +94,8 @@ class StubModel(ChatModel):
                 {
                     "type": "tool",
                     "thought": "Unknown type; search its definition in V1.",
-                    "tool": "search_definition_in_v1",
-                    "args": {"symbol_name": type_name},
+                    "tool": "search_definition",
+                    "args": {"symbol_name": type_name, "version": "v1"},
                 }
             )
 

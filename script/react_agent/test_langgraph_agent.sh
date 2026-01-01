@@ -24,7 +24,17 @@ assert obj["type"] == "final", obj
 assert isinstance(obj.get("steps"), list), obj
 assert len(obj["steps"]) <= 3, obj
 
-allowed = {"inspect_symbol", "read_file_context", "search_definition_in_v1"}
+allowed = {
+    "inspect_symbol",
+    "read_file_context",
+    "search_definition",
+    "search_definition_in_v1",
+    "list_patch_bundle",
+    "get_patch",
+    "search_patches",
+    "get_error_patch",
+    "parse_build_errors",
+}
 
 for step in obj["steps"]:
     decision = step.get("decision") or {}
@@ -43,4 +53,3 @@ PY
 done
 
 echo "OK"
-
