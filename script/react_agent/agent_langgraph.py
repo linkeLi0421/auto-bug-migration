@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
@@ -47,14 +48,28 @@ class GraphState(TypedDict, total=False):
 
 def _extract_first_json_object(text: str) -> str:
     stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        return stripped
     start = stripped.find("{")
     if start < 0:
         return stripped
     depth = 0
+    in_string = False
+    escape = False
     for i in range(start, len(stripped)):
         c = stripped[i]
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if c == "\\":
+                escape = True
+                continue
+            if c == '"':
+                in_string = False
+            continue
+
+        if c == '"':
+            in_string = True
+            continue
         if c == "{":
             depth += 1
         elif c == "}":
@@ -87,14 +102,117 @@ def _validate_tool_decision(decision: Decision) -> None:
         raise ValueError("Tool args must be an object")
 
 
+def _resolve_output_format(value: str) -> str:
+    if value == "auto":
+        return "text" if sys.stdout.isatty() else "json"
+    return value
+
+
+def _render_tools_text() -> str:
+    lines = ["Tools:"]
+    for spec in TOOL_SPECS:
+        name = str(spec.get("name", "")).strip()
+        args = spec.get("args") if isinstance(spec.get("args"), dict) else {}
+        desc = str(spec.get("description", "")).strip()
+        if args:
+            args_s = ", ".join(f"{k}: {v}" for k, v in args.items())
+            sig = f"{name}({args_s})"
+        else:
+            sig = f"{name}()"
+        lines.append(f"- {sig}")
+        if desc:
+            lines.append(textwrap.indent(desc, "  "))
+    return "\n".join(lines) + "\n"
+
+
+def _render_final_text(final: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    error = final.get("error") if isinstance(final.get("error"), dict) else {}
+    error_line = str(error.get("line", "")).strip()
+    snippet = str(error.get("snippet", "")).rstrip("\n")
+    if error_line:
+        lines.append("Build error:")
+        lines.append(textwrap.indent(error_line, "  "))
+    if snippet:
+        if lines:
+            lines.append("")
+        lines.append("Log context:")
+        lines.append(textwrap.indent(snippet, "  "))
+
+    steps = final.get("steps")
+    if isinstance(steps, list) and steps:
+        lines.append("")
+        lines.append(f"Steps ({len(steps)}):")
+        for idx, step in enumerate(steps, start=1):
+            decision = step.get("decision") if isinstance(step, dict) else {}
+            observation = step.get("observation") if isinstance(step, dict) else {}
+            if not isinstance(decision, dict) or not isinstance(observation, dict):
+                lines.append(f"{idx}. (malformed step)")
+                continue
+            tool = str(decision.get("tool", "")).strip()
+            args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+            thought = str(decision.get("thought", "")).strip()
+            args_s = json.dumps(args, ensure_ascii=False)
+            lines.append(f"{idx}. tool: {tool} args: {args_s}")
+            if thought:
+                lines.append(textwrap.indent(f"thought: {thought}", "  "))
+            ok = observation.get("ok")
+            if ok is not None:
+                lines.append(textwrap.indent(f"ok: {ok}", "  "))
+            err = str(observation.get("error", "") or "").strip()
+            if err:
+                lines.append(textwrap.indent(f"error: {err}", "  "))
+            out = str(observation.get("output", "") or "").rstrip("\n")
+            if out:
+                lines.append(textwrap.indent("output:", "  "))
+                lines.append(textwrap.indent(out, "    "))
+
+    summary = str(final.get("summary", "") or "").strip()
+    next_step = str(final.get("next_step", "") or "").strip()
+    thought = str(final.get("thought", "") or "").strip()
+
+    lines.append("")
+    lines.append("Result:")
+    if summary:
+        lines.append(textwrap.indent(f"summary: {summary}", "  "))
+    if next_step:
+        lines.append(textwrap.indent(f"next_step: {next_step}", "  "))
+    if thought:
+        lines.append(textwrap.indent(f"thought: {thought}", "  "))
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def _emit(obj: Dict[str, Any], output_format: str) -> None:
+    fmt = _resolve_output_format(output_format)
+    if fmt == "json":
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False))
+        sys.stdout.write("\n")
+        return
+    if fmt == "json-pretty":
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2))
+        sys.stdout.write("\n")
+        return
+
+    if obj.get("type") == "tools":
+        sys.stdout.write(_render_tools_text())
+        return
+
+    sys.stdout.write(_render_final_text(obj))
+
+
 def _system_prompt() -> str:
-    tools = "\n".join(
-        [
-            "- inspect_symbol({symbol_name})",
-            "- read_file_context({file_path, line_number, context, version})",
-            "- search_definition_in_v1({symbol_name})",
-        ]
-    )
+    tool_lines: List[str] = []
+    for spec in TOOL_SPECS:
+        name = str(spec.get("name", "")).strip()
+        args = spec.get("args") if isinstance(spec.get("args"), dict) else {}
+        desc = str(spec.get("description", "")).strip()
+        args_obj = "{" + ", ".join(str(k) for k in args.keys()) + "}"
+        if desc:
+            tool_lines.append(f"- {name}({args_obj}): {desc}")
+        else:
+            tool_lines.append(f"- {name}({args_obj})")
+    tools = "\n".join(tool_lines)
     return (
         "You are a C/C++ build triage agent.\n"
         "You MUST output exactly one JSON object with no extra text.\n"
@@ -202,6 +320,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("build_log", nargs="?", default="-", help="Build log path, or '-' for stdin.")
 
     parser.add_argument("--list-tools", action="store_true", help="Print available tools and exit.")
+    parser.add_argument(
+        "--output-format",
+        choices=["auto", "json", "json-pretty", "text"],
+        default=os.environ.get("REACT_AGENT_OUTPUT_FORMAT", "auto"),
+        help="Output format (default: auto=text when stdout is a TTY, else json).",
+    )
     parser.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     parser.add_argument("--max-steps", type=int, default=4)
 
@@ -223,8 +347,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: List[str]) -> int:
     args = build_parser().parse_args(argv)
     if args.list_tools:
-        sys.stdout.write(json.dumps({"type": "tools", "tools": TOOL_SPECS}, ensure_ascii=False, indent=2))
-        sys.stdout.write("\n")
+        _emit({"type": "tools", "tools": TOOL_SPECS}, args.output_format)
         return 0
     cfg = AgentConfig(
         max_steps=max(args.max_steps, 1),
@@ -234,8 +357,7 @@ def main(argv: List[str]) -> int:
     build_log = load_build_log(args.build_log)
     error_line, snippet = find_first_fatal(build_log)
     if not error_line:
-        sys.stdout.write(json.dumps({"type": "final", "thought": "No compiler error found.", "summary": "", "next_step": ""}))
-        sys.stdout.write("\n")
+        _emit({"type": "final", "thought": "No compiler error found.", "summary": "", "next_step": ""}, args.output_format)
         return 0
 
     try:
@@ -271,12 +393,10 @@ def main(argv: List[str]) -> int:
 
         final = _run_langgraph(model, runner, state, cfg)
     except Exception as exc:  # noqa: BLE001
-        sys.stdout.write(json.dumps({"type": "final", "thought": "Agent error.", "summary": "", "next_step": str(exc)}))
-        sys.stdout.write("\n")
+        _emit({"type": "final", "thought": "Agent error.", "summary": "", "next_step": str(exc)}, args.output_format)
         return 1
 
-    sys.stdout.write(json.dumps(final, ensure_ascii=False))
-    sys.stdout.write("\n")
+    _emit(final, args.output_format)
     return 0
 
 
