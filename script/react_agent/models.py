@@ -144,29 +144,67 @@ class OpenAIChatCompletionsModel(ChatModel):
             headers["OpenAI-Organization"] = self.org
         if self.project:
             headers["OpenAI-Project"] = self.project
-        payload: Dict[str, Any] = {
+        base_payload: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
         }
+        if not self.model.startswith(("gpt-5", "o")):
+            base_payload["temperature"] = self.temperature
         if self.json_mode:
-            payload["response_format"] = {"type": "json_object"}
+            base_payload["response_format"] = {"type": "json_object"}
 
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-            raise ModelError(f"OpenAI HTTPError: {e.code} {e.reason} {detail}") from e
-        except urllib.error.URLError as e:
-            raise ModelError(f"OpenAI URLError: {e}") from e
+        token_fields = ["max_tokens", "max_completion_tokens"]
+        if self.model.startswith(("gpt-5", "o")):
+            token_fields = ["max_completion_tokens", "max_tokens"]
+
+        raw = ""
+        last_http_error: Optional[urllib.error.HTTPError] = None
+        last_http_detail = ""
+
+        for idx, token_field in enumerate(token_fields):
+            payload = dict(base_payload)
+            payload[token_field] = self.max_tokens
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                last_http_error = None
+                break
+            except urllib.error.HTTPError as e:
+                last_http_error = e
+                last_http_detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
+                unsupported_param = None
+                unsupported_code = None
+                try:
+                    err_data = json.loads(last_http_detail)
+                    err_obj = err_data.get("error", {}) if isinstance(err_data, dict) else {}
+                    if isinstance(err_obj, dict):
+                        unsupported_param = err_obj.get("param")
+                        unsupported_code = err_obj.get("code")
+                except Exception:  # noqa: BLE001
+                    pass
+
+                can_retry = (
+                    e.code == 400
+                    and (unsupported_code == "unsupported_parameter" or "Unsupported parameter" in last_http_detail)
+                    and (unsupported_param == token_field or f"'{token_field}'" in last_http_detail)
+                    and idx < len(token_fields) - 1
+                )
+                if can_retry:
+                    continue
+                raise ModelError(f"OpenAI HTTPError: {e.code} {e.reason} {last_http_detail}") from e
+            except urllib.error.URLError as e:
+                raise ModelError(f"OpenAI URLError: {e}") from e
+
+        if last_http_error is not None:
+            raise ModelError(
+                f"OpenAI HTTPError: {last_http_error.code} {last_http_error.reason} {last_http_detail}"
+            ) from last_http_error
 
         try:
             data = json.loads(raw)

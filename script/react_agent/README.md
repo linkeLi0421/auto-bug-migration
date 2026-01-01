@@ -45,9 +45,14 @@ bash script/react_agent/test_langgraph_agent.sh
 Real tools + OpenAI (requires network + API key):
 ```bash
 export OPENAI_API_KEY=...
-export OPENAI_MODEL=gpt-4o-mini
+export OPENAI_MODEL=gpt-5-mini
 python3 script/react_agent/agent_langgraph.py \
   --model openai --tools real --max-steps 4 tmp1 \
   --v1-json-dir /path/to/v1/json --v2-json-dir /path/to/v2/json \
   --v1-src /path/to/v1/src --v2-src /path/to/v2/src
 ```
+
+Output format:
+
+- Default: `--output-format auto` (prints human-friendly text when stdout is a TTY; otherwise prints JSON)
+- Force JSON: `--output-format json` or `--output-format json-pretty`
