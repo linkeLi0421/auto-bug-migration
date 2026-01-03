@@ -7,10 +7,12 @@ ToolName = Literal[
     "read_file_context",
     "search_definition",
     "search_definition_in_v1",
+    "search_text",
     "list_patch_bundle",
     "get_patch",
     "search_patches",
     "get_error_patch",
+    "get_error_patch_context",
     "parse_build_errors",
 ]
 
@@ -24,7 +26,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
     {
         "name": "read_file_context",
         "args": {"file_path": "string", "line_number": "int", "context": "int", "version": "v1|v2"},
-        "description": "Read source context around a line number.",
+        "description": "Read source context around a source-checkout line number (use KB extents or pre_patch_* mapping in patch-aware runs).",
     },
     {
         "name": "search_definition",
@@ -35,6 +37,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "name": "search_definition_in_v1",
         "args": {"symbol_name": "string"},
         "description": "Return V1 code for the best matching symbol definition (deprecated: use search_definition).",
+    },
+    {
+        "name": "search_text",
+        "args": {"query": "string", "version": "v1|v2", "limit": "int?", "file_glob": "string?"},
+        "description": "Search source files for a literal string (macro/typedef fallback).",
     },
     {
         "name": "list_patch_bundle",
@@ -57,6 +64,18 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": "Map a build error location to the best patch key/signature.",
     },
     {
+        "name": "get_error_patch_context",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "line_number": "int",
+            "error_text": "string?",
+            "context_lines": "int?",
+            "max_total_lines": "int?",
+        },
+        "description": "Map a build error location to a patch and return a bounded diff excerpt + pre_patch_* line mapping when available.",
+    },
+    {
         "name": "parse_build_errors",
         "args": {"build_log_path": "string?", "build_log_text": "string?"},
         "description": "Parse compiler errors into structured fields (read-only).",
@@ -64,4 +83,3 @@ TOOL_SPECS: list[Dict[str, Any]] = [
 ]
 
 ALLOWED_TOOLS: set[str] = {str(spec.get("name", "")) for spec in TOOL_SPECS}
-

@@ -9,6 +9,7 @@ from .registry import ALLOWED_TOOLS
 
 from .migration_tools import (  # noqa: E402
     get_error_patch as get_error_patch_tool,
+    get_error_patch_context as get_error_patch_context_tool,
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
     parse_build_errors as parse_build_errors_tool,
@@ -97,6 +98,25 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
                 out = self._agent_tools.search_definition_in_v1(symbol_name)
                 return ToolObservation(True, tool, {"symbol_name": symbol_name}, output=out)
+
+            if tool == "search_text":
+                if not self._agent_tools:
+                    return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
+                query = str(args.get("query", "")).strip()
+                version = str(args.get("version", "v2")).strip() or "v2"
+                limit = _as_int(args.get("limit"), 20)
+                file_glob = str(args.get("file_glob", "")).strip()
+                if not query:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: query")
+                if version not in {"v1", "v2"}:
+                    return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
+                out = self._agent_tools.search_text(query, version=version, limit=limit, file_glob=file_glob)
+                return ToolObservation(
+                    True,
+                    tool,
+                    {"query": query, "version": version, "limit": limit, "file_glob": file_glob},
+                    output=out,
+                )
 
             if tool == "read_file_context":
                 if not self._agent_tools:
@@ -195,6 +215,41 @@ class ToolRunner:
                     True,
                     tool,
                     {"patch_path": patch_path, "file_path": file_path, "line_number": line_number},
+                    output=out,
+                )
+
+            if tool == "get_error_patch_context":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                line_number = _as_int(args.get("line_number"), 0)
+                error_text = str(args.get("error_text", "")).strip()
+                context_lines = _as_int(args.get("context_lines"), 30)
+                max_total_lines = _as_int(args.get("max_total_lines"), 200)
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if line_number <= 0:
+                    return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
+                out = get_error_patch_context_tool(
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    line_number=line_number,
+                    error_text=error_text,
+                    context_lines=context_lines,
+                    max_total_lines=max_total_lines,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "error_text": error_text[:2000],
+                        "context_lines": context_lines,
+                        "max_total_lines": max_total_lines,
+                    },
                     output=out,
                 )
 

@@ -7,11 +7,12 @@ import os
 import sys
 import textwrap
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph  # type: ignore
 
-from build_log import find_first_fatal, load_build_log
+from build_log import find_first_fatal, iter_compiler_errors, load_build_log
 from agent_tools import AgentTools, KbIndex, SourceManager
 from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
 from tools.registry import ALLOWED_TOOLS, TOOL_SPECS
@@ -31,12 +32,20 @@ class Decision(TypedDict, total=False):
 class AgentConfig:
     max_steps: int = 4
     tools_mode: Literal["real", "fake"] = "real"
+    error_scope: Literal["first", "patch"] = "first"
+    max_errors: int = 20
 
 
 @dataclass
 class AgentState:
+    build_log_path: str
+    patch_path: str
+    error_scope: Literal["first", "patch"]
     error_line: str
     snippet: str
+    patch_key: str = ""
+    grouped_errors: List[Dict[str, Any]] = field(default_factory=list)
+    missing_struct_members: List[Dict[str, Any]] = field(default_factory=list)
     steps: List[Dict[str, Any]] = field(default_factory=list)
     last_observation: Optional[ToolObservation] = None
 
@@ -45,6 +54,30 @@ class GraphState(TypedDict, total=False):
     state: AgentState
     pending: Decision
     final: Dict[str, Any]
+
+
+def _error_payload(state: AgentState) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"line": state.error_line, "snippet": state.snippet}
+    if state.patch_path:
+        payload["patch_path"] = state.patch_path
+    payload["scope"] = state.error_scope
+    if state.patch_key:
+        payload["patch_key"] = state.patch_key
+    if state.grouped_errors:
+        payload["grouped_errors"] = [
+            {
+                "raw": str(e.get("raw", "")).strip(),
+                "file": e.get("file"),
+                "line": e.get("line"),
+                "col": e.get("col"),
+                "msg": e.get("msg"),
+                "old_signature": e.get("old_signature"),
+            }
+            for e in state.grouped_errors
+        ]
+    if state.missing_struct_members:
+        payload["missing_struct_members"] = state.missing_struct_members
+    return payload
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -131,7 +164,19 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     error = final.get("error") if isinstance(final.get("error"), dict) else {}
     error_line = str(error.get("line", "")).strip()
     snippet = str(error.get("snippet", "")).rstrip("\n")
+    patch_path = str(error.get("patch_path", "")).strip()
+    patch_key = str(error.get("patch_key", "")).strip()
+    scope = str(error.get("scope", "")).strip()
+    grouped = error.get("grouped_errors") if isinstance(error.get("grouped_errors"), list) else []
+    if patch_path:
+        lines.append(f"Patch bundle: {patch_path}")
+    if patch_key:
+        lines.append(f"Patch key: {patch_key}")
+    if scope:
+        lines.append(f"Scope: {scope}")
     if error_line:
+        if lines:
+            lines.append("")
         lines.append("Build error:")
         lines.append(textwrap.indent(error_line, "  "))
     if snippet:
@@ -139,6 +184,15 @@ def _render_final_text(final: Dict[str, Any]) -> str:
             lines.append("")
         lines.append("Log context:")
         lines.append(textwrap.indent(snippet, "  "))
+    if grouped:
+        lines.append("")
+        lines.append(f"Grouped errors ({len(grouped)}):")
+        for item in grouped:
+            if not isinstance(item, dict):
+                continue
+            raw = str(item.get("raw", "")).strip()
+            if raw:
+                lines.append(textwrap.indent(raw, "  "))
 
     steps = final.get("steps")
     if isinstance(steps, list) and steps:
@@ -226,6 +280,17 @@ def _system_prompt() -> str:
         "You are a C/C++ build triage agent.\n"
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
+        "Important:\n"
+        "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
+        "- read_file_context reads from the raw V1/V2 source checkouts; it must use pre-patch line numbers.\n"
+        "- Never call read_file_context with the raw build-log /src/...:line values.\n"
+        "- Only call read_file_context using (a) KB-derived locations from search_definition/inspect_symbol, or\n"
+        "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
+        "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context (or get_error_patch + get_patch) -> search_definition/inspect_symbol.\n"
+        "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
+        "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
+        "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
+        "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
         "Tool output format:\n"
@@ -236,14 +301,32 @@ def _system_prompt() -> str:
 
 
 def _build_messages(state: AgentState) -> List[Dict[str, str]]:
+    header_lines: List[str] = []
+    if state.build_log_path:
+        header_lines.append(f"Build log path: {state.build_log_path}")
+    if state.patch_path:
+        header_lines.append(f"Patch bundle path: {state.patch_path}")
+        header_lines.append(
+            "NOTE: file:line locations below refer to migrated code; use patch tools to map locations to patches."
+        )
+    if state.missing_struct_members:
+        header_lines.append("Missing struct members (JSON):")
+        header_lines.append(json.dumps(state.missing_struct_members, ensure_ascii=False))
+    header = "\n".join(header_lines).strip()
+
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": _system_prompt()},
         {
             "role": "user",
-            "content": "Build error:\n"
-            + state.error_line
-            + "\n\nContext:\n"
-            + state.snippet
+            "content": (header + "\n\n" if header else "")
+            + (
+                "Patch-scope errors (all map to the same patch key):\n"
+                + (("\n".join(str(e.get("raw", "")).strip() for e in state.grouped_errors if e.get("raw"))) + "\n\n")
+                + "Details (JSON):\n"
+                + json.dumps({"patch_key": state.patch_key, "errors": state.grouped_errors}, ensure_ascii=False, indent=2)
+                if state.error_scope == "patch" and state.grouped_errors
+                else "Build error:\n" + state.error_line + "\n\nContext:\n" + state.snippet
+            )
             + "\n\nChoose the next best tool call or return a final decision.",
         },
     ]
@@ -268,11 +351,34 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     "summary": "Stopped after max_steps.",
                     "next_step": "Increase --max-steps or review the last observation and proceed manually.",
                     "steps": st.steps,
-                    "error": {"line": st.error_line, "snippet": st.snippet},
+                    "error": _error_payload(st),
                 },
             }
-        raw = model.complete(_build_messages(st))
-        decision = _parse_decision(raw)
+        messages = _build_messages(st)
+        raw = model.complete(messages)
+        try:
+            decision = _parse_decision(raw)
+        except Exception:  # noqa: BLE001
+            # Best-effort repair: some models may ignore JSON-only instructions.
+            raw_snippet = str(raw or "").strip()
+            if len(raw_snippet) > 2000:
+                raw_snippet = raw_snippet[:2000] + "\n...[truncated]"
+            repair_messages = list(messages)
+            if raw_snippet:
+                repair_messages.append({"role": "assistant", "content": raw_snippet})
+            repair_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was invalid (not a single JSON object).\n"
+                        "Return exactly one JSON object now, with no extra text, no markdown, no code fences.\n"
+                        'It must match one of:\n'
+                        '{"type":"tool","tool":"<name>","args":{...},"thought":"<one sentence>"}\n'
+                        '{"type":"final","summary":"<short>","next_step":"<short>","thought":"<one sentence>"}'
+                    ),
+                }
+            )
+            decision = _parse_decision(model.complete(repair_messages))
         if decision["type"] == "final":
             return {
                 "state": st,
@@ -282,7 +388,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     "summary": str(decision.get("summary", "")).strip(),
                     "next_step": str(decision.get("next_step", "")).strip(),
                     "steps": st.steps,
-                    "error": {"line": st.error_line, "snippet": st.snippet},
+                    "error": _error_payload(st),
                 },
             }
         _validate_tool_decision(decision)
@@ -320,7 +426,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
         "summary": "Stopped after max_steps.",
         "next_step": "Increase --max-steps or review the last observation and proceed manually.",
         "steps": state.steps,
-        "error": {"line": state.error_line, "snippet": state.snippet},
+        "error": _error_payload(state),
     }
 
 
@@ -337,12 +443,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     parser.add_argument("--max-steps", type=int, default=4)
+    parser.add_argument(
+        "--error-scope",
+        choices=["first", "patch"],
+        default=os.environ.get("REACT_AGENT_ERROR_SCOPE", "first"),
+        help="Triage scope: only the first error, or all errors mapping to the same patch.",
+    )
+    parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_ERRORS", "20")),
+        help="Max compiler errors to collect from the log (used in patch-scope mode).",
+    )
 
     parser.add_argument("--tools", choices=["real", "fake"], default="real")
     parser.add_argument("--v1-json-dir", help="Root directory containing V1 *_analysis.json files")
     parser.add_argument("--v2-json-dir", help="Root directory containing V2 *_analysis.json files")
     parser.add_argument("--v1-src", help="Local filesystem root for V1 source code")
     parser.add_argument("--v2-src", help="Local filesystem root for V2 source code")
+    parser.add_argument(
+        "--patch-path",
+        default=os.environ.get("REACT_AGENT_PATCH_PATH", ""),
+        help="Path to a tmp_patch bundle (*.patch2) for patch-aware triage.",
+    )
 
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
     parser.add_argument("--openai-model", default=os.environ.get("OPENAI_MODEL", "") or "gpt-5-mini")
@@ -364,13 +487,91 @@ def main(argv: List[str]) -> int:
     cfg = AgentConfig(
         max_steps=max(args.max_steps, 1),
         tools_mode=args.tools,
+        error_scope=args.error_scope,
+        max_errors=max(args.max_errors, 1),
     )
 
     build_log = load_build_log(args.build_log)
+
+    patch_path = str(getattr(args, "patch_path", "") or "").strip()
+    if not patch_path and getattr(args, "v2_src", None):
+        repo_root = Path(__file__).resolve().parents[2]
+        inferred = repo_root / "data" / "tmp_patch" / f"{Path(args.v2_src).resolve().name}.patch2"
+        if inferred.is_file():
+            patch_path = str(inferred)
+
+    grouped_errors: List[Dict[str, Any]] = []
+    patch_key = ""
+    missing_struct_members: List[Dict[str, Any]] = []
+
     error_line, snippet = find_first_fatal(build_log)
     if not error_line:
         _emit({"type": "final", "thought": "No compiler error found.", "summary": "", "next_step": ""}, args.output_format)
         return 0
+
+    if patch_path and cfg.error_scope == "first":
+        try:
+            from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
+
+            first_err = iter_compiler_errors(build_log, limit=1)
+            if first_err:
+                mapping = map_error_patch(
+                    patch_path=patch_path, file_path=first_err[0]["file"], line_number=first_err[0]["line"]
+                )
+                patch_key = str(mapping.get("patch_key") or "").strip()
+        except Exception:
+            patch_key = ""
+
+    if cfg.error_scope == "patch" and not patch_path:
+        raise ValueError("--error-scope patch requires --patch-path (or REACT_AGENT_PATCH_PATH)")
+    if cfg.error_scope == "patch" and patch_path:
+        try:
+            from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
+            from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
+
+            errs = iter_compiler_errors(build_log, limit=cfg.max_errors)
+            groups: Dict[str, List[Dict[str, Any]]] = {}
+            first_mapped_key = ""
+            for err in errs:
+                mapping = map_error_patch(patch_path=patch_path, file_path=err["file"], line_number=err["line"])
+                key = str(mapping.get("patch_key") or "").strip()
+                enriched = dict(err)
+                enriched["patch_key"] = mapping.get("patch_key")
+                enriched["old_signature"] = mapping.get("old_signature")
+                if key:
+                    if not first_mapped_key:
+                        first_mapped_key = key
+                    groups.setdefault(key, []).append(enriched)
+            if groups:
+                patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
+                grouped_errors = groups[patch_key]
+                if grouped_errors:
+                    error_line = str(grouped_errors[0].get("raw", error_line))
+                    snippet = str(grouped_errors[0].get("snippet", snippet))
+                raw_block = "\n".join(str(e.get("raw", "")).strip() for e in grouped_errors if e.get("raw"))
+                if raw_block:
+                    parsed = parse_build_errors_tool(build_log_text=raw_block)
+                    msm = parsed.get("missing_struct_members") if isinstance(parsed, dict) else None
+                    if isinstance(msm, list) and msm:
+                        by_struct: Dict[str, set[str]] = {}
+                        for item in msm:
+                            if not isinstance(item, dict):
+                                continue
+                            struct_raw = str(item.get("struct", "")).strip()
+                            member = str(item.get("member", "")).strip()
+                            if struct_raw and member:
+                                by_struct.setdefault(struct_raw, set()).add(member)
+                        # Bound output size for prompt readability.
+                        max_structs = 8
+                        max_members = 12
+                        missing_struct_members = []
+                        for struct_name in sorted(by_struct.keys())[:max_structs]:
+                            members = sorted(by_struct[struct_name])[:max_members]
+                            missing_struct_members.append({"struct": struct_name, "members": members})
+        except Exception:
+            grouped_errors = []
+            patch_key = ""
+            missing_struct_members = []
 
     try:
         if args.model == "stub":
@@ -401,7 +602,16 @@ def main(argv: List[str]) -> int:
             agent_tools = AgentTools(kb, sm)
 
         runner = ToolRunner(agent_tools, mode=cfg.tools_mode)
-        state = AgentState(error_line=error_line, snippet=snippet)
+        state = AgentState(
+            build_log_path=str(args.build_log),
+            patch_path=patch_path,
+            error_scope=cfg.error_scope,
+            error_line=error_line,
+            snippet=snippet,
+            patch_key=patch_key,
+            grouped_errors=grouped_errors,
+            missing_struct_members=missing_struct_members,
+        )
 
         final = _run_langgraph(model, runner, state, cfg)
     except Exception as exc:  # noqa: BLE001

@@ -36,16 +36,22 @@ class StubModel(ChatModel):
     def complete(self, messages: List[Message]) -> str:
         self._turn += 1
 
-        # After at least one observation, return a final response.
-        if any(m.get("role") == "user" and "Observation:" in m.get("content", "") for m in messages) and self._turn > 1:
-            return json.dumps(
-                {
-                    "type": "final",
-                    "thought": "Sufficient evidence collected; propose next investigation step.",
-                    "summary": "Stub model completed one tool step.",
-                    "next_step": "Run the suggested tool call output through a human review or a patch generator.",
-                }
-            )
+        user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        observation_count = sum(
+            1 for m in messages if m.get("role") == "user" and "Observation:" in m.get("content", "")
+        )
+
+        patch_path = ""
+        for line in user_text.splitlines():
+            if line.startswith("Patch bundle path:"):
+                patch_path = line.split(":", 1)[1].strip()
+                break
+
+        build_log_path = ""
+        for line in user_text.splitlines():
+            if line.startswith("Build log path:"):
+                build_log_path = line.split(":", 1)[1].strip()
+                break
 
         # Find the first error line in the conversation.
         error_line = ""
@@ -63,6 +69,170 @@ class StubModel(ChatModel):
         msg = match.group("msg") if match else ""
         file_path = match.group("file") if match else ""
         line_number = int(match.group("line")) if match else 0
+
+        # Patch-aware triage: migrated logs -> map to patch first.
+        if patch_path and "unknown type name" in msg:
+            if observation_count == 0:
+                args: Dict[str, str] = {"build_log_text": error_line}
+                if build_log_path and build_log_path != "-":
+                    args = {"build_log_path": build_log_path}
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Parse the build log into structured errors first.",
+                        "tool": "parse_build_errors",
+                        "args": args,
+                    }
+                )
+            if observation_count == 1:
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Map the migrated error location to a patch and inspect a bounded diff excerpt.",
+                        "tool": "get_error_patch_context",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "error_text": error_line,
+                            "context_lines": 30,
+                            "max_total_lines": 200,
+                        },
+                    }
+                )
+            return json.dumps(
+                {
+                    "type": "final",
+                    "thought": "Sufficient evidence collected; propose next investigation step.",
+                    "summary": "Stub model completed patch-aware triage steps.",
+                    "next_step": "Use the excerpt to identify missing typedef/include/macro and locate its definition in V1.",
+                }
+            )
+
+        # Patch-aware triage for missing struct members: compare struct definitions in V1 vs V2.
+        if patch_path and "no member named" in msg and "struct" in msg:
+            st = re.search(r"no member named '[^']+' in '([^']+)'", msg)
+            struct_symbol = st.group(1).strip() if st else ""
+            if observation_count == 0:
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Map the migrated error location to a patch and inspect a bounded diff excerpt.",
+                        "tool": "get_error_patch_context",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "error_text": error_line,
+                            "context_lines": 30,
+                            "max_total_lines": 200,
+                        },
+                    }
+                )
+            if observation_count == 1:
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Fetch the struct definition in V1 (the migrated code is V1-origin).",
+                        "tool": "search_definition",
+                        "args": {"symbol_name": struct_symbol, "version": "v1"},
+                    }
+                )
+            if observation_count == 2:
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Fetch the struct definition in V2 to compare and infer member drift.",
+                        "tool": "search_definition",
+                        "args": {"symbol_name": struct_symbol, "version": "v2"},
+                    }
+                )
+            return json.dumps(
+                {
+                    "type": "final",
+                    "thought": "Collected patch context and both struct definitions; ready to propose a migration hint.",
+                    "summary": "Stub model completed cross-version struct-member triage steps.",
+                    "next_step": "Compare the V1 vs V2 struct fields and decide whether the member was renamed/removed; update the migrated code accordingly.",
+                }
+            )
+
+        # Patch-aware fallback: never use read_file_context with raw build-log line numbers.
+        if patch_path:
+            if observation_count == 0:
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Patch-aware run: map the build error to a patch excerpt first.",
+                        "tool": "get_error_patch_context",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "error_text": error_line,
+                            "context_lines": 30,
+                            "max_total_lines": 200,
+                        },
+                    }
+                )
+            if observation_count == 1:
+                pre_file = file_path
+                pre_line = None
+                try:
+                    from tools.migration_tools import get_error_patch_context as map_ctx  # noqa: PLC0415
+
+                    ctx = map_ctx(
+                        patch_path=patch_path,
+                        file_path=file_path,
+                        line_number=line_number,
+                        error_text=error_line,
+                        context_lines=5,
+                        max_total_lines=80,
+                    )
+                    pre_file_raw = ctx.get("pre_patch_file_path")
+                    pre_line_raw = ctx.get("pre_patch_line_number")
+                    if isinstance(pre_file_raw, str) and pre_file_raw.strip():
+                        pre_file = pre_file_raw.strip()
+                    if isinstance(pre_line_raw, int) and pre_line_raw > 0:
+                        pre_line = pre_line_raw
+                except Exception:
+                    pre_line = None
+
+                if pre_line is None:
+                    return json.dumps(
+                        {
+                            "type": "final",
+                            "thought": "Pre-patch line mapping unavailable; rely on patch excerpt and KB locations instead of reading by build-log line numbers.",
+                            "summary": "Stopped after patch mapping.",
+                            "next_step": "Use search_definition/inspect_symbol to get source-checkout locations, or inspect the patch excerpt directly.",
+                        }
+                    )
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Read source context using the pre-patch mapped line number (not the raw build-log line).",
+                        "tool": "read_file_context",
+                        "args": {"file_path": pre_file, "line_number": pre_line, "context": 5, "version": "v2"},
+                    }
+                )
+            return json.dumps(
+                {
+                    "type": "final",
+                    "thought": "Sufficient evidence collected; propose next investigation step.",
+                    "summary": "Stub model completed patch-aware triage steps.",
+                    "next_step": "Review the patch excerpt + pre-patch source context and decide the minimal fix.",
+                }
+            )
+
+        # After at least one observation, return a final response.
+        if observation_count >= 1 and self._turn > 1:
+            return json.dumps(
+                {
+                    "type": "final",
+                    "thought": "Sufficient evidence collected; propose next investigation step.",
+                    "summary": "Stub model completed one tool step.",
+                    "next_step": "Run the suggested tool call output through a human review or a patch generator.",
+                }
+            )
 
         # Heuristics aligned with TASKS.md.
         if "implicit declaration of function" in msg:
