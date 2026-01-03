@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -85,6 +86,69 @@ def _select_best(nodes: List[dict]) -> Optional[dict]:
     return max(nodes, key=rank)
 
 
+def _extract_type_names(type_text: str) -> List[str]:
+    """Extract best-effort candidate symbol names from a typedef/type string."""
+    text = str(type_text or "").strip()
+    if not text:
+        return []
+
+    cleaned = re.sub(r"[^A-Za-z0-9_]+", " ", text)
+    tokens = [t for t in cleaned.split() if t]
+    if not tokens:
+        return []
+
+    qualifiers = {
+        "const",
+        "volatile",
+        "restrict",
+        "__restrict",
+        "__restrict__",
+        "signed",
+        "unsigned",
+        "short",
+        "long",
+        "static",
+        "extern",
+        "register",
+    }
+
+    names: List[str] = []
+    for i, tok in enumerate(tokens):
+        if tok in {"struct", "enum", "union"} and i + 1 < len(tokens):
+            names.append(tokens[i + 1])
+
+    for tok in reversed(tokens):
+        if tok in qualifiers or tok in {"struct", "enum", "union"}:
+            continue
+        names.append(tok)
+        break
+
+    uniq: List[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            uniq.append(name)
+    return uniq
+
+
+def _pseudo_node_for_extent(*, kind: str, extent: dict, reason: str, spelling: str = "", usr: str = "") -> dict:
+    start = extent.get("start", {}) if isinstance(extent, dict) else {}
+    file_path = str(start.get("file", "") or "")
+    line = int(start.get("line", 0) or 0)
+    col = int(start.get("column", 0) or 0)
+    node: dict = {
+        "kind": kind,
+        "spelling": spelling,
+        "location": {"file": file_path, "line": line, "column": col},
+        "extent": extent,
+        "__reason": reason,
+    }
+    if usr:
+        node["usr"] = usr
+    return node
+
+
 class KbIndex:
     """Aggregate scattered JSON files into an in-memory index."""
 
@@ -151,6 +215,107 @@ class KbIndex:
             entry = self.name_index.get(name_or_usr, {"v1": [], "v2": []})
         return {"v1": list(entry.get("v1", [])), "v2": list(entry.get("v2", []))}
 
+    def related_definition_candidates(self, node: dict, version: str, *, max_depth: int = 4) -> List[dict]:
+        """Derive related definition candidates from one KB node.
+
+        This is a best-effort helper intended for cases where the primary symbol
+        match is a typedef/forward decl but the KB contains a TYPE_REF pointing
+        at the underlying definition extent.
+        """
+        ver = str(version).strip().lower()
+        if ver not in {"v1", "v2"}:
+            return []
+        if not isinstance(node, dict):
+            return []
+
+        results: List[dict] = []
+        seen: set[str] = set()
+
+        def node_key(n: dict) -> str:
+            usr = str(n.get("usr", "") or "").strip()
+            if usr:
+                return f"usr:{usr}"
+            extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
+            start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+            end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+            fp = str(start.get("file", "") or "")
+            sl = int(start.get("line", 0) or 0)
+            el = int(end.get("line", 0) or 0)
+            kind = str(n.get("kind", "") or "")
+            spelling = str(n.get("spelling", "") or "")
+            return f"ext:{kind}:{spelling}:{fp}:{sl}:{el}"
+
+        def add(n: dict) -> None:
+            k = node_key(n)
+            if k in seen:
+                return
+            seen.add(k)
+            results.append(n)
+
+        def best_for(query: str) -> Optional[dict]:
+            if not query:
+                return None
+            found = self.query_symbol(query).get(ver)
+            return found if isinstance(found, dict) else None
+
+        def visit(n: dict, depth: int) -> None:
+            if depth <= 0 or not isinstance(n, dict):
+                return
+
+            kind = str(n.get("kind", "") or "")
+
+            if kind == "TYPEDEF_DECL":
+                typedef = str(n.get("typedef", "") or "")
+                for name in _extract_type_names(typedef):
+                    target = best_for(name)
+                    if target:
+                        add(target)
+                        visit(target, depth - 1)
+
+            if kind == "TYPE_REF" or isinstance(n.get("type_ref"), dict):
+                type_ref = n.get("type_ref", {}) if isinstance(n.get("type_ref"), dict) else {}
+                usr = str(type_ref.get("usr", "") or "").strip()
+                if usr:
+                    target = best_for(usr)
+                    if target:
+                        add(target)
+                        visit(target, depth - 1)
+
+                typedef_extent = type_ref.get("typedef_extent")
+                if isinstance(typedef_extent, dict):
+                    add(
+                        _pseudo_node_for_extent(
+                            kind=str(type_ref.get("target_kind", "") or "TYPEDEF_EXTENT"),
+                            extent=typedef_extent,
+                            reason="type_ref.typedef_extent",
+                            spelling=str(type_ref.get("target_name", "") or ""),
+                            usr=usr,
+                        )
+                    )
+
+                underlying = type_ref.get("underlying")
+                if isinstance(underlying, dict):
+                    extent = underlying.get("extent")
+                    if isinstance(extent, dict):
+                        add(
+                            _pseudo_node_for_extent(
+                                kind=str(underlying.get("kind", "") or "UNDERLYING_EXTENT"),
+                                extent=extent,
+                                reason="type_ref.underlying.extent",
+                                spelling=str(underlying.get("name", "") or ""),
+                                usr=usr,
+                            )
+                        )
+                    name = str(underlying.get("name", "") or "").strip()
+                    if name:
+                        target = best_for(name)
+                        if target:
+                            add(target)
+                            visit(target, depth - 1)
+
+        visit(node, max_depth)
+        return results
+
     def get_callers_callees(self, name: str, version: str = "v1") -> List[str]:
         """Return a list of dependencies found in a function's file scope nodes."""
         node = self.query_symbol(name).get(version)
@@ -194,4 +359,3 @@ class KbIndex:
                 seen.add(d)
                 uniq.append(d)
         return uniq
-

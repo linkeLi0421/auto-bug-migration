@@ -10,7 +10,7 @@ from .patch_bundle import PatchBundle, load_patch_bundle
 from .types import PatchInfo
 
 
-_HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
+_HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
 
 
 def _parse_first_hunk(patch_text: str) -> Optional[Tuple[int, int, int, int]]:
@@ -26,6 +26,134 @@ def _parse_first_hunk(patch_text: str) -> Optional[Tuple[int, int, int, int]]:
         new_len = int(m.group("new_len") or 1)
         return old_start, old_len, new_start, new_len
     return None
+
+
+def _iter_hunks(patch_text: str) -> List[Dict[str, Any]]:
+    """Parse unified-diff hunks with their body lines."""
+    hunks: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    for line in (patch_text or "").splitlines():
+        if line.startswith("@@"):
+            if current:
+                hunks.append(current)
+            m = _HUNK_RE.match(line.strip())
+            if not m:
+                current = None
+                continue
+            current = {
+                "old_start": int(m.group("old_start")),
+                "old_len": int(m.group("old_len") or 1),
+                "new_start": int(m.group("new_start")),
+                "new_len": int(m.group("new_len") or 1),
+                "lines": [],
+            }
+            continue
+        if current is not None:
+            current["lines"].append(line)
+    if current:
+        hunks.append(current)
+    return hunks
+
+
+def _infer_migrated_side(patch_text: str) -> str:
+    """Best-effort heuristic: which side likely contains migration artifacts."""
+    markers = ("__revert_", "__rervert_")
+    removed = 0
+    added = 0
+    for line in (patch_text or "").splitlines():
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("-") and any(m in line for m in markers):
+            removed += 1
+        elif line.startswith("+") and any(m in line for m in markers):
+            added += 1
+    if removed > added:
+        return "old"
+    if added > removed:
+        return "new"
+    return ""
+
+
+def _map_new_to_old_in_hunk(hunk: Dict[str, Any], target_new: int) -> Optional[int]:
+    old_ln = int(hunk["old_start"])
+    new_ln = int(hunk["new_start"])
+    for line in hunk.get("lines", []):
+        if not line:
+            continue
+        prefix = line[0]
+        if prefix == " ":
+            if new_ln == target_new:
+                return old_ln
+            old_ln += 1
+            new_ln += 1
+        elif prefix == "+":
+            if new_ln == target_new:
+                return None
+            new_ln += 1
+        elif prefix == "-":
+            old_ln += 1
+        else:
+            continue
+    return None
+
+
+def _map_old_to_new_in_hunk(hunk: Dict[str, Any], target_old: int) -> Optional[int]:
+    old_ln = int(hunk["old_start"])
+    new_ln = int(hunk["new_start"])
+    for line in hunk.get("lines", []):
+        if not line:
+            continue
+        prefix = line[0]
+        if prefix == " ":
+            if old_ln == target_old:
+                return new_ln
+            old_ln += 1
+            new_ln += 1
+        elif prefix == "-":
+            if old_ln == target_old:
+                return None
+            old_ln += 1
+        elif prefix == "+":
+            new_ln += 1
+        else:
+            continue
+    return None
+
+
+def _map_new_to_old_line(hunks: List[Dict[str, Any]], target_new: int) -> Tuple[Optional[int], str]:
+    if target_new <= 0:
+        return None, "invalid target line"
+    delta = 0  # old - new for hunks strictly before the target
+    for hunk in hunks:
+        new_start = int(hunk["new_start"])
+        new_len = int(hunk["new_len"])
+        if target_new < new_start:
+            return target_new + delta, "outside hunks"
+        if new_start <= target_new < new_start + max(new_len, 0):
+            mapped = _map_new_to_old_in_hunk(hunk, target_new)
+            if mapped is None:
+                return None, "line is added-only in patch"
+            return mapped, "mapped inside hunk"
+        delta += int(hunk["old_len"]) - int(hunk["new_len"])
+    return target_new + delta, "outside hunks"
+
+
+def _map_old_to_new_line(hunks: List[Dict[str, Any]], target_old: int) -> Tuple[Optional[int], str]:
+    if target_old <= 0:
+        return None, "invalid target line"
+    delta = 0  # new - old for hunks strictly before the target
+    for hunk in hunks:
+        old_start = int(hunk["old_start"])
+        old_len = int(hunk["old_len"])
+        if target_old < old_start:
+            return target_old + delta, "outside hunks"
+        if old_start <= target_old < old_start + max(old_len, 0):
+            mapped = _map_old_to_new_in_hunk(hunk, target_old)
+            if mapped is None:
+                return None, "line is deleted-only in patch"
+            return mapped, "mapped inside hunk"
+        delta += int(hunk["new_len"]) - int(hunk["old_len"])
+    return target_old + delta, "outside hunks"
 
 
 def _norm_path(path: str) -> str:
@@ -175,11 +303,7 @@ def search_patches(*, patch_path: str, query: str, limit: int = 50, allowed_root
     return {"patch_path": str(Path(patch_path)), "query": q, "matched": len(matches), "limit": limit_n, "patches": matches}
 
 
-def get_error_patch(
-    *, patch_path: str, file_path: str, line_number: int, allowed_roots: Optional[List[str]] = None
-) -> Dict[str, Any]:
-    """Best-effort mapping from a build error location to a patch key in the bundle."""
-    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_path: str, line_number: int) -> Dict[str, Any]:
     ln = int(line_number or 0)
     if ln <= 0:
         raise ValueError("line_number must be > 0")
@@ -257,7 +381,9 @@ def get_error_patch(
 
     hiden_func_items = sorted((patch.hiden_func_dict or {}).items(), key=lambda x: x[1])
     func_start_index = front_context_num
-    func_end_index = len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x and x[0] == "-"), -1) - 4
+    func_end_index = (
+        len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x and x[0] == "-"), -1) - 4
+    )
 
     if {"Merged functions", "Tail function"} & (patch.patch_type or set()):
         last_offset = front_context_num
@@ -275,7 +401,11 @@ def get_error_patch(
         if not chosen:
             func_start_index = last_offset
             old_function_signature = last_func_sig
-            func_end_index = len(patch_lines) - next((i for i, x in enumerate(reversed(patch_lines)) if x and x[0] == "-"), -1) - 4
+            func_end_index = (
+                len(patch_lines)
+                - next((i for i, x in enumerate(reversed(patch_lines)) if x and x[0] == "-"), -1)
+                - 4
+            )
 
     return {
         "patch_path": str(Path(patch_path)),
@@ -285,6 +415,131 @@ def get_error_patch(
         "old_signature": old_function_signature,
         "func_start_index": func_start_index,
         "func_end_index": func_end_index,
+    }
+
+
+def get_error_patch(
+    *, patch_path: str, file_path: str, line_number: int, allowed_roots: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Best-effort mapping from a build error location to a patch key in the bundle."""
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    return _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
+
+
+def get_error_patch_context(
+    *,
+    patch_path: str,
+    file_path: str,
+    line_number: int,
+    error_text: str = "",
+    context_lines: int = 30,
+    max_total_lines: int = 200,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return a small patch excerpt for a build error location."""
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
+    patch_key = mapping.get("patch_key")
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "patch_text_lines_total": 0,
+            "excerpt_line_range": [0, 0],
+            "excerpt_truncated": False,
+            "excerpt": "",
+            "pre_patch_file_path": None,
+            "pre_patch_line_number": None,
+            "mapping_note": "No matching patch_key; cannot derive pre-patch mapping.",
+        }
+
+    ctx = max(0, min(int(context_lines or 0), 100))
+    max_total = max(0, min(int(max_total_lines or 0), 500))
+
+    patch = bundle.patches[str(patch_key)]
+    patch_lines = (patch.patch_text or "").splitlines()
+    total = len(patch_lines)
+
+    start = 0
+    end = total
+    func_start = mapping.get("func_start_index")
+    func_end = mapping.get("func_end_index")
+    if isinstance(func_start, int) and isinstance(func_end, int) and func_start >= 0 and func_end >= 0:
+        start = max(func_start - ctx, 0)
+        end = min(func_end + ctx, total)
+    else:
+        hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), 0)
+        start = max(hunk_idx - ctx, 0)
+        end = min(hunk_idx + ctx + 1, total)
+
+    original_len = max(end - start, 0)
+    if original_len > max_total:
+        end = min(start + max_total, total)
+
+    excerpt_lines = patch_lines[start:end]
+    excerpt_truncated = original_len > len(excerpt_lines)
+
+    hunks = _iter_hunks(patch.patch_text or "")
+    migrated_side = _infer_migrated_side(patch.patch_text or "")
+    pre_patch_file_path: Optional[str] = None
+    pre_patch_line_number: Optional[int] = None
+    mapping_note = ""
+    if hunks:
+        if migrated_side == "new":
+            pre_patch_file_path = str(patch.file_path_old or "")
+            mapped, reason = _map_new_to_old_line(hunks, int(line_number))
+            pre_patch_line_number = int(mapped) if isinstance(mapped, int) and mapped > 0 else None
+            mapping_note = f"Mapped migrated(new)->original(old): {reason}."
+        elif migrated_side == "old":
+            pre_patch_file_path = str(patch.file_path_new or "")
+            mapped, reason = _map_old_to_new_line(hunks, int(line_number))
+            pre_patch_line_number = int(mapped) if isinstance(mapped, int) and mapped > 0 else None
+            mapping_note = f"Mapped migrated(old)->original(new): {reason}."
+        else:
+            new_to_old, r1 = _map_new_to_old_line(hunks, int(line_number))
+            old_to_new, r2 = _map_old_to_new_line(hunks, int(line_number))
+            if new_to_old is None and isinstance(old_to_new, int) and old_to_new > 0:
+                pre_patch_file_path = str(patch.file_path_new or "")
+                pre_patch_line_number = old_to_new
+            else:
+                pre_patch_file_path = str(patch.file_path_old or "")
+                pre_patch_line_number = new_to_old if isinstance(new_to_old, int) and new_to_old > 0 else None
+            mapping_note = (
+                "Ambiguous patch direction for pre-patch mapping. "
+                f"Assuming error line is in new side: {new_to_old} ({r1}). "
+                f"Assuming error line is in old side: {old_to_new} ({r2})."
+            )
+    else:
+        mapping_note = "No hunks found; cannot derive pre-patch mapping."
+
+    symbols: List[str] = []
+    if error_text:
+        text = str(error_text)
+        patterns = [
+            r"unknown type name '([^']+)'",
+            r"use of undeclared identifier '([^']+)'",
+            r"implicit declaration of function\s+'([^']+)'",
+            r"undeclared function '([^']+)'",
+            r"conflicting types for '([^']+)'",
+        ]
+        for pat in patterns:
+            symbols.extend(re.findall(pat, text))
+        for member, struct_name in re.findall(r"no member named '([^']+)' in '([^']+)'", text):
+            symbols.append(member)
+            symbols.append(struct_name)
+        # Dedup preserve order
+        seen: set[str] = set()
+        symbols = [s for s in symbols if s and not (s in seen or seen.add(s))]
+
+    return {
+        **mapping,
+        "patch_text_lines_total": total,
+        "excerpt_line_range": [start, end],
+        "excerpt_truncated": excerpt_truncated,
+        "excerpt": "\n".join(excerpt_lines),
+        "symbols": symbols,
+        "pre_patch_file_path": pre_patch_file_path or None,
+        "pre_patch_line_number": pre_patch_line_number,
+        "mapping_note": mapping_note,
     }
 
 
