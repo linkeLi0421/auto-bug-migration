@@ -613,6 +613,209 @@ def get_error_v1_function_code(
     }
 
 
+def _extract_first_code_fence(text: str) -> str:
+    raw = str(text or "").strip()
+    if "```" not in raw:
+        return raw
+    m = re.search(r"```(?:[a-zA-Z0-9_+-]+)?\n(.*?)```", raw, flags=re.DOTALL)
+    if m:
+        return (m.group(1) or "").strip()
+    return raw.replace("```", "").strip()
+
+
+def _truncate_text(*, text: str, max_lines: int, max_chars: int) -> Tuple[str, bool, int, int]:
+    lines = (text or "").splitlines()
+    total_lines = len(lines)
+    max_n = max(0, min(int(max_lines or 0), 50000))
+    returned = lines[:max_n]
+    out = "\n".join(returned)
+    truncated = total_lines > len(returned)
+
+    max_c = max(0, min(int(max_chars or 0), 2_000_000))
+    if max_c and len(out) > max_c:
+        out = out[:max_c].rstrip("\n") + "\n...[truncated]"
+        truncated = True
+
+    return out, truncated, total_lines, len(returned)
+
+
+def make_error_function_patch(
+    *,
+    patch_path: str,
+    file_path: str,
+    line_number: int,
+    new_func_code: str,
+    context_lines: int = 0,
+    max_lines: int = 2000,
+    max_chars: int = 200000,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Generate a unified diff that replaces the V1-origin function with `new_func_code`.
+
+    This is the reverse of `get_error_v1_function_code`: it uses the same
+    `(patch_key, old_signature, func_start_index, func_end_index)` mapping and
+    reconstructs the old function from `-` lines, then builds a patch that
+    deletes those lines and adds the provided replacement.
+
+    The tool is read-only: it returns patch text but does not apply it.
+    """
+    new_code = _extract_first_code_fence(new_func_code)
+    if not new_code.strip():
+        raise ValueError("new_func_code must be non-empty")
+
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
+    patch_key = mapping.get("patch_key")
+
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No matching patch_key; cannot generate a function replacement patch.",
+        }
+
+    func_start = mapping.get("func_start_index")
+    func_end = mapping.get("func_end_index")
+    if not isinstance(func_start, int) or not isinstance(func_end, int) or func_start < 0 or func_end < 0:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Patch mapping lacks function slice indices (not a recreated-function patch).",
+        }
+
+    patch = bundle.patches[str(patch_key)]
+    patch_lines = (patch.patch_text or "").splitlines()
+    body = patch_lines[4:] if len(patch_lines) >= 4 else []
+    slice_lines = body[func_start:func_end] if func_end > func_start else []
+    old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
+    old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
+
+    if not old_func_code_full.strip():
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Failed to reconstruct old function code from patch slice ('-' lines empty).",
+        }
+
+    new_func_lines = [l.rstrip("\n") for l in str(new_code).replace("\r\n", "\n").split("\n")]
+    # Avoid creating a hunk with 0 new lines; empty replacement is almost always unintended.
+    new_func_lines = [l for l in new_func_lines]
+    if len(new_func_lines) == 1 and not new_func_lines[0] and "\n" not in str(new_code):
+        # Single empty line input.
+        raise ValueError("new_func_code must contain a function definition, not an empty line")
+
+    new_len = len(new_func_lines)
+    old_hunk_start = 0
+    hunk = _parse_first_hunk(patch.patch_text or "")
+    if hunk:
+        old_hunk_start = int(hunk[0])
+    if old_hunk_start <= 0:
+        old_hunk_start = int(patch.old_start_line or 0)
+    if old_hunk_start <= 0:
+        old_hunk_start = 1
+
+    rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
+    rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
+    if not rel_file:
+        rel_file = _norm_path(file_path).lstrip("./").lstrip("/")
+
+    ctx = max(0, min(int(context_lines or 0), 20))
+    ctx_before: List[str] = []
+    ctx_after: List[str] = []
+    ctx_before_start_idx = func_start
+    if ctx:
+        # Pick a few immediate context lines before/after the function slice.
+        before_idx: List[Tuple[int, str]] = []
+        i = func_start - 1
+        while i >= 0 and len(before_idx) < ctx:
+            line = body[i]
+            if line.startswith("@@"):
+                break
+            if line.startswith(" "):
+                before_idx.append((i, line[1:]))
+            i -= 1
+        before_idx.reverse()
+        ctx_before = [t[1] for t in before_idx]
+        if before_idx:
+            ctx_before_start_idx = before_idx[0][0]
+
+        after_idx: List[Tuple[int, str]] = []
+        i = func_end
+        while i < len(body) and len(after_idx) < ctx:
+            line = body[i]
+            if line.startswith("@@"):
+                break
+            if line.startswith(" "):
+                after_idx.append((i, line[1:]))
+            i += 1
+        ctx_after = [t[1] for t in after_idx]
+
+    def _old_line_at(body_idx: int) -> int:
+        consumed = sum(1 for line in body[:body_idx] if line.startswith(" ") or line.startswith("-"))
+        return old_hunk_start + consumed
+
+    start_line = _old_line_at(ctx_before_start_idx)
+
+    hunk_old_lines: List[str] = []
+    hunk_new_lines: List[str] = []
+
+    hunk_old_lines.extend(ctx_before)
+    hunk_old_lines.extend(old_func_lines)
+    hunk_old_lines.extend(ctx_after)
+
+    hunk_new_lines.extend(ctx_before)
+    hunk_new_lines.extend(new_func_lines)
+    hunk_new_lines.extend(ctx_after)
+
+    old_hunk_len = len(hunk_old_lines)
+    new_hunk_len = len(hunk_new_lines)
+
+    header = f"diff --git a/{rel_file} b/{rel_file}\n--- a/{rel_file}\n+++ b/{rel_file}\n"
+    hunk_header = f"@@ -{start_line},{old_hunk_len} +{start_line},{new_hunk_len} @@\n"
+
+    patch_body_lines: List[str] = []
+    for line in ctx_before:
+        patch_body_lines.append(f" {line}")
+    for line in old_func_lines:
+        patch_body_lines.append(f"-{line}")
+    for line in new_func_lines:
+        patch_body_lines.append(f"+{line}")
+    for line in ctx_after:
+        patch_body_lines.append(f" {line}")
+
+    patch_text_full = header + hunk_header + "\n".join(patch_body_lines) + "\n"
+
+    old_func_code, old_truncated, _, _ = _truncate_text(text=old_func_code_full, max_lines=200, max_chars=12000)
+    patch_text, patch_truncated, patch_total_lines, patch_returned_lines = _truncate_text(
+        text=patch_text_full, max_lines=max_lines, max_chars=max_chars
+    )
+
+    return {
+        **mapping,
+        "file_path_patch": rel_file,
+        "old_func_code": old_func_code,
+        "old_func_code_truncated": old_truncated,
+        "new_func_code_lines": new_len,
+        "patch_text": patch_text,
+        "patch_text_truncated": patch_truncated,
+        "patch_text_lines_total": patch_total_lines,
+        "patch_text_lines_returned": patch_returned_lines,
+        "note": (
+            "Generated a unified diff that replaces the V1-origin function text (from '-' lines) "
+            "with the provided replacement. Apply this to the migrated codebase."
+        ),
+    }
+
+
 def parse_build_errors_tool(*, build_log_text: str = "", build_log_path: str = "") -> Dict[str, Any]:
     if build_log_text and build_log_path:
         raise ValueError("Provide only one of build_log_text or build_log_path")

@@ -43,6 +43,8 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
   - `search_patches(patch_path, query, limit?)`
   - `get_error_patch(patch_path, file_path, line_number)`
   - `get_error_patch_context(patch_path, file_path, line_number, error_text?, context_lines?, max_total_lines?)`
+  - `get_error_v1_function_code(patch_path, file_path, line_number, max_lines?, max_chars?)`
+  - `make_error_function_patch(patch_path, file_path, line_number, new_func_code, context_lines?, max_lines?, max_chars?)`
   - `parse_build_errors(build_log_path?|build_log_text?)`
 
 All agent-callable tool specs + dispatch live under `script/react_agent/tools/`.
@@ -62,6 +64,7 @@ Real tools + OpenAI (requires network + API key):
 ```bash
 export OPENAI_API_KEY=...
 export OPENAI_MODEL=gpt-5-mini
+export OPENAI_MAX_TOKENS=4000  # bump if you see empty/invalid JSON responses
 
 # Patch-aware triage (recommended when the build log is from migrated code)
 python3 script/react_agent/agent_langgraph.py \

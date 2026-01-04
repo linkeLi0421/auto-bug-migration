@@ -13,6 +13,7 @@ from .migration_tools import (  # noqa: E402
     get_error_v1_function_code as get_error_v1_function_code_tool,
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
+    make_error_function_patch as make_error_function_patch_tool,
     parse_build_errors as parse_build_errors_tool,
     search_patches as search_patches_tool,
 )
@@ -282,6 +283,46 @@ class ToolRunner:
                         "line_number": line_number,
                         "max_lines": max_lines,
                         "max_chars": max_chars,
+                    },
+                    output=out,
+                )
+
+            if tool == "make_error_function_patch":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                line_number = _as_int(args.get("line_number"), 0)
+                new_func_code = str(args.get("new_func_code", ""))
+                context_lines = _as_int(args.get("context_lines"), 0)
+                max_lines = _as_int(args.get("max_lines"), 2000)
+                max_chars = _as_int(args.get("max_chars"), 200000)
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if line_number <= 0:
+                    return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
+                if not str(new_func_code).strip():
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: new_func_code")
+                out = make_error_function_patch_tool(
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    line_number=line_number,
+                    new_func_code=new_func_code,
+                    context_lines=context_lines,
+                    max_lines=max_lines,
+                    max_chars=max_chars,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "context_lines": context_lines,
+                        "max_lines": max_lines,
+                        "max_chars": max_chars,
+                        "new_func_code": str(new_func_code)[:2000],
                     },
                     output=out,
                 )
