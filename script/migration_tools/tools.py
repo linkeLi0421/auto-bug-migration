@@ -543,6 +543,76 @@ def get_error_patch_context(
     }
 
 
+def get_error_v1_function_code(
+    *,
+    patch_path: str,
+    file_path: str,
+    line_number: int,
+    max_lines: int = 200,
+    max_chars: int = 12000,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Extract the V1-origin function body for a build error from a patch bundle.
+
+    This reuses the same mapping logic as `get_error_patch` to obtain
+    `(patch_key, old_signature, func_start_index, func_end_index)` and then
+    reconstructs the function body from `-` lines in that patch slice.
+    """
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
+    patch_key = mapping.get("patch_key")
+
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "func_code": "",
+            "func_code_lines_total": 0,
+            "func_code_lines_returned": 0,
+            "func_code_truncated": False,
+            "note": "No matching patch_key; cannot extract function code.",
+        }
+
+    func_start = mapping.get("func_start_index")
+    func_end = mapping.get("func_end_index")
+    if not isinstance(func_start, int) or not isinstance(func_end, int) or func_start < 0 or func_end < 0:
+        return {
+            **mapping,
+            "func_code": "",
+            "func_code_lines_total": 0,
+            "func_code_lines_returned": 0,
+            "func_code_truncated": False,
+            "note": "Patch mapping lacks function slice indices (not a recreated-function patch).",
+        }
+
+    patch = bundle.patches[str(patch_key)]
+    patch_lines = (patch.patch_text or "").splitlines()
+    body = patch_lines[4:] if len(patch_lines) >= 4 else []
+    slice_lines = body[func_start:func_end] if func_end > func_start else []
+
+    func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
+    total_lines = len(func_lines)
+
+    max_n = max(0, min(int(max_lines or 0), 5000))
+    returned_lines = func_lines[:max_n]
+    code = "\n".join(returned_lines)
+
+    truncated = total_lines > len(returned_lines)
+    if max_chars is not None:
+        max_c = max(0, min(int(max_chars or 0), 200000))
+        if max_c and len(code) > max_c:
+            code = code[:max_c].rstrip("\n") + "\n...[truncated]"
+            truncated = True
+
+    return {
+        **mapping,
+        "func_code": code,
+        "func_code_lines_total": total_lines,
+        "func_code_lines_returned": len(returned_lines),
+        "func_code_truncated": truncated,
+        "note": "Extracted from '-' lines in the patch function slice (V1-origin code).",
+    }
+
+
 def parse_build_errors_tool(*, build_log_text: str = "", build_log_path: str = "") -> Dict[str, Any]:
     if build_log_text and build_log_path:
         raise ValueError("Provide only one of build_log_text or build_log_path")

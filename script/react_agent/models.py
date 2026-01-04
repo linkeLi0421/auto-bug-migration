@@ -37,6 +37,18 @@ class StubModel(ChatModel):
         self._turn += 1
 
         user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        if "suggests modifying V2 type definitions" in user_text and "Rewrite it into a V2-usage-adaptation plan" in user_text:
+            return json.dumps(
+                {
+                    "type": "final",
+                    "thought": "Avoid changing shared V2 type layouts; adapt call sites.",
+                    "summary": "Rewrite: do not modify V2 type definitions.",
+                    "next_step": (
+                        "Adapt the migrated (V1-origin) code to V2 semantics: remove/replace the missing field usage using V2 APIs/fields.\n"
+                        "If a V2 type edit is truly required, rerun with --allow-v2-type-edits."
+                    ),
+                }
+            )
         observation_count = sum(
             1 for m in messages if m.get("role") == "user" and "Observation:" in m.get("content", "")
         )
@@ -133,18 +145,42 @@ class StubModel(ChatModel):
                 return json.dumps(
                     {
                         "type": "tool",
-                        "thought": "Fetch the struct definition in V1 (the migrated code is V1-origin).",
-                        "tool": "search_definition",
-                        "args": {"symbol_name": struct_symbol, "version": "v1"},
+                        "thought": "Extract the V1-origin function body from the patch to understand the V1 usage.",
+                        "tool": "get_error_v1_function_code",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "max_lines": 200,
+                            "max_chars": 12000,
+                        },
                     }
                 )
             if observation_count == 2:
                 return json.dumps(
                     {
                         "type": "tool",
+                        "thought": "Fetch the struct definition in V1 (the migrated code is V1-origin).",
+                        "tool": "search_definition",
+                        "args": {"symbol_name": struct_symbol, "version": "v1"},
+                    }
+                )
+            if observation_count == 3:
+                return json.dumps(
+                    {
+                        "type": "tool",
                         "thought": "Fetch the struct definition in V2 to compare and infer member drift.",
                         "tool": "search_definition",
                         "args": {"symbol_name": struct_symbol, "version": "v2"},
+                    }
+                )
+            if os.environ.get("REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT", "").strip():
+                return json.dumps(
+                    {
+                        "type": "final",
+                        "thought": "A fast fix is to add the missing fields back, but this may be unsafe.",
+                        "summary": "Option A: add missing members to the struct definition in V2 headers.",
+                        "next_step": "Add the missing fields to the struct definition in the V2 header so the migrated code compiles.",
                     }
                 )
             return json.dumps(
@@ -291,6 +327,7 @@ class OpenAIChatCompletionsModel(ChatModel):
     temperature: float = 0.0
     max_tokens: int = 800
     json_mode: bool = True
+    reasoning_effort: str = "low"
     timeout_s: int = 60
 
     @classmethod
@@ -320,6 +357,8 @@ class OpenAIChatCompletionsModel(ChatModel):
         }
         if not self.model.startswith(("gpt-5", "o")):
             base_payload["temperature"] = self.temperature
+        if self.model.startswith(("gpt-5", "o")) and str(self.reasoning_effort).strip():
+            base_payload["reasoning_effort"] = str(self.reasoning_effort).strip()
         if self.json_mode:
             base_payload["response_format"] = {"type": "json_object"}
 
@@ -328,6 +367,8 @@ class OpenAIChatCompletionsModel(ChatModel):
             token_fields = ["max_completion_tokens", "max_tokens"]
 
         raw = ""
+        status_code: Optional[int] = None
+        content_type: str = ""
         last_http_error: Optional[urllib.error.HTTPError] = None
         last_http_detail = ""
 
@@ -342,6 +383,8 @@ class OpenAIChatCompletionsModel(ChatModel):
             )
             try:
                 with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                    status_code = int(getattr(resp, "status", 0) or 0) or int(resp.getcode() or 0)
+                    content_type = str(resp.headers.get("Content-Type", "") or "")
                     raw = resp.read().decode("utf-8", errors="replace")
                 last_http_error = None
                 break
@@ -377,7 +420,34 @@ class OpenAIChatCompletionsModel(ChatModel):
             ) from last_http_error
 
         try:
+            if not raw.strip():
+                raise ModelError(
+                    "Bad OpenAI response: empty body (possible network/proxy block or invalid OPENAI_BASE_URL)."
+                )
+            if content_type and "json" not in content_type.lower():
+                snippet = raw.strip()
+                if len(snippet) > 400:
+                    snippet = snippet[:400] + "\n...[truncated]"
+                raise ModelError(
+                    "Bad OpenAI response: expected JSON but got "
+                    f"Content-Type={content_type!r} status={status_code}. Body snippet: {snippet!r}"
+                )
             data = json.loads(raw)
             return str(data["choices"][0]["message"]["content"])
+        except ModelError:
+            raise
+        except json.JSONDecodeError as exc:
+            snippet = raw.strip()
+            if len(snippet) > 400:
+                snippet = snippet[:400] + "\n...[truncated]"
+            hint = ""
+            if snippet.startswith("<"):
+                hint = " (looks like HTML; check network/proxy and OPENAI_BASE_URL)"
+            raise ModelError(
+                "Bad OpenAI response: invalid JSON"
+                f"{hint}. status={status_code} Content-Type={content_type!r} error={exc}. Body snippet: {snippet!r}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise ModelError(f"Bad OpenAI response: {type(exc).__name__}: {exc}") from exc
+            raise ModelError(
+                f"Bad OpenAI response: {type(exc).__name__}: {exc}. status={status_code} Content-Type={content_type!r}"
+            ) from exc
