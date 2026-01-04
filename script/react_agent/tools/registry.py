@@ -14,6 +14,7 @@ ToolName = Literal[
     "get_error_patch",
     "get_error_patch_context",
     "get_error_v1_function_code",
+    "make_error_function_patch",
     "parse_build_errors",
 ]
 
@@ -86,6 +87,19 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_chars": "int?",
         },
         "description": "Extract the V1-origin function body from the patch bundle for a build error location (from '-' lines in the mapped function slice).",
+    },
+    {
+        "name": "make_error_function_patch",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "line_number": "int",
+            "new_func_code": "string",
+            "context_lines": "int?",
+            "max_lines": "int?",
+            "max_chars": "int?",
+        },
+        "description": "Generate a unified diff that replaces the V1-origin function (from '-' lines in the patch slice) with the provided replacement function code.",
     },
     {
         "name": "parse_build_errors",

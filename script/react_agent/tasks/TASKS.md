@@ -105,34 +105,34 @@ Constraints:
 ### Tasks
 
 1) Implement patch generator in `migration_tools`
-- [ ] Add a tool (suggested name: `make_error_function_patch`) that accepts:
+- [x] Add a tool (suggested name: `make_error_function_patch`) that accepts:
   - `patch_path`, `file_path`, `line_number`, `new_func_code`
   - optional: `max_lines` / `max_chars` / `context_lines`
-- [ ] Reuse `get_error_patch(patch_path, file_path, line_number)` to resolve:
+- [x] Reuse `get_error_patch(patch_path, file_path, line_number)` to resolve:
   - `patch_key`, `old_signature`, `func_start_index`, `func_end_index`
-- [ ] Reconstruct the exact “old” function text from the mapped slice (same extraction as `get_error_v1_function_code`).
-- [ ] Build a single-file unified diff that replaces the old function with `new_func_code`:
+- [x] Reconstruct the exact “old” function text from the mapped slice (same extraction as `get_error_v1_function_code`).
+- [x] Build a single-file unified diff that replaces the old function with `new_func_code`:
   - header `diff --git a/<file> b/<file>` + `---/+++`
   - hunk header `@@ -start,old_len +start,new_len @@` (prefer `patch.old_function_start_line` when available; fallback to parsed hunk start)
   - removed lines from extracted old function (`-...`)
   - added lines from `new_func_code` splitlines (`+...`)
-- [ ] Return a structured result:
+- [x] Return a structured result:
   - `patch_key`, `file_path`, `line_number`, `old_signature`
   - `old_func_code` (bounded) + `old_func_code_truncated`
   - `patch_text` (bounded) + `patch_text_truncated`
   - `note` for missing mapping/slice indices, and basic validation errors (e.g., empty `new_func_code`)
 
 2) Expose it as a react_agent tool
-- [ ] Add to `script/react_agent/tools/registry.py` (`ToolName` + `TOOL_SPECS`) with a clear description.
-- [ ] Wire it into `script/react_agent/tools/migration_tools.py` + `script/react_agent/tools/runner.py`.
-- [ ] Keep the existing patch-path allowlist behavior (`REACT_AGENT_PATCH_ALLOWED_ROOTS`).
+- [x] Add to `script/react_agent/tools/registry.py` (`ToolName` + `TOOL_SPECS`) with a clear description.
+- [x] Wire it into `script/react_agent/tools/migration_tools.py` + `script/react_agent/tools/runner.py`.
+- [x] Keep the existing patch-path allowlist behavior (`REACT_AGENT_PATCH_ALLOWED_ROOTS`).
 
 3) Teach the agent to output patches (not just code)
-- [ ] Update the system prompt: after drafting replacement function code, call `make_error_function_patch` and include the returned unified diff in the final output.
-- [ ] Make it explicit this patch targets the code that produced the build errors (the side that contains the V1-origin `__revert_*` function), and does not touch V2 type definitions.
+- [x] Update the system prompt: after drafting replacement function code, call `make_error_function_patch` and include the returned unified diff in the final output.
+- [x] Make it explicit this patch targets the code that produced the build errors (the side that contains the V1-origin `__revert_*` function), and does not touch V2 type definitions.
 
 4) Tests / success criteria
-- [ ] Add a unit test that generates a replacement patch for the libxml2 `xmlVRaiseError` example and verifies:
+- [x] Add a unit test that generates a replacement patch from the `sample.patch2.b64` fixture and verifies:
   - patch header targets `error.c`
   - patch includes both `-` (old) and `+` (new) blocks
   - applying the diff to the extracted old function code with `script/utils.py:apply_unified_diff_to_string` yields the replacement code

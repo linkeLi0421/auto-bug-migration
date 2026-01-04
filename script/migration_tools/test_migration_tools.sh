@@ -32,9 +32,11 @@ from script.migration_tools.tools import (
     get_error_v1_function_code,
     get_patch,
     list_patch_bundle,
+    make_error_function_patch,
     parse_build_errors_tool,
     search_patches,
 )
+from script.utils import apply_unified_diff_to_string
 
 try:
     load_patch_bundle(bundle_path)
@@ -73,6 +75,30 @@ json.dumps(func)
 assert func["patch_key"] == "p2", func
 assert func.get("old_signature") and "bar" in func["old_signature"], func
 assert func.get("func_code") and "ctx2" in func["func_code"], func
+
+replacement = "ctx2_fixed"
+patch_replace = make_error_function_patch(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/error.c",
+    line_number=52,
+    new_func_code=replacement,
+    context_lines=0,
+    max_lines=2000,
+    max_chars=200000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(patch_replace)
+assert patch_replace["patch_key"] == "p2", patch_replace
+assert patch_replace.get("patch_text_truncated") is False, patch_replace
+patch_text = patch_replace.get("patch_text") or ""
+assert "diff --git a/error.c b/error.c" in patch_text, patch_text[:200]
+assert "-ctx2" in patch_text and "+ctx2_fixed" in patch_text, patch_text
+
+original = func.get("func_code") or ""
+if original and not original.endswith("\n"):
+    original += "\n"
+patched = apply_unified_diff_to_string(original, patch_text)
+assert patched.strip() == replacement, (patched, replacement)
 
 patch = get_patch(patch_path=str(bundle_path), patch_key="p2", include_text=True, max_lines=3, allowed_roots=allowed_roots)
 json.dumps(patch)

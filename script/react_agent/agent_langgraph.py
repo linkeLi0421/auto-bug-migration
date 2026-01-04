@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
@@ -148,6 +148,93 @@ def _validate_tool_decision(decision: Decision) -> None:
     args = decision.get("args")
     if not isinstance(args, dict):
         raise ValueError("Tool args must be an object")
+
+
+def _collect_focus_terms(state: AgentState) -> List[str]:
+    terms: List[str] = []
+    for item in state.missing_struct_members or []:
+        if not isinstance(item, dict):
+            continue
+        for member in item.get("members") or []:
+            m = str(member or "").strip()
+            if m:
+                terms.append(m)
+        struct_name = str(item.get("struct", "") or "").strip()
+        if struct_name:
+            terms.append(struct_name)
+    # Also include a few tokens from the error line itself.
+    err = str(state.error_line or "")
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", err):
+        if tok in {"error", "fatal", "warning"}:
+            continue
+        terms.append(tok)
+    # Dedup preserve order
+    seen: set[str] = set()
+    out: List[str] = []
+    for t in terms:
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:32]
+
+
+def _truncate_text_around_terms(text: str, terms: List[str], *, max_chars: int) -> str:
+    s = str(text or "")
+    if max_chars <= 0 or len(s) <= max_chars:
+        return s
+    # If any focus term appears, show a window around the first match.
+    for term in terms:
+        if not term:
+            continue
+        idx = s.find(term)
+        if idx < 0:
+            continue
+        half = max_chars // 2
+        start = max(0, idx - half)
+        end = min(len(s), idx + half)
+        prefix = "...[truncated head]...\n" if start > 0 else ""
+        suffix = "\n...[truncated tail]..." if end < len(s) else ""
+        return prefix + s[start:end] + suffix
+    # Fallback: head+tail
+    head_n = max_chars // 2
+    tail_n = max_chars - head_n
+    return s[:head_n] + "\n...[truncated]...\n" + s[-tail_n:]
+
+
+def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
+    """Reduce tool observation size before sending it back to the model.
+
+    This keeps the prompt small enough to avoid empty/invalid responses on long patches.
+    """
+    terms = _collect_focus_terms(state)
+
+    def compact(value: Any, *, depth: int = 0) -> Any:
+        if depth > 4:
+            return "[truncated]"
+        if isinstance(value, str):
+            return _truncate_text_around_terms(value, terms, max_chars=12000)
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= 60:
+                    out["...[truncated_keys]"] = f"{len(value) - i} more keys"
+                    break
+                key = str(k)
+                if key in {"excerpt", "func_code", "patch_text"}:
+                    out[key] = _truncate_text_around_terms(str(v), terms, max_chars=12000)
+                else:
+                    out[key] = compact(v, depth=depth + 1)
+            return out
+        if isinstance(value, list):
+            if len(value) > 50:
+                return [compact(v, depth=depth + 1) for v in value[:50]] + [f"...[{len(value)-50} more items]"]
+            return [compact(v, depth=depth + 1) for v in value]
+        return value
+
+    compacted = compact(observation)
+    if isinstance(compacted, dict):
+        compacted.setdefault("_note", "Tool output in this prompt is truncated; request more with max_lines/max_chars if needed.")
+    return compacted
 
 
 _TYPE_EDIT_RE = re.compile(r"\b(struct|typedef|enum|union)\b", re.IGNORECASE)
@@ -416,6 +503,9 @@ def _system_prompt() -> str:
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
+        "- When you have a concrete function-body fix for the V1-origin (migrated) function (often named __revert_*), generate an actionable patch:\n"
+        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) and then include its patch_text in next_step.\n"
+        "  The patch should only change the migrated function body; do NOT modify V2 type definitions.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
@@ -459,7 +549,8 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
 
     for step in state.steps:
         messages.append({"role": "assistant", "content": json.dumps(step["decision"])})
-        messages.append({"role": "user", "content": "Observation:\n" + json.dumps(step["observation"])})
+        compacted = _compact_observation_for_prompt(state, step.get("observation"))
+        messages.append({"role": "user", "content": "Observation:\n" + json.dumps(compacted, ensure_ascii=False)})
 
     return messages
 
@@ -504,7 +595,17 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     ),
                 }
             )
-            repaired_raw = model.complete(repair_messages)
+            repair_model: ChatModel = model
+            if isinstance(model, OpenAIChatCompletionsModel) and model.json_mode and not raw_snippet:
+                # gpt-5 style models can sometimes return empty content under strict JSON mode when the
+                # completion token budget is too low (reasoning consumes it). Retry with a larger budget
+                # and without response_format enforcement.
+                repair_model = replace(
+                    model,
+                    json_mode=False,
+                    max_tokens=max(int(model.max_tokens or 0), 8000),
+                )
+            repaired_raw = repair_model.complete(repair_messages)
             try:
                 decision = _parse_decision(repaired_raw)
             except Exception as exc:  # noqa: BLE001
@@ -707,6 +808,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openai-base-url", default=os.environ.get("OPENAI_BASE_URL", "") or "https://api.openai.com/v1")
     parser.add_argument("--openai-org", default=os.environ.get("OPENAI_ORG", ""))
     parser.add_argument("--openai-project", default=os.environ.get("OPENAI_PROJECT", ""))
+    parser.add_argument(
+        "--openai-max-tokens",
+        type=int,
+        default=int(os.environ.get("OPENAI_MAX_TOKENS", "0") or 0),
+        help="Max completion tokens for the OpenAI call (0=auto; recommended >=2000 for gpt-5-*).",
+    )
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
     return parser
 
@@ -815,12 +922,17 @@ def main(argv: List[str]) -> int:
             api_key = str(args.openai_api_key).strip()
             if not api_key:
                 raise ModelError("OPENAI_API_KEY (or --openai-api-key) is required")
+            openai_model_name = str(args.openai_model).strip()
+            max_tokens = int(getattr(args, "openai_max_tokens", 0) or 0)
+            if max_tokens <= 0:
+                max_tokens = 4000 if openai_model_name.startswith(("gpt-5", "o")) else 800
             model = OpenAIChatCompletionsModel(
                 api_key=api_key,
-                model=str(args.openai_model).strip(),
+                model=openai_model_name,
                 base_url=str(args.openai_base_url).strip(),
                 org=str(args.openai_org).strip(),
                 project=str(args.openai_project).strip(),
+                max_tokens=max_tokens,
                 json_mode=not bool(args.no_json_mode),
             )
 

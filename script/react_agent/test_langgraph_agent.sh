@@ -36,6 +36,7 @@ allowed = {
     "get_error_patch",
     "get_error_patch_context",
     "get_error_v1_function_code",
+    "make_error_function_patch",
     "parse_build_errors",
 }
 
