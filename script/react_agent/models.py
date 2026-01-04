@@ -45,7 +45,7 @@ class StubModel(ChatModel):
                     "summary": "Rewrite: do not modify V2 type definitions.",
                     "next_step": (
                         "Adapt the migrated (V1-origin) code to V2 semantics: remove/replace the missing field usage using V2 APIs/fields.\n"
-                        "If a V2 type edit is truly required, rerun with --allow-v2-type-edits."
+                        "V2 type definition edits are out-of-policy and require human review."
                     ),
                 }
             )

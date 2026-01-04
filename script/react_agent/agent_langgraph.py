@@ -35,7 +35,6 @@ class AgentConfig:
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
     max_errors: int = 20
-    allow_v2_type_edits: bool = False
 
 
 @dataclass
@@ -389,7 +388,7 @@ def _argv_has_output_format(argv: List[str]) -> bool:
     return any(a == "--output-format" or a.startswith("--output-format=") for a in argv)
 
 
-def _system_prompt(*, allow_v2_type_edits: bool) -> str:
+def _system_prompt() -> str:
     tool_lines: List[str] = []
     for spec in TOOL_SPECS:
         name = str(spec.get("name", "")).strip()
@@ -406,8 +405,7 @@ def _system_prompt(*, allow_v2_type_edits: bool) -> str:
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
         "Important:\n"
-        f"- Policy: V2 type edits allowed: {bool(allow_v2_type_edits)}.\n"
-        "- Unless explicitly allowed, do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
+        "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
         "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
         "- read_file_context reads from the raw V1/V2 source checkouts; it must use pre-patch line numbers.\n"
@@ -415,13 +413,8 @@ def _system_prompt(*, allow_v2_type_edits: bool) -> str:
         "- Only call read_file_context using (a) KB-derived locations from search_definition/inspect_symbol, or\n"
         "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
         "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context (or get_error_patch + get_patch) -> search_definition/inspect_symbol.\n"
-        "- Tool budget: use as few tool calls as possible; once you can propose a concrete V2-usage-adaptation fix, return a final decision.\n"
-        "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and use this sequence (unless already known):\n"
-        "  1) get_error_patch_context\n"
-        "  2) get_error_v1_function_code (inspect the V1-origin function body from the patch)\n"
-        "  3) search_definition(symbol_name='struct Y', version='v1')\n"
-        "  4) search_definition(symbol_name='struct Y', version='v2')\n"
-        "  Then return a final decision; use search_text only as a last resort.\n"
+        "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
+        "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
@@ -433,7 +426,7 @@ def _system_prompt(*, allow_v2_type_edits: bool) -> str:
     )
 
 
-def _build_messages(state: AgentState, *, allow_v2_type_edits: bool) -> List[Dict[str, str]]:
+def _build_messages(state: AgentState) -> List[Dict[str, str]]:
     header_lines: List[str] = []
     if state.build_log_path:
         header_lines.append(f"Build log path: {state.build_log_path}")
@@ -448,7 +441,7 @@ def _build_messages(state: AgentState, *, allow_v2_type_edits: bool) -> List[Dic
     header = "\n".join(header_lines).strip()
 
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": _system_prompt(allow_v2_type_edits=allow_v2_type_edits)},
+        {"role": "system", "content": _system_prompt()},
         {
             "role": "user",
             "content": (header + "\n\n" if header else "")
@@ -487,7 +480,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     "error": _error_payload(st),
                 },
             }
-        messages = _build_messages(st, allow_v2_type_edits=cfg.allow_v2_type_edits)
+        messages = _build_messages(st)
         raw = model.complete(messages)
         try:
             decision = _parse_decision(raw)
@@ -565,7 +558,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     _validate_tool_decision(forced)
                     return {"state": st, "pending": forced}
 
-            if not cfg.allow_v2_type_edits and _decision_suggests_v2_type_edit(decision):
+            if _decision_suggests_v2_type_edit(decision):
                 base_rewrite_messages = list(messages)
                 base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
 
@@ -600,7 +593,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     "Your previous final decision suggests modifying V2 type definitions, which is not allowed.\n"
                     "Rewrite it into a V2-usage-adaptation plan (do not edit V2 struct/typedef/enum/union definitions).\n"
                     "Base your suggestion on the tool observations already shown (patch excerpt, V1 function code, struct defs).\n"
-                    "If you believe V2 type edits are required, say they require rerunning with --allow-v2-type-edits.\n"
+                    "If you believe V2 type edits are required, explicitly say they are out-of-policy and stop.\n"
                     "Return exactly one JSON object of type final with summary/next_step/thought."
                 )
                 rewritten = attempt_rewrite(rewrite_prompt)
@@ -619,7 +612,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                         "summary": "Agent blocked a suggestion to modify V2 type definitions.",
                         "next_step": (
                             "Adapt the V1-origin code to V2 semantics instead (change call sites / field usage / APIs).\n"
-                            "If you explicitly want to consider editing V2 types, rerun with --allow-v2-type-edits."
+                            "V2 type definition edits are out-of-policy and require human review."
                         ),
                     }
             return {
@@ -715,11 +708,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openai-org", default=os.environ.get("OPENAI_ORG", ""))
     parser.add_argument("--openai-project", default=os.environ.get("OPENAI_PROJECT", ""))
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
-    parser.add_argument(
-        "--allow-v2-type-edits",
-        action="store_true",
-        help="Allow the agent to suggest editing V2 type definitions (struct/typedef/enum/union).",
-    )
     return parser
 
 
@@ -736,7 +724,6 @@ def main(argv: List[str]) -> int:
         tools_mode=args.tools,
         error_scope=args.error_scope,
         max_errors=max(args.max_errors, 1),
-        allow_v2_type_edits=bool(getattr(args, "allow_v2_type_edits", False)),
     )
 
     build_log = load_build_log(args.build_log)
