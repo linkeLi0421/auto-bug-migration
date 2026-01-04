@@ -27,7 +27,14 @@ bundle_path.parent.mkdir(parents=True, exist_ok=True)
 bundle_path.write_bytes(data)
 
 from script.migration_tools.patch_bundle import load_patch_bundle
-from script.migration_tools.tools import get_error_patch, get_patch, list_patch_bundle, parse_build_errors_tool, search_patches
+from script.migration_tools.tools import (
+    get_error_patch,
+    get_error_v1_function_code,
+    get_patch,
+    list_patch_bundle,
+    parse_build_errors_tool,
+    search_patches,
+)
 
 try:
     load_patch_bundle(bundle_path)
@@ -53,6 +60,19 @@ json.dumps(err)
 assert err["patch_key"] == "p2", err
 assert err["old_signature"] and "bar" in err["old_signature"], err
 assert err["func_start_index"] is not None, err
+
+func = get_error_v1_function_code(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/error.c",
+    line_number=52,
+    max_lines=200,
+    max_chars=20000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(func)
+assert func["patch_key"] == "p2", func
+assert func.get("old_signature") and "bar" in func["old_signature"], func
+assert func.get("func_code") and "ctx2" in func["func_code"], func
 
 patch = get_patch(patch_path=str(bundle_path), patch_key="p2", include_text=True, max_lines=3, allowed_roots=allowed_roots)
 json.dumps(patch)

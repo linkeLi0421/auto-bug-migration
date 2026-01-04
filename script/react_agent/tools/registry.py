@@ -13,6 +13,7 @@ ToolName = Literal[
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
+    "get_error_v1_function_code",
     "parse_build_errors",
 ]
 
@@ -74,6 +75,17 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_total_lines": "int?",
         },
         "description": "Map a build error location to a patch and return a bounded diff excerpt + pre_patch_* line mapping when available.",
+    },
+    {
+        "name": "get_error_v1_function_code",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "line_number": "int",
+            "max_lines": "int?",
+            "max_chars": "int?",
+        },
+        "description": "Extract the V1-origin function body from the patch bundle for a build error location (from '-' lines in the mapped function slice).",
     },
     {
         "name": "parse_build_errors",

@@ -35,6 +35,7 @@ allowed = {
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
+    "get_error_v1_function_code",
     "parse_build_errors",
 }
 
@@ -126,12 +127,34 @@ for s in steps:
         versions.append(((decision.get("args") or {}).get("version")))
 
 assert tools[0] == "get_error_patch_context", tools
+assert tools[1] == "get_error_v1_function_code", tools
 assert "v1" in versions and "v2" in versions, versions
 
 if "search_text" in tools:
     first_search_text = tools.index("search_text")
     first_v2 = next(i for i, s in enumerate(steps) if (s.get("decision") or {}).get("tool") == "search_definition" and ((s.get("decision") or {}).get("args") or {}).get("version") == "v2")
     assert first_search_text > first_v2, tools
+PY
+
+# Guardrail: block suggestions to edit V2 type definitions by default.
+output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT=1 "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
+  --model stub --tools fake --max-steps 6 --error-scope patch --patch-path "$bundle_path" \
+  "$SCRIPT_DIR/fixtures/patch_scope_missing_member.log")"
+
+"$PYTHON" - "$output" <<'PY'
+import json
+import sys
+
+obj = json.loads(sys.argv[1])
+assert obj["type"] == "final", obj
+
+summary = (obj.get("summary") or "").lower()
+next_step = (obj.get("next_step") or "").lower()
+combined = summary + "\n" + next_step
+
+assert "struct definition" not in combined, combined
+assert "add the missing fields" not in combined, combined
+assert "do not modify v2 type definitions" in combined, combined
 PY
 
 # Patch-aware runs: if read_file_context is used, it must use pre-patch line numbers.

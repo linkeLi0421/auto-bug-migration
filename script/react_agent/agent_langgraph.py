@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import textwrap
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ class AgentConfig:
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
     max_errors: int = 20
+    allow_v2_type_edits: bool = False
 
 
 @dataclass
@@ -114,10 +116,23 @@ def _extract_first_json_object(text: str) -> str:
 
 
 def _parse_decision(text: str) -> Decision:
+    raw = str(text or "")
+    if not raw.strip():
+        raise ValueError("Empty model response (expected a JSON object).")
+
     try:
-        obj = json.loads(text)
+        obj = json.loads(raw)
     except json.JSONDecodeError:
-        obj = json.loads(_extract_first_json_object(text))
+        extracted = _extract_first_json_object(raw)
+        if not extracted.strip():
+            raise ValueError("Model response contained no JSON object.") from None
+        try:
+            obj = json.loads(extracted)
+        except json.JSONDecodeError as exc:
+            snippet = raw.strip()
+            if len(snippet) > 400:
+                snippet = snippet[:400] + "\n...[truncated]"
+            raise ValueError(f"Invalid JSON from model: {exc}. Raw snippet: {snippet!r}") from exc
 
     if not isinstance(obj, dict):
         raise ValueError("Model output must be a JSON object")
@@ -134,6 +149,116 @@ def _validate_tool_decision(decision: Decision) -> None:
     args = decision.get("args")
     if not isinstance(args, dict):
         raise ValueError("Tool args must be an object")
+
+
+_TYPE_EDIT_RE = re.compile(r"\b(struct|typedef|enum|union)\b", re.IGNORECASE)
+_TYPE_EDIT_VERBS_RE = re.compile(
+    r"\b(add|insert|restore|reintroduce|introduce|modify|edit|change|update)\b", re.IGNORECASE
+)
+_TYPE_EDIT_HINT_RE = re.compile(r"\b(field|member|definition|layout|ABI)\b", re.IGNORECASE)
+
+
+def _suggests_v2_type_edit(text: str) -> bool:
+    """Best-effort detector for suggestions to modify V2 type definitions."""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    lowered = t.lower()
+    headerish = ("include/" in lowered) or (".h" in lowered) or ("header" in lowered)
+    if headerish and _TYPE_EDIT_RE.search(t) and _TYPE_EDIT_VERBS_RE.search(t):
+        return True
+    if "struct" in lowered and "add" in lowered and _TYPE_EDIT_HINT_RE.search(t):
+        return True
+    return False
+
+
+def _decision_suggests_v2_type_edit(decision: Decision) -> bool:
+    summary = str(decision.get("summary", "") or "")
+    next_step = str(decision.get("next_step", "") or "")
+    thought = str(decision.get("thought", "") or "")
+    return _suggests_v2_type_edit(summary) or _suggests_v2_type_edit(next_step) or _suggests_v2_type_edit(thought)
+
+
+_MISSING_MEMBER_RE = re.compile(r"no member named '[^']+' in '([^']+)'")
+_ERROR_LOC_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):")
+
+
+def _first_error_location(state: AgentState) -> tuple[str, int]:
+    if state.grouped_errors:
+        fp = str(state.grouped_errors[0].get("file", "") or "").strip()
+        ln = int(state.grouped_errors[0].get("line", 0) or 0)
+        if fp and ln > 0:
+            return fp, ln
+
+    m = _ERROR_LOC_RE.match(str(state.error_line or "").strip())
+    if m:
+        fp = m.group("file")
+        ln = int(m.group("line"))
+        return fp, ln
+    return "", 0
+
+
+def _normalize_struct_queries(struct_name: str) -> List[str]:
+    raw = str(struct_name or "").strip()
+    if not raw:
+        return []
+    names = [raw]
+    parts = raw.split()
+    if len(parts) >= 2 and parts[0] in {"struct", "union", "enum"}:
+        names.append(parts[-1])
+    uniq: List[str] = []
+    seen: set[str] = set()
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            uniq.append(n)
+    return uniq
+
+
+def _should_force_struct_diff_tools(state: AgentState) -> Optional[str]:
+    if not state.patch_path or state.error_scope != "patch":
+        return None
+
+    struct_name = ""
+    if state.missing_struct_members:
+        struct_name = str(state.missing_struct_members[0].get("struct", "") or "").strip()
+    if not struct_name:
+        m = _MISSING_MEMBER_RE.search(str(state.error_line or ""))
+        if m:
+            struct_name = str(m.group(1) or "").strip()
+    if not struct_name:
+        return None
+
+    queries = _normalize_struct_queries(struct_name)
+    if not queries:
+        return None
+
+    def called(tool_name: str, *, version: str = "", symbol_any: Optional[List[str]] = None) -> bool:
+        for step in state.steps:
+            if not isinstance(step, dict):
+                continue
+            decision = step.get("decision")
+            if not isinstance(decision, dict):
+                continue
+            if str(decision.get("tool", "")).strip() != tool_name:
+                continue
+            args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+            if version and str(args.get("version", "")).strip() != version:
+                continue
+            if symbol_any is not None:
+                sym = str(args.get("symbol_name", "")).strip()
+                if sym not in symbol_any:
+                    continue
+            return True
+        return False
+
+    if not called("get_error_v1_function_code"):
+        return "get_error_v1_function_code"
+    if not called("search_definition", version="v1", symbol_any=queries):
+        return f"search_definition:v1:{queries[0]}"
+    if not called("search_definition", version="v2", symbol_any=queries):
+        return f"search_definition:v2:{queries[0]}"
+    return None
 
 
 def _resolve_output_format(value: str) -> str:
@@ -264,7 +389,7 @@ def _argv_has_output_format(argv: List[str]) -> bool:
     return any(a == "--output-format" or a.startswith("--output-format=") for a in argv)
 
 
-def _system_prompt() -> str:
+def _system_prompt(*, allow_v2_type_edits: bool) -> str:
     tool_lines: List[str] = []
     for spec in TOOL_SPECS:
         name = str(spec.get("name", "")).strip()
@@ -281,14 +406,22 @@ def _system_prompt() -> str:
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
         "Important:\n"
+        f"- Policy: V2 type edits allowed: {bool(allow_v2_type_edits)}.\n"
+        "- Unless explicitly allowed, do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
+        "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
         "- read_file_context reads from the raw V1/V2 source checkouts; it must use pre-patch line numbers.\n"
         "- Never call read_file_context with the raw build-log /src/...:line values.\n"
         "- Only call read_file_context using (a) KB-derived locations from search_definition/inspect_symbol, or\n"
         "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
         "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context (or get_error_patch + get_patch) -> search_definition/inspect_symbol.\n"
-        "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
-        "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
+        "- Tool budget: use as few tool calls as possible; once you can propose a concrete V2-usage-adaptation fix, return a final decision.\n"
+        "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and use this sequence (unless already known):\n"
+        "  1) get_error_patch_context\n"
+        "  2) get_error_v1_function_code (inspect the V1-origin function body from the patch)\n"
+        "  3) search_definition(symbol_name='struct Y', version='v1')\n"
+        "  4) search_definition(symbol_name='struct Y', version='v2')\n"
+        "  Then return a final decision; use search_text only as a last resort.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
@@ -300,7 +433,7 @@ def _system_prompt() -> str:
     )
 
 
-def _build_messages(state: AgentState) -> List[Dict[str, str]]:
+def _build_messages(state: AgentState, *, allow_v2_type_edits: bool) -> List[Dict[str, str]]:
     header_lines: List[str] = []
     if state.build_log_path:
         header_lines.append(f"Build log path: {state.build_log_path}")
@@ -315,7 +448,7 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
     header = "\n".join(header_lines).strip()
 
     messages: List[Dict[str, str]] = [
-        {"role": "system", "content": _system_prompt()},
+        {"role": "system", "content": _system_prompt(allow_v2_type_edits=allow_v2_type_edits)},
         {
             "role": "user",
             "content": (header + "\n\n" if header else "")
@@ -354,7 +487,7 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     "error": _error_payload(st),
                 },
             }
-        messages = _build_messages(st)
+        messages = _build_messages(st, allow_v2_type_edits=cfg.allow_v2_type_edits)
         raw = model.complete(messages)
         try:
             decision = _parse_decision(raw)
@@ -378,8 +511,117 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     ),
                 }
             )
-            decision = _parse_decision(model.complete(repair_messages))
+            repaired_raw = model.complete(repair_messages)
+            try:
+                decision = _parse_decision(repaired_raw)
+            except Exception as exc:  # noqa: BLE001
+                repaired_snippet = str(repaired_raw or "").strip()
+                if len(repaired_snippet) > 800:
+                    repaired_snippet = repaired_snippet[:800] + "\n...[truncated]"
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Model did not return valid JSON.",
+                        "summary": "Agent stopped due to invalid model output.",
+                        "next_step": (
+                            f"{exc}\n\n"
+                            "Try again, or run with --no-json-mode, or set OPENAI_MODEL/OPENAI_BASE_URL to a JSON-capable endpoint.\n"
+                            + (f"Repaired raw snippet: {repaired_snippet!r}" if repaired_snippet else "")
+                        ).strip(),
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
         if decision["type"] == "final":
+            remaining = cfg.max_steps - len(st.steps)
+            required = _should_force_struct_diff_tools(st)
+            if required and remaining >= 2:
+                if required == "get_error_v1_function_code":
+                    file_path, line_number = _first_error_location(st)
+                    if file_path and line_number > 0:
+                        forced: Decision = {
+                            "type": "tool",
+                            "thought": "Missing-member error in patch-scope: extract V1-origin function body from the patch before finalizing.",
+                            "tool": "get_error_v1_function_code",
+                            "args": {
+                                "patch_path": st.patch_path,
+                                "file_path": file_path,
+                                "line_number": line_number,
+                                "max_lines": 400,
+                                "max_chars": 20000,
+                            },
+                        }
+                        _validate_tool_decision(forced)
+                        return {"state": st, "pending": forced}
+                elif required.startswith("search_definition:"):
+                    _, version, symbol = required.split(":", 2)
+                    forced = {
+                        "type": "tool",
+                        "thought": f"Missing-member error in patch-scope: fetch {version} definition of the struct before finalizing.",
+                        "tool": "search_definition",
+                        "args": {"symbol_name": symbol, "version": version},
+                    }
+                    _validate_tool_decision(forced)
+                    return {"state": st, "pending": forced}
+
+            if not cfg.allow_v2_type_edits and _decision_suggests_v2_type_edit(decision):
+                base_rewrite_messages = list(messages)
+                base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+
+                def attempt_rewrite(extra_user: str) -> Optional[Decision]:
+                    rewrite_messages = list(base_rewrite_messages)
+                    rewrite_messages.append({"role": "user", "content": extra_user})
+                    raw_out = model.complete(rewrite_messages)
+                    try:
+                        return _parse_decision(raw_out)
+                    except Exception:
+                        raw_snippet = str(raw_out or "").strip()
+                        if len(raw_snippet) > 1200:
+                            raw_snippet = raw_snippet[:1200] + "\n...[truncated]"
+                        repair_messages = list(rewrite_messages)
+                        if raw_snippet:
+                            repair_messages.append({"role": "assistant", "content": raw_snippet})
+                        repair_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Return exactly one JSON object of type final now, with no extra text.\n"
+                                    '{"type":"final","summary":"<short>","next_step":"<short>","thought":"<one sentence>"}'
+                                ),
+                            }
+                        )
+                        try:
+                            return _parse_decision(model.complete(repair_messages))
+                        except Exception:
+                            return None
+
+                rewrite_prompt = (
+                    "Your previous final decision suggests modifying V2 type definitions, which is not allowed.\n"
+                    "Rewrite it into a V2-usage-adaptation plan (do not edit V2 struct/typedef/enum/union definitions).\n"
+                    "Base your suggestion on the tool observations already shown (patch excerpt, V1 function code, struct defs).\n"
+                    "If you believe V2 type edits are required, say they require rerunning with --allow-v2-type-edits.\n"
+                    "Return exactly one JSON object of type final with summary/next_step/thought."
+                )
+                rewritten = attempt_rewrite(rewrite_prompt)
+                if not (isinstance(rewritten, dict) and rewritten.get("type") == "final") or _decision_suggests_v2_type_edit(rewritten or {}):  # type: ignore[arg-type]
+                    rewritten = attempt_rewrite(
+                        rewrite_prompt
+                        + "\nDo NOT mention adding fields/members to structs or editing headers; only propose call-site / API adaptations."
+                    )
+
+                if isinstance(rewritten, dict) and rewritten.get("type") == "final" and not _decision_suggests_v2_type_edit(rewritten or {}):  # type: ignore[arg-type]
+                    decision = rewritten  # type: ignore[assignment]
+                else:
+                    decision = {
+                        "type": "final",
+                        "thought": "Policy forbids suggesting V2 type definition edits.",
+                        "summary": "Agent blocked a suggestion to modify V2 type definitions.",
+                        "next_step": (
+                            "Adapt the V1-origin code to V2 semantics instead (change call sites / field usage / APIs).\n"
+                            "If you explicitly want to consider editing V2 types, rerun with --allow-v2-type-edits."
+                        ),
+                    }
             return {
                 "state": st,
                 "final": {
@@ -473,6 +715,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--openai-org", default=os.environ.get("OPENAI_ORG", ""))
     parser.add_argument("--openai-project", default=os.environ.get("OPENAI_PROJECT", ""))
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
+    parser.add_argument(
+        "--allow-v2-type-edits",
+        action="store_true",
+        help="Allow the agent to suggest editing V2 type definitions (struct/typedef/enum/union).",
+    )
     return parser
 
 
@@ -489,6 +736,7 @@ def main(argv: List[str]) -> int:
         tools_mode=args.tools,
         error_scope=args.error_scope,
         max_errors=max(args.max_errors, 1),
+        allow_v2_type_edits=bool(getattr(args, "allow_v2_type_edits", False)),
     )
 
     build_log = load_build_log(args.build_log)

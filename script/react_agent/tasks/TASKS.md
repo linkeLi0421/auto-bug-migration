@@ -1,90 +1,88 @@
-## Next: Patch-scope + cross-version struct-member triage
+## Next: Policy — don’t change V2 type definitions (adapt V1 code instead)
 
 ### Problem
 
-In patch-scope mode, the build error often refers to **code migrated from V1**, but the agent can “solve” it by only looking at **V2** definitions (because the compile error happens in the migrated codebase).
+In patch-scope runs, the agent may propose “fixes” that **edit V2 data structure definitions**
+(e.g. adding fields back into a shared `struct` in a public header).
 
-Example: `no member named 'nbWarnings' in 'struct _xmlParserCtxt'`
+This is usually a bad migration strategy because:
+- V2 types are used by many other call sites and invariants/ABI expectations may differ.
+- Adding/reordering fields can silently break unrelated code or tests.
+- The goal is typically to adapt **V1-origin usage** to the **V2 API/semantics**, not to retrofit V2 back to V1.
 
-To correctly migrate/fix the V1-origin code, the agent should confirm:
-
-1) Does the member exist in **V1**’s definition of the struct?
-2) If missing in V2, was it **removed** or **renamed/moved**?
-
-Without the V1 check, the agent wastes steps and can’t propose the correct migration edit.
+Example from the current libxml2 run: suggesting “Option A: add `nbWarnings`/`nbErrors` to `struct _xmlParserCtxt`”.
 
 ### Goal
 
-For `missing_struct_member` errors (and similar “API drift” errors) in patch-scope triage:
-
-- always compare the relevant type definition in **V1 vs V2**
-- produce a concrete migration hint (rename/remove/replace field usage)
-- reduce tool calls / steps by fetching the right definitions early
+Make the agent default to a safe migration policy:
+- **Do not propose editing V2 type definitions** (struct/typedef/enum) in shared/public headers.
+- Prefer “usage adaptation”: update the migrated (V1-origin) code to use V2’s existing fields/APIs/behavior.
+- Only allow “edit V2 types” suggestions when explicitly permitted by the user (opt-in).
 
 ### Plan
 
-This is the same workflow as `script/openai/handle_struct_use.py`, but driven by the agent + existing tools:
+1) Update agent policy (system prompt)
+- [x] Add an explicit rule: **never suggest modifying V2 type definitions**; treat V2 types as authoritative.
+- [x] For “missing struct member” errors, require a “V2 adaptation” approach:
+  - check V1 vs V2 definitions,
+  - then search for V2 replacement mechanisms (API/field rename/centralized error object),
+  - propose localized code changes (in the migrated function/module) rather than editing the struct.
 
-1) Use patch-first triage to locate the migrated (V1-origin) code in the patch hunk.
-2) For each `no member named 'X' in 'struct Y'` error, fetch `struct Y` in **both V1 and V2**.
-3) Compare V1 vs V2 struct definitions to infer a field mapping (rename/remove/replace).
-4) Only after that, consider `search_text` as a fallback (e.g. to find renamed fields elsewhere).
+2) Add an output guardrail (opt-in override)
+- [x] Add `--allow-v2-type-edits` to explicitly permit suggesting V2 type edits when desired.
+- [x] Add a lightweight “final output rewrite” step: if the model suggests editing V2 type definitions and the flag is not set, ask it to rewrite the final decision to a V2-usage-adaptation plan.
+- [x] Add a small denylist detector for type-edit suggestions (e.g. “add field to struct”, “edit header”, “modify struct definition”).
 
-### Tasks
-
-1) Detect and summarize struct-member errors in patch-scope mode
-- [x] In patch-scope mode, extract `missing_struct_members` from the grouped error block via `parse_build_errors`.
-- [x] Add a compact summary to the initial prompt header: `[{struct: "...", members: ["...", ...]}]` (deduped + bounded).
-
-2) Enforce “check V1 too” tool ordering
-- [x] Update the system prompt policy: for `missing_struct_member`, do `get_error_patch_context` then `search_definition(struct, v1)` and `search_definition(struct, v2)` before any `search_text`.
-- [x] Update the stub model heuristic so patch-scope missing-member fixtures reliably exercise the same ordering in tests.
-
-3) Make the agent’s reasoning “struct-diff first”
-- [x] Add a prompt rule: treat the failing code as **V1-origin** (from the patch), so V1 struct semantics matter; avoid concluding “deleted field” without checking V1.
-- [x] When multiple members are missing in the same struct (e.g. `nbWarnings`, `nbErrors`), fetch each struct definition once per version and reuse it for all members.
-
-4) Tests
-- [x] Add a patch-scope fixture log with multiple “no member named” errors on the same struct and patch key.
-- [x] Extend `script/react_agent/test_langgraph_agent.sh` to assert the tool order includes both `search_definition(..., version="v1")` and `search_definition(..., version="v2")` before `search_text`.
-
-### Success criteria
-
-- [ ] On the libxml2 example (`nbWarnings` / `nbErrors` in `struct _xmlParserCtxt`), the agent fetches `struct _xmlParserCtxt` in **both** V1 and V2 during the first few steps.
-- [ ] The final output explicitly states whether the missing member existed in V1, and whether it is renamed/removed in V2 (with a concrete migration hint).
+3) Success criteria
+- [x] Running the libxml2 command in patch-scope mode produces a final suggestion that **does not** include “add fields to struct _xmlParserCtxt / include/libxml/parser.h”.
+- [x] For missing-member errors, the final `next_step` proposes **usage adaptation** (rename/replace/remove field usage, or use an existing V2 error-tracking API), and states that V2 type edits are out-of-policy unless explicitly enabled.
 
 
-## Next: Make `read_file_context` patch-safe (use pre-patch line numbers)
+## Next: Tool — extract the V1-origin function code from the patch bundle
 
 ### Problem
 
-`read_file_context(file_path, line_number, version=...)` reads from the **raw V1/V2 checkout roots** (`--v1-src` / `--v2-src`).
+When we decide to adapt V1-origin usage to V2 semantics, the agent needs to see the **V1 function code** that was migrated/removed/recreated by the patch.
 
-In patch-aware runs, the build log’s `/src/...:line:col` locations usually refer to the **patched build tree**, so passing those line numbers directly into `read_file_context` returns misleading source context.
+In many cases the build error line numbers refer to **post-migration** code, so reading `--v2-src` by raw `file:line` is misleading. The patch bundle already contains the relevant function body; we should extract it in a bounded way.
+
+The extraction logic already exists in the rule-based pipeline:
+- `script/revert_patch_test.py:2768` maps `file:line` → `(patch_key, old_signature, func_start_index, func_end_index)`
+- `script/revert_patch_test.py:2776` reconstructs the V1 function by taking the `-` lines from that slice of the unified diff.
 
 ### Goal
 
-Allow `read_file_context` (and any future “read source by file:line” tools) to be used safely by ensuring:
-
-- the `file:line` comes from **pre-patch** sources (KB extents or a patch mapping), not from the build log directly
-- patch hunks remain the primary way to view **patched** code context
+Add a read-only tool so the agent can request:
+- the V1-origin function body (from `-` lines in the patch hunk slice),
+- along with the patch key + old signature that ties it back to the migration context,
+- with bounded output (line/char limits).
 
 ### Tasks
 
-1) Add a pre-patch location mapping to patch tools
-- [x] Extend `get_error_patch_context` to optionally return a best-effort mapping for the error location:
-  - `pre_patch_file_path` (repo-relative, suitable for `read_file_context`)
-  - `pre_patch_line_number` (int) or `null` if unmappable (e.g. added-only lines)
-  - `mapping_note` explaining why/when mapping is unavailable
+1) Implement the extraction helper in `migration_tools`
+- [x] Add a function tool (suggested name: `get_error_v1_function_code`) that accepts:
+  - `patch_path`, `file_path`, `line_number`
+  - optional: `max_lines` / `max_chars`
+- [x] Reuse the existing `get_error_patch(patch_path, file_path, line_number)` result to obtain:
+  - `patch_key`, `old_signature`, `func_start_index`, `func_end_index`
+- [x] Reconstruct V1 function code using the revert logic:
+  - `patch_lines = patch.patch_text.splitlines()[4:]`
+  - `func_code = "\n".join(l[1:] for l in patch_lines[func_start_index:func_end_index] if l.startswith("-"))`
+- [x] Return a structured result:
+  - `patch_key`, `old_signature`, `file_path`, `line_number`
+  - `func_code` (bounded + `truncated` flag)
+  - `note` when extraction isn’t available (no patch match / indices missing)
 
-2) Update agent policy (prompt + stub behavior)
-- [x] Replace the current “don’t use `read_file_context`” wording with:
-  - “Only call `read_file_context` using line numbers from KB results (`search_definition` / `inspect_symbol`) or the `pre_patch_*` mapping from patch tools.”
-  - “Never call `read_file_context` with raw build-log `/src/...:line` numbers.”
+2) Expose it as a react_agent tool
+- [x] Add the tool to `script/react_agent/tools/registry.py` (`TOOL_SPECS` + `ToolName`) with clear args/description.
+- [x] Wire it into `script/react_agent/tools/migration_tools.py` and `script/react_agent/tools/runner.py`.
+- [x] Keep the same patch-path allowlist behavior (`REACT_AGENT_PATCH_ALLOWED_ROOTS`).
 
-3) Tests
-- [x] Add/adjust a patch-aware fixture where the error line can be mapped, and assert that any `read_file_context` call uses `pre_patch_line_number` (not the build-log line).
+3) Teach the agent when to call it
+- [x] Update the system prompt: when proposing “V2 usage adaptation” for a patch-scoped error, call `get_error_v1_function_code` early to read the V1-origin function body (instead of suggesting V2 type edits).
+- [x] Update the stub-model heuristic + tests so the intended tool ordering is exercised.
 
 ### Success criteria
 
-- [ ] In patch-aware mode, the agent never calls `read_file_context` with the raw build-log line number; it either uses `pre_patch_line_number` (when available) or uses KB-derived locations.
+- [x] On the libxml2 `nbWarnings/nbErrors` example, the agent fetches the V1-origin function code from the patch bundle before proposing a fix.
+- [x] The final output proposes a V2-usage-adaptation change (not a V2 struct edit) and references evidence from the extracted V1 function body.
