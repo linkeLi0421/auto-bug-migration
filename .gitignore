@@ -21,3 +21,4 @@ llvm_build_dirs
 /data
 /patch
 /pocs
+/log/

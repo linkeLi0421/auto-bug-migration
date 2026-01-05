@@ -38,6 +38,9 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
   - `search_definition(symbol_name, version)` (use `version=v1|v2`)
   - `search_definition_in_v1(symbol_name)` (deprecated alias)
   - `search_text(query, version, limit?, file_glob?)` (macro/typedef fallback when clang JSON has no result)
+- OSS-Fuzz Docker testing (opt-in):
+  - `ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths?, build_csv?, sanitizer?, architecture?, engine?, fuzz_target?, run_fuzzer_seconds?, timeout_seconds?, use_sudo?)`
+  - It writes a merged `.diff` file (bundle + overrides) under the artifact directory and uses it as the OSS-Fuzz `--patch` input.
 - Patch-bundle tools (read-only, from `data/tmp_patch/*.patch2`):
   - `list_patch_bundle(patch_path, filter_file?, filter_patch_type?, limit?)`
   - `get_patch(patch_path, patch_key, include_text?, max_lines?)`
@@ -90,9 +93,12 @@ Patch bundle path notes:
 
 Artifacts (reduce prompt/output size):
 
-- Patch-related tool outputs (diff excerpts / V1-origin function bodies / generated patches) are persisted under `data/react_agent_artifacts/<run_id>/` and replaced with `{artifact_path, sha256, bytes, lines}` in tool observations.
+- Patch-related tool outputs (diff excerpts / V1-origin function bodies / generated patches) are persisted under `data/react_agent_artifacts/<patch_key>/` when `patch_key` is known (patch-aware runs). Otherwise they use `data/react_agent_artifacts/<run_id>/`.
+- Files are overwritten by name within the `patch_key` directory (no `.1`, `.2`, ... accumulation).
+- Tool observations replace large fields with `{artifact_path, sha256, bytes, lines}`.
 - Configure with:
   - `--artifact-dir /path/to/dir` (or `REACT_AGENT_ARTIFACT_DIR`)
+  - `REACT_AGENT_ARTIFACT_ROOT=/path/to/root` to change the base root while still using `<patch_key>/` or `<run_id>/`
   - `--no-artifacts` to disable
 
 Output format:

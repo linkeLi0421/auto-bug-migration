@@ -9,6 +9,8 @@ from .registry import ALLOWED_TOOLS
 
 from .artifact_tools import read_artifact as read_artifact_tool
 
+from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_and_test_tool
+
 from .migration_tools import (  # noqa: E402
     get_error_patch as get_error_patch_tool,
     get_error_patch_context as get_error_patch_context_tool,
@@ -174,6 +176,88 @@ class ToolRunner:
                     True,
                     tool,
                     {"file_path": file_path, "line_number": line_number, "context": context, "version": version},
+                    output=out,
+                )
+
+            if tool == "ossfuzz_apply_patch_and_test":
+                project = str(args.get("project", "")).strip()
+                commit = str(args.get("commit", "")).strip()
+                patch_path = str(args.get("patch_path", "")).strip()
+                if str(args.get("patch_text", "")).strip():
+                    return ToolObservation(
+                        False, tool, args, output="", error="Unsupported arg: patch_text (use patch_override_paths instead)"
+                    )
+                if str(args.get("patch_file_path", "")).strip():
+                    return ToolObservation(
+                        False,
+                        tool,
+                        args,
+                        output="",
+                        error="Unsupported arg: patch_file_path (use patch_path + patch_override_paths instead)",
+                    )
+
+                override_raw = args.get("patch_override_paths", [])
+                patch_override_paths: list[str] = []
+                if override_raw is None or override_raw == "":
+                    patch_override_paths = []
+                elif isinstance(override_raw, list):
+                    patch_override_paths = [str(p).strip() for p in override_raw if str(p).strip()]
+                elif isinstance(override_raw, str):
+                    patch_override_paths = [override_raw.strip()] if override_raw.strip() else []
+                else:
+                    return ToolObservation(
+                        False,
+                        tool,
+                        args,
+                        output="",
+                        error="Invalid arg: patch_override_paths (expected list[string] or string)",
+                    )
+
+                build_csv = str(args.get("build_csv", "")).strip()
+                sanitizer = str(args.get("sanitizer", "")).strip() or "address"
+                architecture = str(args.get("architecture", "")).strip() or "x86_64"
+                engine = str(args.get("engine", "")).strip() or "libfuzzer"
+                fuzz_target = str(args.get("fuzz_target", "")).strip()
+                run_fuzzer_seconds = _as_int(args.get("run_fuzzer_seconds"), 30)
+                timeout_seconds = _as_int(args.get("timeout_seconds"), 1800)
+                use_sudo = _as_bool(args.get("use_sudo"), False)
+                if not project:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: project")
+                if not commit:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: commit")
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                out = ossfuzz_apply_patch_and_test_tool(
+                    project=project,
+                    commit=commit,
+                    patch_path=patch_path,
+                    patch_override_paths=patch_override_paths,
+                    build_csv=build_csv,
+                    sanitizer=sanitizer,
+                    architecture=architecture,
+                    engine=engine,
+                    fuzz_target=fuzz_target,
+                    run_fuzzer_seconds=run_fuzzer_seconds,
+                    timeout_seconds=timeout_seconds,
+                    use_sudo=use_sudo,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "project": project,
+                        "commit": commit,
+                        "patch_path": patch_path,
+                        "patch_override_paths": patch_override_paths[:20],
+                        "build_csv": build_csv,
+                        "sanitizer": sanitizer,
+                        "architecture": architecture,
+                        "engine": engine,
+                        "fuzz_target": fuzz_target,
+                        "run_fuzzer_seconds": run_fuzzer_seconds,
+                        "timeout_seconds": timeout_seconds,
+                        "use_sudo": use_sudo,
+                    },
                     output=out,
                 )
 

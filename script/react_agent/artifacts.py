@@ -16,6 +16,11 @@ _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
     "get_error_v1_function_code": {"func_code": ".c"},
     "get_patch": {"patch_text": ".diff"},
     "make_error_function_patch": {"old_func_code": ".c", "patch_text": ".diff"},
+    "ossfuzz_apply_patch_and_test": {
+        "build_output": ".log",
+        "check_build_output": ".log",
+        "run_fuzzer_output": ".log",
+    },
 }
 
 
@@ -70,8 +75,9 @@ class ArtifactRef:
 class ArtifactStore:
     """Write-only helper used by the agent runtime to persist large tool outputs."""
 
-    def __init__(self, root_dir: str | Path) -> None:
+    def __init__(self, root_dir: str | Path, *, overwrite: bool = False) -> None:
         self.root = Path(root_dir).expanduser().resolve()
+        self._overwrite = bool(overwrite)
 
     def write_text(self, *, name: str, text: str, ext: str = ".txt") -> ArtifactRef:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -81,7 +87,15 @@ class ArtifactStore:
             ext_norm = "." + ext_norm
         if not ext_norm:
             ext_norm = ".txt"
-        path = _unique_path(self.root / f"{safe}{ext_norm}")
+        path = self.root / f"{safe}{ext_norm}"
+        if self._overwrite:
+            try:
+                if path.exists():
+                    path.unlink()
+            except IsADirectoryError as exc:
+                raise RuntimeError(f"Artifact path is a directory: {path}") from exc
+        else:
+            path = _unique_path(path)
 
         data = (text or "").encode("utf-8", errors="replace")
         path.write_bytes(data)
@@ -176,7 +190,7 @@ def default_run_id() -> str:
     return f"{ts}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
-def resolve_artifact_dir(*, cli_dir: str, disabled: bool) -> Tuple[Optional[ArtifactStore], str]:
+def resolve_artifact_dir(*, cli_dir: str, disabled: bool, patch_key: str = "") -> Tuple[Optional[ArtifactStore], str]:
     """Return (store, artifact_dir) or (None, '') when disabled."""
     if disabled:
         return None, ""
@@ -194,6 +208,12 @@ def resolve_artifact_dir(*, cli_dir: str, disabled: bool) -> Tuple[Optional[Arti
         root = Path(root_raw).expanduser().resolve()
     else:
         root = _repo_root() / "data" / "react_agent_artifacts"
+
+    patch_key_clean = str(patch_key or "").strip()
+    if patch_key_clean:
+        safe_key = _safe_filename(patch_key_clean, max_len=160)
+        store = ArtifactStore(root / safe_key, overwrite=True)
+        return store, str(store.root)
 
     run_id = default_run_id()
     store = ArtifactStore(root / run_id)

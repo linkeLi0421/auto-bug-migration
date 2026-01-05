@@ -780,10 +780,18 @@ def make_error_function_patch(
     else:
         patch_hiden_note = ""
 
-    # Recompute hunk header lengths (keep start lines the same).
+    # Recompute hunk header lengths and recompute +new_start offsets.
+    #
+    # We keep -old_start stable and recompute +new_start by accumulating the
+    # per-hunk delta (new_len - old_len) from the rewritten hunk bodies.
+    new_shift = 0
     i = 0
     while i < len(patch_lines):
         line = patch_lines[i]
+        if line.startswith("diff --git "):
+            new_shift = 0
+            i += 1
+            continue
         if not line.startswith("@@"):
             i += 1
             continue
@@ -792,7 +800,10 @@ def make_error_function_patch(
             i += 1
             continue
         old_start = int(m.group("old_start"))
-        new_start = int(m.group("new_start"))
+        old_len_hdr = int(m.group("old_len") or 1)
+        new_start_hdr = int(m.group("new_start"))
+        new_len_hdr = int(m.group("new_len") or 1)
+
         old_len = 0
         new_len_hunk = 0
         j = i + 1
@@ -808,16 +819,20 @@ def make_error_function_patch(
                 old_len += 1
                 new_len_hunk += 1
             elif prefix == "-":
-                if not body_line.startswith("--- "):
-                    old_len += 1
+                old_len += 1
             elif prefix == "+":
-                if not body_line.startswith("+++ "):
-                    new_len_hunk += 1
+                new_len_hunk += 1
             elif prefix == "\\":
                 # "\ No newline at end of file" marker
                 pass
             j += 1
+
+        is_file_add = old_start == 0 and old_len_hdr == 0
+        is_file_del = new_start_hdr == 0 and new_len_hdr == 0
+        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
         patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
+
+        new_shift += new_len_hunk - old_len
         i = j
 
     patch_text_full = "\n".join(patch_lines)

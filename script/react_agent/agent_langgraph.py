@@ -1235,12 +1235,6 @@ def main(argv: List[str]) -> int:
     )
 
     build_log = load_build_log(args.build_log)
-    artifact_store, artifacts_dir = resolve_artifact_dir(
-        cli_dir=str(getattr(args, "artifact_dir", "") or ""), disabled=bool(args.no_artifacts)
-    )
-    if artifact_store and artifacts_dir:
-        os.environ["REACT_AGENT_ARTIFACT_DIR"] = artifacts_dir
-    # Patch-related tool outputs are persisted as artifacts without size thresholds.
 
     patch_path = str(getattr(args, "patch_path", "") or "").strip()
     if not patch_path and getattr(args, "v2_src", None):
@@ -1321,6 +1315,15 @@ def main(argv: List[str]) -> int:
             grouped_errors = []
             patch_key = ""
             missing_struct_members = []
+
+    artifact_store, artifacts_dir = resolve_artifact_dir(
+        cli_dir=str(getattr(args, "artifact_dir", "") or ""),
+        disabled=bool(args.no_artifacts),
+        patch_key=patch_key,
+    )
+    if artifact_store and artifacts_dir:
+        os.environ["REACT_AGENT_ARTIFACT_DIR"] = artifacts_dir
+    # Patch-related tool outputs are persisted as artifacts without size thresholds.
 
     try:
         if args.model == "stub":

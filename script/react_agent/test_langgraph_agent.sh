@@ -10,6 +10,40 @@ fixtures=(
   "$SCRIPT_DIR/fixtures/syntax_error.log"
 )
 
+# Tool registry sanity.
+tools_json="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --list-tools --output-format json)"
+"$PYTHON" - "$tools_json" <<'PY'
+import json
+import sys
+
+obj = json.loads(sys.argv[1])
+tools = obj.get("tools") or []
+names = {t.get("name") for t in tools if isinstance(t, dict)}
+assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
+PY
+
+# Tool guardrail: OSS-Fuzz tool is disabled unless explicitly enabled.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test  # noqa: E402
+
+try:
+    ossfuzz_apply_patch_and_test(
+        project="example",
+        commit="deadbeef",
+        patch_path="/tmp/example.patch2",
+        timeout_seconds=1,
+    )
+    raise AssertionError("expected REACT_AGENT_ENABLE_OSSFUZZ guardrail")
+except Exception as exc:  # noqa: BLE001
+    assert "REACT_AGENT_ENABLE_OSSFUZZ" in str(exc), str(exc)
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -254,6 +288,84 @@ try:
     raise AssertionError("expected allowlist failure")
 except ValueError:
     pass
+PY
+
+# Patch-key artifact dirs: when only ARTIFACT_ROOT is set, store under <patch_key>/ and overwrite filenames.
+artifact_root="$tmp_dir/artifact_root"
+mkdir -p "$artifact_root"
+
+output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_ROOT="$artifact_root" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
+  --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
+  "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
+
+output2="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_ROOT="$artifact_root" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
+  --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
+  "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
+
+"$PYTHON" - "$output2" "$artifact_root" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+obj = json.loads(sys.argv[1])
+artifact_root = Path(sys.argv[2]).resolve()
+
+err = obj.get("error") or {}
+assert err.get("patch_key") == "p2", err
+
+artifact_dir = (artifact_root / "p2").resolve()
+assert artifact_dir.is_dir(), artifact_dir
+
+expected = artifact_dir / "get_error_patch_context_excerpt_error.c.diff"
+assert expected.is_file(), list(artifact_dir.iterdir())
+
+unexpected = list(artifact_dir.glob("*.1.*"))
+assert not unexpected, unexpected
+PY
+
+# Merge tmp_patch bundle with override diff files (no Docker).
+"$PYTHON" - "$SCRIPT_DIR" "$bundle_path" "$artifact_root" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+bundle_path = Path(sys.argv[2]).resolve()
+artifact_root = Path(sys.argv[3]).resolve()
+
+sys.path.insert(0, str(script_dir))
+
+os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(bundle_path.parent)
+
+artifact_dir = (artifact_root / "p2").resolve()
+artifact_dir.mkdir(parents=True, exist_ok=True)
+os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(artifact_dir)
+
+from tools.ossfuzz_tools import merge_patch_bundle_with_overrides  # noqa: E402
+
+override_path = artifact_dir / "override_p2.diff"
+override_text = (
+    "diff --git a/error.c b/error.c\n"
+    "--- a/error.c\n"
+    "+++ b/error.c\n"
+    "@@ -10,1 +10,1 @@\n"
+    "-line2\n"
+    "+OVERRIDE_LINE\n"
+)
+override_path.write_text(override_text, encoding="utf-8", errors="replace")
+
+out = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(override_path)],
+    output_name="merged_test.diff",
+)
+merged_path = Path(out.get("merged_patch_file_path", "")).resolve()
+assert merged_path.is_file(), out
+merged_text = merged_path.read_text(encoding="utf-8", errors="replace")
+assert "OVERRIDE_LINE" in merged_text, merged_path
+assert "p2" in (out.get("overridden_patch_keys") or []), out
 PY
 
 echo "OK"
