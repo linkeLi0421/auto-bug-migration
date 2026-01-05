@@ -33,7 +33,8 @@ assert "Primary match" in out, out
 assert "include/a.h" in out, out
 assert "include/b.h" in out, out
 assert "Real definition" in out, out
-assert "truncated" in out, out
+assert "...[truncated" not in out, out
+assert "field_130" in out, out
 PY
 
 echo "OK"

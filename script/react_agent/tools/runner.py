@@ -7,6 +7,8 @@ from agent_tools import AgentTools
 
 from .registry import ALLOWED_TOOLS
 
+from .artifact_tools import read_artifact as read_artifact_tool
+
 from .migration_tools import (  # noqa: E402
     get_error_patch as get_error_patch_tool,
     get_error_patch_context as get_error_patch_context_tool,
@@ -71,6 +73,37 @@ class ToolRunner:
             return ToolObservation(True, tool, args, output=f"[FAKE TOOL OUTPUT] {tool}({args})")
 
         try:
+            if tool == "read_artifact":
+                artifact_path = str(args.get("artifact_path", "")).strip()
+                start_line = _as_int(args.get("start_line"), 1)
+                max_lines = _as_int(args.get("max_lines"), 200)
+                query = str(args.get("query", "")).strip()
+                context_lines = _as_int(args.get("context_lines"), 8)
+                max_chars = _as_int(args.get("max_chars"), 20000)
+                if not artifact_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: artifact_path")
+                out = read_artifact_tool(
+                    artifact_path=artifact_path,
+                    start_line=start_line,
+                    max_lines=max_lines,
+                    query=query,
+                    context_lines=context_lines,
+                    max_chars=max_chars,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "artifact_path": artifact_path,
+                        "start_line": start_line,
+                        "max_lines": max_lines,
+                        "query": query,
+                        "context_lines": context_lines,
+                        "max_chars": max_chars,
+                    },
+                    output=out,
+                )
+
             if tool == "inspect_symbol":
                 if not self._agent_tools:
                     return ToolObservation(False, tool, args, output="", error="Tool runner not configured")

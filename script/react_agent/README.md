@@ -33,6 +33,7 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
 
 - Symbol/code tools:
   - `inspect_symbol(symbol_name)`
+  - `read_artifact(artifact_path, start_line?, max_lines?, query?, context_lines?, max_chars?)`
   - `read_file_context(file_path, line_number, context, version)`
   - `search_definition(symbol_name, version)` (use `version=v1|v2`)
   - `search_definition_in_v1(symbol_name)` (deprecated alias)
@@ -86,6 +87,13 @@ Patch bundle path notes:
 - `--error-scope patch` requires `--patch-path` (or `REACT_AGENT_PATCH_PATH`).
 - If `--patch-path` is omitted and `--v2-src` is provided, the agent will try to infer `data/tmp_patch/<v2-src-basename>.patch2` if it exists.
 - For safety, patch bundles are only readable from `data/tmp_patch/` by default; to allow other directories, set `REACT_AGENT_PATCH_ALLOWED_ROOTS` (colon-separated like `PATH`).
+
+Artifacts (reduce prompt/output size):
+
+- Patch-related tool outputs (diff excerpts / V1-origin function bodies / generated patches) are persisted under `data/react_agent_artifacts/<run_id>/` and replaced with `{artifact_path, sha256, bytes, lines}` in tool observations.
+- Configure with:
+  - `--artifact-dir /path/to/dir` (or `REACT_AGENT_ARTIFACT_DIR`)
+  - `--no-artifacts` to disable
 
 Output format:
 

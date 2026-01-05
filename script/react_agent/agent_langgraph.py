@@ -11,10 +11,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
-from langgraph.graph import END, StateGraph  # type: ignore
+try:
+    from langgraph.graph import END, StateGraph  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    from langgraph_shim import END, StateGraph
 
 from build_log import find_first_fatal, iter_compiler_errors, load_build_log
 from agent_tools import AgentTools, KbIndex, SourceManager
+from artifacts import offload_patch_output, resolve_artifact_dir
 from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
 from tools.registry import ALLOWED_TOOLS, TOOL_SPECS
 from tools.runner import ToolObservation, ToolRunner
@@ -44,11 +48,15 @@ class AgentState:
     error_scope: Literal["first", "patch"]
     error_line: str
     snippet: str
+    artifacts_dir: str = ""
     patch_key: str = ""
     grouped_errors: List[Dict[str, Any]] = field(default_factory=list)
     missing_struct_members: List[Dict[str, Any]] = field(default_factory=list)
     steps: List[Dict[str, Any]] = field(default_factory=list)
     last_observation: Optional[ToolObservation] = None
+    pending_patch: Optional[Decision] = None
+    patch_generated: bool = False
+    patch_result: Optional[Dict[str, Any]] = None
 
 
 class GraphState(TypedDict, total=False):
@@ -61,6 +69,8 @@ def _error_payload(state: AgentState) -> Dict[str, Any]:
     payload: Dict[str, Any] = {"line": state.error_line, "snippet": state.snippet}
     if state.patch_path:
         payload["patch_path"] = state.patch_path
+    if state.artifacts_dir:
+        payload["artifacts_dir"] = state.artifacts_dir
     payload["scope"] = state.error_scope
     if state.patch_key:
         payload["patch_key"] = state.patch_key
@@ -220,8 +230,8 @@ def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
                     out["...[truncated_keys]"] = f"{len(value) - i} more keys"
                     break
                 key = str(k)
-                if key in {"excerpt", "func_code", "patch_text"}:
-                    out[key] = _truncate_text_around_terms(str(v), terms, max_chars=12000)
+                if key in {"excerpt", "func_code", "patch_text"} and isinstance(v, str):
+                    out[key] = _truncate_text_around_terms(v, terms, max_chars=12000)
                 else:
                     out[key] = compact(v, depth=depth + 1)
             return out
@@ -233,7 +243,10 @@ def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
 
     compacted = compact(observation)
     if isinstance(compacted, dict):
-        compacted.setdefault("_note", "Tool output in this prompt is truncated; request more with max_lines/max_chars if needed.")
+        compacted.setdefault(
+            "_note",
+            "Tool output in this prompt may be truncated or offloaded to artifacts; use read_artifact(artifact_path, ...) when you see an artifact_path reference.",
+        )
     return compacted
 
 
@@ -347,6 +360,163 @@ def _should_force_struct_diff_tools(state: AgentState) -> Optional[str]:
     return None
 
 
+def _has_tool_call(state: AgentState, tool_name: str) -> bool:
+    for step in state.steps:
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("tool", "")).strip() == tool_name:
+            return True
+    return False
+
+
+def _should_require_make_error_function_patch(state: AgentState) -> bool:
+    """Return True if we should force patch generation before allowing a final decision."""
+    if not state.patch_path or state.error_scope != "patch":
+        return False
+    # Only require this in the function-rewrite workflow (we've extracted a V1-origin function slice).
+    if not _has_tool_call(state, "get_error_v1_function_code"):
+        return False
+    # Do not accept final until we've attempted patch generation at least once.
+    return not _has_tool_call(state, "make_error_function_patch")
+
+
+def _last_tool_call_name(state: AgentState) -> str:
+    if not state.steps:
+        return ""
+    last = state.steps[-1] if isinstance(state.steps[-1], dict) else {}
+    decision = last.get("decision") if isinstance(last, dict) else {}
+    if not isinstance(decision, dict):
+        return ""
+    return str(decision.get("tool", "")).strip()
+
+
+def _structs_to_compare(state: AgentState) -> List[str]:
+    structs: List[str] = []
+    for item in state.missing_struct_members or []:
+        if not isinstance(item, dict):
+            continue
+        s = str(item.get("struct", "") or "").strip()
+        if s:
+            structs.append(s)
+    if not structs:
+        m = _MISSING_MEMBER_RE.search(str(state.error_line or ""))
+        if m:
+            structs.append(str(m.group(1) or "").strip())
+    # Dedup preserve order.
+    seen: set[str] = set()
+    out: List[str] = []
+    for s in structs:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out[:8]
+
+
+def _has_struct_definition(state: AgentState, struct_name: str, version: str) -> bool:
+    queries = set(_normalize_struct_queries(struct_name))
+    if not queries:
+        return False
+    for step in state.steps:
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("tool", "")).strip() != "search_definition":
+            continue
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        if str(args.get("version", "")).strip() != version:
+            continue
+        sym = str(args.get("symbol_name", "")).strip()
+        if sym in queries:
+            return True
+    return False
+
+
+def _last_artifact_path(state: AgentState, tool_name: str, field: str) -> str:
+    for step in reversed(state.steps):
+        if not isinstance(step, dict):
+            continue
+        obs = step.get("observation")
+        if not isinstance(obs, dict):
+            continue
+        if obs.get("ok") is not True:
+            continue
+        if str(obs.get("tool", "")).strip() != tool_name:
+            continue
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            return ""
+        val = out.get(field)
+        if isinstance(val, dict):
+            ap = str(val.get("artifact_path", "") or "").strip()
+            return ap
+        return ""
+    return ""
+
+
+def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
+    if not state.patch_path:
+        return None
+
+    file_path, line_number = _first_error_location(state)
+    if not file_path or line_number <= 0:
+        return None
+
+    if not _has_tool_call(state, "get_error_patch_context"):
+        return {
+            "type": "tool",
+            "thought": "First map the migrated error location to its patch context.",
+            "tool": "get_error_patch_context",
+            "args": {
+                "patch_path": state.patch_path,
+                "file_path": file_path,
+                "line_number": line_number,
+                "error_text": str(state.error_line or "")[:400],
+                "context_lines": 80,
+                "max_total_lines": 800,
+            },
+        }
+
+    if not _has_tool_call(state, "get_error_v1_function_code"):
+        return {
+            "type": "tool",
+            "thought": "Extract the V1-origin function body from the patch before proposing a replacement.",
+            "tool": "get_error_v1_function_code",
+            "args": {
+                "patch_path": state.patch_path,
+                "file_path": file_path,
+                "line_number": line_number,
+                "max_lines": 400,
+                "max_chars": 20000,
+            },
+        }
+
+    structs = _structs_to_compare(state)
+    if structs:
+        for struct_name in structs:
+            if not _has_struct_definition(state, struct_name, "v1"):
+                return {
+                    "type": "tool",
+                    "thought": "Fetch the V1 definition of the struct (the failing code is V1-origin).",
+                    "tool": "search_definition",
+                    "args": {"symbol_name": _normalize_struct_queries(struct_name)[0], "version": "v1"},
+                }
+        for struct_name in structs:
+            if not _has_struct_definition(state, struct_name, "v2"):
+                return {
+                    "type": "tool",
+                    "thought": "Fetch the V2 definition of the struct to compare and infer the correct adaptation.",
+                    "tool": "search_definition",
+                    "args": {"symbol_name": _normalize_struct_queries(struct_name)[0], "version": "v2"},
+                }
+
+    return None
+
+
 def _resolve_output_format(value: str) -> str:
     if value == "auto":
         return "text" if sys.stdout.isatty() else "json"
@@ -376,11 +546,14 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     error_line = str(error.get("line", "")).strip()
     snippet = str(error.get("snippet", "")).rstrip("\n")
     patch_path = str(error.get("patch_path", "")).strip()
+    artifacts_dir = str(error.get("artifacts_dir", "")).strip()
     patch_key = str(error.get("patch_key", "")).strip()
     scope = str(error.get("scope", "")).strip()
     grouped = error.get("grouped_errors") if isinstance(error.get("grouped_errors"), list) else []
     if patch_path:
         lines.append(f"Patch bundle: {patch_path}")
+    if artifacts_dir:
+        lines.append(f"Artifacts: {artifacts_dir}")
     if patch_key:
         lines.append(f"Patch key: {patch_key}")
     if scope:
@@ -492,6 +665,14 @@ def _system_prompt() -> str:
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
         "Important:\n"
+        "- Patch-related tools persist diff excerpts / function bodies / generated patches as artifact files.\n"
+        "  When that happens, the observation contains an object like {artifact_path, sha256, bytes, lines}.\n"
+        "  Use read_artifact(artifact_path, ...) to fetch only the lines you need.\n"
+        "- Tool ordering (two-phase workflow):\n"
+        "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
+        "     Do NOT call read_artifact in this phase.\n"
+        "  2) Patching phase (last): call read_artifact only to pull the minimum code context you need,\n"
+        "     then call make_error_function_patch as the final tool call and immediately return final.\n"
         "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
         "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
@@ -503,9 +684,9 @@ def _system_prompt() -> str:
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
-        "- When you have a concrete function-body fix for the V1-origin (migrated) function (often named __revert_*), generate an actionable patch:\n"
-        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) and then include its patch_text in next_step.\n"
-        "  The patch should only change the migrated function body; do NOT modify V2 type definitions.\n"
+        "- When you have a concrete function-body fix for the V1-origin (often named __revert_*), update the patch bundle slice:\n"
+        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) and then include its patch_text (or the patch_text artifact_path) in next_step.\n"
+        "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
@@ -525,6 +706,8 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         header_lines.append(
             "NOTE: file:line locations below refer to migrated code; use patch tools to map locations to patches."
         )
+    if state.artifacts_dir:
+        header_lines.append(f"Artifacts dir: {state.artifacts_dir}")
     if state.missing_struct_members:
         header_lines.append("Missing struct members (JSON):")
         header_lines.append(json.dumps(state.missing_struct_members, ensure_ascii=False))
@@ -555,10 +738,58 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
     return messages
 
 
-def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg: AgentConfig) -> Dict[str, Any]:
+def _run_langgraph(
+    model: ChatModel,
+    runner: ToolRunner,
+    state: AgentState,
+    cfg: AgentConfig,
+    *,
+    artifact_store: Any = None,
+) -> Dict[str, Any]:
     # Build a small two-node graph: LLM -> TOOL -> LLM (until final).
     def llm_node(gs: GraphState) -> GraphState:
         st = gs["state"]
+        if st.patch_generated:
+            patch_text_path = ""
+            if isinstance(st.patch_result, dict):
+                pt = st.patch_result.get("patch_text")
+                if isinstance(pt, dict):
+                    patch_text_path = str(pt.get("artifact_path", "") or "").strip()
+            next_step = (
+                f"Use the generated patch_text from: {patch_text_path}"
+                if patch_text_path
+                else "Use the generated patch_text from the last tool step."
+            )
+            return {
+                "state": st,
+                "final": {
+                    "type": "final",
+                    "thought": "Generated a patch; stop after patch generation.",
+                    "summary": "Generated a function-body replacement patch.",
+                    "next_step": next_step,
+                    "steps": st.steps,
+                    "error": _error_payload(st),
+                },
+            }
+
+        if st.pending_patch and st.last_observation and st.last_observation.tool == "read_artifact":
+            if len(st.steps) >= cfg.max_steps:
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Reached max tool steps before generating the patch.",
+                        "summary": "Stopped due to max_steps.",
+                        "next_step": "Increase --max-steps to allow make_error_function_patch to run after read_artifact.",
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
+            decision = st.pending_patch
+            st.pending_patch = None
+            _validate_tool_decision(decision)
+            return {"state": st, "pending": decision}
+
         if len(st.steps) >= cfg.max_steps:
             return {
                 "state": st,
@@ -659,6 +890,103 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                     _validate_tool_decision(forced)
                     return {"state": st, "pending": forced}
 
+            # Guardrail: in patch-scope function rewrite flows, do not accept final until
+            # make_error_function_patch has been called (the primary goal is to emit a patch bundle rewrite).
+            if _should_require_make_error_function_patch(st):
+                prereq = _next_patch_prereq_tool(st)
+                if prereq and remaining >= 1:
+                    _validate_tool_decision(prereq)
+                    return {"state": st, "pending": prereq}
+
+                last_tool = _last_tool_call_name(st)
+                file_path, line_number = _first_error_location(st)
+                if not file_path or line_number <= 0:
+                    return {
+                        "state": st,
+                        "final": {
+                            "type": "final",
+                            "thought": "Cannot force patch generation: missing error file/line location.",
+                            "summary": "Stopped before patch generation.",
+                            "next_step": "Ensure the build log contains a file:line:col error location, or run with --error-scope patch on a log with mapped errors.",
+                            "steps": st.steps,
+                            "error": _error_payload(st),
+                        },
+                    }
+
+                # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
+                if last_tool != "read_artifact":
+                    if remaining < 2:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
+                                "summary": "Stopped before patch generation.",
+                                "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                                "steps": st.steps,
+                                "error": _error_payload(st),
+                            },
+                        }
+
+                    artifact_path = _last_artifact_path(st, "get_error_v1_function_code", "func_code") or _last_artifact_path(
+                        st, "get_error_patch_context", "excerpt"
+                    )
+                    forced_read: Decision = {
+                        "type": "tool",
+                        "thought": "Before generating the patch, read the full V1-origin function artifact so we can rewrite it safely.",
+                        "tool": "read_artifact",
+                        "args": {
+                            "artifact_path": artifact_path,
+                            "start_line": 1,
+                            "max_lines": 800,
+                            "max_chars": 200000,
+                        },
+                    }
+                    _validate_tool_decision(forced_read)
+                    return {"state": st, "pending": forced_read}
+
+                # We just read the function code; require the model to emit a patch-generation tool call next.
+                base_rewrite_messages = list(messages)
+                base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                base_rewrite_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Do NOT return a final decision yet.\n"
+                            "You MUST generate a patch now by calling make_error_function_patch.\n"
+                            "Return exactly one JSON object of type tool with:\n"
+                            f'- tool="make_error_function_patch"\n'
+                            f'- args.patch_path="{st.patch_path}"\n'
+                            f'- args.file_path="{file_path}"\n'
+                            f"- args.line_number={line_number}\n"
+                            "- args.new_func_code=<the full replacement function body as a JSON string with \\\\n escapes>\n"
+                            "Do not include any extra text."
+                        ),
+                    }
+                )
+                try:
+                    coerced = _parse_decision(model.complete(base_rewrite_messages))
+                except Exception:
+                    coerced = {}
+                if isinstance(coerced, dict) and coerced.get("type") == "tool" and str(coerced.get("tool", "")).strip() == "make_error_function_patch":
+                    _validate_tool_decision(coerced)  # type: ignore[arg-type]
+                    return {"state": st, "pending": coerced}  # type: ignore[typeddict-item]
+
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Patch generation required, but the model did not produce a make_error_function_patch tool call.",
+                        "summary": "Stopped before patch generation.",
+                        "next_step": (
+                            "Re-run with a larger model / higher OPENAI_MAX_TOKENS, or manually call make_error_function_patch.\n"
+                            "Required: generate a full replacement function body and pass it as new_func_code."
+                        ),
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
+
             if _decision_suggests_v2_type_edit(decision):
                 base_rewrite_messages = list(messages)
                 base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
@@ -728,6 +1056,63 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
                 },
             }
         _validate_tool_decision(decision)
+
+        # Enforce tool ordering: analysis first, patching last.
+        remaining = cfg.max_steps - len(st.steps)
+        tool = str(decision.get("tool", "")).strip()
+        if tool in {"read_artifact", "make_error_function_patch"}:
+            prereq = _next_patch_prereq_tool(st)
+            if prereq:
+                _validate_tool_decision(prereq)
+                return {"state": st, "pending": prereq}
+
+        if tool == "read_artifact" and remaining < 2:
+            return {
+                "state": st,
+                "final": {
+                    "type": "final",
+                    "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
+                    "summary": "Stopped before patch generation.",
+                    "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                    "steps": st.steps,
+                    "error": _error_payload(st),
+                },
+            }
+
+        if tool == "make_error_function_patch" and st.artifacts_dir and _last_tool_call_name(st) != "read_artifact":
+            if remaining >= 2:
+                st.pending_patch = decision
+                focus_terms = _collect_focus_terms(st)
+                query = focus_terms[0] if focus_terms else ""
+                artifact_path = _last_artifact_path(st, "get_error_v1_function_code", "func_code") or _last_artifact_path(
+                    st, "get_error_patch_context", "excerpt"
+                )
+                forced: Decision = {
+                    "type": "tool",
+                    "thought": "Before generating the patch, read the minimal artifact context needed for the replacement function.",
+                    "tool": "read_artifact",
+                    "args": {
+                        "artifact_path": artifact_path,
+                        "query": query,
+                        "context_lines": 20,
+                        "max_lines": 200,
+                        "max_chars": 40000,
+                    },
+                }
+                _validate_tool_decision(forced)
+                return {"state": st, "pending": forced}
+            return {
+                "state": st,
+                "final": {
+                    "type": "final",
+                    "thought": "Not enough remaining tool steps to read artifacts and generate a patch in-order.",
+                    "summary": "Stopped before patch generation.",
+                    "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                    "steps": st.steps,
+                    "error": _error_payload(st),
+                },
+            }
+
         return {"state": st, "pending": decision}
 
     def tool_node(gs: GraphState) -> GraphState:
@@ -736,8 +1121,18 @@ def _run_langgraph(model: ChatModel, runner: ToolRunner, state: AgentState, cfg:
         tool = str(decision["tool"])
         args = dict(decision.get("args", {}))
         obs = runner.call(tool, args)
+        if artifact_store and obs.ok and obs.tool != "read_artifact":
+            offloaded = offload_patch_output(
+                store=artifact_store, tool=obs.tool, args=obs.args, output=obs.output, focus_terms=_collect_focus_terms(st)
+            )
+            if offloaded is not obs.output:
+                obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
         st.steps.append({"decision": decision, "observation": obs.__dict__})
         st.last_observation = obs
+        if obs.ok and obs.tool == "make_error_function_patch":
+            st.patch_generated = True
+            st.patch_result = obs.output if isinstance(obs.output, dict) else None
+            st.pending_patch = None
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -802,6 +1197,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REACT_AGENT_PATCH_PATH", ""),
         help="Path to a tmp_patch bundle (*.patch2) for patch-aware triage.",
     )
+    parser.add_argument(
+        "--artifact-dir",
+        default=os.environ.get("REACT_AGENT_ARTIFACT_DIR", ""),
+        help="Directory for saving large tool outputs (artifacts). Default: data/react_agent_artifacts/<run_id>/",
+    )
+    parser.add_argument("--no-artifacts", action="store_true", help="Disable artifact-backed tool outputs.")
 
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
     parser.add_argument("--openai-model", default=os.environ.get("OPENAI_MODEL", "") or "gpt-5-mini")
@@ -834,6 +1235,12 @@ def main(argv: List[str]) -> int:
     )
 
     build_log = load_build_log(args.build_log)
+    artifact_store, artifacts_dir = resolve_artifact_dir(
+        cli_dir=str(getattr(args, "artifact_dir", "") or ""), disabled=bool(args.no_artifacts)
+    )
+    if artifact_store and artifacts_dir:
+        os.environ["REACT_AGENT_ARTIFACT_DIR"] = artifacts_dir
+    # Patch-related tool outputs are persisted as artifacts without size thresholds.
 
     patch_path = str(getattr(args, "patch_path", "") or "").strip()
     if not patch_path and getattr(args, "v2_src", None):
@@ -955,12 +1362,19 @@ def main(argv: List[str]) -> int:
             error_scope=cfg.error_scope,
             error_line=error_line,
             snippet=snippet,
+            artifacts_dir=artifacts_dir,
             patch_key=patch_key,
             grouped_errors=grouped_errors,
             missing_struct_members=missing_struct_members,
         )
 
-        final = _run_langgraph(model, runner, state, cfg)
+        final = _run_langgraph(
+            model,
+            runner,
+            state,
+            cfg,
+            artifact_store=artifact_store,
+        )
     except Exception as exc:  # noqa: BLE001
         _emit({"type": "final", "thought": "Agent error.", "summary": "", "next_step": str(exc)}, args.output_format)
         return 1
