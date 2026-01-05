@@ -4,6 +4,7 @@ from typing import Any, Dict, Literal
 
 ToolName = Literal[
     "inspect_symbol",
+    "read_artifact",
     "read_file_context",
     "search_definition",
     "search_definition_in_v1",
@@ -24,6 +25,18 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "name": "inspect_symbol",
         "args": {"symbol_name": "string"},
         "description": "Return formatted V1/V2 code for a symbol.",
+    },
+    {
+        "name": "read_artifact",
+        "args": {
+            "artifact_path": "string",
+            "start_line": "int?",
+            "max_lines": "int?",
+            "query": "string?",
+            "context_lines": "int?",
+            "max_chars": "int?",
+        },
+        "description": "Read a bounded slice from an artifact file produced by this agent run.",
     },
     {
         "name": "read_file_context",
@@ -99,7 +112,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Generate a unified diff that replaces the V1-origin function (from '-' lines in the patch slice) with the provided replacement function code.",
+        "description": "Rewrite the mapped recreated-function slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') and recomputing hunk lengths.",
     },
     {
         "name": "parse_build_errors",

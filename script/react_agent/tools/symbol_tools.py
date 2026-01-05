@@ -86,7 +86,6 @@ class AgentTools:
             return ""
 
         max_snippets = 3
-        max_lines_per_snippet = 120
 
         def extent_range(n: dict) -> Tuple[str, int, int]:
             extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
@@ -120,13 +119,6 @@ class AgentTools:
                 return True
             return False
 
-        def truncate(code: str) -> Tuple[str, bool]:
-            lines = (code or "").splitlines()
-            if len(lines) <= max_lines_per_snippet:
-                return (code or "").rstrip("\n"), False
-            kept = "\n".join(lines[:max_lines_per_snippet]).rstrip("\n")
-            return f"{kept}\n...[truncated {len(lines) - max_lines_per_snippet} lines]", True
-
         def render_snippet(n: dict, *, title: str) -> str:
             kind = str(n.get("kind", "") or "Unknown")
             fp, sl, el = extent_range(n)
@@ -137,8 +129,7 @@ class AgentTools:
                 where = f"{fp}:{sl}-{el}"
             elif sl > 0:
                 where = f"{fp}:{sl}"
-            code = self.source_manager.get_function_code(n, ver)
-            code, _ = truncate(code)
+            code = self.source_manager.get_function_code(n, ver).rstrip("\n")
             return (
                 f"{title}:\n"
                 f"- kind: {kind}{reason_suffix}\n"
@@ -201,8 +192,7 @@ class AgentTools:
                     where = f"{fp}:{sl}-{el}"
                 elif sl > 0:
                     where = f"{fp}:{sl}"
-                code = self.source_manager.get_function_code(cand, ver)
-                code, _ = truncate(code)
+                code = self.source_manager.get_function_code(cand, ver).rstrip("\n")
                 pieces.append(f"{idx}. kind: {kind}{reason_suffix} file: {where}")
                 pieces.append("   Code:")
                 pieces.append("\n".join(f"   {line}" for line in code.splitlines()) if code else "   (no code)")

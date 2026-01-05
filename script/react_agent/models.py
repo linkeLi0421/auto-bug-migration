@@ -37,6 +37,57 @@ class StubModel(ChatModel):
         self._turn += 1
 
         user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+        if "You MUST generate a patch now by calling make_error_function_patch" in user_text:
+            # Runtime guardrail prompt: force a patch-generation tool call.
+            match = None
+            error_line = ""
+            for m in messages:
+                if m.get("role") != "user":
+                    continue
+                for line in m.get("content", "").splitlines():
+                    if _COMPILER_ERROR_RE.match(line.strip()):
+                        error_line = line.strip()
+                        break
+                if error_line:
+                    break
+            match = _COMPILER_ERROR_RE.match(error_line)
+            msg = match.group("msg") if match else ""
+            file_path = match.group("file") if match else ""
+            line_number = int(match.group("line")) if match else 0
+
+            patch_path = ""
+            for line in user_text.splitlines():
+                if line.startswith("Patch bundle path:"):
+                    patch_path = line.split(":", 1)[1].strip()
+                    break
+
+            # Provide a small deterministic replacement. Real runs should use the artifact content.
+            new_func_code = (
+                "int __revert_stub(void) {\n"
+                "  /* Stub replacement used by offline tests.\n"
+                "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
+                "   */\n"
+                "  return 0;\n"
+                "}\n"
+            )
+            if patch_path and file_path and line_number > 0 and ("no member named" in msg or "unknown type name" in msg or msg):
+                return json.dumps(
+                    {
+                        "type": "tool",
+                        "thought": "Forced by runtime guardrail: generate a patch now.",
+                        "tool": "make_error_function_patch",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "new_func_code": new_func_code,
+                            "context_lines": 8,
+                            "max_lines": 2000,
+                            "max_chars": 200000,
+                        },
+                    }
+                )
+
         if "suggests modifying V2 type definitions" in user_text and "Rewrite it into a V2-usage-adaptation plan" in user_text:
             return json.dumps(
                 {
@@ -174,13 +225,40 @@ class StubModel(ChatModel):
                         "args": {"symbol_name": struct_symbol, "version": "v2"},
                     }
                 )
-            if os.environ.get("REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT", "").strip():
+            if observation_count == 4:
+                if os.environ.get("REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT", "").strip():
+                    return json.dumps(
+                        {
+                            "type": "final",
+                            "thought": "A fast fix is to add the missing fields back, but this may be unsafe.",
+                            "summary": "Option A: add missing members to the struct definition in V2 headers.",
+                            "next_step": "Add the missing fields to the struct definition in the V2 header so the migrated code compiles.",
+                        }
+                    )
+                # In the real agent flow, read_artifact should happen immediately before
+                # make_error_function_patch (enforced by runtime guardrails).
+                new_func_code = (
+                    "int __revert_stub(void) {\n"
+                    "  /* Stub replacement used by offline tests.\n"
+                    "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
+                    "   */\n"
+                    "  return 0;\n"
+                    "}\n"
+                )
                 return json.dumps(
                     {
-                        "type": "final",
-                        "thought": "A fast fix is to add the missing fields back, but this may be unsafe.",
-                        "summary": "Option A: add missing members to the struct definition in V2 headers.",
-                        "next_step": "Add the missing fields to the struct definition in the V2 header so the migrated code compiles.",
+                        "type": "tool",
+                        "thought": "Generate a patch that replaces the migrated (V1-origin) function body with an adapted version.",
+                        "tool": "make_error_function_patch",
+                        "args": {
+                            "patch_path": patch_path,
+                            "file_path": file_path,
+                            "line_number": line_number,
+                            "new_func_code": new_func_code,
+                            "context_lines": 8,
+                            "max_lines": 2000,
+                            "max_chars": 200000,
+                        },
                     }
                 )
             return json.dumps(

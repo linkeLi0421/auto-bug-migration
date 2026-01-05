@@ -650,14 +650,14 @@ def make_error_function_patch(
     max_chars: int = 200000,
     allowed_roots: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Generate a unified diff that replaces the V1-origin function with `new_func_code`.
+    """Rewrite a recreated-function patch slice by replacing its `-` lines.
 
     This is the reverse of `get_error_v1_function_code`: it uses the same
     `(patch_key, old_signature, func_start_index, func_end_index)` mapping and
-    reconstructs the old function from `-` lines, then builds a patch that
-    deletes those lines and adds the provided replacement.
+    rewrites the underlying patch text by replacing the `-` lines in the mapped
+    function slice with `new_func_code` (each line prefixed with `-`).
 
-    The tool is read-only: it returns patch text but does not apply it.
+    The tool is read-only: it returns the updated patch text but does not apply it.
     """
     new_code = _extract_first_code_fence(new_func_code)
     if not new_code.strip():
@@ -690,9 +690,39 @@ def make_error_function_patch(
         }
 
     patch = bundle.patches[str(patch_key)]
-    patch_lines = (patch.patch_text or "").splitlines()
-    body = patch_lines[4:] if len(patch_lines) >= 4 else []
-    slice_lines = body[func_start:func_end] if func_end > func_start else []
+    rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
+    rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
+    if not rel_file:
+        rel_file = _norm_path(file_path).lstrip("./").lstrip("/")
+
+    patch_lines = (patch.patch_text or "").split("\n")
+    if len(patch_lines) < 4:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Patch text is too short to contain a unified-diff header.",
+        }
+
+    body_start = 4
+    body_len = len(patch_lines) - body_start
+    func_start_n = max(0, min(int(func_start), body_len))
+    func_end_n = max(0, min(int(func_end), body_len))
+    if func_end_n <= func_start_n:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Invalid function slice indices (empty slice).",
+        }
+
+    slice_start = body_start + func_start_n
+    slice_end = body_start + func_end_n
+    slice_lines = patch_lines[slice_start:slice_end]
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
 
@@ -706,100 +736,98 @@ def make_error_function_patch(
             "note": "Failed to reconstruct old function code from patch slice ('-' lines empty).",
         }
 
-    new_func_lines = [l.rstrip("\n") for l in str(new_code).replace("\r\n", "\n").split("\n")]
-    # Avoid creating a hunk with 0 new lines; empty replacement is almost always unintended.
-    new_func_lines = [l for l in new_func_lines]
-    if len(new_func_lines) == 1 and not new_func_lines[0] and "\n" not in str(new_code):
-        # Single empty line input.
-        raise ValueError("new_func_code must contain a function definition, not an empty line")
-
+    new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
+    new_func_lines = new_code_norm.splitlines()
+    if not any(line.strip() for line in new_func_lines):
+        raise ValueError("new_func_code must contain a function definition")
+    new_minus_lines = [f"-{line}" for line in new_func_lines]
     new_len = len(new_func_lines)
-    old_hunk_start = 0
-    hunk = _parse_first_hunk(patch.patch_text or "")
-    if hunk:
-        old_hunk_start = int(hunk[0])
-    if old_hunk_start <= 0:
-        old_hunk_start = int(patch.old_start_line or 0)
-    if old_hunk_start <= 0:
-        old_hunk_start = 1
 
-    rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
-    rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
-    if not rel_file:
-        rel_file = _norm_path(file_path).lstrip("./").lstrip("/")
+    rewritten_slice: List[str] = []
+    inserted = False
+    for line in slice_lines:
+        if line.startswith("-"):
+            if not inserted:
+                rewritten_slice.extend(new_minus_lines)
+                inserted = True
+            continue
+        rewritten_slice.append(line)
+    if not inserted:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No '-' lines found in the mapped function slice; cannot rewrite patch.",
+        }
 
-    ctx = max(0, min(int(context_lines or 0), 20))
-    ctx_before: List[str] = []
-    ctx_after: List[str] = []
-    ctx_before_start_idx = func_start
-    if ctx:
-        # Pick a few immediate context lines before/after the function slice.
-        before_idx: List[Tuple[int, str]] = []
-        i = func_start - 1
-        while i >= 0 and len(before_idx) < ctx:
-            line = body[i]
-            if line.startswith("@@"):
-                break
-            if line.startswith(" "):
-                before_idx.append((i, line[1:]))
-            i -= 1
-        before_idx.reverse()
-        ctx_before = [t[1] for t in before_idx]
-        if before_idx:
-            ctx_before_start_idx = before_idx[0][0]
+    delta = len(rewritten_slice) - len(slice_lines)
+    patch_lines[slice_start:slice_end] = rewritten_slice
 
-        after_idx: List[Tuple[int, str]] = []
-        i = func_end
-        while i < len(body) and len(after_idx) < ctx:
-            line = body[i]
-            if line.startswith("@@"):
-                break
-            if line.startswith(" "):
-                after_idx.append((i, line[1:]))
+    # If the patch contains merged/tail functions, adjust offsets after the rewritten slice.
+    hiden_func_dict_updated: Optional[Dict[str, int]] = None
+    if delta and getattr(patch, "hiden_func_dict", None):
+        try:
+            new_hiden: Dict[str, int] = {}
+            for sig, off in (patch.hiden_func_dict or {}).items():
+                off_i = int(off)
+                new_hiden[str(sig)] = off_i + delta if off_i >= func_end_n else off_i
+            hiden_func_dict_updated = new_hiden
+            patch_hiden_note = f" Updated hiden_func_dict offsets by {delta} lines."
+        except Exception:
+            patch_hiden_note = ""
+    else:
+        patch_hiden_note = ""
+
+    # Recompute hunk header lengths (keep start lines the same).
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if not line.startswith("@@"):
             i += 1
-        ctx_after = [t[1] for t in after_idx]
+            continue
+        m = _HUNK_RE.match(line.strip())
+        if not m:
+            i += 1
+            continue
+        old_start = int(m.group("old_start"))
+        new_start = int(m.group("new_start"))
+        old_len = 0
+        new_len_hunk = 0
+        j = i + 1
+        while j < len(patch_lines):
+            body_line = patch_lines[j]
+            if body_line.startswith("@@") or body_line.startswith("diff --git "):
+                break
+            if not body_line:
+                j += 1
+                continue
+            prefix = body_line[0]
+            if prefix == " ":
+                old_len += 1
+                new_len_hunk += 1
+            elif prefix == "-":
+                if not body_line.startswith("--- "):
+                    old_len += 1
+            elif prefix == "+":
+                if not body_line.startswith("+++ "):
+                    new_len_hunk += 1
+            elif prefix == "\\":
+                # "\ No newline at end of file" marker
+                pass
+            j += 1
+        patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
+        i = j
 
-    def _old_line_at(body_idx: int) -> int:
-        consumed = sum(1 for line in body[:body_idx] if line.startswith(" ") or line.startswith("-"))
-        return old_hunk_start + consumed
-
-    start_line = _old_line_at(ctx_before_start_idx)
-
-    hunk_old_lines: List[str] = []
-    hunk_new_lines: List[str] = []
-
-    hunk_old_lines.extend(ctx_before)
-    hunk_old_lines.extend(old_func_lines)
-    hunk_old_lines.extend(ctx_after)
-
-    hunk_new_lines.extend(ctx_before)
-    hunk_new_lines.extend(new_func_lines)
-    hunk_new_lines.extend(ctx_after)
-
-    old_hunk_len = len(hunk_old_lines)
-    new_hunk_len = len(hunk_new_lines)
-
-    header = f"diff --git a/{rel_file} b/{rel_file}\n--- a/{rel_file}\n+++ b/{rel_file}\n"
-    hunk_header = f"@@ -{start_line},{old_hunk_len} +{start_line},{new_hunk_len} @@\n"
-
-    patch_body_lines: List[str] = []
-    for line in ctx_before:
-        patch_body_lines.append(f" {line}")
-    for line in old_func_lines:
-        patch_body_lines.append(f"-{line}")
-    for line in new_func_lines:
-        patch_body_lines.append(f"+{line}")
-    for line in ctx_after:
-        patch_body_lines.append(f" {line}")
-
-    patch_text_full = header + hunk_header + "\n".join(patch_body_lines) + "\n"
+    patch_text_full = "\n".join(patch_lines)
 
     old_func_code, old_truncated, _, _ = _truncate_text(text=old_func_code_full, max_lines=200, max_chars=12000)
     patch_text, patch_truncated, patch_total_lines, patch_returned_lines = _truncate_text(
         text=patch_text_full, max_lines=max_lines, max_chars=max_chars
     )
 
-    return {
+    out: Dict[str, Any] = {
         **mapping,
         "file_path_patch": rel_file,
         "old_func_code": old_func_code,
@@ -810,10 +838,14 @@ def make_error_function_patch(
         "patch_text_lines_total": patch_total_lines,
         "patch_text_lines_returned": patch_returned_lines,
         "note": (
-            "Generated a unified diff that replaces the V1-origin function text (from '-' lines) "
-            "with the provided replacement. Apply this to the migrated codebase."
+            "Rewrote the patch bundle's recreated-function slice by replacing '-' lines with the provided code. "
+            "Use the returned patch_text to update the patch bundle entry."
+            + patch_hiden_note
         ),
     }
+    if hiden_func_dict_updated is not None:
+        out["hiden_func_dict_updated"] = hiden_func_dict_updated
+    return out
 
 
 def parse_build_errors_tool(*, build_log_text: str = "", build_log_path: str = "") -> Dict[str, Any]:
