@@ -106,3 +106,45 @@ assert any(i.get("kind") == "unknown_type_name" for i in parsed.get("undeclared_
 
 print("OK")
 PY
+
+# Multi-hunk header rewrite: later hunks must get +new_start adjusted when the first hunk delta changes.
+fixture_b64="$SCRIPT_DIR/fixtures/multi_hunk.patch2.b64"
+bundle_path="$tmp_dir/_fixture_multi_hunk.patch2"
+
+"$PYTHON" - "$fixture_b64" "$bundle_path" <<'PY'
+import base64
+import json
+import sys
+from pathlib import Path
+
+fixture_b64 = Path(sys.argv[1])
+bundle_path = Path(sys.argv[2])
+allowed_roots = [str(bundle_path.parent)]
+
+data = base64.b64decode(fixture_b64.read_text(encoding="utf-8").strip())
+bundle_path.parent.mkdir(parents=True, exist_ok=True)
+bundle_path.write_bytes(data)
+
+from script.migration_tools.patch_bundle import load_patch_bundle
+from script.migration_tools.tools import make_error_function_patch
+
+bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
+assert list(bundle.patches.keys()) == ["p2"], list(bundle.patches.keys())
+
+out = make_error_function_patch(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/error.c",
+    line_number=11,
+    new_func_code="NEW1\nNEW2",
+    max_lines=2000,
+    max_chars=200000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(out)
+patch_text = out.get("patch_text") or ""
+assert "@@ -10,4 +10,2 @@" in patch_text, patch_text
+assert "@@ -30,2 +28,3 @@" in patch_text, patch_text
+assert "-NEW1" in patch_text and "-NEW2" in patch_text, patch_text
+
+print("OK")
+PY
