@@ -53,7 +53,7 @@ This should reuse the existing implementation/approach in `script/revert_patch_t
 - [x] Define the tool API and guardrails:
   - [x] Name: `ossfuzz_apply_patch_and_test`.
   - [x] Args: `project`, `commit`, `patch_path`, optional `patch_override_paths`, `sanitizer`, `architecture`, `engine`, `build_csv`, `fuzz_target`.
-  - [x] Disabled by default; require explicit opt-in (`REACT_AGENT_ENABLE_OSSFUZZ=1`) because it uses Docker and may require `sudo`.
+  - [x] Enabled by default (no opt-in guard); may require `sudo` depending on Docker setup (`--ossfuzz-use-sudo`).
   - [x] Timeouts + bounded outputs (logs are artifact-backed in agent runs).
 - [x] Implement the tool by reusing existing code paths:
   - [x] Build via `script/fuzz_helper.py build_version` (same as `script/revert_patch_test.py`).
@@ -135,28 +135,52 @@ The agent should ALWAYS test the patch in OSS-Fuzz after generating it (no opt-i
 
 ### Plan / Tasks
 
-- [ ] Add agent CLI/config for OSS-Fuzz testing:
-  - [ ] `--ossfuzz-project`, `--ossfuzz-commit`
-  - [ ] optional: `--ossfuzz-build-csv`, `--ossfuzz-sanitizer`, `--ossfuzz-arch`, `--ossfuzz-engine`, `--ossfuzz-fuzz-target`, `--ossfuzz-use-sudo`
-  - [ ] include these values in the initial prompt header so the model can call the tool without guessing.
-  - [ ] if required OSS-Fuzz args are missing, fail fast (don’t allow a run that can generate a patch but cannot test it).
-  - [ ] remove the opt-in env guard (`REACT_AGENT_ENABLE_OSSFUZZ`) so testing can’t be skipped by configuration.
-- [ ] Track the generated override diff path(s) in agent state:
-  - [ ] after `make_error_function_patch`, store `patch_text.artifact_path` into `state.patch_override_paths`.
-  - [ ] keep only the latest override per `patch_key` (or just keep the last one for the current `patch_key` run).
-- [ ] Update runtime guardrails / phase rules:
-  - [ ] replace “stop after patch generation” with mandatory testing:
-    - [ ] after a successful `make_error_function_patch`, force one more tool call `ossfuzz_apply_patch_and_test`, then `final`.
-  - [ ] add a new guardrail: don’t accept `final` unless `ossfuzz_apply_patch_and_test` has been called after `make_error_function_patch`.
-  - [ ] update step budgeting: require enough remaining steps for `read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test`.
-- [ ] Prompt updates:
-  - [ ] add a system-prompt rule: after generating a patch, ALWAYS call `ossfuzz_apply_patch_and_test` before returning `final`.
-  - [ ] model should pass override diff paths directly (do NOT call `read_artifact` just to read the diff).
-- [ ] Tests (non-Docker):
-  - [ ] extend stub-mode tests to assert mandatory ordering:
-    - [ ] `... make_error_function_patch -> ossfuzz_apply_patch_and_test -> final`
-  - [ ] remove/replace any tests that assume OSS-Fuzz testing is optional.
+- [x] Add agent CLI/config for OSS-Fuzz testing:
+  - [x] `--ossfuzz-project`, `--ossfuzz-commit`
+  - [x] optional: `--ossfuzz-build-csv`, `--ossfuzz-sanitizer`, `--ossfuzz-arch`, `--ossfuzz-engine`, `--ossfuzz-fuzz-target`, `--ossfuzz-use-sudo`
+  - [x] include these values in the initial prompt header so the model can call the tool without guessing.
+  - [x] if required OSS-Fuzz args are missing, fail fast (don’t allow a run that can generate a patch but cannot test it).
+  - [x] remove the opt-in env guard (`REACT_AGENT_ENABLE_OSSFUZZ`) so testing can’t be skipped by configuration.
+- [x] Track the generated override diff path(s) in agent state:
+  - [x] after `make_error_function_patch`, store `patch_text.artifact_path` into `state.patch_override_paths`.
+  - [x] keep only the latest override per `patch_key` (or just keep the last one for the current `patch_key` run).
+- [x] Update runtime guardrails / phase rules:
+  - [x] replace “stop after patch generation” with mandatory testing:
+    - [x] after a successful `make_error_function_patch`, force one more tool call `ossfuzz_apply_patch_and_test`, then `final`.
+  - [x] add a new guardrail: don’t accept `final` unless `ossfuzz_apply_patch_and_test` has been called after `make_error_function_patch`.
+  - [x] update step budgeting: require enough remaining steps for `read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test`.
+- [x] Prompt updates:
+  - [x] add a system-prompt rule: after generating a patch, ALWAYS call `ossfuzz_apply_patch_and_test` before returning `final`.
+  - [x] model should pass override diff paths directly (do NOT call `read_artifact` just to read the diff).
+- [x] Tests (non-Docker):
+  - [x] extend stub-mode tests to assert mandatory ordering:
+    - [x] `... make_error_function_patch -> ossfuzz_apply_patch_and_test -> final`
+  - [x] remove/replace any tests that assume OSS-Fuzz testing is optional.
 
 ### Success criteria
 
-- [ ] A patch-scope run ends with an OSS-Fuzz test attempt (logs saved as artifacts) instead of stopping right after patch generation.
+- [x] A patch-scope run ends with an OSS-Fuzz test attempt (logs saved as artifacts) instead of stopping right after patch generation.
+
+
+## Next: Remove all error-count limits (no `--max-errors`, no internal caps)
+
+### Problem
+
+`--max-errors` forces callers to pick an arbitrary limit and complicates the CLI. Previously, `iter_compiler_errors(...)` also capped the number of collected errors.
+
+### Goal
+
+Remove `--max-errors` / `REACT_AGENT_MAX_ERRORS` and remove any internal caps on how many errors are parsed from the build log.
+
+### Plan / Tasks
+
+- [x] Remove `--max-errors` and `REACT_AGENT_MAX_ERRORS` from `script/react_agent/agent_langgraph.py`.
+- [x] Update `script/react_agent/build_log.py` to remove `limit` and stop capping/breaking by error count.
+- [x] Update callsites to use the new `iter_compiler_errors(...)` signature.
+- [x] Update docs/tests that reference `--max-errors` (e.g. `script/react_agent/README.md`, `script/react_agent/test_langgraph_agent.sh`).
+
+### Success criteria
+
+- [x] The agent runs without any `--max-errors` flag.
+- [x] Patch-scope runs still group multiple errors when present.
+- [x] The agent never truncates the number of parsed errors due to an internal cap.

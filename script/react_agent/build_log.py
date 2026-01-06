@@ -10,7 +10,6 @@ _COMPILER_ERROR_RE = re.compile(
     r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?:fatal\s+)?error:\s*(?P<msg>.*)$"
 )
 
-
 def load_build_log(path_or_stdin: Optional[str]) -> str:
     """Load a build log from a file path, or stdin when path_or_stdin is '-' / None."""
     if not path_or_stdin or path_or_stdin == "-":
@@ -39,7 +38,7 @@ def find_first_fatal(build_log: str) -> Tuple[str, str]:
     return "", ""
 
 
-def iter_compiler_errors(build_log: str, *, limit: int = 50, snippet_lines: int = 2) -> List[Dict[str, Any]]:
+def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict[str, Any]]:
     """Return compiler errors parsed from the log in order.
 
     Output items:
@@ -49,7 +48,6 @@ def iter_compiler_errors(build_log: str, *, limit: int = 50, snippet_lines: int 
     lines = build_log.splitlines()
     errors: List[Dict[str, Any]] = []
     seen: set[Tuple[str, int, int, str]] = set()
-    max_n = max(0, min(int(limit or 0), 200))
     ctx = max(0, min(int(snippet_lines or 0), 10))
 
     for idx, line in enumerate(lines):
@@ -79,7 +77,4 @@ def iter_compiler_errors(build_log: str, *, limit: int = 50, snippet_lines: int 
                 "snippet": "\n".join(lines[start:end]),
             }
         )
-        if len(errors) >= max_n:
-            break
-
     return errors

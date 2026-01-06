@@ -175,9 +175,6 @@ def ossfuzz_apply_patch_and_test(
 
     This reuses the same workflow used by script/revert_patch_test.py via script/fuzz_helper.py and oss-fuzz/infra/helper.py.
     """
-    if not _env_flag("REACT_AGENT_ENABLE_OSSFUZZ"):
-        raise ValueError("OSS-Fuzz tool is disabled. Set REACT_AGENT_ENABLE_OSSFUZZ=1 to enable it.")
-
     project_name = str(project or "").strip()
     commit_id = str(commit or "").strip()
     if not project_name:
