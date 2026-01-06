@@ -99,11 +99,17 @@ class AgentTools:
 
         def node_key(n: dict) -> str:
             usr = str(n.get("usr", "") or "").strip()
-            if usr:
-                return f"usr:{usr}"
             fp, sl, el = extent_range(n)
             kind = str(n.get("kind", "") or "")
             spelling = str(n.get("spelling", "") or "")
+            reason = str(n.get("__reason", "") or "").strip()
+            # For pseudo candidates derived from nested extents (e.g. type_ref.typedef_extent),
+            # include the extent in the key even when a USR is present; otherwise we may drop
+            # the real definition if multiple extents share the same USR.
+            if reason:
+                return f"pseudo:{usr}:{kind}:{spelling}:{fp}:{sl}:{el}:{reason}"
+            if usr:
+                return f"usr:{usr}"
             return f"ext:{kind}:{spelling}:{fp}:{sl}:{el}"
 
         def snippet_lines(n: dict) -> int:
@@ -115,7 +121,7 @@ class AgentTools:
         def looks_forward_decl(n: dict) -> bool:
             kind = str(n.get("kind", "") or "")
             line_count = snippet_lines(n)
-            if kind in {"TYPEDEF_DECL", "STRUCT_DECL", "UNION_DECL", "ENUM_DECL"} and line_count <= 2:
+            if kind in {"TYPEDEF_DECL", "STRUCT_DECL", "UNION_DECL", "ENUM_DECL", "TYPE_REF"} and line_count <= 2:
                 return True
             return False
 

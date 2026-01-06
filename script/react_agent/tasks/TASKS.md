@@ -58,13 +58,13 @@ For typedef-to-struct patterns, `search_definition` prints:
 
 ### Plan / Tasks
 
-- [ ] Add a helper to materialize “virtual nodes” from KB nested extents:
+- [x] Add a helper to materialize “virtual nodes” from KB nested extents:
   - if a node has `type_ref.typedef_extent`, emit a synthetic candidate node whose `extent` is that `typedef_extent` (and `kind` like `STRUCT_DECL` with a `__reason` such as `type_ref.typedef_extent`).
   - do the same for any other nested extents we rely on (keep it minimal; start with `typedef_extent`).
-- [ ] Update `KbIndex.related_definition_candidates(...)` (or `AgentTools.search_definition`) to include these synthetic candidates so ranking can prefer the real body over forward decl/typedef.
-- [ ] Add a regression test for `_xmlHashTable` (v2) that asserts the output includes the `hash.c:<start>-<end>` struct snippet (not just the typedef line).
-- [ ] Ensure the output remains bounded and doesn’t introduce `...[truncated]` markers in the `search_definition` tool output.
+- [x] Update `KbIndex.related_definition_candidates(...)` (or `AgentTools.search_definition`) to include these synthetic candidates so ranking can prefer the real body over forward decl/typedef.
+- [x] Add a regression test for `_xmlHashTable` (v2) that asserts the output includes the `hash.c:<start>-<end>` struct snippet (not just the typedef line).
+- [x] Ensure the output remains bounded and doesn’t introduce `...[truncated]` markers in the `search_definition` tool output.
 
 ### Success criteria
 
-- [ ] Running `search_definition("struct _xmlHashTable", version="v2")` shows the actual struct body (via `typedef_extent`) in addition to the typedef alias.
+- [x] Running `search_definition("struct _xmlHashTable", version="v2")` shows the actual struct body (via `typedef_extent`) in addition to the typedef alias.
