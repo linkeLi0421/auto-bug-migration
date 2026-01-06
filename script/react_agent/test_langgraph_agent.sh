@@ -355,4 +355,94 @@ assert "OVERRIDE_LINE" in merged_text, merged_path
 assert "p2" in (out.get("overridden_patch_keys") or []), out
 PY
 
+# Target-error verdict helper (non-Docker): verify we can detect whether the original error remains in OSS-Fuzz logs.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, ToolObservation, _summarize_target_error_status  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    bundle_path = root / "bundle.pkl"
+    patches = {
+        "p_target": PatchInfo(
+            file_path_old="libxml2/hash.c",
+            file_path_new="libxml2/hash.c",
+            patch_text=(
+                "diff --git a/libxml2/hash.c b/libxml2/hash.c\n"
+                "--- a/libxml2/hash.c\n"
+                "+++ b/libxml2/hash.c\n"
+                "@@ -290,10 +290,10 @@\n"
+                "-old\n"
+                "+new\n"
+            ),
+            file_type="source",
+            old_start_line=290,
+            old_end_line=299,
+            new_start_line=290,
+            new_end_line=299,
+        ),
+        "p_other": PatchInfo(
+            file_path_old="libxml2/hash.c",
+            file_path_new="libxml2/hash.c",
+            patch_text=(
+                "diff --git a/libxml2/hash.c b/libxml2/hash.c\n"
+                "--- a/libxml2/hash.c\n"
+                "+++ b/libxml2/hash.c\n"
+                "@@ -550,10 +550,10 @@\n"
+                "-old2\n"
+                "+new2\n"
+            ),
+            file_type="source",
+            old_start_line=550,
+            old_end_line=559,
+            new_start_line=550,
+            new_end_line=559,
+        ),
+    }
+    bundle_path.write_bytes(pickle.dumps(patches))
+
+    build_log = root / "build.log"
+    msg = "no member named 'randomSeed' in 'struct _xmlHashTable'"
+    build_log.write_text(f"/src/libxml2/hash.c:295:11: error: {msg}\n", encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="-",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line="/src/libxml2/hash.c:295:11: error: no member named 'randomSeed' in 'struct _xmlHashTable'",
+        snippet="",
+        artifacts_dir=str(root),
+        patch_key="p_target",
+        grouped_errors=[],
+        missing_struct_members=[],
+        target_errors=[{"patch_key": "p_target", "msg": msg}],
+    )
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_log)}},
+        error=None,
+    )
+    verdict = _summarize_target_error_status(st)
+    assert verdict.get("status") == "ok", verdict
+    assert verdict.get("fixed") is False, verdict
+
+    build_log.write_text(f"/src/libxml2/hash.c:554:52: error: {msg}\n", encoding="utf-8")
+    verdict2 = _summarize_target_error_status(st)
+    assert verdict2.get("status") == "ok", verdict2
+    assert verdict2.get("fixed") is True, verdict2
+PY
+
 echo "OK"
