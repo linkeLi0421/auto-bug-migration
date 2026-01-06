@@ -1494,6 +1494,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a tmp_patch bundle (*.patch2) for patch-aware triage.",
     )
     parser.add_argument(
+        "--focus-patch-key",
+        default=os.environ.get("REACT_AGENT_FOCUS_PATCH_KEY", ""),
+        help="In --error-scope patch mode, select this patch_key group (hunk) instead of the default heuristic.",
+    )
+    parser.add_argument(
         "--artifact-dir",
         default=os.environ.get("REACT_AGENT_ARTIFACT_DIR", ""),
         help="Directory for saving large tool outputs (artifacts). Default: data/react_agent_artifacts/<run_id>/",
@@ -1604,7 +1609,11 @@ def main(argv: List[str]) -> int:
                         first_mapped_key = key
                     groups.setdefault(key, []).append(enriched)
             if groups:
-                patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
+                focus = str(getattr(args, "focus_patch_key", "") or "").strip()
+                if focus and focus in groups:
+                    patch_key = focus
+                else:
+                    patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
                 grouped_errors = groups[patch_key]
                 if grouped_errors:
                     error_line = str(grouped_errors[0].get("raw", error_line))

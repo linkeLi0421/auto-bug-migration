@@ -68,3 +68,49 @@ For typedef-to-struct patterns, `search_definition` prints:
 ### Success criteria
 
 - [x] Running `search_definition("struct _xmlHashTable", version="v2")` shows the actual struct body (via `typedef_extent`) in addition to the typedef alias.
+
+## Next: Parallelize patch-scope fixing across multiple hunks
+
+### Problem
+
+Right now the agent solves only the **first** error group (typically the first/most common `patch_key` group). In practice, OSS-Fuzz builds often fail with **multiple independent patch hunks** (different `patch_key`s), and we want to triage/fix them in parallel and then decide which fix(es) to apply.
+
+### Goal
+
+Given a build log (or OSS-Fuzz build/check_build artifacts), automatically:
+
+1. parse compiler errors
+2. map each error to a `patch_key` (hunk key) using the patch bundle
+3. group by `patch_key` and pick one representative “primary” error line per group
+4. run **one ReAct agent per group** (separately) and collect their results for review
+
+The user reviews the per-hunk agent outputs and decides next actions (apply only certain overrides, rerun OSS-Fuzz, iterate, etc.).
+
+### Plan / Tasks
+
+- [x] Add a new driver command that fans out per-hunk agents (no auto-apply):
+  - new CLI entry (recommended): `script/react_agent/multi_agent.py` or a new `--mode multi` in `agent_langgraph.py`.
+  - inputs: `--patch-path`, `--build-log` (or `--ossfuzz-artifacts`), `--v1-json-dir`, `--v2-json-dir`, `--v1-src`, `--v2-src`.
+  - outputs: one JSON/text report plus per-hunk artifact dirs.
+- [x] Error parsing + grouping pipeline:
+  - reuse `script/react_agent/build_log.py:iter_compiler_errors` to extract `(file,line,col,msg,raw)` from build/check_build logs.
+  - load patch bundle via `script/migration_tools/patch_bundle.py:load_patch_bundle` (respect `REACT_AGENT_PATCH_ALLOWED_ROOTS`).
+  - map each error to `patch_key` with `migration_tools.tools._get_error_patch_from_bundle(...)`.
+  - group errors by `patch_key`; drop unmapped errors into `patch_key=None` group.
+  - select a stable representative per group (e.g. first error in file/line order).
+- [x] Per-hunk agent invocation:
+  - for each `patch_key` group, call the existing agent with `--error-scope patch` but override its `state.error_line`/`state.grouped_errors` to that group.
+  - ensure each sub-agent writes to its own artifact dir: `data/react_agent_artifacts/<parent_run>/<patch_key>/...`.
+  - enforce the existing “must OSS-Fuzz test after generating a patch” policy **within each sub-agent**, but do not automatically merge/apply across groups unless user requests.
+- [x] Aggregate reporting:
+  - produce a summary table: `patch_key`, primary error, `Target error fixed`, whether an override diff was generated, and artifact paths.
+  - keep the report bounded and easy to scan in text mode; save full details to artifacts.
+- [x] Add tests (non-Docker):
+  - synthetic build log with 2 different patch keys and verify grouping + stable representative selection.
+  - smoke test that the driver produces N sub-runs and a top-level summary.
+
+### Success criteria
+
+- [x] One command produces per-hunk agent results for all patch keys found in the build logs.
+- [x] No automatic “apply everything”; user can choose which overrides to keep/merge.
+- [x] The workflow scales to dozens of hunks while keeping console output bounded (details offloaded to artifacts).
