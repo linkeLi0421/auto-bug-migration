@@ -56,6 +56,7 @@ class AgentState:
     pending_patch: Optional[Decision] = None
     patch_generated: bool = False
     patch_result: Optional[Dict[str, Any]] = None
+    target_errors: List[Dict[str, str]] = field(default_factory=list)
 
     # OSS-Fuzz testing config (required for patch-scope runs once a patch is generated)
     ossfuzz_project: str = ""
@@ -101,9 +102,195 @@ def _error_payload(state: AgentState) -> Dict[str, Any]:
             }
             for e in state.grouped_errors
         ]
+    if state.target_errors:
+        payload["target_errors"] = state.target_errors
     if state.missing_struct_members:
         payload["missing_struct_members"] = state.missing_struct_members
     return payload
+
+
+def _extract_target_errors(
+    *,
+    error_line: str,
+    grouped_errors: List[Dict[str, Any]],
+    patch_key: str = "",
+) -> List[Dict[str, str]]:
+    targets: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    pk = str(patch_key or "").strip()
+    for e in grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        fp = str(e.get("file", "") or "").strip()
+        msg = str(e.get("msg", "") or "").strip()
+        if not fp or not msg:
+            continue
+        key = (pk or fp, msg)
+        if key in seen:
+            continue
+        seen.add(key)
+        item = {"file": fp, "msg": msg}
+        if pk:
+            item["patch_key"] = pk
+        targets.append(item)
+    if targets:
+        return targets
+
+    raw = str(error_line or "").strip()
+    m = _ERROR_LOC_RE.match(raw)
+    if m:
+        fp = str(m.group("file") or "").strip()
+        msg_m = re.search(r"\berror:\s*(.*)$", raw)
+        msg = str((msg_m.group(1) if msg_m else "") or "").strip()
+        if fp and msg:
+            targets.append({"file": fp, "msg": msg})
+    return targets
+
+
+def _read_text(path: str) -> str:
+    p = Path(str(path or "").strip()).expanduser().resolve()
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
+    """Return whether the original target errors still appear after OSS-Fuzz build/check_build."""
+    targets = list(state.target_errors or [])
+    if not targets:
+        targets = _extract_target_errors(error_line=state.error_line, grouped_errors=state.grouped_errors, patch_key=state.patch_key)
+    if not targets:
+        return {"status": "unknown", "reason": "No target errors captured."}
+
+    obs = state.last_observation
+    out = obs.output if isinstance(obs, ToolObservation) else None
+    if not isinstance(out, dict):
+        return {"status": "unknown", "reason": "Missing OSS-Fuzz tool output."}
+
+    def artifact_path(field: str) -> str:
+        v = out.get(field)
+        if isinstance(v, dict):
+            return str(v.get("artifact_path", "") or "").strip()
+        if isinstance(v, str):
+            return v.strip()
+        return ""
+
+    build_path = artifact_path("build_output")
+    check_path = artifact_path("check_build_output")
+    if not build_path and not check_path:
+        return {"status": "unknown", "reason": "No build/check_build log artifacts found."}
+
+    combined_errors: List[Dict[str, Any]] = []
+    sources: List[str] = []
+    try:
+        if build_path:
+            sources.append(build_path)
+            combined_errors.extend(iter_compiler_errors(_read_text(build_path), snippet_lines=0))
+        if check_path:
+            sources.append(check_path)
+            combined_errors.extend(iter_compiler_errors(_read_text(check_path), snippet_lines=0))
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "reason": f"Failed to parse logs: {exc}", "log_artifacts": sources}
+
+    def same_file(a: str, b: str) -> bool:
+        a_s = str(a or "").strip()
+        b_s = str(b or "").strip()
+        if not a_s or not b_s:
+            return False
+        if a_s == b_s:
+            return True
+        return Path(a_s).name == Path(b_s).name
+
+    def allowed_roots_from_env() -> list[str] | None:
+        raw = os.environ.get("REACT_AGENT_PATCH_ALLOWED_ROOTS", "").strip()
+        if not raw:
+            return None
+        roots = [r.strip() for r in raw.split(os.pathsep) if r.strip()]
+        return roots or None
+
+    bundle: Any = None
+    bundle_err: Optional[str] = None
+    load_patch_bundle: Any = None
+    get_error_patch_from_bundle: Any = None
+
+    def patch_key_for_error(file_path: str, line_number: int) -> str:
+        nonlocal bundle, bundle_err, load_patch_bundle, get_error_patch_from_bundle
+        fp = str(file_path or "").strip()
+        ln = int(line_number or 0)
+        if not (state.patch_path and fp and ln > 0):
+            return ""
+        if bundle_err is not None:
+            return ""
+        try:
+            if bundle is None:
+                script_dir = Path(__file__).resolve().parents[1]
+                if str(script_dir) not in sys.path:
+                    sys.path.insert(0, str(script_dir))
+                from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
+                from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+
+                load_patch_bundle = _lpb
+                get_error_patch_from_bundle = _gepb
+                bundle = load_patch_bundle(state.patch_path, allowed_roots=allowed_roots_from_env())
+            mapping = get_error_patch_from_bundle(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            return str(mapping.get("patch_key") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            bundle_err = f"{type(exc).__name__}: {exc}"
+            return ""
+
+    matched: List[Dict[str, Any]] = []
+    matched_keys: set[tuple[str, str]] = set()
+    for err in combined_errors:
+        fp = str(err.get("file", "") or "").strip()
+        ln = int(err.get("line", 0) or 0)
+        msg = str(err.get("msg", "") or "").strip()
+        if not fp or not msg:
+            continue
+        err_patch_key = patch_key_for_error(fp, ln)
+        for t in targets:
+            t_patch_key = str(t.get("patch_key", "") or "").strip()
+            if t_patch_key:
+                if err_patch_key != t_patch_key:
+                    continue
+                if msg != str(t.get("msg", "")).strip():
+                    continue
+                k = (t_patch_key, msg)
+                if k in matched_keys:
+                    continue
+                matched_keys.add(k)
+                matched.append(
+                    {"raw": err.get("raw", ""), "file": fp, "line": ln, "patch_key": err_patch_key, "msg": msg}
+                )
+                continue
+            if not same_file(fp, t.get("file", "")):
+                continue
+            if msg != str(t.get("msg", "")).strip():
+                continue
+            k = (fp, msg)
+            if k in matched_keys:
+                continue
+            matched_keys.add(k)
+            matched.append({"raw": err.get("raw", ""), "file": fp, "line": ln, "patch_key": err_patch_key, "msg": msg})
+
+    fixed = len(matched) == 0
+    other = [
+        {
+            "raw": str(e.get("raw", "") or "").strip(),
+            "file": str(e.get("file", "") or "").strip(),
+            "line": int(e.get("line", 0) or 0),
+            "patch_key": patch_key_for_error(str(e.get("file", "") or ""), int(e.get("line", 0) or 0)),
+            "msg": str(e.get("msg", "") or "").strip(),
+        }
+        for e in combined_errors
+        if str(e.get("raw", "") or "").strip()
+    ]
+    return {
+        "status": "ok",
+        "fixed": fixed,
+        "targets": targets,
+        "matched_target_errors": matched,
+        "other_errors": other[:10],
+        "log_artifacts": sources,
+        "mapping_error": bundle_err,
+    }
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -841,15 +1028,37 @@ def _run_langgraph(
                 out = st.last_observation.output
                 if isinstance(out, dict):
                     merged_patch_file_path = str(out.get("merged_patch_file_path", "") or "").strip()
-            next_step = "Review OSS-Fuzz logs in artifacts and apply the merged patch file." \
-                + (f" Merged patch: {merged_patch_file_path}" if merged_patch_file_path else "") \
-                + (f" Override diff: {patch_text_path}" if patch_text_path else "")
+            verdict = _summarize_target_error_status(st)
+            fixed_str = "unknown"
+            if verdict.get("status") == "ok":
+                fixed_str = "yes" if verdict.get("fixed") else "no"
+            next_step_lines = [f"Target error fixed: {fixed_str}."]
+            if verdict.get("status") == "ok":
+                matched = verdict.get("matched_target_errors") or []
+                if matched:
+                    next_step_lines.append("Remaining target errors:")
+                    for m in matched[:5]:
+                        raw = str((m or {}).get("raw", "")).strip()
+                        if raw:
+                            next_step_lines.append(f"- {raw}")
+                elif verdict.get("other_errors"):
+                    next_step_lines.append("Next top errors:")
+                    for e in (verdict.get("other_errors") or [])[:5]:
+                        raw = str((e or {}).get("raw", "")).strip()
+                        if raw:
+                            next_step_lines.append(f"- {raw}")
+            next_step_lines.append("Review OSS-Fuzz logs in artifacts and apply the merged patch file.")
+            if merged_patch_file_path:
+                next_step_lines.append(f"Merged patch: {merged_patch_file_path}")
+            if patch_text_path:
+                next_step_lines.append(f"Override diff: {patch_text_path}")
+            next_step = "\n".join(next_step_lines).strip()
             return {
                 "state": st,
                 "final": {
                     "type": "final",
                     "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
-                    "summary": "Generated a function-body replacement patch and tested it in OSS-Fuzz.",
+                    "summary": "Generated a function-body replacement patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
                     "next_step": next_step.strip(),
                     "steps": st.steps,
                     "error": _error_payload(st),
@@ -1224,7 +1433,7 @@ def _run_langgraph(
                     patch_text_path = str(pt.get("artifact_path", "") or "").strip()
             if patch_text_path:
                 st.patch_override_paths = [patch_text_path]
-        if obs.ok and obs.tool == "ossfuzz_apply_patch_and_test":
+        if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
         return {"state": st}
 
@@ -1425,6 +1634,8 @@ def main(argv: List[str]) -> int:
             patch_key = ""
             missing_struct_members = []
 
+    target_errors = _extract_target_errors(error_line=error_line, grouped_errors=grouped_errors, patch_key=patch_key)
+
     artifact_store, artifacts_dir = resolve_artifact_dir(
         cli_dir=str(getattr(args, "artifact_dir", "") or ""),
         disabled=bool(args.no_artifacts),
@@ -1478,6 +1689,7 @@ def main(argv: List[str]) -> int:
             patch_key=patch_key,
             grouped_errors=grouped_errors,
             missing_struct_members=missing_struct_members,
+            target_errors=target_errors,
             ossfuzz_project=ossfuzz_project,
             ossfuzz_commit=ossfuzz_commit,
             ossfuzz_build_csv=str(getattr(args, "ossfuzz_build_csv", "") or "").strip(),
