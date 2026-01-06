@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -138,9 +139,13 @@ def merge_patch_bundle_with_overrides(
 def _run(
     cmd: List[str],
     *,
+    label: str = "",
     cwd: Optional[str] = None,
     timeout_seconds: int = 1800,
 ) -> Dict[str, Any]:
+    rendered = shlex.join([str(x) for x in cmd])
+    prefix = f"[ossfuzz_apply_patch_and_test] {label}: " if str(label or "").strip() else "[ossfuzz_apply_patch_and_test] "
+    print(prefix + rendered, flush=True)
     proc = subprocess.run(
         [str(x) for x in cmd],
         cwd=cwd,
@@ -229,7 +234,7 @@ def ossfuzz_apply_patch_and_test(
     build_cmd.append(project_name)
     build_cmd = _maybe_prefix_sudo(build_cmd, use_sudo=use_sudo)
 
-    build_res = _run(build_cmd, cwd=str(repo_root), timeout_seconds=timeout_seconds)
+    build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
     build_ok = build_res["returncode"] == 0
 
     check_build_cmd: List[str] = [
@@ -248,7 +253,7 @@ def ossfuzz_apply_patch_and_test(
     ]
     check_build_cmd = _maybe_prefix_sudo(check_build_cmd, use_sudo=use_sudo)
 
-    check_res = _run(check_build_cmd, cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
+    check_res = _run(check_build_cmd, label="check_build", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
     check_ok = check_res["returncode"] == 0
 
     run_fuzzer_output = ""
@@ -269,7 +274,7 @@ def ossfuzz_apply_patch_and_test(
             "-timeout=5",
         ]
         run_fuzzer_cmd = _maybe_prefix_sudo(run_fuzzer_cmd, use_sudo=use_sudo)
-        run_res = _run(run_fuzzer_cmd, cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
+        run_res = _run(run_fuzzer_cmd, label="run_fuzzer", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
         run_fuzzer_output = run_res["output"]
         run_fuzzer_ok = run_res["returncode"] == 0
 
