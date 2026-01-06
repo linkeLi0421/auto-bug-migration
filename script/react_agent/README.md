@@ -25,7 +25,7 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
 
 - `load_build_log(path_or_stdin)`
 - `find_first_fatal(build_log)`
-- `iter_compiler_errors(build_log, limit=..., snippet_lines=...)`
+- `iter_compiler_errors(build_log, snippet_lines=...)`
 
 ## LLM + LangGraph agent
 
@@ -79,8 +79,9 @@ python3 script/react_agent/agent_langgraph.py \
 
 # Patch-scope triage: group all errors that map to the same patch key
 python3 script/react_agent/agent_langgraph.py \
-  --model openai --tools real --max-steps 6 --error-scope patch --max-errors 50 tmp1 \
+  --model openai --tools real --max-steps 8 --error-scope patch tmp1 \
   --patch-path data/tmp_patch/libxml2.patch2 \
+  --ossfuzz-project libxml2 --ossfuzz-commit <git-sha> \
   --v1-json-dir /path/to/v1/json --v2-json-dir /path/to/v2/json \
   --v1-src /path/to/v1/src --v2-src /path/to/v2/src
 ```

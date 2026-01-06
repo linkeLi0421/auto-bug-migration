@@ -75,7 +75,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "timeout_seconds": "int?",
             "use_sudo": "bool?",
         },
-        "description": "Merge a tmp_patch bundle with override patch diff files, then run OSS-Fuzz Docker build/check_build (requires REACT_AGENT_ENABLE_OSSFUZZ=1).",
+    "description": "Merge a tmp_patch bundle with override patch diff files, then run OSS-Fuzz Docker build/check_build.",
     },
     {
         "name": "list_patch_bundle",

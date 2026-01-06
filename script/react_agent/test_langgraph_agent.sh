@@ -22,28 +22,6 @@ names = {t.get("name") for t in tools if isinstance(t, dict)}
 assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
 PY
 
-# Tool guardrail: OSS-Fuzz tool is disabled unless explicitly enabled.
-"$PYTHON" - "$SCRIPT_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-script_dir = Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(script_dir))
-
-from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test  # noqa: E402
-
-try:
-    ossfuzz_apply_patch_and_test(
-        project="example",
-        commit="deadbeef",
-        patch_path="/tmp/example.patch2",
-        timeout_seconds=1,
-    )
-    raise AssertionError("expected REACT_AGENT_ENABLE_OSSFUZZ guardrail")
-except Exception as exc:  # noqa: BLE001
-    assert "REACT_AGENT_ENABLE_OSSFUZZ" in str(exc), str(exc)
-PY
-
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -110,6 +88,7 @@ PY
 
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools fake --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
 
 "$PYTHON" - "$output" <<'PY'
@@ -135,7 +114,8 @@ PY
 
 # Patch-scope mode: missing struct member should compare V1 vs V2 before grep.
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
-  --model stub --tools fake --max-steps 6 --error-scope patch --patch-path "$bundle_path" \
+  --model stub --tools fake --max-steps 8 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   "$SCRIPT_DIR/fixtures/patch_scope_missing_member.log")"
 
 "$PYTHON" - "$output" <<'PY'
@@ -166,9 +146,11 @@ assert tools[0] == "get_error_patch_context", tools
 assert tools[1] == "get_error_v1_function_code", tools
 assert "v1" in versions and "v2" in versions, versions
 
-# Patch generation must be last; artifact reads only happen right before it.
-assert tools[-1] == "make_error_function_patch", tools
-assert tools[-2] == "read_artifact", tools
+# Patch generation is followed by mandatory OSS-Fuzz test; artifact reads only happen right before patch generation.
+assert "make_error_function_patch" in tools, tools
+idx_patch = tools.index("make_error_function_patch")
+assert idx_patch > 0 and tools[idx_patch - 1] == "read_artifact", tools
+assert "ossfuzz_apply_patch_and_test" in tools[idx_patch + 1 :], tools
 
 if "search_text" in tools:
     first_search_text = tools.index("search_text")
@@ -178,7 +160,8 @@ PY
 
 # Guardrail: block suggestions to edit V2 type definitions by default.
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT=1 "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
-  --model stub --tools fake --max-steps 6 --error-scope patch --patch-path "$bundle_path" \
+  --model stub --tools fake --max-steps 8 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   "$SCRIPT_DIR/fixtures/patch_scope_missing_member.log")"
 
 "$PYTHON" - "$output" <<'PY'
@@ -196,12 +179,13 @@ assert "struct definition" not in combined, combined
 assert "add the missing fields" not in combined, combined
 
 tools = [((s.get("decision") or {}).get("tool")) for s in (obj.get("steps") or []) if isinstance(s, dict)]
-assert tools and tools[-1] == "make_error_function_patch", tools
+assert "make_error_function_patch" in tools, tools
 PY
 
 # Patch-aware runs: if read_file_context is used, it must use pre-patch line numbers.
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools fake --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   "$SCRIPT_DIR/fixtures/patch_safe_read_context.log")"
 
 "$PYTHON" - "$output" "$bundle_path" "$SCRIPT_DIR" <<'PY'
@@ -249,6 +233,7 @@ v_src="$bundle_fixture/src"
 
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_DIR="$artifact_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
   "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
 
@@ -296,11 +281,13 @@ mkdir -p "$artifact_root"
 
 output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_ROOT="$artifact_root" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
   "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
 
 output2="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_ROOT="$artifact_root" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
+  --ossfuzz-project example --ossfuzz-commit deadbeef \
   --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
   "$SCRIPT_DIR/fixtures/patch_scope_unknown_type.log")"
 

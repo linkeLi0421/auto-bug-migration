@@ -38,7 +38,6 @@ class AgentConfig:
     max_steps: int = 4
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
-    max_errors: int = 20
 
 
 @dataclass
@@ -57,6 +56,22 @@ class AgentState:
     pending_patch: Optional[Decision] = None
     patch_generated: bool = False
     patch_result: Optional[Dict[str, Any]] = None
+
+    # OSS-Fuzz testing config (required for patch-scope runs once a patch is generated)
+    ossfuzz_project: str = ""
+    ossfuzz_commit: str = ""
+    ossfuzz_build_csv: str = ""
+    ossfuzz_sanitizer: str = "address"
+    ossfuzz_arch: str = "x86_64"
+    ossfuzz_engine: str = "libfuzzer"
+    ossfuzz_fuzz_target: str = ""
+    ossfuzz_use_sudo: bool = False
+
+    # Tracks the latest generated override diff artifact paths (for OSS-Fuzz tool)
+    patch_override_paths: List[str] = field(default_factory=list)
+
+    # Indicates we already attempted OSS-Fuzz test after generating a patch.
+    ossfuzz_test_attempted: bool = False
 
 
 class GraphState(TypedDict, total=False):
@@ -672,7 +687,9 @@ def _system_prompt() -> str:
         "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
         "     Do NOT call read_artifact in this phase.\n"
         "  2) Patching phase (last): call read_artifact only to pull the minimum code context you need,\n"
-        "     then call make_error_function_patch as the final tool call and immediately return final.\n"
+        "     then call make_error_function_patch to generate an override diff,\n"
+        "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
+        "     then return final.\n"
         "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
         "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
@@ -685,8 +702,10 @@ def _system_prompt() -> str:
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
         "- When you have a concrete function-body fix for the V1-origin (often named __revert_*), update the patch bundle slice:\n"
-        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) and then include its patch_text (or the patch_text artifact_path) in next_step.\n"
+        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
+        "  then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
         "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
+        "- After generating a patch (make_error_function_patch), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
@@ -708,6 +727,21 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         )
     if state.artifacts_dir:
         header_lines.append(f"Artifacts dir: {state.artifacts_dir}")
+    if state.ossfuzz_project and state.ossfuzz_commit:
+        header_lines.append("OSS-Fuzz test config:")
+        header_lines.append(f"  project: {state.ossfuzz_project}")
+        header_lines.append(f"  commit: {state.ossfuzz_commit}")
+        if state.ossfuzz_build_csv:
+            header_lines.append(f"  build_csv: {state.ossfuzz_build_csv}")
+        if state.ossfuzz_sanitizer:
+            header_lines.append(f"  sanitizer: {state.ossfuzz_sanitizer}")
+        if state.ossfuzz_arch:
+            header_lines.append(f"  arch: {state.ossfuzz_arch}")
+        if state.ossfuzz_engine:
+            header_lines.append(f"  engine: {state.ossfuzz_engine}")
+        if state.ossfuzz_fuzz_target:
+            header_lines.append(f"  fuzz_target: {state.ossfuzz_fuzz_target}")
+        header_lines.append(f"  use_sudo: {state.ossfuzz_use_sudo}")
     if state.missing_struct_members:
         header_lines.append("Missing struct members (JSON):")
         header_lines.append(json.dumps(state.missing_struct_members, ensure_ascii=False))
@@ -749,24 +783,74 @@ def _run_langgraph(
     # Build a small two-node graph: LLM -> TOOL -> LLM (until final).
     def llm_node(gs: GraphState) -> GraphState:
         st = gs["state"]
-        if st.patch_generated:
+        if st.patch_generated and not st.ossfuzz_test_attempted:
+            # Mandatory: test the generated override patch in OSS-Fuzz before allowing final.
+            if not st.patch_path:
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Cannot run OSS-Fuzz test: missing patch_path.",
+                        "summary": "Stopped after patch generation (missing patch bundle path).",
+                        "next_step": "Re-run with --patch-path so the agent can merge bundle + override(s) and test in OSS-Fuzz.",
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
+            if not (st.ossfuzz_project and st.ossfuzz_commit):
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Cannot run OSS-Fuzz test: missing required OSS-Fuzz CLI args.",
+                        "summary": "Stopped after patch generation (OSS-Fuzz config missing).",
+                        "next_step": "Re-run with --ossfuzz-project and --ossfuzz-commit.",
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
+
+            decision = {
+                "type": "tool",
+                "thought": "Test the generated patch in OSS-Fuzz using the patch bundle + override diff artifacts.",
+                "tool": "ossfuzz_apply_patch_and_test",
+                "args": {
+                    "project": st.ossfuzz_project,
+                    "commit": st.ossfuzz_commit,
+                    "patch_path": st.patch_path,
+                    "patch_override_paths": list(st.patch_override_paths or []),
+                    "build_csv": st.ossfuzz_build_csv,
+                    "sanitizer": st.ossfuzz_sanitizer,
+                    "architecture": st.ossfuzz_arch,
+                    "engine": st.ossfuzz_engine,
+                    "fuzz_target": st.ossfuzz_fuzz_target,
+                    "use_sudo": bool(st.ossfuzz_use_sudo),
+                },
+            }
+            _validate_tool_decision(decision)
+            return {"state": st, "pending": decision}
+
+        if st.patch_generated and st.ossfuzz_test_attempted:
             patch_text_path = ""
+            merged_patch_file_path = ""
             if isinstance(st.patch_result, dict):
                 pt = st.patch_result.get("patch_text")
                 if isinstance(pt, dict):
                     patch_text_path = str(pt.get("artifact_path", "") or "").strip()
-            next_step = (
-                f"Use the generated patch_text from: {patch_text_path}"
-                if patch_text_path
-                else "Use the generated patch_text from the last tool step."
-            )
+            if isinstance(st.last_observation, ToolObservation) and st.last_observation.tool == "ossfuzz_apply_patch_and_test":
+                out = st.last_observation.output
+                if isinstance(out, dict):
+                    merged_patch_file_path = str(out.get("merged_patch_file_path", "") or "").strip()
+            next_step = "Review OSS-Fuzz logs in artifacts and apply the merged patch file." \
+                + (f" Merged patch: {merged_patch_file_path}" if merged_patch_file_path else "") \
+                + (f" Override diff: {patch_text_path}" if patch_text_path else "")
             return {
                 "state": st,
                 "final": {
                     "type": "final",
-                    "thought": "Generated a patch; stop after patch generation.",
-                    "summary": "Generated a function-body replacement patch.",
-                    "next_step": next_step,
+                    "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
+                    "summary": "Generated a function-body replacement patch and tested it in OSS-Fuzz.",
+                    "next_step": next_step.strip(),
                     "steps": st.steps,
                     "error": _error_payload(st),
                 },
@@ -915,14 +999,14 @@ def _run_langgraph(
 
                 # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
                 if last_tool != "read_artifact":
-                    if remaining < 2:
+                    if remaining < 3:
                         return {
                             "state": st,
                             "final": {
                                 "type": "final",
                                 "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                                 "summary": "Stopped before patch generation.",
-                                "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                                "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
                                 "steps": st.steps,
                                 "error": _error_payload(st),
                             },
@@ -1066,21 +1150,21 @@ def _run_langgraph(
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
 
-        if tool == "read_artifact" and remaining < 2:
+        if tool == "read_artifact" and remaining < 3:
             return {
                 "state": st,
                 "final": {
                     "type": "final",
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                     "summary": "Stopped before patch generation.",
-                    "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
                     "steps": st.steps,
                     "error": _error_payload(st),
                 },
             }
 
         if tool == "make_error_function_patch" and st.artifacts_dir and _last_tool_call_name(st) != "read_artifact":
-            if remaining >= 2:
+            if remaining >= 3:
                 st.pending_patch = decision
                 focus_terms = _collect_focus_terms(st)
                 query = focus_terms[0] if focus_terms else ""
@@ -1107,7 +1191,7 @@ def _run_langgraph(
                     "type": "final",
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch in-order.",
                     "summary": "Stopped before patch generation.",
-                    "next_step": "Increase --max-steps (need at least 2 remaining steps: read_artifact then make_error_function_patch).",
+                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
                     "steps": st.steps,
                     "error": _error_payload(st),
                 },
@@ -1133,6 +1217,15 @@ def _run_langgraph(
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            patch_text_path = ""
+            if isinstance(st.patch_result, dict):
+                pt = st.patch_result.get("patch_text")
+                if isinstance(pt, dict):
+                    patch_text_path = str(pt.get("artifact_path", "") or "").strip()
+            if patch_text_path:
+                st.patch_override_paths = [patch_text_path]
+        if obs.ok and obs.tool == "ossfuzz_apply_patch_and_test":
+            st.ossfuzz_test_attempted = True
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -1181,13 +1274,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Triage scope: only the first error, or all errors mapping to the same patch.",
     )
     parser.add_argument(
-        "--max-errors",
-        type=int,
-        default=int(os.environ.get("REACT_AGENT_MAX_ERRORS", "20")),
-        help="Max compiler errors to collect from the log (used in patch-scope mode).",
-    )
-
-    parser.add_argument("--tools", choices=["real", "fake"], default="real")
+        "--tools", choices=["real", "fake"], default="real")
     parser.add_argument("--v1-json-dir", help="Root directory containing V1 *_analysis.json files")
     parser.add_argument("--v2-json-dir", help="Root directory containing V2 *_analysis.json files")
     parser.add_argument("--v1-src", help="Local filesystem root for V1 source code")
@@ -1216,6 +1303,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max completion tokens for the OpenAI call (0=auto; recommended >=2000 for gpt-5-*).",
     )
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
+
+    # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
+    parser.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
+    parser.add_argument("--ossfuzz-commit", default=os.environ.get("REACT_AGENT_OSSFUZZ_COMMIT", ""))
+    parser.add_argument("--ossfuzz-build-csv", default=os.environ.get("REACT_AGENT_OSSFUZZ_BUILD_CSV", ""))
+    parser.add_argument("--ossfuzz-sanitizer", default=os.environ.get("REACT_AGENT_OSSFUZZ_SANITIZER", "address"))
+    parser.add_argument("--ossfuzz-arch", default=os.environ.get("REACT_AGENT_OSSFUZZ_ARCH", "x86_64"))
+    parser.add_argument("--ossfuzz-engine", default=os.environ.get("REACT_AGENT_OSSFUZZ_ENGINE", "libfuzzer"))
+    parser.add_argument("--ossfuzz-fuzz-target", default=os.environ.get("REACT_AGENT_OSSFUZZ_FUZZ_TARGET", ""))
+    parser.add_argument("--ossfuzz-use-sudo", action="store_true", default=bool(os.environ.get("REACT_AGENT_OSSFUZZ_USE_SUDO", "")))
     return parser
 
 
@@ -1231,8 +1328,22 @@ def main(argv: List[str]) -> int:
         max_steps=max(args.max_steps, 1),
         tools_mode=args.tools,
         error_scope=args.error_scope,
-        max_errors=max(args.max_errors, 1),
     )
+
+    # Fail fast: in patch-scope runs we will generate a patch and must be able to test it.
+    ossfuzz_project = str(getattr(args, "ossfuzz_project", "") or "").strip()
+    ossfuzz_commit = str(getattr(args, "ossfuzz_commit", "") or "").strip()
+    if cfg.error_scope == "patch":
+        missing_ossfuzz: List[str] = []
+        if not ossfuzz_project:
+            missing_ossfuzz.append("--ossfuzz-project")
+        if not ossfuzz_commit:
+            missing_ossfuzz.append("--ossfuzz-commit")
+        if missing_ossfuzz:
+            raise ValueError(
+                "Patch-scope runs require OSS-Fuzz test config (agent tests the patch before stopping). Missing: "
+                + ", ".join(missing_ossfuzz)
+            )
 
     build_log = load_build_log(args.build_log)
 
@@ -1256,11 +1367,9 @@ def main(argv: List[str]) -> int:
         try:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
 
-            first_err = iter_compiler_errors(build_log, limit=1)
-            if first_err:
-                mapping = map_error_patch(
-                    patch_path=patch_path, file_path=first_err[0]["file"], line_number=first_err[0]["line"]
-                )
+            m = _ERROR_LOC_RE.match(str(error_line or "").strip())
+            if m:
+                mapping = map_error_patch(patch_path=patch_path, file_path=m.group("file"), line_number=int(m.group("line")))
                 patch_key = str(mapping.get("patch_key") or "").strip()
         except Exception:
             patch_key = ""
@@ -1272,7 +1381,7 @@ def main(argv: List[str]) -> int:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
             from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
 
-            errs = iter_compiler_errors(build_log, limit=cfg.max_errors)
+            errs = iter_compiler_errors(build_log)
             groups: Dict[str, List[Dict[str, Any]]] = {}
             first_mapped_key = ""
             for err in errs:
@@ -1369,6 +1478,14 @@ def main(argv: List[str]) -> int:
             patch_key=patch_key,
             grouped_errors=grouped_errors,
             missing_struct_members=missing_struct_members,
+            ossfuzz_project=ossfuzz_project,
+            ossfuzz_commit=ossfuzz_commit,
+            ossfuzz_build_csv=str(getattr(args, "ossfuzz_build_csv", "") or "").strip(),
+            ossfuzz_sanitizer=str(getattr(args, "ossfuzz_sanitizer", "") or "address").strip() or "address",
+            ossfuzz_arch=str(getattr(args, "ossfuzz_arch", "") or "x86_64").strip() or "x86_64",
+            ossfuzz_engine=str(getattr(args, "ossfuzz_engine", "") or "libfuzzer").strip() or "libfuzzer",
+            ossfuzz_fuzz_target=str(getattr(args, "ossfuzz_fuzz_target", "") or "").strip(),
+            ossfuzz_use_sudo=bool(getattr(args, "ossfuzz_use_sudo", False)),
         )
 
         final = _run_langgraph(
