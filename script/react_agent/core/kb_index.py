@@ -233,8 +233,6 @@ class KbIndex:
 
         def node_key(n: dict) -> str:
             usr = str(n.get("usr", "") or "").strip()
-            if usr:
-                return f"usr:{usr}"
             extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
             start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
             end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
@@ -243,6 +241,13 @@ class KbIndex:
             el = int(end.get("line", 0) or 0)
             kind = str(n.get("kind", "") or "")
             spelling = str(n.get("spelling", "") or "")
+            reason = str(n.get("__reason", "") or "").strip()
+            # For pseudo nodes derived from nested extents, include the extent in the key even if
+            # they carry the same USR as other candidates; otherwise we may dedup away the real body.
+            if reason:
+                return f"pseudo:{usr}:{kind}:{spelling}:{fp}:{sl}:{el}:{reason}"
+            if usr:
+                return f"usr:{usr}"
             return f"ext:{kind}:{spelling}:{fp}:{sl}:{el}"
 
         def add(n: dict) -> None:
@@ -283,29 +288,35 @@ class KbIndex:
 
                 typedef_extent = type_ref.get("typedef_extent")
                 if isinstance(typedef_extent, dict):
-                    add(
-                        _pseudo_node_for_extent(
-                            kind=str(type_ref.get("target_kind", "") or "TYPEDEF_EXTENT"),
-                            extent=typedef_extent,
-                            reason="type_ref.typedef_extent",
-                            spelling=str(type_ref.get("target_name", "") or ""),
-                            usr=usr,
+                    start = typedef_extent.get("start", {}) if isinstance(typedef_extent.get("start"), dict) else {}
+                    end = typedef_extent.get("end", {}) if isinstance(typedef_extent.get("end"), dict) else {}
+                    if str(start.get("file", "") or "").strip() and int(start.get("line", 0) or 0) > 0 and int(end.get("line", 0) or 0) > 0:
+                        add(
+                            _pseudo_node_for_extent(
+                                kind=str(type_ref.get("target_kind", "") or "TYPEDEF_EXTENT"),
+                                extent=typedef_extent,
+                                reason="type_ref.typedef_extent",
+                                spelling=str(type_ref.get("target_name", "") or ""),
+                                usr=usr,
+                            )
                         )
-                    )
 
                 underlying = type_ref.get("underlying")
                 if isinstance(underlying, dict):
                     extent = underlying.get("extent")
                     if isinstance(extent, dict):
-                        add(
-                            _pseudo_node_for_extent(
-                                kind=str(underlying.get("kind", "") or "UNDERLYING_EXTENT"),
-                                extent=extent,
-                                reason="type_ref.underlying.extent",
-                                spelling=str(underlying.get("name", "") or ""),
-                                usr=usr,
+                        start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+                        end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+                        if str(start.get("file", "") or "").strip() and int(start.get("line", 0) or 0) > 0 and int(end.get("line", 0) or 0) > 0:
+                            add(
+                                _pseudo_node_for_extent(
+                                    kind=str(underlying.get("kind", "") or "UNDERLYING_EXTENT"),
+                                    extent=extent,
+                                    reason="type_ref.underlying.extent",
+                                    spelling=str(underlying.get("name", "") or ""),
+                                    usr=usr,
+                                )
                             )
-                        )
                     name = str(underlying.get("name", "") or "").strip()
                     if name:
                         target = best_for(name)
