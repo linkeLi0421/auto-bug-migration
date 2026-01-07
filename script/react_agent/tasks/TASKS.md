@@ -114,3 +114,26 @@ The user reviews the per-hunk agent outputs and decides next actions (apply only
 - [x] One command produces per-hunk agent results for all patch keys found in the build logs.
 - [x] No automatic “apply everything”; user can choose which overrides to keep/merge.
 - [x] The workflow scales to dozens of hunks while keeping console output bounded (details offloaded to artifacts).
+
+## Maintenance: Remove `inspect_symbol` tool
+
+- [x] Remove `inspect_symbol` from the agent-facing tool registry; use `search_definition(..., version=v1|v2)` instead.
+- [x] Update stub model/tooling/docs/tests to avoid emitting or expecting `inspect_symbol` tool calls.
+
+## Next: Multi-agent artifact directory normalization (avoid duplicate `_foo` vs `foo` dirs)
+
+### Problem
+
+Some patch keys can start with punctuation (e.g. `_extra_encoding.c`). The agent’s artifact directory logic normalizes
+patch keys (strips leading `._-`) when creating per-`patch_key` artifact folders, but `multi_agent.py` previously used the
+raw `patch_key` as a directory name for `agent_cmd.txt`/`agent_stdout.json`. This can produce two directories for the same
+hunk within one multi-agent run:
+
+- `.../_extra_encoding.c/` (multi_agent’s raw directory)
+- `.../extra_encoding.c/` (agent’s normalized artifact directory)
+
+### Plan / Tasks
+
+- [x] Make `multi_agent.py` write per-hunk artifacts into the same normalized directory name as the agent (safe filename).
+- [x] Add `patch_key_dirname` to the multi-agent summary for clarity/debugging.
+- [x] Add/adjust a non-Docker test to ensure the summary always includes `patch_key_dirname`.

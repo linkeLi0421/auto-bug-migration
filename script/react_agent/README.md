@@ -32,7 +32,6 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
 `script/react_agent/agent_langgraph.py` is an LLM-driven agent loop that can call:
 
 - Symbol/code tools:
-  - `inspect_symbol(symbol_name)`
   - `read_artifact(artifact_path, start_line?, max_lines?, query?, context_lines?, max_chars?)`
   - `read_file_context(file_path, line_number, context, version)`
   - `search_definition(symbol_name, version)` (use `version=v1|v2`)
@@ -84,7 +83,34 @@ python3 script/react_agent/agent_langgraph.py \
   --ossfuzz-project libxml2 --ossfuzz-commit <git-sha> \
   --v1-json-dir /path/to/v1/json --v2-json-dir /path/to/v2/json \
   --v1-src /path/to/v1/src --v2-src /path/to/v2/src
+
+# Patch-scope triage for a specific hunk (patch_key)
+python3 script/react_agent/agent_langgraph.py \
+  --model openai --tools real --max-steps 8 --error-scope patch --focus-patch-key <patch_key> tmp1 \
+  --patch-path data/tmp_patch/libxml2.patch2 \
+  --ossfuzz-project libxml2 --ossfuzz-commit <git-sha> \
+  --v1-json-dir /path/to/v1/json --v2-json-dir /path/to/v2/json \
+  --v1-src /path/to/v1/src --v2-src /path/to/v2/src
 ```
+
+## Multi-hunk driver (one agent per patch_key)
+
+`script/react_agent/multi_agent.py` parses a build log, maps errors to patch hunks (`patch_key`), and runs one patch-scope
+agent per hunk. It does **not** automatically merge/apply all results; review the per-hunk outputs and decide what to keep.
+
+```bash
+python3 script/react_agent/multi_agent.py tmp1 \
+  --patch-path data/tmp_patch/libxml2.patch2 \
+  --ossfuzz-project libxml2 --ossfuzz-commit <git-sha> \
+  --model openai --tools real --max-steps 8 \
+  --v1-json-dir /path/to/v1/json --v2-json-dir /path/to/v2/json \
+  --v1-src /path/to/v1/src --v2-src /path/to/v2/src
+```
+
+Notes:
+- Limit fan-out: `--max-groups 10`
+- Run only specific hunks: `--only-patch-keys p1,p2,p3`
+- Multi-run artifacts: `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` plus a top-level `summary.json`
 
 Patch bundle path notes:
 

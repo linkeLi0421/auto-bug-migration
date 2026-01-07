@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, Literal
 
 ToolName = Literal[
-    "inspect_symbol",
     "read_artifact",
     "read_file_context",
     "search_definition",
@@ -22,11 +21,6 @@ ToolName = Literal[
 
 
 TOOL_SPECS: list[Dict[str, Any]] = [
-    {
-        "name": "inspect_symbol",
-        "args": {"symbol_name": "string"},
-        "description": "Return formatted V1/V2 code for a symbol.",
-    },
     {
         "name": "read_artifact",
         "args": {

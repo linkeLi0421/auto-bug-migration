@@ -74,7 +74,7 @@ out_path="$tmp_dir/out.json"
   --patch-path "$bundle_path" \
   --model stub --tools fake --max-steps 3 \
   --ossfuzz-project libxml2 --ossfuzz-commit f0fd1b \
-  --output-format json >"$out_path"
+  --output-format json-pretty >"$out_path"
 
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$out_path" <<'PY'
 import json
@@ -88,6 +88,7 @@ assert set(keys) >= {"p1", "p2"}, keys
 for r in obj["results"]:
     assert r["artifacts_dir"], r
     assert r["agent_stdout_path"], r
+    assert r["patch_key_dirname"], r
 PY
 
 echo "OK"
