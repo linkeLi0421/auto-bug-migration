@@ -37,7 +37,7 @@ class StubModel(ChatModel):
         self._turn += 1
 
         user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
-        if "You MUST generate a patch now by calling make_error_function_patch" in user_text:
+        if "You MUST generate a patch now by calling make_error_patch_override" in user_text:
             # Runtime guardrail prompt: force a patch-generation tool call.
             match = None
             error_line = ""
@@ -75,7 +75,7 @@ class StubModel(ChatModel):
                     {
                         "type": "tool",
                         "thought": "Forced by runtime guardrail: generate a patch now.",
-                        "tool": "make_error_function_patch",
+                        "tool": "make_error_patch_override",
                         "args": {
                             "patch_path": patch_path,
                             "file_path": file_path,
@@ -197,7 +197,7 @@ class StubModel(ChatModel):
                     {
                         "type": "tool",
                         "thought": "Extract the V1-origin function body from the patch to understand the V1 usage.",
-                        "tool": "get_error_v1_function_code",
+                        "tool": "get_error_v1_code_slice",
                         "args": {
                             "patch_path": patch_path,
                             "file_path": file_path,
@@ -236,7 +236,7 @@ class StubModel(ChatModel):
                         }
                     )
                 # In the real agent flow, read_artifact should happen immediately before
-                # make_error_function_patch (enforced by runtime guardrails).
+                # make_error_patch_override (enforced by runtime guardrails).
                 new_func_code = (
                     "int __revert_stub(void) {\n"
                     "  /* Stub replacement used by offline tests.\n"
@@ -249,7 +249,7 @@ class StubModel(ChatModel):
                     {
                         "type": "tool",
                         "thought": "Generate a patch that replaces the migrated (V1-origin) function body with an adapted version.",
-                        "tool": "make_error_function_patch",
+                        "tool": "make_error_patch_override",
                         "args": {
                             "patch_path": patch_path,
                             "file_path": file_path,

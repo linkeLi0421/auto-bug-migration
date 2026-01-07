@@ -67,10 +67,6 @@ class AgentTools:
             + "\n".join(numbered)
         )
 
-    def search_definition_in_v1(self, symbol_name: str) -> str:
-        """Deprecated: use `search_definition(..., version=\"v1\")`."""
-        return self.search_definition(symbol_name, version="v1")
-
     def search_definition(self, symbol_name: str, version: str = "v1") -> str:
         """Return a bounded bundle of symbol definition snippets for the requested version."""
         ver = str(version).strip().lower()

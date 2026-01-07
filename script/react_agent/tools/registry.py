@@ -6,7 +6,6 @@ ToolName = Literal[
     "read_artifact",
     "read_file_context",
     "search_definition",
-    "search_definition_in_v1",
     "search_text",
     "ossfuzz_apply_patch_and_test",
     "list_patch_bundle",
@@ -14,8 +13,8 @@ ToolName = Literal[
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
-    "get_error_v1_function_code",
-    "make_error_function_patch",
+    "get_error_v1_code_slice",
+    "make_error_patch_override",
     "parse_build_errors",
 ]
 
@@ -42,11 +41,6 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "name": "search_definition",
         "args": {"symbol_name": "string", "version": "v1|v2"},
         "description": "Return code for the best matching symbol definition in the requested version.",
-    },
-    {
-        "name": "search_definition_in_v1",
-        "args": {"symbol_name": "string"},
-        "description": "Return V1 code for the best matching symbol definition (deprecated: use search_definition).",
     },
     {
         "name": "search_text",
@@ -104,7 +98,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": "Map a build error location to a patch and return a bounded diff excerpt + pre_patch_* line mapping when available.",
     },
     {
-        "name": "get_error_v1_function_code",
+        "name": "get_error_v1_code_slice",
         "args": {
             "patch_path": "string",
             "file_path": "string",
@@ -112,10 +106,10 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Extract the V1-origin function body from the patch bundle for a build error location (from '-' lines in the mapped function slice).",
+        "description": "Extract the V1-origin code slice from the patch bundle for a build error location (from '-' lines in the mapped patch slice; works for functions/macros/decls).",
     },
     {
-        "name": "make_error_function_patch",
+        "name": "make_error_patch_override",
         "args": {
             "patch_path": "string",
             "file_path": "string",
@@ -125,7 +119,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Rewrite the mapped recreated-function slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') and recomputing hunk lengths.",
+        "description": "Rewrite the mapped patch slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') and recomputing hunk lengths.",
     },
     {
         "name": "parse_build_errors",

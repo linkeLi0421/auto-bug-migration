@@ -13,9 +13,9 @@ from typing import Any, Dict, Optional, Tuple
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
     "get_error_patch_context": {"excerpt": ".diff"},
-    "get_error_v1_function_code": {"func_code": ".c"},
+    "get_error_v1_code_slice": {"func_code": ".c"},
     "get_patch": {"patch_text": ".diff"},
-    "make_error_function_patch": {"old_func_code": ".c", "patch_text": ".diff"},
+    "make_error_patch_override": {"old_func_code": ".c", "patch_text": ".diff"},
     "ossfuzz_apply_patch_and_test": {
         "build_output": ".log",
         "check_build_output": ".log",
@@ -32,7 +32,9 @@ def _repo_root() -> Path:
 def _safe_filename(name: str, *, max_len: int = 120) -> str:
     raw = str(name or "").strip()
     raw = raw.replace(os.sep, "_")
-    cleaned = _SAFE_NAME_RE.sub("_", raw).strip("._-")
+    # Keep leading/trailing "_" intact (patch_key can legitimately start/end with "_");
+    # strip only "."/"-" to avoid hidden/awkward names.
+    cleaned = _SAFE_NAME_RE.sub("_", raw).strip(".-")
     if not cleaned:
         cleaned = "artifact"
     return cleaned[:max_len]
@@ -175,7 +177,7 @@ def offload_patch_output(
             snippet = _focus_snippet(val, terms)
             if snippet:
                 updated.setdefault("focus_excerpt", snippet)
-        if terms and tool == "get_error_v1_function_code" and key == "func_code":
+        if terms and tool == "get_error_v1_code_slice" and key == "func_code":
             snippet = _focus_snippet(val, terms)
             if snippet:
                 updated.setdefault("focus_func_snippet", snippet)

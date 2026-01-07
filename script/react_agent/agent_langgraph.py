@@ -553,8 +553,8 @@ def _should_force_struct_diff_tools(state: AgentState) -> Optional[str]:
             return True
         return False
 
-    if not called("get_error_v1_function_code"):
-        return "get_error_v1_function_code"
+    if not called("get_error_v1_code_slice"):
+        return "get_error_v1_code_slice"
     if not called("search_definition", version="v1", symbol_any=queries):
         return f"search_definition:v1:{queries[0]}"
     if not called("search_definition", version="v2", symbol_any=queries):
@@ -574,15 +574,15 @@ def _has_tool_call(state: AgentState, tool_name: str) -> bool:
     return False
 
 
-def _should_require_make_error_function_patch(state: AgentState) -> bool:
+def _should_require_make_error_patch_override(state: AgentState) -> bool:
     """Return True if we should force patch generation before allowing a final decision."""
     if not state.patch_path or state.error_scope != "patch":
         return False
-    # Only require this in the function-rewrite workflow (we've extracted a V1-origin function slice).
-    if not _has_tool_call(state, "get_error_v1_function_code"):
+    # Only require this in the patch-slice rewrite workflow (we've extracted a V1-origin slice).
+    if not _has_tool_call(state, "get_error_v1_code_slice"):
         return False
     # Do not accept final until we've attempted patch generation at least once.
-    return not _has_tool_call(state, "make_error_function_patch")
+    return not _has_tool_call(state, "make_error_patch_override")
 
 
 def _last_tool_call_name(state: AgentState) -> str:
@@ -683,11 +683,11 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
             },
         }
 
-    if not _has_tool_call(state, "get_error_v1_function_code"):
+    if not _has_tool_call(state, "get_error_v1_code_slice"):
         return {
             "type": "tool",
-            "thought": "Extract the V1-origin function body from the patch before proposing a replacement.",
-            "tool": "get_error_v1_function_code",
+            "thought": "Extract the V1-origin code slice from the patch before proposing a replacement.",
+            "tool": "get_error_v1_code_slice",
             "args": {
                 "patch_path": state.patch_path,
                 "file_path": file_path,
@@ -867,14 +867,15 @@ def _system_prompt() -> str:
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
         "Important:\n"
-        "- Patch-related tools persist diff excerpts / function bodies / generated patches as artifact files.\n"
+        "- Patch-related tools persist diff excerpts / V1-origin code slices / generated patches as artifact files.\n"
         "  When that happens, the observation contains an object like {artifact_path, sha256, bytes, lines}.\n"
         "  Use read_artifact(artifact_path, ...) to fetch only the lines you need.\n"
+        "- Patch bundles are applied via `git apply --reverse`: in these diffs, `-` lines become additions.\n"
         "- Tool ordering (two-phase workflow):\n"
         "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
         "     Do NOT call read_artifact in this phase.\n"
         "  2) Patching phase (last): call read_artifact only to pull the minimum code context you need,\n"
-        "     then call make_error_function_patch to generate an override diff,\n"
+        "     then call make_error_patch_override to generate an override diff,\n"
         "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
         "     then return final.\n"
         "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
@@ -888,11 +889,11 @@ def _system_prompt() -> str:
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
-        "- When you have a concrete function-body fix for the V1-origin (often named __revert_*), update the patch bundle slice:\n"
-        "  call make_error_function_patch(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
+        "- When you have a concrete fix for the V1-origin code slice (functions/macros/consts/decls; often inside __revert_*), update the patch bundle slice:\n"
+        "  call make_error_patch_override(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
         "  then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
         "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
-        "- After generating a patch (make_error_function_patch), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
+        "- After generating a patch (make_error_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
@@ -1073,7 +1074,7 @@ def _run_langgraph(
                         "type": "final",
                         "thought": "Reached max tool steps before generating the patch.",
                         "summary": "Stopped due to max_steps.",
-                        "next_step": "Increase --max-steps to allow make_error_function_patch to run after read_artifact.",
+                        "next_step": "Increase --max-steps to allow make_error_patch_override to run after read_artifact.",
                         "steps": st.steps,
                         "error": _error_payload(st),
                     },
@@ -1155,13 +1156,13 @@ def _run_langgraph(
             remaining = cfg.max_steps - len(st.steps)
             required = _should_force_struct_diff_tools(st)
             if required and remaining >= 2:
-                if required == "get_error_v1_function_code":
+                if required == "get_error_v1_code_slice":
                     file_path, line_number = _first_error_location(st)
                     if file_path and line_number > 0:
                         forced: Decision = {
                             "type": "tool",
                             "thought": "Missing-member error in patch-scope: extract V1-origin function body from the patch before finalizing.",
-                            "tool": "get_error_v1_function_code",
+                            "tool": "get_error_v1_code_slice",
                             "args": {
                                 "patch_path": st.patch_path,
                                 "file_path": file_path,
@@ -1183,9 +1184,9 @@ def _run_langgraph(
                     _validate_tool_decision(forced)
                     return {"state": st, "pending": forced}
 
-            # Guardrail: in patch-scope function rewrite flows, do not accept final until
-            # make_error_function_patch has been called (the primary goal is to emit a patch bundle rewrite).
-            if _should_require_make_error_function_patch(st):
+            # Guardrail: in patch-scope patch-slice rewrite flows, do not accept final until
+            # make_error_patch_override has been called (the primary goal is to emit a patch bundle rewrite).
+            if _should_require_make_error_patch_override(st):
                 prereq = _next_patch_prereq_tool(st)
                 if prereq and remaining >= 1:
                     _validate_tool_decision(prereq)
@@ -1215,13 +1216,13 @@ def _run_langgraph(
                                 "type": "final",
                                 "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                                 "summary": "Stopped before patch generation.",
-                                "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
+                                "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
                                 "steps": st.steps,
                                 "error": _error_payload(st),
                             },
                         }
 
-                    artifact_path = _last_artifact_path(st, "get_error_v1_function_code", "func_code") or _last_artifact_path(
+                    artifact_path = _last_artifact_path(st, "get_error_v1_code_slice", "func_code") or _last_artifact_path(
                         st, "get_error_patch_context", "excerpt"
                     )
                     forced_read: Decision = {
@@ -1246,9 +1247,9 @@ def _run_langgraph(
                         "role": "user",
                         "content": (
                             "Do NOT return a final decision yet.\n"
-                            "You MUST generate a patch now by calling make_error_function_patch.\n"
+                            "You MUST generate a patch now by calling make_error_patch_override.\n"
                             "Return exactly one JSON object of type tool with:\n"
-                            f'- tool="make_error_function_patch"\n'
+                            f'- tool="make_error_patch_override"\n'
                             f'- args.patch_path="{st.patch_path}"\n'
                             f'- args.file_path="{file_path}"\n'
                             f"- args.line_number={line_number}\n"
@@ -1261,7 +1262,7 @@ def _run_langgraph(
                     coerced = _parse_decision(model.complete(base_rewrite_messages))
                 except Exception:
                     coerced = {}
-                if isinstance(coerced, dict) and coerced.get("type") == "tool" and str(coerced.get("tool", "")).strip() == "make_error_function_patch":
+                if isinstance(coerced, dict) and coerced.get("type") == "tool" and str(coerced.get("tool", "")).strip() == "make_error_patch_override":
                     _validate_tool_decision(coerced)  # type: ignore[arg-type]
                     return {"state": st, "pending": coerced}  # type: ignore[typeddict-item]
 
@@ -1269,10 +1270,10 @@ def _run_langgraph(
                     "state": st,
                     "final": {
                         "type": "final",
-                        "thought": "Patch generation required, but the model did not produce a make_error_function_patch tool call.",
+                        "thought": "Patch generation required, but the model did not produce a make_error_patch_override tool call.",
                         "summary": "Stopped before patch generation.",
                         "next_step": (
-                            "Re-run with a larger model / higher OPENAI_MAX_TOKENS, or manually call make_error_function_patch.\n"
+                            "Re-run with a larger model / higher OPENAI_MAX_TOKENS, or manually call make_error_patch_override.\n"
                             "Required: generate a full replacement function body and pass it as new_func_code."
                         ),
                         "steps": st.steps,
@@ -1353,7 +1354,7 @@ def _run_langgraph(
         # Enforce tool ordering: analysis first, patching last.
         remaining = cfg.max_steps - len(st.steps)
         tool = str(decision.get("tool", "")).strip()
-        if tool in {"read_artifact", "make_error_function_patch"}:
+        if tool in {"read_artifact", "make_error_patch_override"}:
             prereq = _next_patch_prereq_tool(st)
             if prereq:
                 _validate_tool_decision(prereq)
@@ -1366,18 +1367,18 @@ def _run_langgraph(
                     "type": "final",
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                     "summary": "Stopped before patch generation.",
-                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
+                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
                     "steps": st.steps,
                     "error": _error_payload(st),
                 },
             }
 
-        if tool == "make_error_function_patch" and st.artifacts_dir and _last_tool_call_name(st) != "read_artifact":
+        if tool == "make_error_patch_override" and st.artifacts_dir and _last_tool_call_name(st) != "read_artifact":
             if remaining >= 3:
                 st.pending_patch = decision
                 focus_terms = _collect_focus_terms(st)
                 query = focus_terms[0] if focus_terms else ""
-                artifact_path = _last_artifact_path(st, "get_error_v1_function_code", "func_code") or _last_artifact_path(
+                artifact_path = _last_artifact_path(st, "get_error_v1_code_slice", "func_code") or _last_artifact_path(
                     st, "get_error_patch_context", "excerpt"
                 )
                 forced: Decision = {
@@ -1400,7 +1401,7 @@ def _run_langgraph(
                     "type": "final",
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch in-order.",
                     "summary": "Stopped before patch generation.",
-                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_function_patch -> ossfuzz_apply_patch_and_test).",
+                    "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
                     "steps": st.steps,
                     "error": _error_payload(st),
                 },
@@ -1422,7 +1423,7 @@ def _run_langgraph(
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
         st.steps.append({"decision": decision, "observation": obs.__dict__})
         st.last_observation = obs
-        if obs.ok and obs.tool == "make_error_function_patch":
+        if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
