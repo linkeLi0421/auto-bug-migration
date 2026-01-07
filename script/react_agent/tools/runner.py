@@ -14,10 +14,10 @@ from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_a
 from .migration_tools import (  # noqa: E402
     get_error_patch as get_error_patch_tool,
     get_error_patch_context as get_error_patch_context_tool,
-    get_error_v1_function_code as get_error_v1_function_code_tool,
+    get_error_v1_code_slice as get_error_v1_code_slice_tool,
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
-    make_error_function_patch as make_error_function_patch_tool,
+    make_error_patch_override as make_error_patch_override_tool,
     parse_build_errors as parse_build_errors_tool,
     search_patches as search_patches_tool,
 )
@@ -120,15 +120,6 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
                 out = self._agent_tools.search_definition(symbol_name, version=version)
                 return ToolObservation(True, tool, {"symbol_name": symbol_name, "version": version}, output=out)
-
-            if tool == "search_definition_in_v1":
-                if not self._agent_tools:
-                    return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
-                symbol_name = str(args.get("symbol_name", "")).strip()
-                if not symbol_name:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
-                out = self._agent_tools.search_definition_in_v1(symbol_name)
-                return ToolObservation(True, tool, {"symbol_name": symbol_name}, output=out)
 
             if tool == "search_text":
                 if not self._agent_tools:
@@ -366,7 +357,7 @@ class ToolRunner:
                     output=out,
                 )
 
-            if tool == "get_error_v1_function_code":
+            if tool == "get_error_v1_code_slice":
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 line_number = _as_int(args.get("line_number"), 0)
@@ -378,7 +369,7 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
                 if line_number <= 0:
                     return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
-                out = get_error_v1_function_code_tool(
+                out = get_error_v1_code_slice_tool(
                     patch_path=patch_path,
                     file_path=file_path,
                     line_number=line_number,
@@ -398,7 +389,7 @@ class ToolRunner:
                     output=out,
                 )
 
-            if tool == "make_error_function_patch":
+            if tool == "make_error_patch_override":
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 line_number = _as_int(args.get("line_number"), 0)
@@ -414,7 +405,7 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
                 if not str(new_func_code).strip():
                     return ToolObservation(False, tool, args, output="", error="Missing arg: new_func_code")
-                out = make_error_function_patch_tool(
+                out = make_error_patch_override_tool(
                     patch_path=patch_path,
                     file_path=file_path,
                     line_number=line_number,

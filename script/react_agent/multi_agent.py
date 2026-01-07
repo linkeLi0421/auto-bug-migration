@@ -20,7 +20,9 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 def _safe_patch_key_dirname(name: str, *, max_len: int = 160) -> str:
     raw = str(name or "").strip()
     raw = raw.replace(os.sep, "_")
-    cleaned = _SAFE_NAME_RE.sub("_", raw).strip("._-")
+    # Keep leading/trailing "_" intact (patch_key can legitimately start/end with "_");
+    # strip only "."/"-" to avoid hidden/awkward names.
+    cleaned = _SAFE_NAME_RE.sub("_", raw).strip(".-")
     if not cleaned:
         cleaned = "patch_key"
     return cleaned[:max_len]

@@ -13,10 +13,10 @@ if str(_SCRIPT_DIR) not in sys.path:
 from migration_tools.tools import (  # noqa: E402
     get_error_patch as _get_error_patch,
     get_error_patch_context as _get_error_patch_context,
-    get_error_v1_function_code as _get_error_v1_function_code,
+    get_error_v1_code_slice as _get_error_v1_code_slice,
     get_patch as _get_patch,
     list_patch_bundle as _list_patch_bundle,
-    make_error_function_patch as _make_error_function_patch,
+    make_error_patch_override as _make_error_patch_override,
     parse_build_errors_tool as _parse_build_errors_tool,
     search_patches as _search_patches,
 )
@@ -88,7 +88,7 @@ def get_error_patch_context(
     )
 
 
-def get_error_v1_function_code(
+def get_error_v1_code_slice(
     *,
     patch_path: str,
     file_path: str,
@@ -96,7 +96,7 @@ def get_error_v1_function_code(
     max_lines: int = 200,
     max_chars: int = 12000,
 ) -> Dict[str, Any]:
-    return _get_error_v1_function_code(
+    return _get_error_v1_code_slice(
         patch_path=patch_path,
         file_path=file_path,
         line_number=line_number,
@@ -106,7 +106,7 @@ def get_error_v1_function_code(
     )
 
 
-def make_error_function_patch(
+def make_error_patch_override(
     *,
     patch_path: str,
     file_path: str,
@@ -116,7 +116,7 @@ def make_error_function_patch(
     max_lines: int = 2000,
     max_chars: int = 200000,
 ) -> Dict[str, Any]:
-    return _make_error_function_patch(
+    return _make_error_patch_override(
         patch_path=patch_path,
         file_path=file_path,
         line_number=line_number,

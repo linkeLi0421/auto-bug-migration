@@ -1,139 +1,164 @@
-## Next: Auto-verify whether the target error is fixed after OSS-Fuzz test
+## Next: Simplify tools + unify patch rewriting
 
-### Problem
+### Goals
 
-In `log/agent_log/tmp.log`, the agent ends with “Review OSS-Fuzz logs in artifacts…”, but it doesn’t clearly answer whether the *original target error(s)* are still present after `ossfuzz_apply_patch_and_test` (which ran `build_version` + `check_build`).
+1) Make the tool surface non-duplicative (start with removing `search_definition_in_v1`).
+2) Use **one** patch-rewrite workflow for *all* patch hunks (functions + macros/consts/decls) by generalizing:
+   - `get_error_v1_code_slice` → return the V1-origin **patch slice** (not just function bodies)
+   - `make_error_patch_override` → rewrite the mapped **patch slice** (not just recreated functions)
+3) Rename patch-slice tools to reflect their real semantics (not function-only) and update all descriptions/docs accordingly.
 
-We want an automatic “did we fix it?” check, without manually opening logs.
+### Next: Rename tools (plan)
 
-### Goal
+#### Naming proposal
 
-After `ossfuzz_apply_patch_and_test`, automatically parse the resulting OSS-Fuzz logs (artifact-backed) and report:
+- Chosen (implemented):
+  - `get_error_v1_function_code` → `get_error_v1_code_slice`
+  - `make_error_function_patch` → `make_error_patch_override`
 
-- whether the original error signature(s) are gone **for the original patch hunk key**
-- if not fixed, the remaining matching errors
-- if fixed but build still fails, the new top errors (next triage target)
+#### Execution steps
+
+- [x] Decide final tool names (A or B above).
+- [x] Rename tool names in the agent tool surface:
+  - update `script/react_agent/tools/registry.py` (`ToolName`, `TOOL_SPECS`, descriptions)
+  - update `script/react_agent/tools/runner.py` dispatch names
+  - update `script/react_agent/agent_langgraph.py` system prompt strings + any guardrails referencing the old names
+  - update docs: `script/react_agent/README.md`
+  - update tests: `script/react_agent/test_langgraph_agent.sh`
+- [x] Rename wrapper functions in `script/react_agent/tools/migration_tools.py` to match tool names (keep internal imports from `script/migration_tools/tools.py`).
+- [x] Decide compatibility policy:
+  - preferred (clean tool surface): remove old tool names entirely (breaking change)
+  - alternative (temporary deprecation): keep old names for one release behind an env flag (but this reintroduces duplicate tools).
+- [x] Update `script/migration_tools/tools.py` docstrings/notes to match the new semantics (“patch slice”, “V1-origin code”, `git apply --reverse`).
+- [x] Add/adjust tests to cover the renamed tool calls (ensure `--list-tools` only shows the new names).
+
+### Proposed design
+
+- Keep only one canonical definition tool:
+  - `search_definition(symbol_name, version=v1|v2)`
+  - remove the deprecated alias tool `search_definition_in_v1`
+
+- Generalize patch mapping to always produce a “rewriteable slice”:
+  - extend `_get_error_patch_from_bundle(...)` to return slice indices for **non-`Recreated function`** patches.
+  - for recreated-function patches: keep the existing function-slice selection logic.
+  - for non-function patches: select the hunk/body region corresponding to the error line (hunk-based selection).
+  - keep current field names (`func_start_index`, `func_end_index`) but treat them as generic slice indices in docs/tool behavior (so we don’t add new duplicate tools).
+
+- Generalize `get_error_v1_code_slice`:
+  - if slice indices exist, extract `-` lines from the slice as `func_code` (rename description to “V1-origin code slice from patch”).
+  - if there are no `-` lines in the slice, return a best-effort excerpt (e.g., include context ` ` lines too) and clearly mark it in `note`.
+
+- Generalize `make_error_patch_override`:
+  - accept non-function replacement code (macros/consts/decls) in `new_func_code` (consider renaming description; keep one canonical tool name).
+  - replace the slice’s `-` lines with the provided replacement lines, each prefixed with `-`.
+  - recompute hunk headers (old/new lengths) after rewrite (already implemented; verify on non-function hunks).
 
 ### Plan / Tasks
 
-- [x] Capture the “target error” at the beginning of a patch-scope run:
-  - store normalized `(patch_key, msg)` as `state.target_errors` (optionally with `file` for display).
-  - for grouped errors, store all unique missing-member error patterns for that `patch_key`.
-- [x] After `ossfuzz_apply_patch_and_test`, parse logs automatically:
-  - use the existing error parsing helpers (`script/react_agent/build_log.py:iter_compiler_errors` and/or `parse_build_errors`) to extract compiler error lines from:
-    - `ossfuzz_apply_patch_and_test.build_output` (artifact)
-    - `ossfuzz_apply_patch_and_test.check_build_output` (artifact)
-  - return a compact result: `matched_target_errors`, `other_errors[:N]`.
-- [x] Update the agent final output to include an explicit verdict:
-  - `Target error fixed: yes/no`
-  - if `no`: include the remaining matching errors **mapped to the same `patch_key` as the target** (bounded)
-  - if `yes`: include the next top compiler errors (bounded, regardless of patch key)
-  - include artifact paths to the full build/check_build logs.
-- [x] Add non-Docker tests:
-  - feed synthetic `check_build_output`/`build_output` strings to the parser and assert **patch-key-based** target matching works.
-  - ensure outputs are bounded and stable.
+- [x] Tool cleanup: remove `search_definition_in_v1` from tool registry/runner/README/tests.
+- [ ] (Optional but recommended) Tool cleanup: remove `get_error_patch` from tool registry/runner/docs/tests; always use `get_error_patch_context` when mapping is needed.
+- [x] Mapping: update `_get_error_patch_from_bundle(...)` to compute slice indices for non-`Recreated function` patches (hunk-based selection).
+- [x] Tool behavior: update `get_error_v1_code_slice` description/output notes to reflect “patch slice” semantics (not function-only).
+- [x] Tool behavior: update `make_error_patch_override` description/output notes to reflect “patch slice rewrite” semantics (not function-only).
+- [x] Agent flow: remove patch-type branching; use one path:
+  - `get_error_patch_context` → `get_error_v1_code_slice` → `make_error_patch_override` → `ossfuzz_apply_patch_and_test`
+- [x] System prompt: document that `get_error_v1_code_slice`/`make_error_patch_override` apply to macros/consts/decls too, and remind that patches are applied via `git apply --reverse` (`-` lines become additions).
+- [x] Tests (non-Docker):
+  - add a tiny patch bundle with a macro/decl hunk and verify `get_error_v1_code_slice` returns the `-` lines.
+  - verify `make_error_patch_override` rewrites the slice and produces valid hunk headers.
+  - update stub/agent tests to cover the unified flow (no separate override tool).
 
 ### Success criteria
 
-- [x] For runs like `log/agent_log/tmp.log`, the final summary explicitly states whether the missing-member error is fixed.
-- [x] The agent no longer requires manual log browsing to confirm the target error’s status.
+- [x] `--list-tools` no longer shows `search_definition_in_v1`.
+- [ ] Patch-scope agent can handle both recreated-function errors and non-function macro/decl errors using only:
+  - `get_error_v1_code_slice` + `make_error_patch_override`
+  - followed by `ossfuzz_apply_patch_and_test`.
 
-## Next: `search_definition` should follow typedef extents to real struct bodies
+## Next: Fix patch_key/artifact-dir mismatch (leading "_" folders)
 
 ### Problem
 
-In `log/agent_log/tmp.log`, `search_definition(symbol_name="struct _xmlHashTable", version="v2")` only returns the typedef:
+Some runs create artifacts under `data/react_agent_artifacts/<basename>/...` (e.g. `extra_encoding.c/`) while the mapped
+`patch_key` is different (e.g. `_extra_encoding.c`). When an override diff is passed to `ossfuzz_apply_patch_and_test`, the tool
+fails to infer the patch key from the override artifact path and aborts with:
 
-- primary: `typedef struct _xmlHashTable xmlHashTable;`
-- related: still points at the typedef line, not the real struct body
+`ValueError: Could not infer patch_key for override patch file. Put override artifacts under a directory named <patch_key> ...`
 
-But the KB entry includes a `type_ref.typedef_extent` pointing to the actual definition range (e.g. `hash.c:68-76`). The tool should surface that as the “real definition”, even when `type_ref.underlying` is `NO_DECL_FOUND`.
+### Hypothesis
+
+`resolve_artifact_dir(..., patch_key=...)` is being called with an empty or “sanitized” patch_key, or multi-agent / grouping code
+uses a derived directory name (e.g. filename) that doesn’t exactly match the patch_key coming from patch mapping (including leading `_`).
+
+### Plan
+
+- [x] Reproduce from `log/agent_log/tmp.log`: identify where `patch_key` is set (likely `_extra_encoding.c`) and where the artifacts
+      directory is chosen (`extra_encoding.c`).
+- [x] Decide the canonical folder naming rule:
+  - prefer: always use the **actual patch_key** string for the artifact subdir (including leading `_`), and never fall back to filename.
+  - ensure this rule applies consistently to both single-agent and `multi_agent.py` runs.
+- [x] Implement fix (choose one):
+  1) **Artifact dir selection fix**: ensure `resolve_artifact_dir(..., patch_key=patch_key)` always receives the true patch_key used in the run.
+     - verify `patch_key` is determined before `resolve_artifact_dir` is called (or delay artifact dir selection until after patch_key is known).
+  2) **Override-path inference fix**: update `ossfuzz_apply_patch_and_test` override handling to accept override diffs located under either:
+     - `.../<patch_key>/...` or
+     - `.../<normalized_patch_key>/...` where normalization strips a single leading `_` (only if safe), or
+     - optionally accept an explicit `patch_key` argument so inference is never needed.
+
+- [x] Add a regression test:
+  - simulate `patch_key="_foo.c"` with artifacts written under `foo.c/` and ensure the system either:
+    - writes under `_foo.c/` (preferred), or
+    - successfully infers / accepts the patch key when applying overrides.
+- [x] Verify end-to-end on a real run: generate an override under the patch_key dir and confirm `ossfuzz_apply_patch_and_test` merges
+      and tests without the inference error.
+
+## Next: Fix macro/decl hunk dependencies (MAKE_HANDLER / EMPTY_ICONV example)
+
+### Problem
+
+Some non-function hunks introduce new macros/consts/decls but omit *dependent* definitions/macros that the surrounding code expects.
+Example from `encoding.c` after applying the patch bundle with `git apply --reverse` (`-` lines become additions):
+
+- The hunk adds `MAKE_HANDLER(...)` but does not also add `EMPTY_ICONV` / `EMPTY_UCONV`.
+- The build then fails with a macro-expansion parse error like “expected '}'” at a `MAKE_HANDLER(...)` usage because the expansion
+  references undefined tokens/macros and breaks the initializer syntax.
+
+This often yields an unhelpful agent loop where `make_error_patch_override` is called but produces an override with no meaningful change.
 
 ### Goal
 
-For typedef-to-struct patterns, `search_definition` prints:
+Teach the agent how to fix “macro/decl hunk missing dependencies” cases by:
+1) identifying what extra macros/decls must be added alongside the hunk, and
+2) generating a *changed* override patch slice that includes them.
 
-- the typedef (alias) site
-- the underlying struct body when it is reachable via `type_ref.typedef_extent` (or other KB-provided extents)
+### Plan
 
-### Plan / Tasks
+- [ ] Add a dedicated tool for dependency discovery around an error line in a patch bundle:
+  - `get_error_patch_dependencies(patch_path, file_path, line_number, error_text?)` → returns:
+    - the mapped patch slice excerpt (existing), plus
+    - macro identifiers referenced by the slice (token scan of `-` lines), and
+    - for each unknown macro token, a `search_text` suggestion and/or V1/V2 “definition candidates” locations.
+  - Implementation can be lightweight: regex tokenization for ALLCAPS-like identifiers + `search_text` fallback.
 
-- [x] Add a helper to materialize “virtual nodes” from KB nested extents:
-  - if a node has `type_ref.typedef_extent`, emit a synthetic candidate node whose `extent` is that `typedef_extent` (and `kind` like `STRUCT_DECL` with a `__reason` such as `type_ref.typedef_extent`).
-  - do the same for any other nested extents we rely on (keep it minimal; start with `typedef_extent`).
-- [x] Update `KbIndex.related_definition_candidates(...)` (or `AgentTools.search_definition`) to include these synthetic candidates so ranking can prefer the real body over forward decl/typedef.
-- [x] Add a regression test for `_xmlHashTable` (v2) that asserts the output includes the `hash.c:<start>-<end>` struct snippet (not just the typedef line).
-- [x] Ensure the output remains bounded and doesn’t introduce `...[truncated]` markers in the `search_definition` tool output.
+- [ ] Add a dedicated tool to extract “neighbor macro definitions” from V1/V2 sources:
+  - `get_macro_block(version, file_path, near_line, name)` that returns a bounded block around the macro definition,
+    including any helper macros used in its body (one-hop dependency expansion).
 
-### Success criteria
+- [ ] Update system prompt with a one-shot worked example (“MAKE_HANDLER missing EMPTY_ICONV/EMPTY_UCONV”):
+  - Decision pattern:
+    1) `parse_build_errors` → detect macro expansion parse error (expected '}', expanded from macro 'X').
+    2) `get_error_patch_context` to view the macro hunk slice.
+    3) If macro body references missing identifiers (e.g. `EMPTY_ICONV`), treat as “missing dependency macro”.
+    4) Use `search_text` (v2 first, then v1) to find missing macro definitions.
+    5) Call `make_error_patch_override` to rewrite the macro/decl slice so it adds both the macro and its dependencies.
 
-- [x] Running `search_definition("struct _xmlHashTable", version="v2")` shows the actual struct body (via `typedef_extent`) in addition to the typedef alias.
+- [ ] Update the patch-slice rewrite guidance in prompt:
+  - explicitly state: for non-function slices, `new_func_code` may be multiple macro/decl lines, and the fix may need to *add*
+    prerequisite macros referenced by the slice.
 
-## Next: Parallelize patch-scope fixing across multiple hunks
+- [ ] Add regression test fixture in `script/migration_tools/test_migration_tools.sh`:
+  - a macro slice containing `MAKE_HANDLER` referencing `EMPTY_ICONV/EMPTY_UCONV` where the replacement code adds all three,
+    ensuring `make_error_patch_override` rewrites the `-` run correctly.
 
-### Problem
-
-Right now the agent solves only the **first** error group (typically the first/most common `patch_key` group). In practice, OSS-Fuzz builds often fail with **multiple independent patch hunks** (different `patch_key`s), and we want to triage/fix them in parallel and then decide which fix(es) to apply.
-
-### Goal
-
-Given a build log (or OSS-Fuzz build/check_build artifacts), automatically:
-
-1. parse compiler errors
-2. map each error to a `patch_key` (hunk key) using the patch bundle
-3. group by `patch_key` and pick one representative “primary” error line per group
-4. run **one ReAct agent per group** (separately) and collect their results for review
-
-The user reviews the per-hunk agent outputs and decides next actions (apply only certain overrides, rerun OSS-Fuzz, iterate, etc.).
-
-### Plan / Tasks
-
-- [x] Add a new driver command that fans out per-hunk agents (no auto-apply):
-  - new CLI entry (recommended): `script/react_agent/multi_agent.py` or a new `--mode multi` in `agent_langgraph.py`.
-  - inputs: `--patch-path`, `--build-log` (or `--ossfuzz-artifacts`), `--v1-json-dir`, `--v2-json-dir`, `--v1-src`, `--v2-src`.
-  - outputs: one JSON/text report plus per-hunk artifact dirs.
-- [x] Error parsing + grouping pipeline:
-  - reuse `script/react_agent/build_log.py:iter_compiler_errors` to extract `(file,line,col,msg,raw)` from build/check_build logs.
-  - load patch bundle via `script/migration_tools/patch_bundle.py:load_patch_bundle` (respect `REACT_AGENT_PATCH_ALLOWED_ROOTS`).
-  - map each error to `patch_key` with `migration_tools.tools._get_error_patch_from_bundle(...)`.
-  - group errors by `patch_key`; drop unmapped errors into `patch_key=None` group.
-  - select a stable representative per group (e.g. first error in file/line order).
-- [x] Per-hunk agent invocation:
-  - for each `patch_key` group, call the existing agent with `--error-scope patch` but override its `state.error_line`/`state.grouped_errors` to that group.
-  - ensure each sub-agent writes to its own artifact dir: `data/react_agent_artifacts/<parent_run>/<patch_key>/...`.
-  - enforce the existing “must OSS-Fuzz test after generating a patch” policy **within each sub-agent**, but do not automatically merge/apply across groups unless user requests.
-- [x] Aggregate reporting:
-  - produce a summary table: `patch_key`, primary error, `Target error fixed`, whether an override diff was generated, and artifact paths.
-  - keep the report bounded and easy to scan in text mode; save full details to artifacts.
-- [x] Add tests (non-Docker):
-  - synthetic build log with 2 different patch keys and verify grouping + stable representative selection.
-  - smoke test that the driver produces N sub-runs and a top-level summary.
-
-### Success criteria
-
-- [x] One command produces per-hunk agent results for all patch keys found in the build logs.
-- [x] No automatic “apply everything”; user can choose which overrides to keep/merge.
-- [x] The workflow scales to dozens of hunks while keeping console output bounded (details offloaded to artifacts).
-
-## Maintenance: Remove `inspect_symbol` tool
-
-- [x] Remove `inspect_symbol` from the agent-facing tool registry; use `search_definition(..., version=v1|v2)` instead.
-- [x] Update stub model/tooling/docs/tests to avoid emitting or expecting `inspect_symbol` tool calls.
-
-## Next: Multi-agent artifact directory normalization (avoid duplicate `_foo` vs `foo` dirs)
-
-### Problem
-
-Some patch keys can start with punctuation (e.g. `_extra_encoding.c`). The agent’s artifact directory logic normalizes
-patch keys (strips leading `._-`) when creating per-`patch_key` artifact folders, but `multi_agent.py` previously used the
-raw `patch_key` as a directory name for `agent_cmd.txt`/`agent_stdout.json`. This can produce two directories for the same
-hunk within one multi-agent run:
-
-- `.../_extra_encoding.c/` (multi_agent’s raw directory)
-- `.../extra_encoding.c/` (agent’s normalized artifact directory)
-
-### Plan / Tasks
-
-- [x] Make `multi_agent.py` write per-hunk artifacts into the same normalized directory name as the agent (safe filename).
-- [x] Add `patch_key_dirname` to the multi-agent summary for clarity/debugging.
-- [x] Add/adjust a non-Docker test to ensure the summary always includes `patch_key_dirname`.
+- [ ] Validate end-to-end with the provided testcase log:
+  - run the agent on the failing `encoding.c` log and confirm the first override is meaningfully different and fixes the compile error.

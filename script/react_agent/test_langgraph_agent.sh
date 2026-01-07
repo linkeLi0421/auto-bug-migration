@@ -22,6 +22,28 @@ names = {t.get("name") for t in tools if isinstance(t, dict)}
 assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
 PY
 
+# Artifact directories must preserve patch_key (including leading/trailing "_"),
+# otherwise override diff files cannot be mapped back to bundle patch keys.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+repo_root = script_dir.parents[1]
+sys.path.insert(0, str(repo_root))
+
+from script.react_agent.artifacts import resolve_artifact_dir  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = td
+    store, out_dir = resolve_artifact_dir(cli_dir="", disabled=False, patch_key="_extra_encoding.c")
+    assert Path(out_dir).name == "_extra_encoding.c", out_dir
+
+print("OK")
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -40,15 +62,14 @@ allowed = {
     "read_artifact",
     "read_file_context",
     "search_definition",
-    "search_definition_in_v1",
     "search_text",
     "list_patch_bundle",
     "get_patch",
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
-    "get_error_v1_function_code",
-    "make_error_function_patch",
+    "get_error_v1_code_slice",
+    "make_error_patch_override",
     "parse_build_errors",
 }
 
@@ -142,12 +163,12 @@ for s in steps:
         versions.append(((decision.get("args") or {}).get("version")))
 
 assert tools[0] == "get_error_patch_context", tools
-assert tools[1] == "get_error_v1_function_code", tools
+assert tools[1] == "get_error_v1_code_slice", tools
 assert "v1" in versions and "v2" in versions, versions
 
 # Patch generation is followed by mandatory OSS-Fuzz test; artifact reads only happen right before patch generation.
-assert "make_error_function_patch" in tools, tools
-idx_patch = tools.index("make_error_function_patch")
+assert "make_error_patch_override" in tools, tools
+idx_patch = tools.index("make_error_patch_override")
 assert idx_patch > 0 and tools[idx_patch - 1] == "read_artifact", tools
 assert "ossfuzz_apply_patch_and_test" in tools[idx_patch + 1 :], tools
 
@@ -178,7 +199,7 @@ assert "struct definition" not in combined, combined
 assert "add the missing fields" not in combined, combined
 
 tools = [((s.get("decision") or {}).get("tool")) for s in (obj.get("steps") or []) if isinstance(s, dict)]
-assert "make_error_function_patch" in tools, tools
+assert "make_error_patch_override" in tools, tools
 PY
 
 # Patch-aware runs: if read_file_context is used, it must use pre-patch line numbers.
