@@ -317,7 +317,7 @@ class StubModel(ChatModel):
                             "type": "final",
                             "thought": "Pre-patch line mapping unavailable; rely on patch excerpt and KB locations instead of reading by build-log line numbers.",
                             "summary": "Stopped after patch mapping.",
-                            "next_step": "Use search_definition/inspect_symbol to get source-checkout locations, or inspect the patch excerpt directly.",
+                            "next_step": "Use search_definition to get source-checkout locations, or inspect the patch excerpt directly.",
                         }
                     )
                 return json.dumps(
@@ -356,8 +356,8 @@ class StubModel(ChatModel):
                 {
                     "type": "tool",
                     "thought": "Implicit function declaration; inspect the function symbol across versions.",
-                    "tool": "inspect_symbol",
-                    "args": {"symbol_name": symbol},
+                    "tool": "search_definition",
+                    "args": {"symbol_name": symbol, "version": "v2"},
                 }
             )
         if "no member named" in msg and "struct" in msg:
@@ -367,8 +367,8 @@ class StubModel(ChatModel):
                 {
                     "type": "tool",
                     "thought": "Struct member missing; inspect the struct symbol across versions.",
-                    "tool": "inspect_symbol",
-                    "args": {"symbol_name": struct_name},
+                    "tool": "search_definition",
+                    "args": {"symbol_name": f"struct {struct_name}" if struct_name else "", "version": "v2"},
                 }
             )
         if "unknown type name" in msg:

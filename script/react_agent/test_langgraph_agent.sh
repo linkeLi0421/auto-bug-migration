@@ -37,7 +37,6 @@ assert isinstance(obj.get("steps"), list), obj
 assert len(obj["steps"]) <= 3, obj
 
 allowed = {
-    "inspect_symbol",
     "read_artifact",
     "read_file_context",
     "search_definition",
@@ -61,9 +60,9 @@ for step in obj["steps"]:
     assert tool in allowed, (tool, step)
 
 if fixture.endswith("implicit_function.log"):
-    assert any((s.get("decision") or {}).get("tool") == "inspect_symbol" for s in obj["steps"]), obj
+    assert any((s.get("decision") or {}).get("tool") == "search_definition" for s in obj["steps"]), obj
 elif fixture.endswith("struct_missing_member.log"):
-    assert any((s.get("decision") or {}).get("tool") == "inspect_symbol" for s in obj["steps"]), obj
+    assert any((s.get("decision") or {}).get("tool") == "search_definition" for s in obj["steps"]), obj
 elif fixture.endswith("syntax_error.log"):
     assert any((s.get("decision") or {}).get("tool") == "read_file_context" for s in obj["steps"]), obj
 PY

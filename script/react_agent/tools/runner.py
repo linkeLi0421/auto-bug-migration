@@ -107,13 +107,7 @@ class ToolRunner:
                 )
 
             if tool == "inspect_symbol":
-                if not self._agent_tools:
-                    return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
-                symbol_name = str(args.get("symbol_name", "")).strip()
-                if not symbol_name:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
-                out = self._agent_tools.inspect_symbol(symbol_name)
-                return ToolObservation(True, tool, {"symbol_name": symbol_name}, output=out)
+                return ToolObservation(False, tool, args, output="", error="Removed tool: inspect_symbol (use search_definition).")
 
             if tool == "search_definition":
                 if not self._agent_tools:

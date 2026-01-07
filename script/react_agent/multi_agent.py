@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -13,9 +14,37 @@ from artifacts import default_run_id
 from build_log import iter_compiler_errors, load_build_log
 
 
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_patch_key_dirname(name: str, *, max_len: int = 160) -> str:
+    raw = str(name or "").strip()
+    raw = raw.replace(os.sep, "_")
+    cleaned = _SAFE_NAME_RE.sub("_", raw).strip("._-")
+    if not cleaned:
+        cleaned = "patch_key"
+    return cleaned[:max_len]
+
+
+def _redact_cmd_for_log(cmd: List[str]) -> str:
+    redacted: List[str] = []
+    skip_next = False
+    for token in cmd:
+        if skip_next:
+            redacted.append("REDACTED")
+            skip_next = False
+            continue
+        if token == "--openai-api-key":
+            redacted.append(token)
+            skip_next = True
+            continue
+        redacted.append(token)
+    return " ".join(redacted) + "\n"
+
+
 def _resolve_output_format(value: str) -> str:
     if value == "auto":
-        return "text" if sys.stdout.isatty() else "json"
+        return "json-pretty" if sys.stdout.isatty() else "json"
     return value
 
 
@@ -87,10 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("build_log", nargs="?", default="-", help="Build log path, or '-' for stdin.")
     p.add_argument("--patch-path", required=True, help="Path to a tmp_patch bundle (*.patch2).")
     p.add_argument("--max-groups", type=int, default=20, help="Max patch_key groups to run (default: 20).")
-    p.add_argument("--output-format", choices=["auto", "json", "json-pretty", "text"], default="auto")
+    p.add_argument("--output-format", choices=["auto", "json", "json-pretty", "text"], default="json-pretty")
     p.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     p.add_argument("--tools", choices=["real", "fake"], default="real")
-    p.add_argument("--max-steps", type=int, default=6)
+    p.add_argument("--max-steps", type=int, default=10)
     p.add_argument("--only-patch-keys", default="", help="Comma-separated patch_key allowlist.")
     p.add_argument(
         "--include-agent-output",
@@ -128,7 +157,7 @@ def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) 
         str(agent_script),
         str(args.build_log),
         "--output-format",
-        "json",
+        "json-pretty",
         "--model",
         str(args.model),
         "--tools",
@@ -168,16 +197,6 @@ def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) 
     if str(args.v2_src).strip():
         cmd.extend(["--v2-src", str(args.v2_src)])
 
-    if str(args.openai_api_key).strip():
-        cmd.extend(["--openai-api-key", str(args.openai_api_key)])
-    if str(args.openai_model).strip():
-        cmd.extend(["--openai-model", str(args.openai_model)])
-    if str(args.openai_base_url).strip():
-        cmd.extend(["--openai-base-url", str(args.openai_base_url)])
-    if str(args.openai_org).strip():
-        cmd.extend(["--openai-org", str(args.openai_org)])
-    if str(args.openai_project).strip():
-        cmd.extend(["--openai-project", str(args.openai_project)])
     if int(args.openai_max_tokens or 0) > 0:
         cmd.extend(["--openai-max-tokens", str(int(args.openai_max_tokens))])
     if bool(args.no_json_mode):
@@ -220,6 +239,7 @@ def main(argv: List[str]) -> int:
     results: List[Dict[str, Any]] = []
     env = dict(os.environ)
     env["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
+    env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     for key in ranked:
         errs = groups.get(key) or []
@@ -236,9 +256,9 @@ def main(argv: List[str]) -> int:
             except json.JSONDecodeError as exc:
                 parse_error = f"{type(exc).__name__}: {exc}"
 
-        out_dir = artifacts_root / str(key)
+        out_dir = artifacts_root / _safe_patch_key_dirname(key)
         out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "agent_cmd.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8", errors="replace")
+        (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
         (out_dir / "agent_stdout.json").write_text(stdout + ("\n" if stdout else ""), encoding="utf-8", errors="replace")
         if stderr:
             (out_dir / "agent_stderr.log").write_text(stderr + "\n", encoding="utf-8", errors="replace")
@@ -252,6 +272,7 @@ def main(argv: List[str]) -> int:
 
         item: Dict[str, Any] = {
             "patch_key": key,
+            "patch_key_dirname": out_dir.name,
             "errors": len(errs),
             "primary_error": primary,
             "agent_exit_code": int(proc.returncode),
