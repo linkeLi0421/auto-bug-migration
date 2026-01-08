@@ -111,6 +111,31 @@ assert "EMPTY_ICONV" in (forced.get("args") or {}).get("query", ""), forced
 print("OK")
 PY
 
+# Macro lookup fallback: when v2 has no matches, macro_lookup should fall back to v1.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _macro_lookup_update_from_search_text_output  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="expanded from macro 'MAKE_HANDLER'",
+)
+state.macro_lookup = {"token": "EMPTY_ICONV", "stage": "need_search_text", "version": "v2"}
+_macro_lookup_update_from_search_text_output(state, {"matches": [], "truncated": False})
+assert state.macro_lookup and state.macro_lookup.get("version") == "v1", state.macro_lookup
+assert state.macro_lookup.get("stage") == "need_search_text", state.macro_lookup
+
+print("OK")
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -359,6 +384,50 @@ try:
     raise AssertionError("expected allowlist failure")
 except ValueError:
     pass
+PY
+
+# read_artifact: max_lines=0/max_chars=0 should return full text, and prompt compaction must not truncate it.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _compact_observation_for_prompt  # noqa: E402
+from tools.artifact_tools import read_artifact  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="",
+)
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(root)
+
+    big = root / "big.txt"
+    lines = ["HEADER"] + [f"LINE{i:05d} " + ("X" * 80) for i in range(300)] + ["TAIL"]
+    big.write_text("\n".join(lines) + "\n", encoding="utf-8", errors="replace")
+
+    out = read_artifact(artifact_path=str(big), start_line=1, max_lines=0, max_chars=0)
+    text = out.get("text") or ""
+    assert "HEADER\n" in text, out
+    assert "TAIL\n" in text, out
+    assert len(text) > 12000, len(text)
+    assert out.get("truncated") is False, out
+
+    obs = {"ok": True, "tool": "read_artifact", "args": {"max_lines": 0, "max_chars": 0}, "output": out, "error": None}
+    compacted = _compact_observation_for_prompt(state, obs)
+    compacted_text = (((compacted or {}).get("output") or {}).get("text") or "")
+    assert compacted_text == text, (len(compacted_text), len(text))
+
+print("OK")
 PY
 
 # Patch-key artifact dirs: when only ARTIFACT_ROOT is set, store under <patch_key>/ and overwrite filenames.

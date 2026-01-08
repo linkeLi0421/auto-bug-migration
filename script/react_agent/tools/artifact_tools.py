@@ -28,6 +28,13 @@ def _clamp_int(value: Any, default: int, *, min_value: int, max_value: int) -> i
     return max(min_value, min(n, max_value))
 
 
+def _parse_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def read_artifact(
     *,
     artifact_path: str,
@@ -37,7 +44,12 @@ def read_artifact(
     context_lines: int = 8,
     max_chars: int = 20000,
 ) -> Dict[str, Any]:
-    """Read a bounded slice from an artifact file created during this agent run."""
+    """Read a slice from an artifact file created during this agent run.
+
+    Notes:
+    - max_lines=0 means "read all remaining lines".
+    - max_chars=0 means "no character truncation".
+    """
     allow_root = _artifact_allow_root()
     if not allow_root.exists():
         raise FileNotFoundError(f"Artifact root does not exist: {allow_root}")
@@ -55,10 +67,22 @@ def read_artifact(
     if not path.is_file():
         raise FileNotFoundError(f"Artifact not found: {path}")
 
-    max_lines_n = _clamp_int(max_lines, 200, min_value=1, max_value=800)
     start_n = _clamp_int(start_line, 1, min_value=1, max_value=10_000_000)
     ctx = _clamp_int(context_lines, 8, min_value=0, max_value=200)
-    max_chars_n = _clamp_int(max_chars, 20000, min_value=200, max_value=200000)
+
+    max_lines_raw = _parse_int(max_lines, 200)
+    max_lines_n: Optional[int]
+    if max_lines_raw == 0:
+        max_lines_n = None
+    else:
+        max_lines_n = _clamp_int(max_lines_raw, 200, min_value=1, max_value=10_000_000)
+
+    max_chars_raw = _parse_int(max_chars, 20000)
+    max_chars_n: Optional[int]
+    if max_chars_raw == 0:
+        max_chars_n = None
+    else:
+        max_chars_n = _clamp_int(max_chars_raw, 20000, min_value=1, max_value=50_000_000)
 
     text = path.read_text(encoding="utf-8", errors="replace")
     lines = text.splitlines()
@@ -75,11 +99,14 @@ def read_artifact(
         if match_line is not None:
             start_n = max(match_line - ctx, 1)
 
-    slice_lines = lines[start_n - 1 : start_n - 1 + max_lines_n]
-    end_n = start_n + max(len(slice_lines), 1) - 1
+    if max_lines_n is None:
+        slice_lines = lines[start_n - 1 :]
+    else:
+        slice_lines = lines[start_n - 1 : start_n - 1 + max_lines_n]
+    end_n = start_n + len(slice_lines) - 1 if slice_lines else start_n
     out_text = "\n".join(slice_lines).rstrip("\n") + ("\n" if slice_lines else "")
     truncated = end_n < total_lines
-    if max_chars_n and len(out_text) > max_chars_n:
+    if max_chars_n is not None and len(out_text) > max_chars_n:
         out_text = out_text[:max_chars_n].rstrip("\n") + "\n...[truncated]"
         truncated = True
 
@@ -92,4 +119,3 @@ def read_artifact(
         "match_line": match_line,
         "text": out_text,
     }
-

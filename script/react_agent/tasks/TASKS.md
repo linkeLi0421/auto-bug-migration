@@ -67,3 +67,54 @@ their real definitions in V1/V2 source. We want the fix to be general and tool-d
 - [x] Add a regression test that enforces “tool evidence before defines”:
   - `script/react_agent/test_langgraph_agent.sh` unit-tests the guardrail helper to ensure an attempted `#define EMPTY_ICONV` triggers a forced `search_text` first.
   - (Future) expand to an end-to-end patch-scope fixture asserting `search_text` + `read_file_context` occur before override generation.
+
+## Next: Macro resolution must fall back to V1 when V2 misses
+
+Problem (seen in `log/agent_log/tmp.log`): for tokens like `EMPTY_ICONV` / `EMPTY_UCONV`, the agent may search V2 only, not find them, and then:
+- either stop early, or
+- “give up” and remove the tokens without confirming whether V1 defines them.
+
+We want a consistent policy:
+- If token is missing in V2: search V1.
+- If token exists in V1: prefer using V1’s definition (copy/adapt the guarded `#define` block).
+- If token exists in neither: then (and only then) remove/replace the token usage.
+
+### Plan
+
+- [x] Strengthen prompt rules for missing macro tokens:
+  - Always search in this order: `search_text(query=\"#define TOKEN\", version=\"v2\")` → if no matches, `search_text(..., version=\"v1\")`.
+  - Never use a bare `search_text(query=\"TOKEN\")` for macro-definition lookup; it’s too noisy and misses the intended `#define`.
+  - If V1 defines TOKEN but V2 doesn’t, prefer copying the V1 `#define` block into the override slice (do not invent a stub).
+
+- [x] Make the runtime macro guardrail explicitly enforce V1 fallback:
+  - If V2 search returns 0 matches for `#define TOKEN`, automatically schedule the V1 search next (without model choice).
+  - If both searches return 0 matches, set a guardrail flag like `macro_lookup.not_found=True` and inject a short instruction into the prompt:
+    “TOKEN not defined in V1/V2; remove/replace TOKEN usage instead of defining it.”
+
+- [ ] Add an end-to-end regression fixture for the fallback behavior:
+  - Provide a tiny v1/v2 source tree fixture where:
+    - V2 does *not* define `EMPTY_ICONV`, but V1 does (with guards).
+  - Assert the agent calls `search_text` in v2 then v1, then `read_file_context` on the V1 match, before producing an override.
+
+## Next: Remove patch-generation truncation limits (avoid accidental code deletion)
+
+Problem (seen in `log/agent_log/tmp.log` / `_extra_parser.c`): `make_error_patch_override` replaces the entire mapped `-` slice.
+If the agent/model only sees a truncated slice (or the model’s response is truncated), it will emit an incomplete `new_func_code`,
+silently deleting the missing tail lines (e.g., trailing `static ...` prototypes).
+
+### Plan
+
+- [x] Remove small hard caps in `read_artifact`:
+  - Support `max_lines=0` meaning “read all remaining lines”.
+  - Support `max_chars=0` meaning “no char truncation”.
+  - Raise/remove the current internal clamps (800 lines / 200k chars) so full patch slices can be read in one call.
+
+- [x] Remove the extra prompt-compaction truncation for `read_artifact` outputs:
+  - `_compact_observation_for_prompt` currently truncates all strings to ~12k chars; this can cut off patch slices even when `read_artifact` returned them.
+  - Special-case `read_artifact` so its `output.text` is not compacted (or is compacted using a much higher cap, respecting `max_chars=0`).
+
+- [x] Change the forced pre-patch `read_artifact` call to request full slice content:
+  - Use `start_line=1`, `query=\"\"`, `context_lines=0`, `max_lines=0`, `max_chars=0` when reading `get_error_v1_code_slice.func_code` artifacts.
+
+- [x] Add a small regression test:
+  - Create a synthetic artifact file >12k chars and ensure `read_artifact(max_chars=0)` + prompt compaction keeps the full text.
