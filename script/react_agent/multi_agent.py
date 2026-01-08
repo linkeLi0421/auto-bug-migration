@@ -83,7 +83,7 @@ def _load_bundle(patch_path: str) -> Tuple[Any, Any]:
 def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[str, List[Dict[str, Any]]]:
     bundle, get_error_patch = _load_bundle(patch_path)
     groups: Dict[str, List[Dict[str, Any]]] = {}
-    for err in iter_compiler_errors(build_log_text):
+    for err in iter_compiler_errors(build_log_text, snippet_lines=10):
         mapping = get_error_patch(bundle, patch_path=patch_path, file_path=err["file"], line_number=err["line"])
         key = str(mapping.get("patch_key") or "").strip()
         if not key:

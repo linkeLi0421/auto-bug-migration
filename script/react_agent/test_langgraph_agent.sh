@@ -44,6 +44,40 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# Focus-term extraction: macro-expansion snippets should surface macro tokens and avoid tiny noise tokens.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _collect_focus_terms  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/libxml2/encoding.c:104:5: error: expected '}'",
+    snippet=(
+        "/src/libxml2/encoding.c:104:5: error: expected '}'\n"
+        "  104 |     MAKE_HANDLER(\"UTF-8\", __revert_e11519_UTF8ToUTF8, __revert_e11519_UTF8ToUTF8)\n"
+        "      |     ^\n"
+        "/src/libxml2/encoding.c:102:30: note: expanded from macro 'MAKE_HANDLER'\n"
+        "  102 |     { (char *) name, in, out EMPTY_ICONV EMPTY_UCONV }\n"
+        "      |                              ^\n"
+    ),
+)
+
+terms = _collect_focus_terms(state)
+assert "MAKE_HANDLER" in terms, terms
+assert "EMPTY_ICONV" in terms, terms
+assert "EMPTY_UCONV" in terms, terms
+assert "c" not in terms, terms
+
+print("OK")
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -66,7 +100,6 @@ allowed = {
     "list_patch_bundle",
     "get_patch",
     "search_patches",
-    "get_error_patch",
     "get_error_patch_context",
     "get_error_v1_code_slice",
     "make_error_patch_override",

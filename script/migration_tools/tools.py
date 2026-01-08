@@ -770,6 +770,27 @@ def get_error_v1_code_slice(
 
     func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     total_lines = len(func_lines)
+    defined_macros: set[str] = set()
+    for line in func_lines:
+        m = re.match(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+        if m:
+            defined_macros.add(str(m.group(1)))
+
+    referenced_macro_tokens: set[str] = set()
+    for line in func_lines:
+        # Drop simple strings/comments to reduce noisy tokens; this is heuristic, not a preprocessor.
+        stripped = re.sub(r'"([^"\\]|\\.)*"', '""', line)
+        stripped = re.sub(r"//.*$", "", stripped)
+        stripped = re.sub(r"/\*.*?\*/", "", stripped)
+        for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", stripped):
+            if tok.isupper() and any(c.isalpha() for c in tok):
+                referenced_macro_tokens.add(tok)
+
+    missing_macro_tokens = referenced_macro_tokens - defined_macros
+    # Bound output size.
+    defined_macros_list = sorted(defined_macros)[:200]
+    referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
+    missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
 
     max_n = max(0, min(int(max_lines or 0), 5000))
     returned_lines = func_lines[:max_n]
@@ -788,6 +809,9 @@ def get_error_v1_code_slice(
         "func_code_lines_total": total_lines,
         "func_code_lines_returned": len(returned_lines),
         "func_code_truncated": truncated,
+        "defined_macros": defined_macros_list,
+        "referenced_macro_tokens": referenced_macro_tokens_list,
+        "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
         "note": "Extracted from '-' lines in the mapped patch slice (V1-origin code; git apply --reverse adds these lines).",
     }
 
@@ -907,6 +931,12 @@ def make_error_patch_override(
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
 
     new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
+
+    def _norm_for_compare(text: str) -> str:
+        return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
+
+    if _norm_for_compare(old_func_code_full) == _norm_for_compare(new_code_norm):
+        raise ValueError("new_func_code is identical to the existing mapped '-' slice (no-op rewrite)")
     new_func_lines = new_code_norm.splitlines()
     if not any(line.strip() for line in new_func_lines):
         raise ValueError("new_func_code must contain at least one non-empty line")

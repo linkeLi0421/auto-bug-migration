@@ -11,7 +11,6 @@ ToolName = Literal[
     "list_patch_bundle",
     "get_patch",
     "search_patches",
-    "get_error_patch",
     "get_error_patch_context",
     "get_error_v1_code_slice",
     "make_error_patch_override",
@@ -81,11 +80,6 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": "Search patches by key/file/signature/type.",
     },
     {
-        "name": "get_error_patch",
-        "args": {"patch_path": "string", "file_path": "string", "line_number": "int"},
-        "description": "Map a build error location to the best patch key/signature.",
-    },
-    {
         "name": "get_error_patch_context",
         "args": {
             "patch_path": "string",
@@ -106,7 +100,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Extract the V1-origin code slice from the patch bundle for a build error location (from '-' lines in the mapped patch slice; works for functions/macros/decls).",
+        "description": "Extract the V1-origin code slice from the patch bundle for a build error location (from '-' lines in the mapped patch slice; works for functions/macros/decls). Also returns macro-token hints (defined_macros / macro_tokens_not_defined_in_slice).",
     },
     {
         "name": "make_error_patch_override",

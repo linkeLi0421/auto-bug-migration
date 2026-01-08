@@ -364,22 +364,47 @@ def _validate_tool_decision(decision: Decision) -> None:
 
 def _collect_focus_terms(state: AgentState) -> List[str]:
     terms: List[str] = []
+
+    def keep(term: str) -> bool:
+        t = str(term or "").strip()
+        if not t:
+            return False
+        # Very short tokens are usually noise and can anchor snippets incorrectly (e.g. "c" matches "char").
+        if len(t) < 3:
+            return False
+        low = t.lower()
+        if low in {"error", "fatal", "warning", "note", "expected"}:
+            return False
+        if low in {"src", "include"}:
+            return False
+        return True
+
+    # Macro-expansion errors: prioritize the macro name and macro-like tokens from the snippet.
+    snippet = str(state.snippet or "")
+    if snippet:
+        for macro_name in re.findall(r"expanded from macro '([^']+)'", snippet):
+            if keep(macro_name):
+                terms.append(str(macro_name).strip())
+        # Include ALLCAPS tokens (e.g. MAKE_HANDLER, EMPTY_ICONV) from the snippet.
+        snippet_sanitized = re.sub(r'"([^"\\]|\\.)*"', '""', snippet)
+        for tok in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", snippet_sanitized):
+            if keep(tok):
+                terms.append(tok)
     for item in state.missing_struct_members or []:
         if not isinstance(item, dict):
             continue
         for member in item.get("members") or []:
             m = str(member or "").strip()
-            if m:
+            if keep(m):
                 terms.append(m)
         struct_name = str(item.get("struct", "") or "").strip()
-        if struct_name:
+        if keep(struct_name):
             terms.append(struct_name)
     # Also include a few tokens from the error line itself.
     err = str(state.error_line or "")
     for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", err):
-        if tok in {"error", "fatal", "warning"}:
-            continue
-        terms.append(tok)
+        if keep(tok):
+            terms.append(tok)
     # Dedup preserve order
     seen: set[str] = set()
     out: List[str] = []
@@ -885,7 +910,7 @@ def _system_prompt() -> str:
         "- Never call read_file_context with the raw build-log /src/...:line values.\n"
         "- Only call read_file_context using (a) KB-derived locations from search_definition, or\n"
         "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
-        "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context (or get_error_patch + get_patch) -> search_definition.\n"
+        "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context -> search_definition.\n"
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
@@ -895,6 +920,13 @@ def _system_prompt() -> str:
         "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
         "- After generating a patch (make_error_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
+        "- Macro/decl hunks: syntax errors like \"expected '}'\" can be caused by a macro body referencing undefined\n"
+        "  placeholder macros (e.g. a slice defines `MAKE_HANDLER(... out EMPTY_ICONV EMPTY_UCONV ...)` but does not\n"
+        "  also add `EMPTY_ICONV` / `EMPTY_UCONV`). Use get_error_v1_code_slice.macro_tokens_not_defined_in_slice as a\n"
+        "  hint, search for the missing macro definitions (search_text + read_file_context; v2 first, then v1), and include\n"
+        "  the required `#define ...` lines (or a V2-equivalent adaptation) in the override `new_func_code`.\n"
+        "  Example: add `#define EMPTY_ICONV` and `#define EMPTY_UCONV` above `#define MAKE_HANDLER(...)` if that matches\n"
+        "  the intended V1 semantics, or copy the correct definitions from V2/V1 and adapt call sites as needed.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
         "Tool output format:\n"
@@ -1596,7 +1628,7 @@ def main(argv: List[str]) -> int:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
             from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
 
-            errs = iter_compiler_errors(build_log)
+            errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
             first_mapped_key = ""
             for err in errs:

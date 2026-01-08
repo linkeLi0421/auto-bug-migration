@@ -12,7 +12,6 @@ from .artifact_tools import read_artifact as read_artifact_tool
 from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_and_test_tool
 
 from .migration_tools import (  # noqa: E402
-    get_error_patch as get_error_patch_tool,
     get_error_patch_context as get_error_patch_context_tool,
     get_error_v1_code_slice as get_error_v1_code_slice_tool,
     get_patch as get_patch_tool,
@@ -303,24 +302,6 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: query")
                 out = search_patches_tool(patch_path=patch_path, query=query, limit=limit)
                 return ToolObservation(True, tool, {"patch_path": patch_path, "query": query, "limit": limit}, output=out)
-
-            if tool == "get_error_patch":
-                patch_path = str(args.get("patch_path", "")).strip()
-                file_path = str(args.get("file_path", "")).strip()
-                line_number = _as_int(args.get("line_number"), 0)
-                if not patch_path:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
-                if not file_path:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
-                if line_number <= 0:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
-                out = get_error_patch_tool(patch_path=patch_path, file_path=file_path, line_number=line_number)
-                return ToolObservation(
-                    True,
-                    tool,
-                    {"patch_path": patch_path, "file_path": file_path, "line_number": line_number},
-                    output=out,
-                )
 
             if tool == "get_error_patch_context":
                 patch_path = str(args.get("patch_path", "")).strip()
