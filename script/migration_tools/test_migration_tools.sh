@@ -176,6 +176,10 @@ code = get_error_v1_code_slice(
 )
 json.dumps(code)
 assert "#define FOO 1" in (code.get("func_code") or ""), code
+defined = set(code.get("defined_macros") or [])
+assert {"FOO", "BAR", "BAZ"} <= defined, defined
+missing = set(code.get("macro_tokens_not_defined_in_slice") or [])
+assert not ({"FOO", "BAR", "BAZ"} & missing), missing
 
 out = make_error_patch_override(
     patch_path=str(bundle_path),
@@ -190,6 +194,100 @@ json.dumps(out)
 patch_text_out = out.get("patch_text") or ""
 assert "@@ -100,2 +100,0 @@" in patch_text_out, patch_text_out
 assert "-#define FOO 10" in patch_text_out and "-#define BAR 20" in patch_text_out, patch_text_out
+
+print("OK")
+PY
+
+# Macro dependency hint: detect macro tokens referenced but not defined in the slice.
+bundle_path="$tmp_dir/_fixture_macro_deps.patch2"
+
+"$PYTHON" - "$bundle_path" <<'PY'
+import json
+import pickle
+import sys
+from pathlib import Path
+
+bundle_path = Path(sys.argv[1])
+allowed_roots = [str(bundle_path.parent)]
+
+repo_root = bundle_path.parents[4]
+script_dir = repo_root / "script"
+sys.path.insert(0, str(script_dir))
+
+from migration_tools.patch_bundle import load_patch_bundle
+from migration_tools.tools import get_error_v1_code_slice, make_error_patch_override
+from migration_tools.types import PatchInfo
+
+patch_text = "\n".join(
+    [
+        "diff --git a/encoding.c b/encoding.c",
+        "index 0000000..1111111 100644",
+        "--- a/encoding.c",
+        "+++ b/encoding.c",
+        "@@ -100,2 +100,0 @@",
+        "-#define MAKE_HANDLER(name, in, out) \\",
+        "-    { (char *) name, in, out EMPTY_ICONV EMPTY_UCONV }",
+    ]
+)
+
+data = {
+    "p1": PatchInfo(
+        file_path_old="encoding.c",
+        file_path_new="encoding.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=100,
+        old_end_line=101,
+        new_start_line=100,
+        new_end_line=101,
+        patch_type=set(["Macro"]),
+    )
+}
+
+bundle_path.write_bytes(pickle.dumps(data))
+bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
+assert list(bundle.patches.keys()) == ["p1"], list(bundle.patches.keys())
+
+code = get_error_v1_code_slice(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/encoding.c",
+    line_number=100,
+    max_lines=200,
+    max_chars=20000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(code)
+missing = set(code.get("macro_tokens_not_defined_in_slice") or [])
+assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
+
+# Guardrail: a no-op rewrite (new_func_code identical to the existing '-' slice) should be rejected.
+try:
+    make_error_patch_override(
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/encoding.c",
+        line_number=100,
+        new_func_code=code.get("func_code") or "",
+        max_lines=2000,
+        max_chars=200000,
+        allowed_roots=allowed_roots,
+    )
+    raise AssertionError("expected ValueError for no-op rewrite")
+except ValueError:
+    pass
+
+out = make_error_patch_override(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/encoding.c",
+    line_number=100,
+    new_func_code="#define EMPTY_ICONV\n#define EMPTY_UCONV\n#define MAKE_HANDLER(name, in, out) \\\n    { (char *) name, in, out EMPTY_ICONV EMPTY_UCONV }",
+    max_lines=2000,
+    max_chars=200000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(out)
+patch_text_out = out.get("patch_text") or ""
+assert "@@ -100,4 +100,0 @@" in patch_text_out, patch_text_out
+assert "-#define EMPTY_ICONV" in patch_text_out and "-#define EMPTY_UCONV" in patch_text_out, patch_text_out
 
 print("OK")
 PY

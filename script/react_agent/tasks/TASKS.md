@@ -56,7 +56,7 @@
 ### Plan / Tasks
 
 - [x] Tool cleanup: remove `search_definition_in_v1` from tool registry/runner/README/tests.
-- [ ] (Optional but recommended) Tool cleanup: remove `get_error_patch` from tool registry/runner/docs/tests; always use `get_error_patch_context` when mapping is needed.
+- [x] (Optional but recommended) Tool cleanup: remove `get_error_patch` from tool registry/runner/docs/tests; always use `get_error_patch_context` when mapping is needed.
 - [x] Mapping: update `_get_error_patch_from_bundle(...)` to compute slice indices for non-`Recreated function` patches (hunk-based selection).
 - [x] Tool behavior: update `get_error_v1_code_slice` description/output notes to reflect “patch slice” semantics (not function-only).
 - [x] Tool behavior: update `make_error_patch_override` description/output notes to reflect “patch slice rewrite” semantics (not function-only).
@@ -133,18 +133,26 @@ Teach the agent how to fix “macro/decl hunk missing dependencies” cases by:
 
 ### Plan
 
-- [ ] Add a dedicated tool for dependency discovery around an error line in a patch bundle:
-  - `get_error_patch_dependencies(patch_path, file_path, line_number, error_text?)` → returns:
-    - the mapped patch slice excerpt (existing), plus
-    - macro identifiers referenced by the slice (token scan of `-` lines), and
-    - for each unknown macro token, a `search_text` suggestion and/or V1/V2 “definition candidates” locations.
-  - Implementation can be lightweight: regex tokenization for ALLCAPS-like identifiers + `search_text` fallback.
+- [x] Tooling: extend `get_error_v1_code_slice` to expose macro dependency hints:
+  - `defined_macros`, `referenced_macro_tokens`, `macro_tokens_not_defined_in_slice` (token scan of `-` lines)
+  - use these to decide what extra `#define ...` lines must be added alongside the macro/decl slice.
 
-- [ ] Add a dedicated tool to extract “neighbor macro definitions” from V1/V2 sources:
-  - `get_macro_block(version, file_path, near_line, name)` that returns a bounded block around the macro definition,
-    including any helper macros used in its body (one-hop dependency expansion).
+- [x] Fix focus/snippet quality so the model *sees* the macro root cause:
+  - [x] Patch-scope snippet capture: increase `iter_compiler_errors(..., snippet_lines=10)` in:
+    - `script/react_agent/agent_langgraph.py` patch-scope grouping
+    - `script/react_agent/multi_agent.py` grouping
+    so the build snippet includes lines like `expanded from macro 'MAKE_HANDLER'` and the macro body line with `EMPTY_ICONV`.
+  - [x] Focus-term extraction: update `_collect_focus_terms(...)` to:
+    - parse `state.snippet` for `expanded from macro 'X'` and include `X`
+    - include ALLCAPS tokens from the snippet (e.g. `MAKE_HANDLER`, `EMPTY_ICONV`, `EMPTY_UCONV`)
+    - drop noisy tiny tokens (e.g. `c`) so `focus_func_snippet` doesn’t anchor to unrelated lines like `unsigned char`
+  - [x] (Optional) Hard guardrail: make `make_error_patch_override` fail on no-op rewrites (new slice identical to old slice).
 
-- [ ] Update system prompt with a one-shot worked example (“MAKE_HANDLER missing EMPTY_ICONV/EMPTY_UCONV”):
+- [x] Macro definition lookup: use existing tools (no new tool):
+  - `search_text(query=<MACRO>, version=v2|v1)` to find candidate definition lines
+  - `read_file_context(file_path, line_number, context, version)` to capture the full macro block
+
+- [x] Update system prompt with a one-shot worked example (“MAKE_HANDLER missing EMPTY_ICONV/EMPTY_UCONV”):
   - Decision pattern:
     1) `parse_build_errors` → detect macro expansion parse error (expected '}', expanded from macro 'X').
     2) `get_error_patch_context` to view the macro hunk slice.
@@ -152,13 +160,16 @@ Teach the agent how to fix “macro/decl hunk missing dependencies” cases by:
     4) Use `search_text` (v2 first, then v1) to find missing macro definitions.
     5) Call `make_error_patch_override` to rewrite the macro/decl slice so it adds both the macro and its dependencies.
 
-- [ ] Update the patch-slice rewrite guidance in prompt:
+- [x] Update the patch-slice rewrite guidance in prompt:
   - explicitly state: for non-function slices, `new_func_code` may be multiple macro/decl lines, and the fix may need to *add*
     prerequisite macros referenced by the slice.
 
-- [ ] Add regression test fixture in `script/migration_tools/test_migration_tools.sh`:
+- [x] Add regression test fixture in `script/migration_tools/test_migration_tools.sh`:
   - a macro slice containing `MAKE_HANDLER` referencing `EMPTY_ICONV/EMPTY_UCONV` where the replacement code adds all three,
     ensuring `make_error_patch_override` rewrites the `-` run correctly.
 
 - [ ] Validate end-to-end with the provided testcase log:
-  - run the agent on the failing `encoding.c` log and confirm the first override is meaningfully different and fixes the compile error.
+  - run the agent on the failing `encoding.c` log and confirm:
+    - the snippet shown to the model includes the macro-expansion lines (`expanded from macro ...` + macro body)
+    - `focus_func_snippet` is centered on `#define MAKE_HANDLER` (not just `static int ...`)
+    - the first `make_error_patch_override` output actually adds the missing macros (`EMPTY_ICONV`, `EMPTY_UCONV`) and fixes the compile error.
