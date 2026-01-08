@@ -74,6 +74,12 @@ class AgentState:
     # Indicates we already attempted OSS-Fuzz test after generating a patch.
     ossfuzz_test_attempted: bool = False
 
+    # Latest macro tokens reported by get_error_v1_code_slice (used for guardrails).
+    macro_tokens_not_defined_in_slice: List[str] = field(default_factory=list)
+
+    # Macro-lookup guardrail state when the model tries to invent missing macros.
+    macro_lookup: Optional[Dict[str, Any]] = None
+
 
 class GraphState(TypedDict, total=False):
     state: AgentState
@@ -436,6 +442,68 @@ def _truncate_text_around_terms(text: str, terms: List[str], *, max_chars: int) 
     head_n = max_chars // 2
     tail_n = max_chars - head_n
     return s[:head_n] + "\n...[truncated]...\n" + s[-tail_n:]
+
+
+def _extract_defined_macros_from_code(text: str) -> List[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+    names: List[str] = []
+    for line in raw.splitlines():
+        m = re.match(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+        if m:
+            names.append(str(m.group(1)))
+    # Dedup preserve order
+    seen: set[str] = set()
+    out: List[str] = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
+    t = str(token or "").strip()
+    if not t:
+        return False
+    for step in state.steps:
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision") or {}
+        if (decision.get("tool") or "") != "read_file_context":
+            continue
+        obs = step.get("observation") or {}
+        out = obs.get("output")
+        if not isinstance(out, str):
+            continue
+        # Require both token presence and a define line to avoid unrelated mentions.
+        if t in out and "#define" in out:
+            return True
+    return False
+
+
+def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Return a forced search_text decision when the override invents missing macros without source evidence."""
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_code = str(args_obj.get("new_func_code", "") or "")
+    defines = set(_extract_defined_macros_from_code(new_code))
+    missing = set(str(t) for t in (state.macro_tokens_not_defined_in_slice or []) if str(t).strip())
+    for tok in sorted(defines & missing):
+        if _has_read_file_context_for_token(state, tok):
+            continue
+        state.macro_lookup = {"token": tok, "stage": "need_search_text", "version": "v2"}
+        return {
+            "type": "tool",
+            "thought": f"Macro guardrail: locate the real #define for {tok} before adding it.",
+            "tool": "search_text",
+            "args": {"query": f"#define {tok}", "version": "v2", "limit": 20, "file_glob": ""},
+        }
+    return None
 
 
 def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
@@ -927,6 +995,17 @@ def _system_prompt() -> str:
         "  the required `#define ...` lines (or a V2-equivalent adaptation) in the override `new_func_code`.\n"
         "  Example: add `#define EMPTY_ICONV` and `#define EMPTY_UCONV` above `#define MAKE_HANDLER(...)` if that matches\n"
         "  the intended V1 semantics, or copy the correct definitions from V2/V1 and adapt call sites as needed.\n\n"
+        "- Guardrail (macros): do NOT invent placeholder macro definitions.\n"
+        "  If you plan to add `#define TOKEN ...` for any missing macro token (from get_error_v1_code_slice.macro_tokens_not_defined_in_slice),\n"
+        "  you MUST first locate its real definition using tools:\n"
+        "    - search_text(query=\"#define TOKEN\", version=\"v2\") then search_text(..., version=\"v1\")\n"
+        "    - read_file_context(version, file_path, line_number, context=80) on the best match to capture the full guarded block.\n"
+        "  If neither V1 nor V2 defines TOKEN, do NOT add a dummy `#define`; instead remove/replace TOKEN in the macro body or adapt to V2 semantics.\n\n"
+        "- Macro dependency resolution recipe (general):\n"
+        "  1) From the build snippet, identify the expanded macro name (`expanded from macro 'X'`).\n"
+        "  2) From get_error_v1_code_slice.macro_tokens_not_defined_in_slice, pick the 1–3 missing tokens most relevant to X.\n"
+        "  3) For each token, locate `#define` with search_text (v2 then v1) and confirm via read_file_context (include full #if/#endif block).\n"
+        "  4) Only then rewrite the patch slice: include dependency macro blocks first, then the macro being added/modified, then call make_error_patch_override.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
         "Tool output format:\n"
@@ -1128,6 +1207,32 @@ def _run_langgraph(
                     "error": _error_payload(st),
                 },
             }
+        if isinstance(st.macro_lookup, dict):
+            stage = str(st.macro_lookup.get("stage", "") or "").strip()
+            token = str(st.macro_lookup.get("token", "") or "").strip()
+            version = str(st.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
+            if stage == "need_search_text" and token:
+                forced: Decision = {
+                    "type": "tool",
+                    "thought": f"Macro guardrail: locate the real #define for {token} before adding it.",
+                    "tool": "search_text",
+                    "args": {"query": f"#define {token}", "version": version, "limit": 20, "file_glob": ""},
+                }
+                _validate_tool_decision(forced)
+                return {"state": st, "pending": forced}
+            if stage == "need_read_file_context":
+                file_path = str(st.macro_lookup.get("file_path", "") or "").strip()
+                line_number = int(st.macro_lookup.get("line_number") or 0)
+                if file_path and line_number > 0:
+                    forced = {
+                        "type": "tool",
+                        "thought": f"Macro guardrail: read the real definition context for {token} before rewriting the patch.",
+                        "tool": "read_file_context",
+                        "args": {"file_path": file_path, "line_number": line_number, "context": 80, "version": version},
+                    }
+                    _validate_tool_decision(forced)
+                    st.macro_lookup = {"token": token, "stage": "done", "version": version}
+                    return {"state": st, "pending": forced}
         messages = _build_messages(st)
         raw = model.complete(messages)
         try:
@@ -1383,6 +1488,11 @@ def _run_langgraph(
             }
         _validate_tool_decision(decision)
 
+        forced_macro = _macro_define_guardrail_for_override(st, decision)
+        if forced_macro:
+            _validate_tool_decision(forced_macro)
+            return {"state": st, "pending": forced_macro}
+
         # Enforce tool ordering: analysis first, patching last.
         remaining = cfg.max_steps - len(st.steps)
         tool = str(decision.get("tool", "")).strip()
@@ -1455,6 +1565,30 @@ def _run_langgraph(
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
         st.steps.append({"decision": decision, "observation": obs.__dict__})
         st.last_observation = obs
+        if obs.ok and obs.tool == "get_error_v1_code_slice" and isinstance(obs.output, dict):
+            missing = obs.output.get("macro_tokens_not_defined_in_slice")
+            if isinstance(missing, list):
+                st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
+        if obs.ok and obs.tool == "search_text" and isinstance(st.macro_lookup, dict):
+            stage = str(st.macro_lookup.get("stage", "") or "").strip()
+            token = str(st.macro_lookup.get("token", "") or "").strip()
+            version = str(st.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
+            if stage == "need_search_text" and token and isinstance(obs.output, dict):
+                matches = obs.output.get("matches") if isinstance(obs.output.get("matches"), list) else []
+                first = matches[0] if matches else None
+                if isinstance(first, dict) and first.get("file") and first.get("line"):
+                    st.macro_lookup = {
+                        "token": token,
+                        "stage": "need_read_file_context",
+                        "version": version,
+                        "file_path": str(first.get("file")),
+                        "line_number": int(first.get("line") or 0),
+                    }
+                else:
+                    if version == "v2":
+                        st.macro_lookup = {"token": token, "stage": "need_search_text", "version": "v1"}
+                    else:
+                        st.macro_lookup = {"token": token, "stage": "done", "version": version, "not_found": True}
         if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None

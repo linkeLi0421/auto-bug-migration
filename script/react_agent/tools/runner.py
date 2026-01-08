@@ -339,21 +339,24 @@ class ToolRunner:
                 )
 
             if tool == "get_error_v1_code_slice":
+                excerpt = args.get("excerpt")
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 line_number = _as_int(args.get("line_number"), 0)
                 max_lines = _as_int(args.get("max_lines"), 200)
                 max_chars = _as_int(args.get("max_chars"), 12000)
-                if not patch_path:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
-                if not file_path:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
-                if line_number <= 0:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
+                if excerpt is None:
+                    if not patch_path:
+                        return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path (or provide excerpt)")
+                    if not file_path:
+                        return ToolObservation(False, tool, args, output="", error="Missing arg: file_path (or provide excerpt)")
+                    if line_number <= 0:
+                        return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number (or provide excerpt)")
                 out = get_error_v1_code_slice_tool(
                     patch_path=patch_path,
                     file_path=file_path,
                     line_number=line_number,
+                    excerpt=excerpt,
                     max_lines=max_lines,
                     max_chars=max_chars,
                 )
@@ -361,6 +364,7 @@ class ToolRunner:
                     True,
                     tool,
                     {
+                        "excerpt": excerpt,
                         "patch_path": patch_path,
                         "file_path": file_path,
                         "line_number": line_number,
