@@ -44,7 +44,7 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
   - `get_patch(patch_path, patch_key, include_text?, max_lines?)`
   - `search_patches(patch_path, query, limit?)`
   - `get_error_patch_context(patch_path, file_path, line_number, error_text?, context_lines?, max_total_lines?)`
-  - `get_error_v1_code_slice(patch_path, file_path, line_number, max_lines?, max_chars?)` (extracts V1-origin code slice from `-` lines; works for functions/macros/decls; includes macro-token hints like `macro_tokens_not_defined_in_slice`)
+  - `get_error_v1_code_slice(excerpt?, patch_path?, file_path?, line_number?, max_lines?, max_chars?)` (extracts V1-origin code slice from `-` lines; preferred: pass `excerpt={artifact_path: ...}` from `get_error_patch_context`; includes macro-token hints like `macro_tokens_not_defined_in_slice`)
   - `make_error_patch_override(patch_path, file_path, line_number, new_func_code, context_lines?, max_lines?, max_chars?)` (rewrites the mapped patch slice by replacing its `-` lines)
   - `parse_build_errors(build_log_path?|build_log_text?)`
 

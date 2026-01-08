@@ -94,13 +94,14 @@ TOOL_SPECS: list[Dict[str, Any]] = [
     {
         "name": "get_error_v1_code_slice",
         "args": {
-            "patch_path": "string",
-            "file_path": "string",
-            "line_number": "int",
+            "excerpt": "object?",
+            "patch_path": "string?",
+            "file_path": "string?",
+            "line_number": "int?",
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Extract the V1-origin code slice from the patch bundle for a build error location (from '-' lines in the mapped patch slice; works for functions/macros/decls). Also returns macro-token hints (defined_macros / macro_tokens_not_defined_in_slice).",
+        "description": "Extract the V1-origin code slice (from '-' lines) for a build error. Preferred: pass excerpt={artifact_path: ...} from get_error_patch_context.excerpt. Fallback: pass patch_path+file_path+line_number. Also returns macro-token hints (defined_macros / macro_tokens_not_defined_in_slice).",
     },
     {
         "name": "make_error_patch_override",

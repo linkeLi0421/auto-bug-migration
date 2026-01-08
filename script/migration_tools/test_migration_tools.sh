@@ -292,6 +292,48 @@ assert "-#define EMPTY_ICONV" in patch_text_out and "-#define EMPTY_UCONV" in pa
 print("OK")
 PY
 
+# Excerpt-based slicing: get_error_v1_code_slice can operate on a single-hunk excerpt artifact.
+"$PYTHON" - "$tmp_dir" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+tmp_dir = Path(sys.argv[1]).resolve()
+repo_root = tmp_dir.parents[3]
+sys.path.insert(0, str(repo_root))
+
+from script.migration_tools.tools import get_error_v1_code_slice  # noqa: E402
+
+artifact_dir = tmp_dir / "artifacts"
+artifact_dir.mkdir(parents=True, exist_ok=True)
+os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(artifact_dir)
+
+excerpt_path = artifact_dir / "excerpt.diff"
+excerpt_path.write_text(
+    "\n".join(
+        [
+            "diff --git a/encoding.c b/encoding.c",
+            "--- a/encoding.c",
+            "+++ b/encoding.c",
+            "@@ -100,2 +100,0 @@",
+            "-#define MAKE_HANDLER(name, in, out) \\",
+            "-    { (char *) name, in, out EMPTY_ICONV EMPTY_UCONV }",
+        ]
+    )
+    + "\n",
+    encoding="utf-8",
+    errors="replace",
+)
+
+out = get_error_v1_code_slice(excerpt={"artifact_path": str(excerpt_path)}, max_lines=200, max_chars=20000)
+code = out.get("func_code") or ""
+assert "MAKE_HANDLER" in code, code
+missing = set(out.get("macro_tokens_not_defined_in_slice") or [])
+assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
+
+print("OK")
+PY
+
 # Multi-hunk header rewrite: later hunks must get +new_start adjusted when the first hunk delta changes.
 fixture_b64="$SCRIPT_DIR/fixtures/multi_hunk.patch2.b64"
 bundle_path="$tmp_dir/_fixture_multi_hunk.patch2"

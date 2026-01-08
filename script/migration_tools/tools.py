@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -720,11 +721,71 @@ def get_error_patch_context(
     }
 
 
+def _repo_root() -> Path:
+    # script/migration_tools/tools.py -> script/migration_tools -> script -> repo
+    return Path(__file__).resolve().parents[2]
+
+
+def _is_allowed_artifact_path(path: Path) -> bool:
+    p = path.expanduser().resolve()
+    if not p.is_file():
+        return False
+    env_dir = str(os.environ.get("REACT_AGENT_ARTIFACT_DIR", "") or "").strip()
+    env_root = str(os.environ.get("REACT_AGENT_ARTIFACT_ROOT", "") or "").strip()
+    allowed: List[Path] = []
+    if env_dir:
+        allowed.append(Path(env_dir).expanduser().resolve())
+    if env_root:
+        allowed.append(Path(env_root).expanduser().resolve())
+    allowed.append((_repo_root() / "data" / "react_agent_artifacts").resolve())
+    return any(a == p or a in p.parents for a in allowed)
+
+
+def _load_excerpt_text(excerpt: Any) -> str:
+    if isinstance(excerpt, str):
+        return excerpt
+    if isinstance(excerpt, dict):
+        artifact_path = str(excerpt.get("artifact_path", "") or "").strip()
+        if not artifact_path:
+            raise ValueError("excerpt.artifact_path is required when excerpt is an object")
+        p = Path(artifact_path)
+        if not _is_allowed_artifact_path(p):
+            raise ValueError(f"excerpt.artifact_path is not under allowed artifact roots: {p}")
+        return p.read_text(encoding="utf-8", errors="replace")
+    raise ValueError("excerpt must be a string diff excerpt or an object with artifact_path")
+
+
+def _extract_minus_lines_from_unified_diff(diff_text: str) -> List[str]:
+    lines = str(diff_text or "").splitlines()
+    in_hunk = False
+    out: List[str] = []
+    for line in lines:
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if not line:
+            continue
+        if line.startswith("\\"):
+            continue
+        if line.startswith("+") or line.startswith(" "):
+            continue
+        if not line.startswith("-"):
+            continue
+        # Skip unified-diff file headers if they appear (usually outside hunks).
+        if line.startswith("---"):
+            continue
+        out.append(line[1:])
+    return out
+
+
 def get_error_v1_code_slice(
     *,
-    patch_path: str,
-    file_path: str,
-    line_number: int,
+    patch_path: str = "",
+    file_path: str = "",
+    line_number: int = 0,
+    excerpt: Any = None,
     max_lines: int = 200,
     max_chars: int = 12000,
     allowed_roots: Optional[List[str]] = None,
@@ -735,6 +796,66 @@ def get_error_v1_code_slice(
     `(patch_key, old_signature, func_start_index, func_end_index)` and then
     reconstructs the V1-origin code from `-` lines in that patch slice.
     """
+    if excerpt is not None:
+        func_lines = _extract_minus_lines_from_unified_diff(_load_excerpt_text(excerpt))
+        total_lines = len(func_lines)
+
+        defined_macros: set[str] = set()
+        for line in func_lines:
+            m = re.match(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
+            if m:
+                defined_macros.add(str(m.group(1)))
+
+        referenced_macro_tokens: set[str] = set()
+        for line in func_lines:
+            stripped = re.sub(r'"([^"\\]|\\.)*"', '""', line)
+            stripped = re.sub(r"//.*$", "", stripped)
+            stripped = re.sub(r"/\*.*?\*/", "", stripped)
+            for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", stripped):
+                if tok.isupper() and any(c.isalpha() for c in tok):
+                    referenced_macro_tokens.add(tok)
+
+        missing_macro_tokens = referenced_macro_tokens - defined_macros
+        defined_macros_list = sorted(defined_macros)[:200]
+        referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
+        missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
+
+        max_n = max(0, min(int(max_lines or 0), 5000))
+        returned_lines = func_lines[:max_n]
+        code = "\n".join(returned_lines)
+        truncated = total_lines > len(returned_lines)
+
+        if max_chars is not None:
+            max_c = max(0, min(int(max_chars or 0), 200000))
+            if max_c and len(code) > max_c:
+                code = code[:max_c].rstrip("\n") + "\n...[truncated]"
+                truncated = True
+
+        return {
+            "patch_path": str(patch_path or ""),
+            "file_path": str(file_path or ""),
+            "line_number": int(line_number or 0),
+            "patch_key": "",
+            "old_signature": "",
+            "func_start_index": None,
+            "func_end_index": None,
+            "func_code": code,
+            "func_code_lines_total": total_lines,
+            "func_code_lines_returned": len(returned_lines),
+            "func_code_truncated": truncated,
+            "defined_macros": defined_macros_list,
+            "referenced_macro_tokens": referenced_macro_tokens_list,
+            "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
+            "note": "Extracted from '-' lines in a unified-diff excerpt (typically get_error_patch_context.excerpt).",
+        }
+
+    if not patch_path:
+        raise ValueError("patch_path is required when excerpt is not provided")
+    if not file_path:
+        raise ValueError("file_path is required when excerpt is not provided")
+    if int(line_number or 0) <= 0:
+        raise ValueError("line_number must be > 0 when excerpt is not provided")
+
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
     mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
     patch_key = mapping.get("patch_key")

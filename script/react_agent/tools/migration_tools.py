@@ -90,9 +90,10 @@ def get_error_patch_context(
 
 def get_error_v1_code_slice(
     *,
-    patch_path: str,
-    file_path: str,
-    line_number: int,
+    patch_path: str = "",
+    file_path: str = "",
+    line_number: int = 0,
+    excerpt: Any = None,
     max_lines: int = 200,
     max_chars: int = 12000,
 ) -> Dict[str, Any]:
@@ -100,6 +101,7 @@ def get_error_v1_code_slice(
         patch_path=patch_path,
         file_path=file_path,
         line_number=line_number,
+        excerpt=excerpt,
         max_lines=max_lines,
         max_chars=max_chars,
         allowed_roots=_allowed_roots_from_env(),

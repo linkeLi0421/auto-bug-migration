@@ -78,6 +78,39 @@ assert "c" not in terms, terms
 print("OK")
 PY
 
+# Macro guardrail: if the override tries to add a #define for a missing macro token without source evidence,
+# agent_langgraph should force search_text("#define TOKEN") first.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _macro_define_guardrail_for_override  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/libxml2/encoding.c:104:5: error: expected '}'",
+    snippet="",
+)
+state.macro_tokens_not_defined_in_slice = ["EMPTY_ICONV", "EMPTY_UCONV"]
+
+decision = {
+    "type": "tool",
+    "tool": "make_error_patch_override",
+    "thought": "try defining missing macros",
+    "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": "#define EMPTY_ICONV\n#define EMPTY_UCONV\n"},
+}
+
+forced = _macro_define_guardrail_for_override(state, decision)
+assert forced and forced.get("tool") == "search_text", forced
+assert "EMPTY_ICONV" in (forced.get("args") or {}).get("query", ""), forced
+print("OK")
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
