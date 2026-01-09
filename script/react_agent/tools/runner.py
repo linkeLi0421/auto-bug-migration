@@ -120,22 +120,29 @@ class ToolRunner:
                 out = self._agent_tools.search_definition(symbol_name, version=version)
                 return ToolObservation(True, tool, {"symbol_name": symbol_name, "version": version}, output=out)
 
-            if tool == "search_text":
+            if tool == "kb_search_symbols":
                 if not self._agent_tools:
                     return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
-                query = str(args.get("query", "")).strip()
+                symbols = args.get("symbols", [])
                 version = str(args.get("version", "v2")).strip() or "v2"
-                limit = _as_int(args.get("limit"), 20)
-                file_glob = str(args.get("file_glob", "")).strip()
-                if not query:
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: query")
+                kinds = args.get("kinds")
+                limit_per_symbol = _as_int(args.get("limit_per_symbol"), 5)
+                if not isinstance(symbols, list):
+                    symbols = [symbols]
+                if kinds is not None and not isinstance(kinds, list):
+                    kinds = [kinds]
                 if version not in {"v1", "v2"}:
                     return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
-                out = self._agent_tools.search_text(query, version=version, limit=limit, file_glob=file_glob)
+                out = self._agent_tools.kb_search_symbols(
+                    [str(s) for s in symbols],
+                    version=version,
+                    kinds=[str(k) for k in kinds] if kinds is not None else None,
+                    limit_per_symbol=limit_per_symbol,
+                )
                 return ToolObservation(
                     True,
                     tool,
-                    {"query": query, "version": version, "limit": limit, "file_glob": file_glob},
+                    {"symbols": [str(s) for s in symbols], "version": version, "kinds": kinds, "limit_per_symbol": limit_per_symbol},
                     output=out,
                 )
 

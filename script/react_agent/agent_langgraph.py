@@ -38,6 +38,8 @@ class AgentConfig:
     max_steps: int = 4
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
+    debug_llm: bool = False
+    debug_llm_dir: str = ""
 
 
 @dataclass
@@ -463,6 +465,82 @@ def _extract_defined_macros_from_code(text: str) -> List[str]:
     return out
 
 
+_CODE_FENCE_RE = re.compile(r"```(?:[A-Za-z0-9_+-]+)?\n(.*?)```", re.DOTALL)
+
+
+def _extract_first_code_fence(text: str) -> str:
+    """Return the first fenced code block if present, otherwise return the raw text."""
+    raw = str(text or "")
+    if "```" not in raw:
+        return raw
+    m = _CODE_FENCE_RE.search(raw)
+    if not m:
+        return raw
+    return str(m.group(1) or "")
+
+
+def _last_read_artifact_text(state: AgentState) -> str:
+    for step in reversed(state.steps):
+        if not isinstance(step, dict):
+            continue
+        obs = step.get("observation")
+        if not isinstance(obs, dict) or obs.get("ok") is not True:
+            continue
+        if str(obs.get("tool", "")).strip() != "read_artifact":
+            continue
+        out = obs.get("output")
+        if isinstance(out, dict):
+            text = out.get("text")
+            if isinstance(text, str) and text:
+                return text
+    return ""
+
+
+def _override_preserve_base_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error message if new_func_code drops too much of the read_artifact base slice."""
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = _last_read_artifact_text(state)
+    if not base_text.strip():
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    base_lines = [ln.rstrip() for ln in base_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+    new_lines = [ln.rstrip() for ln in new_text.splitlines()]
+    base_n = len(base_lines)
+    new_n = len(new_lines)
+    if base_n <= 0 or new_n <= 0:
+        return None
+
+    dropped = base_n - new_n
+    if dropped > max(20, base_n // 3):
+        return (
+            f"new_func_code is much shorter than the BASE slice from read_artifact "
+            f"(BASE lines={base_n}, new_func_code lines={new_n}). "
+            "This likely dropped tail lines and will silently delete code when rewriting the '-' slice."
+        )
+
+    base_tail = [ln for ln in base_lines if ln.strip()]
+    base_tail = base_tail[-6:] if len(base_tail) >= 6 else base_tail
+    if base_tail:
+        hits = sum(1 for ln in base_tail if ln and ln in new_text)
+        if hits < min(2, len(base_tail)):
+            return (
+                "new_func_code does not appear to include the tail of the BASE slice from read_artifact. "
+                "Do not drop unrelated lines; start from the BASE text and apply minimal edits."
+            )
+
+    return None
+
+
 def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
     t = str(token or "").strip()
     if not t:
@@ -484,25 +562,76 @@ def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
 
 
 def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
-    """Return a forced search_text decision when the override invents missing macros without source evidence."""
+    """Return a forced KB lookup decision when the override invents missing macros without source evidence."""
     if str(decision.get("type", "")).strip() != "tool":
         return None
     if str(decision.get("tool", "")).strip() != "make_error_patch_override":
         return None
+    def _has_kb_macro_definition_for_token(token: str) -> bool:
+        t = str(token or "").strip()
+        if not t:
+            return False
+        for step in state.steps:
+            if not isinstance(step, dict):
+                continue
+            decision_obj = step.get("decision") or {}
+            if not isinstance(decision_obj, dict) or str(decision_obj.get("tool", "")).strip() != "kb_search_symbols":
+                continue
+            args_obj = decision_obj.get("args") if isinstance(decision_obj.get("args"), dict) else {}
+            kinds = args_obj.get("kinds")
+            if kinds is not None:
+                if isinstance(kinds, str):
+                    kinds_list = [kinds]
+                elif isinstance(kinds, list):
+                    kinds_list = [str(k) for k in kinds]
+                else:
+                    kinds_list = []
+                if "MACRO_DEFINITION" not in kinds_list:
+                    continue
+            obs = step.get("observation") or {}
+            out = obs.get("output")
+            if not isinstance(out, dict):
+                continue
+            results = out.get("results") if isinstance(out.get("results"), list) else []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("symbol", "") or "").strip() != t:
+                    continue
+                matches = item.get("matches") if isinstance(item.get("matches"), list) else []
+                if matches:
+                    return True
+        return False
+
     args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
     new_code = str(args_obj.get("new_func_code", "") or "")
     defines = set(_extract_defined_macros_from_code(new_code))
     missing = set(str(t) for t in (state.macro_tokens_not_defined_in_slice or []) if str(t).strip())
-    for tok in sorted(defines & missing):
-        if _has_read_file_context_for_token(state, tok):
-            continue
-        state.macro_lookup = {"token": tok, "stage": "need_search_text", "version": "v2"}
-        return {
-            "type": "tool",
-            "thought": f"Macro guardrail: locate the real #define for {tok} before adding it.",
-            "tool": "search_text",
-            "args": {"query": f"#define {tok}", "version": "v2", "limit": 20, "file_glob": ""},
-        }
+    # We require some tool-based evidence before defining a missing macro:
+    # - Prefer read_file_context evidence; but if the KB already returned a MACRO_DEFINITION match, allow it
+    #   (the model may decide the appropriate read_file_context window itself).
+    tokens = [
+        t
+        for t in sorted(defines & missing)
+        if t and (not _has_read_file_context_for_token(state, t)) and (not _has_kb_macro_definition_for_token(t))
+    ]
+    if not tokens:
+        return None
+    # Keep this bounded; if we ever see a giant list, the agent can repeat the lookup later.
+    tokens = tokens[:10]
+    state.macro_lookup = {
+        "tokens": tokens,
+        "search_tokens": tokens,
+        "queue_read": [],
+        "stage": "need_kb_search",
+        "version": "v2",
+    }
+    return {
+        "type": "tool",
+        "thought": f"Macro guardrail: locate the real #define blocks for {', '.join(tokens)} (v2 then v1) before adding them.",
+        "tool": "kb_search_symbols",
+        "args": {"symbols": tokens, "version": "v2", "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
+    }
     return None
 
 
@@ -520,55 +649,106 @@ def _macro_lookup_pick_token(state: AgentState) -> str:
     return missing[0] if missing else ""
 
 
-def _rewrite_search_text_query_for_macro(state: AgentState, decision: Decision) -> Optional[Decision]:
-    """Rewrite search_text(query=TOKEN) to search_text(query=\"#define TOKEN\") for missing macro tokens."""
-    if str(decision.get("type", "")).strip() != "tool":
-        return None
-    if str(decision.get("tool", "")).strip() != "search_text":
-        return None
-    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
-    query = str(args_obj.get("query", "") or "").strip()
-    if not query or query.startswith("#define "):
-        return None
-    missing = set(str(t) for t in (state.macro_tokens_not_defined_in_slice or []) if str(t).strip())
-    if query not in missing:
-        return None
-    rewritten = dict(decision)
-    rewritten_args = dict(args_obj)
-    rewritten_args["query"] = f"#define {query}"
-    rewritten_args.setdefault("version", "v2")
-    rewritten["args"] = rewritten_args  # type: ignore[assignment]
-    rewritten["thought"] = (str(decision.get("thought", "") or "").strip() + f" (rewrite search to find macro definition for {query})").strip()
-    return rewritten  # type: ignore[return-value]
+def _macro_lookup_pick_tokens(state: AgentState, *, max_tokens: int = 3) -> List[str]:
+    """Pick up to max_tokens missing macro tokens, prioritized by appearance in the compiler snippet."""
+    snippet = str(state.snippet or "")
+    missing = [str(t) for t in (state.macro_tokens_not_defined_in_slice or []) if str(t).strip()]
+    if not missing:
+        return []
+    ordered: List[str] = []
+    for tok in missing:
+        if tok and tok in snippet and tok not in ordered:
+            ordered.append(tok)
+    for tok in missing:
+        if tok and tok not in ordered:
+            ordered.append(tok)
+    return ordered[: max(0, int(max_tokens or 0))]
 
 
-def _macro_lookup_update_from_search_text_output(state: AgentState, output: Any) -> None:
-    """Advance macro_lookup state based on a search_text tool output."""
+def _macro_lookup_update_from_kb_search_output(state: AgentState, output: Any) -> None:
+    """Advance macro_lookup state based on a kb_search_symbols tool output."""
     if not isinstance(state.macro_lookup, dict):
         return
     stage = str(state.macro_lookup.get("stage", "") or "").strip()
-    token = str(state.macro_lookup.get("token", "") or "").strip()
     version = str(state.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
-    if stage != "need_search_text" or not token:
+    if stage != "need_kb_search":
         return
     if not isinstance(output, dict):
         return
-    matches = output.get("matches") if isinstance(output.get("matches"), list) else []
-    first = matches[0] if matches else None
-    if isinstance(first, dict) and first.get("file") and first.get("line"):
+    search_tokens = [str(t) for t in (state.macro_lookup.get("search_tokens") or []) if str(t).strip()]
+    found_locations: List[Dict[str, Any]] = []
+
+    results = output.get("results") if isinstance(output.get("results"), list) else []
+    found_tokens: set[str] = set()
+    missing_tokens: List[str] = []
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        tok = str(item.get("symbol", "") or "").strip()
+        if not tok:
+            continue
+        matches = item.get("matches") if isinstance(item.get("matches"), list) else []
+        first = matches[0] if matches else None
+        if isinstance(first, dict) and first.get("file") and first.get("line"):
+            found_tokens.add(tok)
+            found_locations.append(
+                {
+                    "token": tok,
+                    "version": version,
+                    "file_path": str(first.get("file")),
+                    "line_number": int(first.get("line") or 0),
+                    "kind": str(first.get("kind", "") or "").strip() or None,
+                }
+            )
+        else:
+            missing_tokens.append(tok)
+
+    # If KB didn't return per-symbol entries, fall back to the requested list.
+    if not results and search_tokens:
+        missing_tokens = list(search_tokens)
+
+    # For anything not explicitly returned, treat it as missing in this version.
+    for tok in search_tokens:
+        if tok not in found_tokens and tok not in missing_tokens:
+            missing_tokens.append(tok)
+
+    # Dedupe found locations by token+version+file+line, keep order.
+    seen_loc: set[tuple[str, str, str, int]] = set()
+    found_locations_dedup: List[Dict[str, Any]] = []
+    for loc in found_locations:
+        if not isinstance(loc, dict):
+            continue
+        key = (
+            str(loc.get("token") or "").strip(),
+            str(loc.get("version") or "").strip(),
+            str(loc.get("file_path") or "").strip(),
+            int(loc.get("line_number") or 0),
+        )
+        if key in seen_loc:
+            continue
+        seen_loc.add(key)
+        found_locations_dedup.append(loc)
+    found_locations = found_locations_dedup
+
+    # No matches at all: try the other version (v2 -> v1), then mark done.
+    if version == "v2" and missing_tokens:
         state.macro_lookup = {
-            "token": token,
-            "stage": "need_read_file_context",
-            "version": version,
-            "file_path": str(first.get("file")),
-            "line_number": int(first.get("line") or 0),
+            "tokens": list(state.macro_lookup.get("tokens") or []),
+            "search_tokens": missing_tokens,
+            "stage": "need_kb_search",
+            "version": "v1",
         }
         return
-    # No matches: try the other version, then give up.
-    if version == "v2":
-        state.macro_lookup = {"token": token, "stage": "need_search_text", "version": "v1"}
-    else:
-        state.macro_lookup = {"token": token, "stage": "done", "version": version, "not_found": True}
+
+    state.macro_lookup = {
+        "tokens": list(state.macro_lookup.get("tokens") or []),
+        "search_tokens": [],
+        "stage": "done",
+        "version": version,
+        "found_locations": found_locations,
+        "not_found_tokens": missing_tokens,
+    }
 
 
 def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
@@ -1048,6 +1228,9 @@ def _system_prompt() -> str:
         "     then call make_error_patch_override to generate an override diff,\n"
         "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
         "     then return final.\n"
+        "- Patch rewrite rule: when you call make_error_patch_override, args.new_func_code MUST be based on the latest\n"
+        "  read_artifact.output.text (the BASE slice). Make only the minimal edits needed to fix the reported error.\n"
+        "  Do not drop unrelated lines or omit the tail of the BASE slice.\n"
         "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
         "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
@@ -1057,31 +1240,31 @@ def _system_prompt() -> str:
         "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
         "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context -> search_definition.\n"
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
-        "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before search_text.\n"
+        "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before any macro lookup.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
         "- When you have a concrete fix for the V1-origin code slice (functions/macros/consts/decls; often inside __revert_*), update the patch bundle slice:\n"
         "  call make_error_patch_override(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
         "  then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
         "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
         "- After generating a patch (make_error_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
-        "- If a missing token is likely a macro and search_definition returns nothing, use search_text as a fallback.\n\n"
+        "- If a missing token is likely a macro and search_definition returns nothing, use kb_search_symbols(kinds=['MACRO_DEFINITION']).\n\n"
         "- Macro/decl hunks: syntax errors like \"expected '}'\" can be caused by a macro body referencing undefined\n"
         "  placeholder macros (e.g. a slice defines `MAKE_HANDLER(... out EMPTY_ICONV EMPTY_UCONV ...)` but does not\n"
         "  also add `EMPTY_ICONV` / `EMPTY_UCONV`). Use get_error_v1_code_slice.macro_tokens_not_defined_in_slice as a\n"
-        "  hint, search for the missing macro definitions (search_text + read_file_context; v2 first, then v1), and include\n"
+        "  hint, locate the missing macro definitions (kb_search_symbols + read_file_context; v2 first, then v1), and include\n"
         "  the required `#define ...` lines (or a V2-equivalent adaptation) in the override `new_func_code`.\n"
         "  Example: add `#define EMPTY_ICONV` and `#define EMPTY_UCONV` above `#define MAKE_HANDLER(...)` if that matches\n"
         "  the intended V1 semantics, or copy the correct definitions from V2/V1 and adapt call sites as needed.\n\n"
         "- Guardrail (macros): do NOT invent placeholder macro definitions.\n"
         "  If you plan to add `#define TOKEN ...` for any missing macro token (from get_error_v1_code_slice.macro_tokens_not_defined_in_slice),\n"
         "  you MUST first locate its real definition using tools:\n"
-        "    - search_text(query=\"#define TOKEN\", version=\"v2\") then search_text(query=\"#define TOKEN\", version=\"v1\")\n"
-        "    - read_file_context(version, file_path, line_number, context=80) on the best match to capture the full guarded block.\n"
+        "    - kb_search_symbols(symbols=[\"TOKEN\"], kinds=[\"MACRO_DEFINITION\"], version=\"v2\") then kb_search_symbols(..., version=\"v1\")\n"
+        "    - read_file_context(version, file_path, line_number, context) on the best match to capture the full guarded block.\n"
         "  If neither V1 nor V2 defines TOKEN, do NOT add a dummy `#define`; instead remove/replace TOKEN in the macro body or adapt to V2 semantics.\n\n"
         "- Macro dependency resolution recipe (general):\n"
         "  1) From the build snippet, identify the expanded macro name (`expanded from macro 'X'`).\n"
         "  2) From get_error_v1_code_slice.macro_tokens_not_defined_in_slice, pick the 1–3 missing tokens most relevant to X.\n"
-        "  3) For each token, locate `#define` with search_text (v2 then v1) and confirm via read_file_context (include full #if/#endif block).\n"
+        "  3) For each token, locate `#define` with kb_search_symbols (v2 then v1) and confirm via read_file_context (include full #if/#endif block).\n"
         "  4) Only then rewrite the patch slice: include dependency macro blocks first, then the macro being added/modified, then call make_error_patch_override.\n\n"
         "Available tools:\n"
         f"{tools}\n\n"
@@ -1157,6 +1340,38 @@ def _run_langgraph(
     artifact_store: Any = None,
 ) -> Dict[str, Any]:
     # Build a small two-node graph: LLM -> TOOL -> LLM (until final).
+    llm_call_seq = 0
+
+    def _debug_dump_llm(*, call_id: int, label: str, messages: List[Dict[str, str]], response: Optional[str] = None) -> None:
+        if not cfg.debug_llm:
+            return
+        payload = {"call_id": call_id, "label": str(label or ""), "messages": messages}
+        if response is not None:
+            payload["response"] = str(response)
+
+        if cfg.debug_llm_dir:
+            out_dir = Path(str(cfg.debug_llm_dir)).expanduser()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            kind = "response" if response is not None else "request"
+            (out_dir / f"llm_call_{call_id:04d}_{kind}.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+                errors="replace",
+            )
+
+        sys.stderr.write(f"\n=== LLM {call_id:04d} {label} ({'response' if response is not None else 'request'}) ===\n")
+        sys.stderr.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        sys.stderr.write("\n")
+
+    def _complete(model_obj: ChatModel, messages: List[Dict[str, str]], *, label: str) -> str:
+        nonlocal llm_call_seq
+        llm_call_seq += 1
+        call_id = llm_call_seq
+        _debug_dump_llm(call_id=call_id, label=label, messages=messages)
+        out = model_obj.complete(messages)
+        _debug_dump_llm(call_id=call_id, label=label, messages=messages, response=out)
+        return out
+
     def llm_node(gs: GraphState) -> GraphState:
         st = gs["state"]
         if st.patch_generated and not st.ossfuzz_test_attempted:
@@ -1254,7 +1469,11 @@ def _run_langgraph(
                 },
             }
 
+        force_patch_after_read = False
         if st.pending_patch and st.last_observation and st.last_observation.tool == "read_artifact":
+            # A prior make_error_patch_override attempt was deferred until we had the BASE slice.
+            # Do not execute the stale tool call: ask the model to regenerate new_func_code from
+            # the just-read BASE slice with minimal edits.
             if len(st.steps) >= cfg.max_steps:
                 return {
                     "state": st,
@@ -1267,10 +1486,8 @@ def _run_langgraph(
                         "error": _error_payload(st),
                     },
                 }
-            decision = st.pending_patch
             st.pending_patch = None
-            _validate_tool_decision(decision)
-            return {"state": st, "pending": decision}
+            force_patch_after_read = True
 
         if len(st.steps) >= cfg.max_steps:
             return {
@@ -1292,46 +1509,61 @@ def _run_langgraph(
             and st.macro_tokens_not_defined_in_slice
             and "expanded from macro" in str(st.snippet or "")
         ):
-            token = _macro_lookup_pick_token(st)
-            if token:
-                st.macro_lookup = {"token": token, "stage": "need_search_text", "version": "v2"}
+            tokens = _macro_lookup_pick_tokens(st, max_tokens=3)
+            if tokens:
+                st.macro_lookup = {
+                    "tokens": tokens,
+                    "search_tokens": tokens,
+                    "queue_read": [],
+                    "stage": "need_kb_search",
+                    "version": "v2",
+                }
                 forced: Decision = {
                     "type": "tool",
-                    "thought": f"Macro preflight: locate the real #define for {token} (v2 then v1) before rewriting the patch.",
-                    "tool": "search_text",
-                    "args": {"query": f"#define {token}", "version": "v2", "limit": 20, "file_glob": ""},
+                    "thought": f"Macro preflight: locate the real #define blocks for {', '.join(tokens)} (v2 then v1) before rewriting the patch.",
+                    "tool": "kb_search_symbols",
+                    "args": {"symbols": tokens, "version": "v2", "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
                 }
                 _validate_tool_decision(forced)
                 return {"state": st, "pending": forced}
 
         if isinstance(st.macro_lookup, dict):
             stage = str(st.macro_lookup.get("stage", "") or "").strip()
-            token = str(st.macro_lookup.get("token", "") or "").strip()
             version = str(st.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
-            if stage == "need_search_text" and token:
+            if stage == "need_kb_search":
+                search_tokens = [str(t) for t in (st.macro_lookup.get("search_tokens") or []) if str(t).strip()]
+                if not search_tokens:
+                    search_tokens = [str(t) for t in (st.macro_lookup.get("tokens") or []) if str(t).strip()]
                 forced: Decision = {
                     "type": "tool",
-                    "thought": f"Macro guardrail: locate the real #define for {token} before adding it.",
-                    "tool": "search_text",
-                    "args": {"query": f"#define {token}", "version": version, "limit": 20, "file_glob": ""},
+                    "thought": f"Macro guardrail: locate the real #define blocks for {', '.join(search_tokens)} before adding/removing/adapting them.",
+                    "tool": "kb_search_symbols",
+                    "args": {"symbols": search_tokens, "version": version, "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
                 }
                 _validate_tool_decision(forced)
                 return {"state": st, "pending": forced}
-            if stage == "need_read_file_context":
-                file_path = str(st.macro_lookup.get("file_path", "") or "").strip()
-                line_number = int(st.macro_lookup.get("line_number") or 0)
-                if file_path and line_number > 0:
-                    forced = {
-                        "type": "tool",
-                        "thought": f"Macro guardrail: read the real definition context for {token} before rewriting the patch.",
-                        "tool": "read_file_context",
-                        "args": {"file_path": file_path, "line_number": line_number, "context": 80, "version": version},
-                    }
-                    _validate_tool_decision(forced)
-                    st.macro_lookup = {"token": token, "stage": "done", "version": version}
-                    return {"state": st, "pending": forced}
         messages = _build_messages(st)
-        raw = model.complete(messages)
+        if force_patch_after_read and st.patch_path and st.error_scope == "patch":
+            file_path, line_number = _first_error_location(st)
+            base_text = _last_read_artifact_text(st)
+            base_lines = len(base_text.splitlines()) if base_text else 0
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Do NOT return a final decision yet.\n"
+                        "You just read the BASE slice via read_artifact.\n"
+                        f"BASE slice lines (approx): {base_lines}\n"
+                        "Now generate an override by calling make_error_patch_override with:\n"
+                        f'- args.patch_path="{st.patch_path}"\n'
+                        f'- args.file_path="{file_path}"\n'
+                        f"- args.line_number={line_number}\n"
+                        "- args.new_func_code=<the BASE slice with minimal edits only; do NOT drop unrelated lines or omit the tail>\n"
+                        "Return exactly one JSON tool object."
+                    ),
+                }
+            )
+        raw = _complete(model, messages, label="main")
         try:
             decision = _parse_decision(raw)
         except Exception:  # noqa: BLE001
@@ -1364,7 +1596,7 @@ def _run_langgraph(
                     json_mode=False,
                     max_tokens=max(int(model.max_tokens or 0), 8000),
                 )
-            repaired_raw = repair_model.complete(repair_messages)
+            repaired_raw = _complete(repair_model, repair_messages, label="json_repair")
             try:
                 decision = _parse_decision(repaired_raw)
             except Exception as exc:  # noqa: BLE001
@@ -1493,7 +1725,7 @@ def _run_langgraph(
                     }
                 )
                 try:
-                    coerced = _parse_decision(model.complete(base_rewrite_messages))
+                    coerced = _parse_decision(_complete(model, base_rewrite_messages, label="force_patch"))
                 except Exception:
                     coerced = {}
                 if isinstance(coerced, dict) and coerced.get("type") == "tool" and str(coerced.get("tool", "")).strip() == "make_error_patch_override":
@@ -1522,7 +1754,7 @@ def _run_langgraph(
                 def attempt_rewrite(extra_user: str) -> Optional[Decision]:
                     rewrite_messages = list(base_rewrite_messages)
                     rewrite_messages.append({"role": "user", "content": extra_user})
-                    raw_out = model.complete(rewrite_messages)
+                    raw_out = _complete(model, rewrite_messages, label="rewrite_v2_type_edit")
                     try:
                         return _parse_decision(raw_out)
                     except Exception:
@@ -1542,7 +1774,7 @@ def _run_langgraph(
                             }
                         )
                         try:
-                            return _parse_decision(model.complete(repair_messages))
+                            return _parse_decision(_complete(model, repair_messages, label="rewrite_v2_type_edit_repair"))
                         except Exception:
                             return None
 
@@ -1585,10 +1817,55 @@ def _run_langgraph(
             }
         _validate_tool_decision(decision)
 
-        rewritten_search = _rewrite_search_text_query_for_macro(st, decision)
-        if rewritten_search:
-            decision = rewritten_search  # type: ignore[assignment]
-            _validate_tool_decision(decision)
+        # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
+        # drops large portions of it (common failure mode: model emits only a short snippet).
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            shrink_err = _override_preserve_base_guardrail_error(st, decision)
+            if shrink_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your make_error_patch_override.new_func_code appears to drop too much of the BASE slice.\n"
+                            f"{shrink_err}\n\n"
+                            "Fix: start from the latest read_artifact.output.text (BASE slice) and apply the smallest possible edits.\n"
+                            "Do NOT omit the tail; keep all unrelated lines.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_shrink_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not shrink_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly produced a truncated override body.",
+                                "summary": "Stopped before patch generation due to an incomplete override body.",
+                                "next_step": (
+                                    f"{shrink_err2}\n\n"
+                                    "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
+                                    "or manually construct new_func_code by editing the read_artifact BASE slice."
+                                ).strip(),
+                                "steps": st.steps,
+                                "error": _error_payload(st),
+                            },
+                        }
 
         forced_macro = _macro_define_guardrail_for_override(st, decision)
         if forced_macro:
@@ -1670,8 +1947,8 @@ def _run_langgraph(
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
                 st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
-        if obs.ok and obs.tool == "search_text" and isinstance(st.macro_lookup, dict):
-            _macro_lookup_update_from_search_text_output(st, obs.output)
+        if obs.ok and obs.tool == "kb_search_symbols" and isinstance(st.macro_lookup, dict):
+            _macro_lookup_update_from_kb_search_output(st, obs.output)
         if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
@@ -1768,6 +2045,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
 
+    parser.add_argument(
+        "--debug-llm",
+        action="store_true",
+        default=str(os.environ.get("REACT_AGENT_DEBUG_LLM", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"},
+        help="Print full LLM request/response messages to stderr (for debugging).",
+    )
+    parser.add_argument(
+        "--debug-llm-dir",
+        default=os.environ.get("REACT_AGENT_DEBUG_LLM_DIR", ""),
+        help="If set, also write each LLM request/response as JSON under this directory.",
+    )
+
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
     parser.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
     parser.add_argument("--ossfuzz-commit", default=os.environ.get("REACT_AGENT_OSSFUZZ_COMMIT", ""))
@@ -1792,6 +2081,8 @@ def main(argv: List[str]) -> int:
         max_steps=max(args.max_steps, 1),
         tools_mode=args.tools,
         error_scope=args.error_scope,
+        debug_llm=bool(getattr(args, "debug_llm", False)),
+        debug_llm_dir=str(getattr(args, "debug_llm_dir", "") or "").strip(),
     )
 
     # Fail fast: in patch-scope runs we will generate a patch and must be able to test it.

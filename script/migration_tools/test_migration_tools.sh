@@ -107,6 +107,42 @@ assert any(i.get("kind") == "unknown_type_name" for i in parsed.get("undeclared_
 print("OK")
 PY
 
+# get_error_v1_code_slice: by default (max_lines=0/max_chars=0), return full text and never inject a "[truncated]" marker.
+"$PYTHON" - <<'PY'
+import json
+
+from script.migration_tools.tools import get_error_v1_code_slice
+
+minus_lines = [f"-LINE{i:04d} " + ("X" * 40) for i in range(50)]
+diff_text = "\n".join(
+    [
+        "diff --git a/x.c b/x.c",
+        "--- a/x.c",
+        "+++ b/x.c",
+        "@@ -1,50 +1,0 @@",
+        *minus_lines,
+        "",
+    ]
+)
+
+out = get_error_v1_code_slice(excerpt=diff_text)
+json.dumps(out)
+assert out["func_code_lines_total"] == 50, out
+assert out["func_code_lines_returned"] == 50, out
+assert out["func_code_truncated"] is False, out
+code = out.get("func_code") or ""
+assert "...[truncated]" not in code, code[-200:]
+
+limited = get_error_v1_code_slice(excerpt=diff_text, max_lines=3, max_chars=50)
+json.dumps(limited)
+assert limited["func_code_lines_total"] == 50, limited
+assert limited["func_code_lines_returned"] == 3, limited
+assert limited["func_code_truncated"] is True, limited
+assert "...[truncated]" not in (limited.get("func_code") or ""), limited
+
+print("OK")
+PY
+
 # Non-function patches (macros/consts/decls) should also be rewriteable by slice.
 bundle_path="$tmp_dir/_fixture_macro_hunk.patch2"
 
