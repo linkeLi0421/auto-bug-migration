@@ -79,7 +79,7 @@ print("OK")
 PY
 
 # Macro guardrail: if the override tries to add a #define for a missing macro token without source evidence,
-# agent_langgraph should force search_text("#define TOKEN") first.
+# agent_langgraph should force kb_search_symbols(TOKEN,kinds=[MACRO_DEFINITION]) first.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -106,12 +106,15 @@ decision = {
 }
 
 forced = _macro_define_guardrail_for_override(state, decision)
-assert forced and forced.get("tool") == "search_text", forced
-assert "EMPTY_ICONV" in (forced.get("args") or {}).get("query", ""), forced
+assert forced and forced.get("tool") == "kb_search_symbols", forced
+args = forced.get("args") or {}
+assert "EMPTY_ICONV" in (args.get("symbols") or []), forced
+assert "MACRO_DEFINITION" in (args.get("kinds") or []), forced
 print("OK")
 PY
 
-# Macro lookup fallback: when v2 has no matches, macro_lookup should fall back to v1.
+# Override guardrail: when we have a BASE slice from read_artifact, reject make_error_patch_override calls
+# that drop large portions of it (to avoid silent tail deletion).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -119,7 +122,60 @@ from pathlib import Path
 script_dir = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(script_dir))
 
-from agent_langgraph import AgentState, _macro_lookup_update_from_search_text_output  # noqa: E402
+from agent_langgraph import AgentState, _override_preserve_base_guardrail_error  # noqa: E402
+
+base_lines = [f"LINE{i:04d} " + ("X" * 40) for i in range(120)]
+base_text = "\n".join(base_lines) + "\n"
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="",
+)
+state.steps.append(
+    {
+        "decision": {"type": "tool", "tool": "read_artifact", "args": {"artifact_path": "x"}, "thought": "read base"},
+        "observation": {
+            "ok": True,
+            "tool": "read_artifact",
+            "args": {"artifact_path": "x"},
+            "output": {"text": base_text},
+            "error": None,
+        },
+    }
+)
+
+short = "\n".join(base_lines[:30]) + "\n"
+decision = {
+    "type": "tool",
+    "tool": "make_error_patch_override",
+    "thought": "oops, too short",
+    "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": short},
+}
+assert _override_preserve_base_guardrail_error(state, decision), "expected shrink guardrail to trigger"
+
+ok_decision = {
+    "type": "tool",
+    "tool": "make_error_patch_override",
+    "thought": "keep base",
+    "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": base_text},
+}
+assert _override_preserve_base_guardrail_error(state, ok_decision) is None, "expected guardrail to allow full base"
+
+print("OK")
+PY
+
+# Macro lookup fallback: when v2 has no matches, macro_lookup should fall back to v1 (batch mode).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _macro_lookup_update_from_kb_search_output  # noqa: E402
 
 state = AgentState(
     build_log_path="build.log",
@@ -128,10 +184,40 @@ state = AgentState(
     error_line="x:1:1: error: y",
     snippet="expanded from macro 'MAKE_HANDLER'",
 )
-state.macro_lookup = {"token": "EMPTY_ICONV", "stage": "need_search_text", "version": "v2"}
-_macro_lookup_update_from_search_text_output(state, {"matches": [], "truncated": False})
+state.macro_lookup = {"tokens": ["EMPTY_ICONV"], "search_tokens": ["EMPTY_ICONV"], "queue_read": [], "stage": "need_kb_search", "version": "v2"}
+_macro_lookup_update_from_kb_search_output(state, {"results": [{"symbol": "EMPTY_ICONV", "matches": [], "truncated": False}]})
 assert state.macro_lookup and state.macro_lookup.get("version") == "v1", state.macro_lookup
-assert state.macro_lookup.get("stage") == "need_search_text", state.macro_lookup
+assert state.macro_lookup.get("stage") == "need_kb_search", state.macro_lookup
+assert state.macro_lookup.get("search_tokens") == ["EMPTY_ICONV"], state.macro_lookup
+
+print("OK")
+PY
+
+# Macro lookup should not force read_file_context or hard-code a context window.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _macro_lookup_update_from_kb_search_output  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="expanded from macro 'MAKE_HANDLER'",
+)
+state.macro_lookup = {"tokens": ["EMPTY_ICONV"], "search_tokens": ["EMPTY_ICONV"], "stage": "need_kb_search", "version": "v1"}
+_macro_lookup_update_from_kb_search_output(
+    state,
+    {"results": [{"symbol": "EMPTY_ICONV", "matches": [{"kind": "MACRO_DEFINITION", "file": "encoding.c", "line": 123, "column": 1, "code": "#define EMPTY_ICONV"}]}]},
+)
+
+assert state.macro_lookup and state.macro_lookup.get("stage") == "done", state.macro_lookup
+assert "queue_read" not in state.macro_lookup, state.macro_lookup
 
 print("OK")
 PY
@@ -154,7 +240,7 @@ allowed = {
     "read_artifact",
     "read_file_context",
     "search_definition",
-    "search_text",
+    "kb_search_symbols",
     "list_patch_bundle",
     "get_patch",
     "search_patches",
@@ -263,10 +349,8 @@ idx_patch = tools.index("make_error_patch_override")
 assert idx_patch > 0 and tools[idx_patch - 1] == "read_artifact", tools
 assert "ossfuzz_apply_patch_and_test" in tools[idx_patch + 1 :], tools
 
-if "search_text" in tools:
-    first_search_text = tools.index("search_text")
-    first_v2 = next(i for i, s in enumerate(steps) if (s.get("decision") or {}).get("tool") == "search_definition" and ((s.get("decision") or {}).get("args") or {}).get("version") == "v2")
-    assert first_search_text > first_v2, tools
+# kb_search_symbols may appear in macro-expansion flows; ordering is enforced by macro_lookup guardrails,
+# not by this patch-scope missing-member fixture.
 PY
 
 # Guardrail: block suggestions to edit V2 type definitions by default.

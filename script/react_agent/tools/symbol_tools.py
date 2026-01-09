@@ -201,68 +201,95 @@ class AgentTools:
 
         return "\n".join(pieces).rstrip("\n")
 
-    def search_text(self, query: str, *, version: str = "v2", limit: int = 20, file_glob: str = "") -> Dict[str, Any]:
-        """Search for a literal string in the source tree (macro/typedef fallback)."""
-        q = str(query or "")
+    def kb_search_symbols(
+        self,
+        symbols: List[str],
+        *,
+        version: str = "v2",
+        kinds: Optional[List[str]] = None,
+        limit_per_symbol: int = 5,
+    ) -> Dict[str, Any]:
+        """Query the KB index for existence/locations/snippets of symbols (batch-friendly).
+
+        This is intended to replace repo-wide grep for most agent workflows, including macro
+        definition lookups (MACRO_DEFINITION).
+        """
         ver = str(version).strip().lower()
-        limit_n = max(0, min(int(limit or 0), 200))
         if ver not in {"v1", "v2"}:
-            return {"query": q, "version": ver, "matches": [], "truncated": False, "error": "invalid version"}
-        if not q or limit_n <= 0:
-            return {"query": q, "version": ver, "matches": [], "truncated": False, "error": ""}
+            return {"version": ver, "results": [], "error": "invalid version"}
 
-        root = self.source_manager._repo_root(ver)
-        patterns = [str(file_glob)] if str(file_glob or "").strip() else [
-            "*.h",
-            "*.hpp",
-            "*.hh",
-            "*.hxx",
-            "*.c",
-            "*.cc",
-            "*.cpp",
-            "*.cxx",
-            "*.inc",
-        ]
+        limit_n = max(0, min(int(limit_per_symbol or 0), 50))
+        kind_set = {str(k).strip() for k in (kinds or []) if str(k).strip()} or None
 
-        matches: List[Dict[str, Any]] = []
-        scanned_files = 0
-        truncated = False
-        for pattern in patterns:
-            for path in root.rglob(pattern):
-                if not path.is_file():
-                    continue
-                try:
-                    if path.stat().st_size > 2_000_000:
-                        continue
-                except OSError:
-                    continue
-                scanned_files += 1
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                for line_no, line in enumerate(text.splitlines(), start=1):
-                    if q not in line:
-                        continue
-                    try:
-                        file_rel = str(path.relative_to(root))
-                    except ValueError:
-                        file_rel = str(path)
-                    matches.append({"file": file_rel, "line": line_no, "text": line.rstrip("\n")})
-                    if len(matches) >= limit_n:
-                        truncated = True
-                        break
-                if truncated:
-                    break
-            if truncated:
-                break
+        def is_definition(node: dict) -> bool:
+            kind = str(node.get("kind", "") or "")
+            return node.get("is_definition") is True or kind.endswith(("DEFI", "DEF", "DEFINITION")) or kind in {
+                "STRUCT_DECL",
+                "UNION_DECL",
+                "ENUM_DECL",
+                "MACRO_DEFINITION",
+            }
 
-        return {
-            "query": q,
-            "version": ver,
-            "repo_root": str(root),
-            "file_glob": str(file_glob or ""),
-            "matches": matches,
-            "truncated": truncated,
-            "scanned_files": scanned_files,
-        }
+        def extent_lines(node: dict) -> int:
+            extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+            start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+            end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+            sl = int(start.get("line", 0) or 0)
+            el = int(end.get("line", 0) or 0)
+            if sl > 0 and el >= sl:
+                return el - sl + 1
+            return 0
+
+        def loc_tuple(node: dict) -> Tuple[str, int, int]:
+            loc = node.get("location", {}) if isinstance(node.get("location"), dict) else {}
+            fp = str(loc.get("file", "") or "")
+            ln = int(loc.get("line", 0) or 0)
+            col = int(loc.get("column", 0) or 0)
+            return fp, ln, col
+
+        results: List[Dict[str, Any]] = []
+        for raw in symbols or []:
+            sym = str(raw or "").strip()
+            if not sym:
+                continue
+
+            nodes = self.kb_index.query_all(sym).get(ver, [])
+            if kind_set is not None:
+                nodes = [n for n in nodes if isinstance(n, dict) and str(n.get("kind", "") or "").strip() in kind_set]
+
+            def rank(n: dict) -> Tuple[int, int, int, int]:
+                fp, ln, col = loc_tuple(n)
+                # Higher is better for the first two. Then stable-ish ordering by location.
+                return (1 if is_definition(n) else 0, extent_lines(n), -ln, -col)
+
+            nodes_sorted = sorted([n for n in nodes if isinstance(n, dict)], key=rank, reverse=True)
+            truncated = False
+            chosen = nodes_sorted
+            if limit_n and len(nodes_sorted) > limit_n:
+                chosen = nodes_sorted[:limit_n]
+                truncated = True
+
+            matches: List[Dict[str, Any]] = []
+            for n in chosen:
+                fp, ln, col = loc_tuple(n)
+                code = self.source_manager.get_function_code(n, ver).rstrip("\n")
+                matches.append(
+                    {
+                        "kind": str(n.get("kind", "") or "").strip(),
+                        "file": fp,
+                        "line": ln,
+                        "column": col,
+                        "code": code,
+                    }
+                )
+
+            results.append(
+                {
+                    "symbol": sym,
+                    "exists": bool(matches),
+                    "matches": matches,
+                    "truncated": truncated,
+                }
+            )
+
+        return {"version": ver, "kinds": sorted(kind_set) if kind_set else None, "limit_per_symbol": limit_n, "results": results}

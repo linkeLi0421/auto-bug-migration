@@ -786,8 +786,8 @@ def get_error_v1_code_slice(
     file_path: str = "",
     line_number: int = 0,
     excerpt: Any = None,
-    max_lines: int = 200,
-    max_chars: int = 12000,
+    max_lines: int = 0,
+    max_chars: int = 0,
     allowed_roots: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Extract the V1-origin code slice for a build error from a patch bundle.
@@ -820,15 +820,17 @@ def get_error_v1_code_slice(
         referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
         missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
 
-        max_n = max(0, min(int(max_lines or 0), 5000))
-        returned_lines = func_lines[:max_n]
+        max_n_raw = int(max_lines or 0)
+        max_n = None if max_n_raw == 0 else max(0, min(max_n_raw, 1_000_000))
+        returned_lines = func_lines if max_n is None else func_lines[:max_n]
         code = "\n".join(returned_lines)
         truncated = total_lines > len(returned_lines)
 
         if max_chars is not None:
-            max_c = max(0, min(int(max_chars or 0), 200000))
+            max_c_raw = int(max_chars or 0)
+            max_c = None if max_c_raw == 0 else max(0, min(max_c_raw, 50_000_000))
             if max_c and len(code) > max_c:
-                code = code[:max_c].rstrip("\n") + "\n...[truncated]"
+                code = code[:max_c].rstrip("\n")
                 truncated = True
 
         return {
@@ -913,15 +915,17 @@ def get_error_v1_code_slice(
     referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
     missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
 
-    max_n = max(0, min(int(max_lines or 0), 5000))
-    returned_lines = func_lines[:max_n]
+    max_n_raw = int(max_lines or 0)
+    max_n = None if max_n_raw == 0 else max(0, min(max_n_raw, 1_000_000))
+    returned_lines = func_lines if max_n is None else func_lines[:max_n]
     code = "\n".join(returned_lines)
 
     truncated = total_lines > len(returned_lines)
     if max_chars is not None:
-        max_c = max(0, min(int(max_chars or 0), 200000))
+        max_c_raw = int(max_chars or 0)
+        max_c = None if max_c_raw == 0 else max(0, min(max_c_raw, 50_000_000))
         if max_c and len(code) > max_c:
-            code = code[:max_c].rstrip("\n") + "\n...[truncated]"
+            code = code[:max_c].rstrip("\n")
             truncated = True
 
     return {

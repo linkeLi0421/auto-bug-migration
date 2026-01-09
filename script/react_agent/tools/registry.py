@@ -6,7 +6,7 @@ ToolName = Literal[
     "read_artifact",
     "read_file_context",
     "search_definition",
-    "search_text",
+    "kb_search_symbols",
     "ossfuzz_apply_patch_and_test",
     "list_patch_bundle",
     "get_patch",
@@ -42,9 +42,9 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": "Return code for the best matching symbol definition in the requested version.",
     },
     {
-        "name": "search_text",
-        "args": {"query": "string", "version": "v1|v2", "limit": "int?", "file_glob": "string?"},
-        "description": "Search source files for a literal string (macro/typedef fallback).",
+        "name": "kb_search_symbols",
+        "args": {"symbols": "list[string]", "version": "v1|v2", "kinds": "list[string]?", "limit_per_symbol": "int?"},
+        "description": "Query the clang-JSON KB for symbol existence/locations/snippets (batch-friendly; includes MACRO_DEFINITION).",
     },
     {
         "name": "ossfuzz_apply_patch_and_test",
