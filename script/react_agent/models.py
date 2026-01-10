@@ -26,6 +26,14 @@ class ChatModel:
 
 _COMPILER_ERROR_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?:fatal\s+)?error:\s*(?P<msg>.*)$")
 
+@dataclass(frozen=True)
+class ModelResponseDebug:
+    status_code: Optional[int]
+    content_type: str
+    raw_body: str
+    raw_body_truncated: bool
+    parsed_finish_reason: str
+
 
 @dataclass
 class StubModel(ChatModel):
@@ -406,7 +414,8 @@ class OpenAIChatCompletionsModel(ChatModel):
     max_tokens: int = 800
     json_mode: bool = True
     reasoning_effort: str = "low"
-    timeout_s: int = 60
+    timeout_s: int = 120
+    max_debug_body_chars: int = 200_000
 
     @classmethod
     def from_env(cls) -> "OpenAIChatCompletionsModel":
@@ -419,7 +428,7 @@ class OpenAIChatCompletionsModel(ChatModel):
             raise ModelError("OPENAI_API_KEY is required")
         return cls(api_key=api_key, model=model, base_url=base_url, org=org, project=project)
 
-    def complete(self, messages: List[Message]) -> str:
+    def complete_with_raw(self, messages: List[Message]) -> tuple[str, ModelResponseDebug]:
         url = self.base_url.rstrip("/") + "/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -445,10 +454,12 @@ class OpenAIChatCompletionsModel(ChatModel):
             token_fields = ["max_completion_tokens", "max_tokens"]
 
         raw = ""
+        raw_for_debug = ""
         status_code: Optional[int] = None
         content_type: str = ""
         last_http_error: Optional[urllib.error.HTTPError] = None
         last_http_detail = ""
+        raw_body_truncated = False
 
         for idx, token_field in enumerate(token_fields):
             payload = dict(base_payload)
@@ -464,6 +475,10 @@ class OpenAIChatCompletionsModel(ChatModel):
                     status_code = int(getattr(resp, "status", 0) or 0) or int(resp.getcode() or 0)
                     content_type = str(resp.headers.get("Content-Type", "") or "")
                     raw = resp.read().decode("utf-8", errors="replace")
+                raw_for_debug = raw
+                if self.max_debug_body_chars and len(raw_for_debug) > int(self.max_debug_body_chars):
+                    raw_for_debug = raw_for_debug[: int(self.max_debug_body_chars)]
+                    raw_body_truncated = True
                 last_http_error = None
                 break
             except urllib.error.HTTPError as e:
@@ -511,7 +526,17 @@ class OpenAIChatCompletionsModel(ChatModel):
                     f"Content-Type={content_type!r} status={status_code}. Body snippet: {snippet!r}"
                 )
             data = json.loads(raw)
-            return str(data["choices"][0]["message"]["content"])
+            choice0 = data.get("choices", [{}])[0] if isinstance(data, dict) else {}
+            msg0 = choice0.get("message", {}) if isinstance(choice0, dict) else {}
+            content = str(msg0.get("content", "") or "")
+            finish_reason = str(choice0.get("finish_reason", "") or "")
+            return content, ModelResponseDebug(
+                status_code=status_code,
+                content_type=content_type,
+                raw_body=raw_for_debug,
+                raw_body_truncated=raw_body_truncated,
+                parsed_finish_reason=finish_reason,
+            )
         except ModelError:
             raise
         except json.JSONDecodeError as exc:
@@ -529,3 +554,7 @@ class OpenAIChatCompletionsModel(ChatModel):
             raise ModelError(
                 f"Bad OpenAI response: {type(exc).__name__}: {exc}. status={status_code} Content-Type={content_type!r}"
             ) from exc
+
+    def complete(self, messages: List[Message]) -> str:
+        content, _debug = self.complete_with_raw(messages)
+        return content

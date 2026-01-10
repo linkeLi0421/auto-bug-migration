@@ -684,4 +684,80 @@ with tempfile.TemporaryDirectory() as td:
     assert verdict2.get("fixed") is True, verdict2
 PY
 
+# Patch-scope iteration helper: after OSS-Fuzz finds remaining target errors, state should
+# be prepared for another make_error_patch_override + ossfuzz_apply_patch_and_test cycle.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import (  # noqa: E402
+    AgentConfig,
+    AgentState,
+    _patch_scope_prepare_next_iteration_after_ossfuzz,
+)
+
+cfg = AgentConfig(max_steps=10, tools_mode="fake", error_scope="patch", max_ossfuzz_runs=2)
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/libxml2/parser.c:10:1: error: unknown type name 'xmlParserNsData'",
+    snippet="",
+    patch_key="p2",
+    patch_generated=True,
+    ossfuzz_test_attempted=True,
+    ossfuzz_runs_attempted=1,
+    target_errors=[
+        {"patch_key": "p2", "msg": "unknown type name 'xmlHashedString'"},
+        {"patch_key": "p2", "msg": "unknown type name 'xmlParserNsData'"},
+    ],
+)
+
+verdict = {
+    "status": "ok",
+    "fixed": False,
+    "matched_target_errors": [
+        {
+            "raw": "/src/libxml2/parser.c:20:3: error: unknown type name 'xmlHashedString'",
+            "file": "/src/libxml2/parser.c",
+            "line": 20,
+            "col": 3,
+            "msg": "unknown type name 'xmlHashedString'",
+            "patch_key": "p2",
+        }
+    ],
+    "other_errors": [
+        {
+            "raw": "/src/libxml2/parser.c:21:3: error: something else",
+            "file": "/src/libxml2/parser.c",
+            "line": 21,
+            "col": 3,
+            "msg": "something else",
+            "patch_key": "p2",
+        }
+    ],
+}
+
+assert _patch_scope_prepare_next_iteration_after_ossfuzz(state, cfg, verdict) is True
+assert state.auto_iterate_pending is True
+assert state.patch_generated is False
+assert state.patch_result is None
+assert state.ossfuzz_test_attempted is False
+assert state.grouped_errors and "xmlHashedString" in (state.grouped_errors[0].get("msg") or ""), state.grouped_errors
+assert "xmlHashedString" in state.error_line, state.error_line
+
+# If the max run limit is reached, the helper should refuse to continue.
+state.patch_generated = True
+state.ossfuzz_test_attempted = True
+state.ossfuzz_runs_attempted = 2
+assert _patch_scope_prepare_next_iteration_after_ossfuzz(state, cfg, verdict) is False
+assert state.auto_iterate_pending is False
+
+print("OK")
+PY
+
 echo "OK"

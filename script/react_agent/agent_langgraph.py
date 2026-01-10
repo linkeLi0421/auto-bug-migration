@@ -7,7 +7,8 @@ import os
 import re
 import sys
 import textwrap
-from dataclasses import dataclass, field, replace
+import inspect
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
@@ -38,6 +39,8 @@ class AgentConfig:
     max_steps: int = 4
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
+    max_ossfuzz_runs: int = 1
+    recursion_limit: int = 0
     debug_llm: bool = False
     debug_llm_dir: str = ""
 
@@ -75,6 +78,12 @@ class AgentState:
 
     # Indicates we already attempted OSS-Fuzz test after generating a patch.
     ossfuzz_test_attempted: bool = False
+    ossfuzz_runs_attempted: int = 0
+
+    # In iterative patch-scope runs, this stores the current BASE slice (after all applied overrides)
+    # as an artifact path so subsequent overrides can preserve prior fixes.
+    base_slice_artifact_path: str = ""
+    auto_iterate_pending: bool = False
 
     # Latest macro tokens reported by get_error_v1_code_slice (used for guardrails).
     macro_tokens_not_defined_in_slice: List[str] = field(default_factory=list)
@@ -299,6 +308,82 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
         "log_artifacts": sources,
         "mapping_error": bundle_err,
     }
+
+
+def _patch_scope_prepare_next_iteration_after_ossfuzz(
+    state: AgentState, cfg: AgentConfig, verdict: Dict[str, Any]
+) -> bool:
+    """Return True if the state was updated to continue patch-scope iteration after OSS-Fuzz."""
+    pk = str(state.patch_key or "").strip()
+    if state.error_scope != "patch":
+        state.auto_iterate_pending = False
+        return False
+    if int(cfg.max_ossfuzz_runs or 0) <= 1:
+        state.auto_iterate_pending = False
+        return False
+    if int(state.ossfuzz_runs_attempted or 0) >= int(cfg.max_ossfuzz_runs or 0):
+        state.auto_iterate_pending = False
+        return False
+    if str(verdict.get("status", "")).strip() != "ok":
+        state.auto_iterate_pending = False
+        return False
+    if verdict.get("fixed") is not False:
+        state.auto_iterate_pending = False
+        return False
+
+    matched_now = verdict.get("matched_target_errors") if isinstance(verdict.get("matched_target_errors"), list) else []
+    other_now = verdict.get("other_errors") if isinstance(verdict.get("other_errors"), list) else []
+
+    combined: List[Dict[str, Any]] = []
+    for seq in (matched_now, other_now):
+        for item in seq:
+            if not isinstance(item, dict):
+                continue
+            item_pk = str(item.get("patch_key", "") or "").strip()
+            if pk and item_pk and item_pk != pk:
+                continue
+            combined.append(item)
+
+    seen: set[tuple[str, int, str]] = set()
+    refreshed: List[Dict[str, Any]] = []
+    for item in combined:
+        raw_err = str(item.get("raw", "") or "").strip()
+        msg_err = str(item.get("msg", "") or "").strip()
+        ln_err = int(item.get("line", 0) or 0)
+        if not raw_err or not msg_err or ln_err <= 0:
+            continue
+        key = (str(item.get("file", "") or "").strip(), ln_err, msg_err)
+        if key in seen:
+            continue
+        seen.add(key)
+        refreshed.append(
+            {
+                "file": str(item.get("file", "") or "").strip(),
+                "line": ln_err,
+                "col": int(item.get("col", 0) or 0),
+                "msg": msg_err,
+                "raw": raw_err,
+                "snippet": str(item.get("snippet", "") or "").strip() or raw_err,
+                "patch_key": item.get("patch_key") or pk,
+                "old_signature": "",
+            }
+        )
+
+    if not refreshed:
+        state.auto_iterate_pending = False
+        return False
+
+    state.grouped_errors = refreshed
+    state.error_line = str(refreshed[0].get("raw", "") or state.error_line)
+    state.snippet = str(refreshed[0].get("snippet", "") or state.snippet)
+    state.target_errors = _extract_target_errors(
+        error_line=state.error_line, grouped_errors=state.grouped_errors, patch_key=state.patch_key
+    )
+    state.patch_generated = False
+    state.patch_result = None
+    state.ossfuzz_test_attempted = False
+    state.auto_iterate_pending = True
+    return True
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -1342,12 +1427,21 @@ def _run_langgraph(
     # Build a small two-node graph: LLM -> TOOL -> LLM (until final).
     llm_call_seq = 0
 
-    def _debug_dump_llm(*, call_id: int, label: str, messages: List[Dict[str, str]], response: Optional[str] = None) -> None:
+    def _debug_dump_llm(
+        *,
+        call_id: int,
+        label: str,
+        messages: List[Dict[str, str]],
+        response: Optional[str] = None,
+        response_debug: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not cfg.debug_llm:
             return
         payload = {"call_id": call_id, "label": str(label or ""), "messages": messages}
         if response is not None:
             payload["response"] = str(response)
+        if response_debug is not None:
+            payload["response_debug"] = response_debug
 
         if cfg.debug_llm_dir:
             out_dir = Path(str(cfg.debug_llm_dir)).expanduser()
@@ -1368,8 +1462,18 @@ def _run_langgraph(
         llm_call_seq += 1
         call_id = llm_call_seq
         _debug_dump_llm(call_id=call_id, label=label, messages=messages)
-        out = model_obj.complete(messages)
-        _debug_dump_llm(call_id=call_id, label=label, messages=messages, response=out)
+        response_debug: Optional[Dict[str, Any]] = None
+        if cfg.debug_llm and hasattr(model_obj, "complete_with_raw"):
+            content, debug_info = getattr(model_obj, "complete_with_raw")(messages)
+            out = str(content)
+            if not out.strip():
+                try:
+                    response_debug = asdict(debug_info)
+                except Exception:
+                    response_debug = {"debug_info_type": str(type(debug_info))}
+        else:
+            out = model_obj.complete(messages)
+        _debug_dump_llm(call_id=call_id, label=label, messages=messages, response=out, response_debug=response_debug)
         return out
 
     def llm_node(gs: GraphState) -> GraphState:
@@ -1428,14 +1532,20 @@ def _run_langgraph(
                 pt = st.patch_result.get("patch_text")
                 if isinstance(pt, dict):
                     patch_text_path = str(pt.get("artifact_path", "") or "").strip()
-            if isinstance(st.last_observation, ToolObservation) and st.last_observation.tool == "ossfuzz_apply_patch_and_test":
+
+            if (
+                isinstance(st.last_observation, ToolObservation)
+                and st.last_observation.tool == "ossfuzz_apply_patch_and_test"
+            ):
                 out = st.last_observation.output
                 if isinstance(out, dict):
                     merged_patch_file_path = str(out.get("merged_patch_file_path", "") or "").strip()
+
             verdict = _summarize_target_error_status(st)
             fixed_str = "unknown"
             if verdict.get("status") == "ok":
                 fixed_str = "yes" if verdict.get("fixed") else "no"
+
             next_step_lines = [f"Target error fixed: {fixed_str}."]
             if verdict.get("status") == "ok":
                 matched = verdict.get("matched_target_errors") or []
@@ -1457,17 +1567,32 @@ def _run_langgraph(
             if patch_text_path:
                 next_step_lines.append(f"Override diff: {patch_text_path}")
             next_step = "\n".join(next_step_lines).strip()
-            return {
-                "state": st,
-                "final": {
-                    "type": "final",
-                    "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
-                    "summary": "Generated a function-body replacement patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
-                    "next_step": next_step.strip(),
-                    "steps": st.steps,
-                    "error": _error_payload(st),
-                },
-            }
+
+            if not _patch_scope_prepare_next_iteration_after_ossfuzz(st, cfg, verdict):
+                st.auto_iterate_pending = False
+                if (
+                    st.error_scope == "patch"
+                    and cfg.max_ossfuzz_runs > 1
+                    and verdict.get("status") == "ok"
+                    and verdict.get("fixed") is False
+                    and st.ossfuzz_runs_attempted >= cfg.max_ossfuzz_runs
+                ):
+                    next_step = (
+                        next_step
+                        + "\n"
+                        + f"Reached --max-ossfuzz-runs={cfg.max_ossfuzz_runs}; increase it to keep iterating automatically."
+                    ).strip()
+                return {
+                    "state": st,
+                    "final": {
+                        "type": "final",
+                        "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
+                        "summary": "Generated an override patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
+                        "next_step": next_step.strip(),
+                        "steps": st.steps,
+                        "error": _error_payload(st),
+                    },
+                }
 
         force_patch_after_read = False
         if st.pending_patch and st.last_observation and st.last_observation.tool == "read_artifact":
@@ -1804,6 +1929,47 @@ def _run_langgraph(
                             "V2 type definition edits are out-of-policy and require human review."
                         ),
                     }
+            # Auto-iteration: if OSS-Fuzz still reports errors in patch-scope mode and we still have remaining
+            # OSS-Fuzz runs available, do not allow the model to stop with a final decision yet.
+            if st.auto_iterate_pending and st.patch_path and st.error_scope == "patch":
+                if remaining < 3:
+                    return {
+                        "state": st,
+                        "final": {
+                            "type": "final",
+                            "thought": "Not enough remaining tool steps to continue auto-iteration.",
+                            "summary": "Stopped before the next patch iteration.",
+                            "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
+                            "steps": st.steps,
+                            "error": _error_payload(st),
+                        },
+                    }
+
+                st.pending_patch = {
+                    "type": "tool",
+                    "tool": "make_error_patch_override",
+                    "args": {},
+                    "thought": "Continue patch-scope iteration.",
+                }
+                artifact_path = (
+                    str(st.base_slice_artifact_path or "").strip()
+                    or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
+                    or _last_artifact_path(st, "get_error_patch_context", "excerpt")
+                )
+                forced_read: Decision = {
+                    "type": "tool",
+                    "thought": "Continue patch-scope iteration: read the current BASE slice before generating the next override.",
+                    "tool": "read_artifact",
+                    "args": {
+                        "artifact_path": artifact_path,
+                        "start_line": 1,
+                        "max_lines": 0,
+                        "max_chars": 0,
+                    },
+                }
+                _validate_tool_decision(forced_read)
+                return {"state": st, "pending": forced_read}
+
             return {
                 "state": st,
                 "final": {
@@ -1897,8 +2063,10 @@ def _run_langgraph(
         if tool == "make_error_patch_override" and st.artifacts_dir and _last_tool_call_name(st) != "read_artifact":
             if remaining >= 3:
                 st.pending_patch = decision
-                artifact_path = _last_artifact_path(st, "get_error_v1_code_slice", "func_code") or _last_artifact_path(
-                    st, "get_error_patch_context", "excerpt"
+                artifact_path = (
+                    str(st.base_slice_artifact_path or "").strip()
+                    or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
+                    or _last_artifact_path(st, "get_error_patch_context", "excerpt")
                 )
                 forced: Decision = {
                     "type": "tool",
@@ -1953,6 +2121,18 @@ def _run_langgraph(
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            # Persist the new BASE slice (the code we just wrote into the '-' slice) so
+            # iterative patch-scope runs can preserve prior fixes.
+            try:
+                raw_new = str((decision.get("args") or {}).get("new_func_code", "") or "")
+                new_base = _extract_first_code_fence(raw_new).replace("\r\n", "\n").replace("\r", "\n")
+                if new_base and not new_base.endswith("\n"):
+                    new_base += "\n"
+                if artifact_store and new_base.strip():
+                    ref = artifact_store.write_text(name="base_slice_current", text=new_base, ext=".c")  # type: ignore[attr-defined]
+                    st.base_slice_artifact_path = str(getattr(ref, "artifact_path", "") or "").strip()
+            except Exception:
+                pass
             patch_text_path = ""
             if isinstance(st.patch_result, dict):
                 pt = st.patch_result.get("patch_text")
@@ -1962,6 +2142,7 @@ def _run_langgraph(
                 st.patch_override_paths = [patch_text_path]
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
+            st.ossfuzz_runs_attempted += 1
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -1976,7 +2157,25 @@ def _run_langgraph(
     graph.add_conditional_edges("llm", route, {"tool": "tool", "final": END})
     graph.add_edge("tool", "llm")
     compiled = graph.compile()
-    result = compiled.invoke({"state": state})
+    # LangGraph has a default recursion limit of 25, which can be too low for patch-scope
+    # workflows where we may loop llm<->tool multiple times (e.g. iterative OSS-Fuzz runs).
+    # Keep this configurable and default it based on max_steps.
+    recursion_limit = int(cfg.recursion_limit or 0)
+    if recursion_limit <= 0:
+        recursion_limit = max(25, int(cfg.max_steps or 0) * 8 + 25)
+    # LangGraph/shim compatibility:
+    # - real langgraph compiled graphs accept `invoke(input, config=...)` (RunnableConfig)
+    # - our langgraph_shim `_CompiledGraph.invoke(initial)` accepts no config at all
+    invoke_sig = None
+    try:
+        invoke_sig = inspect.signature(compiled.invoke)  # type: ignore[arg-type]
+    except Exception:
+        invoke_sig = None
+
+    if invoke_sig and ("config" in invoke_sig.parameters or any(p.kind == p.VAR_KEYWORD for p in invoke_sig.parameters.values())):
+        result = compiled.invoke({"state": state}, config={"recursion_limit": recursion_limit})
+    else:
+        result = compiled.invoke({"state": state})
     final = result.get("final")
     if final:
         return final
@@ -2003,6 +2202,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     parser.add_argument("--max-steps", type=int, default=4)
+    parser.add_argument(
+        "--recursion-limit",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_RECURSION_LIMIT", "0") or 0),
+        help="LangGraph recursion_limit (0=auto based on --max-steps; increase if you hit the default limit of 25).",
+    )
     parser.add_argument(
         "--error-scope",
         choices=["first", "patch"],
@@ -2058,6 +2263,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
+    parser.add_argument(
+        "--max-ossfuzz-runs",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_OSSFUZZ_RUNS", "1") or 1),
+        help="Maximum number of OSS-Fuzz build/test cycles to run in --error-scope patch mode (default: 1).",
+    )
     parser.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
     parser.add_argument("--ossfuzz-commit", default=os.environ.get("REACT_AGENT_OSSFUZZ_COMMIT", ""))
     parser.add_argument("--ossfuzz-build-csv", default=os.environ.get("REACT_AGENT_OSSFUZZ_BUILD_CSV", ""))
@@ -2081,6 +2292,8 @@ def main(argv: List[str]) -> int:
         max_steps=max(args.max_steps, 1),
         tools_mode=args.tools,
         error_scope=args.error_scope,
+        max_ossfuzz_runs=max(int(getattr(args, "max_ossfuzz_runs", 1) or 1), 1),
+        recursion_limit=int(getattr(args, "recursion_limit", 0) or 0),
         debug_llm=bool(getattr(args, "debug_llm", False)),
         debug_llm_dir=str(getattr(args, "debug_llm_dir", "") or "").strip(),
     )
