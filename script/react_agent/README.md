@@ -91,6 +91,12 @@ python3 script/react_agent/agent_langgraph.py \
   --v1-src /path/to/v1/src --v2-src /path/to/v2/src
 ```
 
+Debugging LLM I/O:
+
+- `--debug-llm` prints the full request `messages` and parsed `response` to stderr.
+- `--debug-llm-dir <dir>` also writes `llm_call_XXXX_request.json` / `llm_call_XXXX_response.json`.
+- If the parsed `response` is empty, the response dump includes `response_debug` with raw HTTP JSON (`raw_body`) and basic metadata (status/content-type/finish_reason) to help diagnose provider-side empty outputs.
+
 ## Multi-hunk driver (one agent per patch_key)
 
 `script/react_agent/multi_agent.py` parses a build log, maps errors to patch hunks (`patch_key`), and runs one patch-scope
