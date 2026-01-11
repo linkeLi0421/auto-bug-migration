@@ -39,10 +39,11 @@ class AgentConfig:
     max_steps: int = 4
     tools_mode: Literal["real", "fake"] = "real"
     error_scope: Literal["first", "patch"] = "first"
-    max_ossfuzz_runs: int = 1
     recursion_limit: int = 0
     debug_llm: bool = False
     debug_llm_dir: str = ""
+    auto_ossfuzz_loop: bool = False
+    ossfuzz_loop_max: int = 1
 
 
 @dataclass
@@ -54,8 +55,20 @@ class AgentState:
     snippet: str
     artifacts_dir: str = ""
     patch_key: str = ""
+
+    # Active patch-slice focus (used for patch-scope iteration across OSS-Fuzz runs).
+    active_patch_key: str = ""
+    active_file_path: str = ""
+    active_line_number: int = 0
+    active_func_start_index: Optional[int] = None
+    active_func_end_index: Optional[int] = None
+    active_excerpt_artifact_path: str = ""
     grouped_errors: List[Dict[str, Any]] = field(default_factory=list)
     missing_struct_members: List[Dict[str, Any]] = field(default_factory=list)
+    # Compact record of previously targeted errors (survives state.steps trimming in auto-loop).
+    error_history: List[Dict[str, Any]] = field(default_factory=list)
+    # Full tool-call history across the whole run (survives state.steps trimming in auto-loop).
+    step_history: List[Dict[str, Any]] = field(default_factory=list)
     steps: List[Dict[str, Any]] = field(default_factory=list)
     last_observation: Optional[ToolObservation] = None
     pending_patch: Optional[Decision] = None
@@ -78,12 +91,11 @@ class AgentState:
 
     # Indicates we already attempted OSS-Fuzz test after generating a patch.
     ossfuzz_test_attempted: bool = False
+    # Total number of ossfuzz_apply_patch_and_test tool calls in this run.
     ossfuzz_runs_attempted: int = 0
 
-    # In iterative patch-scope runs, this stores the current BASE slice (after all applied overrides)
-    # as an artifact path so subsequent overrides can preserve prior fixes.
-    base_slice_artifact_path: str = ""
-    auto_iterate_pending: bool = False
+    # When set, points to the current BASE slice artifact to read before generating the next override.
+    loop_base_func_code_artifact_path: str = ""
 
     # Latest macro tokens reported by get_error_v1_code_slice (used for guardrails).
     macro_tokens_not_defined_in_slice: List[str] = field(default_factory=list)
@@ -119,11 +131,21 @@ def _error_payload(state: AgentState) -> Dict[str, Any]:
             }
             for e in state.grouped_errors
         ]
+    if state.error_history:
+        payload["error_history"] = state.error_history
     if state.target_errors:
         payload["target_errors"] = state.target_errors
     if state.missing_struct_members:
         payload["missing_struct_members"] = state.missing_struct_members
     return payload
+
+
+def _steps_for_output(state: AgentState) -> List[Dict[str, Any]]:
+    hist = state.step_history if isinstance(getattr(state, "step_history", None), list) else []
+    if hist:
+        return hist
+    steps = state.steps if isinstance(getattr(state, "steps", None), list) else []
+    return steps
 
 
 def _extract_target_errors(
@@ -164,9 +186,71 @@ def _extract_target_errors(
     return targets
 
 
+_ERROR_HISTORY_MAX_ENTRIES = 20
+_ERROR_HISTORY_MAX_GROUP_LINES = 12
+
+
+def _make_error_history_entry(
+    *,
+    patch_key: str,
+    error_line: str,
+    grouped_errors: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    pk = str(patch_key or "").strip()
+    line = str(error_line or "").strip()
+    raw_group: List[str] = []
+    for e in grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if not raw:
+            continue
+        raw_group.append(raw)
+        if len(raw_group) >= _ERROR_HISTORY_MAX_GROUP_LINES:
+            break
+    if not raw_group and line:
+        raw_group = [line]
+    if not line and raw_group:
+        line = raw_group[0]
+    if not line and not raw_group:
+        return None
+    return {"patch_key": pk, "error_line": line, "grouped_errors": raw_group}
+
+
+def _append_error_history(state: AgentState, entry: Optional[Dict[str, Any]]) -> None:
+    if not entry:
+        return
+    pk = str(entry.get("patch_key", "") or "").strip()
+    line = str(entry.get("error_line", "") or "").strip()
+    if not line:
+        return
+    for existing in state.error_history:
+        if not isinstance(existing, dict):
+            continue
+        if str(existing.get("patch_key", "") or "").strip() == pk and str(existing.get("error_line", "") or "").strip() == line:
+            return
+    state.error_history.append(entry)
+    if len(state.error_history) > _ERROR_HISTORY_MAX_ENTRIES:
+        state.error_history = state.error_history[-_ERROR_HISTORY_MAX_ENTRIES:]
+
+
+def _record_current_error_group(state: AgentState) -> None:
+    pk = str(state.active_patch_key or state.patch_key or "").strip()
+    entry = _make_error_history_entry(patch_key=pk, error_line=state.error_line, grouped_errors=state.grouped_errors)
+    _append_error_history(state, entry)
+
+
 def _read_text(path: str) -> str:
     p = Path(str(path or "").strip()).expanduser().resolve()
     return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _allowed_patch_roots_from_env() -> list[str] | None:
+    raw = os.environ.get("REACT_AGENT_PATCH_ALLOWED_ROOTS", "").strip()
+    if not raw:
+        return None
+    roots = [r.strip() for r in raw.split(os.pathsep) if r.strip()]
+    return roots or None
 
 
 def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
@@ -216,13 +300,6 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             return True
         return Path(a_s).name == Path(b_s).name
 
-    def allowed_roots_from_env() -> list[str] | None:
-        raw = os.environ.get("REACT_AGENT_PATCH_ALLOWED_ROOTS", "").strip()
-        if not raw:
-            return None
-        roots = [r.strip() for r in raw.split(os.pathsep) if r.strip()]
-        return roots or None
-
     bundle: Any = None
     bundle_err: Optional[str] = None
     load_patch_bundle: Any = None
@@ -246,7 +323,7 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
 
                 load_patch_bundle = _lpb
                 get_error_patch_from_bundle = _gepb
-                bundle = load_patch_bundle(state.patch_path, allowed_roots=allowed_roots_from_env())
+                bundle = load_patch_bundle(state.patch_path, allowed_roots=_allowed_patch_roots_from_env())
             mapping = get_error_patch_from_bundle(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
             return str(mapping.get("patch_key") or "").strip()
         except Exception as exc:  # noqa: BLE001
@@ -310,80 +387,337 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     }
 
 
-def _patch_scope_prepare_next_iteration_after_ossfuzz(
-    state: AgentState, cfg: AgentConfig, verdict: Dict[str, Any]
-) -> bool:
-    """Return True if the state was updated to continue patch-scope iteration after OSS-Fuzz."""
-    pk = str(state.patch_key or "").strip()
-    if state.error_scope != "patch":
-        state.auto_iterate_pending = False
-        return False
-    if int(cfg.max_ossfuzz_runs or 0) <= 1:
-        state.auto_iterate_pending = False
-        return False
-    if int(state.ossfuzz_runs_attempted or 0) >= int(cfg.max_ossfuzz_runs or 0):
-        state.auto_iterate_pending = False
-        return False
-    if str(verdict.get("status", "")).strip() != "ok":
-        state.auto_iterate_pending = False
-        return False
-    if verdict.get("fixed") is not False:
-        state.auto_iterate_pending = False
-        return False
+def _ossfuzz_artifact_path(output: Any, field: str) -> str:
+    if not isinstance(output, dict):
+        return ""
+    v = output.get(field)
+    if isinstance(v, dict):
+        return str(v.get("artifact_path", "") or "").strip()
+    if isinstance(v, str):
+        return v.strip()
+    return ""
 
-    matched_now = verdict.get("matched_target_errors") if isinstance(verdict.get("matched_target_errors"), list) else []
-    other_now = verdict.get("other_errors") if isinstance(verdict.get("other_errors"), list) else []
 
-    combined: List[Dict[str, Any]] = []
-    for seq in (matched_now, other_now):
-        for item in seq:
-            if not isinstance(item, dict):
+def _reindex_patch_bundle(bundle: Any) -> Any:
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return bundle
+
+    hunk_re = re.compile(r"^@@ -(?P<old_start>\\d+)(?:,(?P<old_len>\\d+))? \\+(?P<new_start>\\d+)(?:,(?P<new_len>\\d+))? @@")
+
+    def new_start_for(key: str) -> int:
+        p = patches.get(key)
+        if p is None:
+            return 0
+        text = str(getattr(p, "patch_text", "") or "")
+        for line in text.splitlines():
+            if not line.startswith("@@"):
                 continue
-            item_pk = str(item.get("patch_key", "") or "").strip()
-            if pk and item_pk and item_pk != pk:
+            m = hunk_re.match(line.strip())
+            if not m:
                 continue
-            combined.append(item)
+            try:
+                return int(m.group("new_start"))
+            except Exception:
+                return 0
+        try:
+            return int(getattr(p, "new_start_line", 0) or 0)
+        except Exception:
+            return 0
 
-    seen: set[tuple[str, int, str]] = set()
-    refreshed: List[Dict[str, Any]] = []
-    for item in combined:
-        raw_err = str(item.get("raw", "") or "").strip()
-        msg_err = str(item.get("msg", "") or "").strip()
-        ln_err = int(item.get("line", 0) or 0)
-        if not raw_err or not msg_err or ln_err <= 0:
+    keys_sorted = sorted(patches.keys(), key=lambda k: (-new_start_for(k), str(k)))
+    by_file_new: Dict[str, list[str]] = {}
+    by_patch_type: Dict[str, list[str]] = {}
+    by_signature: Dict[str, list[str]] = {}
+
+    for key in keys_sorted:
+        patch = patches[key]
+        file_new = str(getattr(patch, "file_path_new", "") or "")
+        by_file_new.setdefault(file_new, []).append(key)
+        for pt in sorted(getattr(patch, "patch_type", None) or set()):
+            by_patch_type.setdefault(str(pt), []).append(key)
+        for sig in (getattr(patch, "old_signature", None), getattr(patch, "new_signature", None)):
+            if sig:
+                by_signature.setdefault(str(sig), []).append(key)
+
+    try:
+        return replace(bundle, keys_sorted=keys_sorted, by_file_new=by_file_new, by_patch_type=by_patch_type, by_signature=by_signature)
+    except Exception:
+        return bundle
+
+
+def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | None, Optional[str]]:
+    """Load the patch bundle, optionally overlaying the latest override patch_text for active_patch_key."""
+    if not state.patch_path:
+        return None, "missing patch_path"
+
+    script_dir = Path(__file__).resolve().parents[1]
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+
+    try:
+        from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return None, f"failed to import patch_bundle: {type(exc).__name__}: {exc}"
+
+    try:
+        bundle = _lpb(state.patch_path, allowed_roots=_allowed_patch_roots_from_env())
+    except Exception as exc:  # noqa: BLE001
+        return None, f"failed to load patch bundle: {type(exc).__name__}: {exc}"
+
+    active_key = str(state.active_patch_key or state.patch_key or "").strip()
+    override_path = str((state.patch_override_paths[-1] if state.patch_override_paths else "") or "").strip()
+    if active_key and override_path and isinstance(getattr(bundle, "patches", None), dict) and active_key in bundle.patches:
+        try:
+            override_text = _read_text(override_path)
+            if override_text.strip():
+                bundle.patches[active_key].patch_text = override_text
+        except Exception:
+            pass
+
+    bundle = _reindex_patch_bundle(bundle)
+    return bundle, None
+
+
+def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any]], List[str], Optional[str]]:
+    obs = state.last_observation
+    out = obs.output if isinstance(obs, ToolObservation) else None
+    if not isinstance(out, dict):
+        return [], [], "Missing OSS-Fuzz tool output."
+
+    build_path = _ossfuzz_artifact_path(out, "build_output")
+    check_path = _ossfuzz_artifact_path(out, "check_build_output")
+    if not build_path and not check_path:
+        return [], [], "No build/check_build log artifacts found."
+
+    combined_errors: List[Dict[str, Any]] = []
+    sources: List[str] = []
+    try:
+        if build_path:
+            sources.append(build_path)
+            combined_errors.extend(iter_compiler_errors(_read_text(build_path), snippet_lines=2))
+        if check_path:
+            sources.append(check_path)
+            combined_errors.extend(iter_compiler_errors(_read_text(check_path), snippet_lines=2))
+    except Exception as exc:  # noqa: BLE001
+        return [], sources, f"Failed to parse OSS-Fuzz logs: {type(exc).__name__}: {exc}"
+
+    # De-dup across build/check_build while preserving order.
+    seen: set[tuple[str, int, int, str]] = set()
+    deduped: List[Dict[str, Any]] = []
+    for err in combined_errors:
+        fp = str(err.get("file", "") or "").strip()
+        ln = int(err.get("line", 0) or 0)
+        col = int(err.get("col", 0) or 0)
+        msg = str(err.get("msg", "") or "").strip()
+        if not fp or ln <= 0 or not msg:
             continue
-        key = (str(item.get("file", "") or "").strip(), ln_err, msg_err)
+        key = (fp, ln, col, msg)
         if key in seen:
             continue
         seen.add(key)
-        refreshed.append(
-            {
-                "file": str(item.get("file", "") or "").strip(),
-                "line": ln_err,
-                "col": int(item.get("col", 0) or 0),
-                "msg": msg_err,
-                "raw": raw_err,
-                "snippet": str(item.get("snippet", "") or "").strip() or raw_err,
-                "patch_key": item.get("patch_key") or pk,
-                "old_signature": "",
-            }
-        )
+        deduped.append(err)
 
-    if not refreshed:
-        state.auto_iterate_pending = False
-        return False
+    return deduped, sources, None
 
-    state.grouped_errors = refreshed
-    state.error_line = str(refreshed[0].get("raw", "") or state.error_line)
-    state.snippet = str(refreshed[0].get("snippet", "") or state.snippet)
+
+def _extract_minus_slice_from_patch_text(*, patch_text: str, func_start_index: int, func_end_index: int) -> str:
+    patch_lines = str(patch_text or "").splitlines()
+    if not patch_lines:
+        return ""
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+    body_len = max(len(patch_lines) - body_start, 0)
+    fs = max(0, min(int(func_start_index), body_len))
+    fe = max(0, min(int(func_end_index), body_len))
+    if fe <= fs:
+        return ""
+    slice_lines = patch_lines[body_start + fs : body_start + fe]
+    minus_lines = [line[1:] for line in slice_lines if line.startswith("-")]
+    return "\n".join(minus_lines).rstrip("\n")
+
+
+def _prepare_next_patch_scope_iteration_after_ossfuzz(
+    state: AgentState,
+    cfg: AgentConfig,
+    *,
+    artifact_store: Any = None,
+) -> Optional[Decision]:
+    """If auto-loop is enabled and errors remain in the active patch_key, refresh state and force a BASE-slice read."""
+    if not cfg.auto_ossfuzz_loop:
+        return None
+    if state.error_scope != "patch":
+        return None
+    if state.ossfuzz_runs_attempted >= max(int(cfg.ossfuzz_loop_max or 0), 1):
+        return None
+    if not state.patch_path:
+        return None
+    if not state.patch_override_paths:
+        return None
+
+    active_key = str(state.active_patch_key or state.patch_key or "").strip()
+    if not active_key:
+        return None
+
+    errors, sources, err_msg = _iter_ossfuzz_compiler_errors(state)
+    if err_msg:
+        return None
+    if not errors:
+        return None
+
+    bundle, bundle_err = _load_effective_patch_bundle_for_mapping(state)
+    if bundle_err or bundle is None:
+        return None
+
+    try:
+        from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+    except Exception:
+        return None
+
+    enriched: List[Dict[str, Any]] = []
+    for e in errors:
+        fp = str(e.get("file", "") or "").strip()
+        ln = int(e.get("line", 0) or 0)
+        if not fp or ln <= 0:
+            continue
+        try:
+            mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+        except Exception:
+            mapping = {}
+        patch_key = str((mapping or {}).get("patch_key") or "").strip()
+        item = dict(e)
+        if patch_key:
+            item["patch_key"] = patch_key
+        if isinstance(mapping, dict):
+            for k in ("old_signature", "func_start_index", "func_end_index"):
+                if k in mapping:
+                    item[k] = mapping.get(k)
+        enriched.append(item)
+
+    in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
+    if not in_active:
+        return None
+
+    _record_current_error_group(state)
+
+    next_err = in_active[0]
+    state.grouped_errors = in_active[:10]
+    state.error_line = str(next_err.get("raw", "") or "").strip() or state.error_line
+    state.snippet = str(next_err.get("snippet", "") or "").rstrip("\n") or state.snippet
     state.target_errors = _extract_target_errors(
-        error_line=state.error_line, grouped_errors=state.grouped_errors, patch_key=state.patch_key
+        error_line=state.error_line, grouped_errors=state.grouped_errors, patch_key=active_key
     )
+    _record_current_error_group(state)
+
+    # Refresh missing-member summary for this iteration (bounded output).
+    state.missing_struct_members = []
+    try:
+        from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
+
+        raw_block = "\n".join(str(e.get("raw", "")).strip() for e in state.grouped_errors if e.get("raw"))
+        if raw_block:
+            parsed = parse_build_errors_tool(build_log_text=raw_block)
+            msm = parsed.get("missing_struct_members") if isinstance(parsed, dict) else None
+            if isinstance(msm, list) and msm:
+                by_struct: Dict[str, set[str]] = {}
+                for item in msm:
+                    if not isinstance(item, dict):
+                        continue
+                    struct_raw = str(item.get("struct", "")).strip()
+                    member = str(item.get("member", "")).strip()
+                    if struct_raw and member:
+                        by_struct.setdefault(struct_raw, set()).add(member)
+                max_structs = 8
+                max_members = 12
+                out: List[Dict[str, Any]] = []
+                for struct_name in sorted(by_struct.keys())[:max_structs]:
+                    members = sorted(by_struct[struct_name])[:max_members]
+                    out.append({"struct": struct_name, "members": members})
+                state.missing_struct_members = out
+    except Exception:
+        state.missing_struct_members = []
+
+    # Clear macro guardrail state across iterations to avoid drift.
+    state.macro_tokens_not_defined_in_slice = []
+    state.macro_lookup = None
+
+    # Extract the current BASE slice from the latest override patch_text (no get_error_patch_context/v1 slice tools).
+    fp, ln = _active_override_location(state)
+    if not fp or ln <= 0:
+        fp = str(next_err.get("file", "") or "").strip()
+        ln = int(next_err.get("line", 0) or 0)
+    if not fp or ln <= 0:
+        return None
+    try:
+        mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+    except Exception:
+        mapping = {}
+    fs = mapping.get("func_start_index") if isinstance(mapping, dict) else None
+    fe = mapping.get("func_end_index") if isinstance(mapping, dict) else None
+    if isinstance(fs, int):
+        state.active_func_start_index = fs
+    if isinstance(fe, int):
+        state.active_func_end_index = fe
+    if not isinstance(fs, int) or not isinstance(fe, int):
+        return None
+
+    override_path = str(state.patch_override_paths[-1] or "").strip()
+    if not override_path:
+        return None
+    try:
+        override_text = _read_text(override_path)
+    except Exception:
+        return None
+    base_code = _extract_minus_slice_from_patch_text(patch_text=override_text, func_start_index=fs, func_end_index=fe)
+    if not base_code.strip():
+        return None
+
+    base_artifact_path = ""
+    if artifact_store:
+        try:
+            ref = artifact_store.write_text(
+                name=f"loop_base_slice_{active_key}_{state.ossfuzz_runs_attempted}",
+                text=base_code + ("\n" if not base_code.endswith("\n") else ""),
+                ext=".c",
+            )
+            base_artifact_path = str(ref.artifact_path or "").strip()
+        except Exception:
+            base_artifact_path = ""
+    if not base_artifact_path and state.artifacts_dir:
+        try:
+            out_path = Path(state.artifacts_dir) / f"loop_base_slice_{active_key}_{state.ossfuzz_runs_attempted}.c"
+            out_path.write_text(base_code + ("\n" if not base_code.endswith("\n") else ""), encoding="utf-8", errors="replace")
+            base_artifact_path = str(out_path)
+        except Exception:
+            base_artifact_path = ""
+    if not base_artifact_path:
+        return None
+
+    state.loop_base_func_code_artifact_path = base_artifact_path
+
+    # Drop most prior context before looping.
+    state.steps = state.steps[-1:] if state.steps else []
+
+    # Reset patch/test state for the next iteration.
     state.patch_generated = False
     state.patch_result = None
     state.ossfuzz_test_attempted = False
-    state.auto_iterate_pending = True
-    return True
+    state.last_observation = None
+
+    # Force the next step to read the BASE slice, then force make_error_patch_override.
+    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}, "thought": "auto-loop sentinel"}
+    forced: Decision = {
+        "type": "tool",
+        "thought": f"Auto-loop: read the current BASE slice (from last override) and generate the next override. Sources: {', '.join(sources)}",
+        "tool": "read_artifact",
+        "args": {
+            "artifact_path": base_artifact_path,
+            "start_line": 1,
+            "max_lines": 800,
+            "max_chars": 200000,
+        },
+    }
+    return forced
 
 
 def _extract_first_json_object(text: str) -> str:
@@ -934,6 +1268,14 @@ def _first_error_location(state: AgentState) -> tuple[str, int]:
     return "", 0
 
 
+def _active_override_location(state: AgentState) -> tuple[str, int]:
+    fp = str(getattr(state, "active_file_path", "") or "").strip()
+    ln = int(getattr(state, "active_line_number", 0) or 0)
+    if fp and ln > 0:
+        return fp, ln
+    return _first_error_location(state)
+
+
 def _normalize_struct_queries(struct_name: str) -> List[str]:
     raw = str(struct_name or "").strip()
     if not raw:
@@ -1099,6 +1441,11 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
     if not state.patch_path:
         return None
 
+    # Auto-loop iteration: the next override is driven from the latest override patch_text and a BASE slice
+    # extracted from it (loop_base_func_code_artifact_path). Do not force get_error_patch_context/get_error_v1_code_slice.
+    if str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip():
+        return None
+
     file_path, line_number = _first_error_location(state)
     if not file_path or line_number <= 0:
         return None
@@ -1187,6 +1534,7 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     patch_key = str(error.get("patch_key", "")).strip()
     scope = str(error.get("scope", "")).strip()
     grouped = error.get("grouped_errors") if isinstance(error.get("grouped_errors"), list) else []
+    history = error.get("error_history") if isinstance(error.get("error_history"), list) else []
     if patch_path:
         lines.append(f"Patch bundle: {patch_path}")
     if artifacts_dir:
@@ -1215,10 +1563,29 @@ def _render_final_text(final: Dict[str, Any]) -> str:
             if raw:
                 lines.append(textwrap.indent(raw, "  "))
 
+    if history:
+        lines.append("")
+        lines.append(f"Error history ({len(history)}):")
+        for idx, entry in enumerate(history, start=1):
+            if not isinstance(entry, dict):
+                continue
+            pk = str(entry.get("patch_key", "")).strip()
+            el = str(entry.get("error_line", "")).strip()
+            raw_group = entry.get("grouped_errors") if isinstance(entry.get("grouped_errors"), list) else []
+            header = f"{idx}. {el}" if el else f"{idx}."
+            if pk:
+                header += f" (patch_key={pk})"
+            lines.append(textwrap.indent(header, "  "))
+            for raw in raw_group[:6]:
+                r = str(raw or "").strip()
+                if not r or r == el:
+                    continue
+                lines.append(textwrap.indent(f"- {r}", "    "))
+
     steps = final.get("steps")
     if isinstance(steps, list) and steps:
         lines.append("")
-        lines.append(f"Steps ({len(steps)}):")
+        lines.append(f"Steps (full run, {len(steps)}):")
         for idx, step in enumerate(steps, start=1):
             decision = step.get("decision") if isinstance(step, dict) else {}
             observation = step.get("observation") if isinstance(step, dict) else {}
@@ -1302,15 +1669,17 @@ def _system_prompt() -> str:
         "You MUST output exactly one JSON object with no extra text.\n"
         "You can either request one tool call, or return a final decision.\n\n"
         "Important:\n"
-        "- Patch-related tools persist diff excerpts / V1-origin code slices / generated patches as artifact files.\n"
+        "- Patch-related tools persist diff excerpts / patch slices (V1-origin `-` lines from the patch bundle) /\n"
+        "  generated patches as artifact files.\n"
         "  When that happens, the observation contains an object like {artifact_path, sha256, bytes, lines}.\n"
-        "  Use read_artifact(artifact_path, ...) to fetch only the lines you need.\n"
+        "  read_artifact(...) reads those artifact files only; it does NOT read V1/V2 source checkouts.\n"
         "- Patch bundles are applied via `git apply --reverse`: in these diffs, `-` lines become additions.\n"
         "- Tool ordering (two-phase workflow):\n"
         "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
-        "     Do NOT call read_artifact in this phase.\n"
-        "  2) Patching phase (last): call read_artifact only to pull the minimum code context you need,\n"
-        "     then call make_error_patch_override to generate an override diff,\n"
+        "     Avoid read_artifact unless you must inspect an artifact_path (e.g. a truncated slice) to proceed.\n"
+        "  2) Patching phase (last): ensure you have a BASE slice (usually via read_artifact on the\n"
+        "     get_error_v1_code_slice.func_code.artifact_path), then call make_error_patch_override\n"
+        "     to generate an override diff,\n"
         "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
         "     then return final.\n"
         "- Patch rewrite rule: when you call make_error_patch_override, args.new_func_code MUST be based on the latest\n"
@@ -1426,6 +1795,9 @@ def _run_langgraph(
 ) -> Dict[str, Any]:
     # Build a small two-node graph: LLM -> TOOL -> LLM (until final).
     llm_call_seq = 0
+    if not state.step_history and state.steps:
+        # Preserve any pre-populated steps (tests/resumed runs) before auto-loop trimming kicks in.
+        state.step_history = list(state.steps)
 
     def _debug_dump_llm(
         *,
@@ -1488,7 +1860,7 @@ def _run_langgraph(
                         "thought": "Cannot run OSS-Fuzz test: missing patch_path.",
                         "summary": "Stopped after patch generation (missing patch bundle path).",
                         "next_step": "Re-run with --patch-path so the agent can merge bundle + override(s) and test in OSS-Fuzz.",
-                        "steps": st.steps,
+                        "steps": _steps_for_output(st),
                         "error": _error_payload(st),
                     },
                 }
@@ -1500,7 +1872,7 @@ def _run_langgraph(
                         "thought": "Cannot run OSS-Fuzz test: missing required OSS-Fuzz CLI args.",
                         "summary": "Stopped after patch generation (OSS-Fuzz config missing).",
                         "next_step": "Re-run with --ossfuzz-project and --ossfuzz-commit.",
-                        "steps": st.steps,
+                        "steps": _steps_for_output(st),
                         "error": _error_payload(st),
                     },
                 }
@@ -1526,6 +1898,11 @@ def _run_langgraph(
             return {"state": st, "pending": decision}
 
         if st.patch_generated and st.ossfuzz_test_attempted:
+            forced_loop = _prepare_next_patch_scope_iteration_after_ossfuzz(st, cfg, artifact_store=artifact_store)
+            if forced_loop:
+                _validate_tool_decision(forced_loop)
+                return {"state": st, "pending": forced_loop}
+
             patch_text_path = ""
             merged_patch_file_path = ""
             if isinstance(st.patch_result, dict):
@@ -1567,32 +1944,17 @@ def _run_langgraph(
             if patch_text_path:
                 next_step_lines.append(f"Override diff: {patch_text_path}")
             next_step = "\n".join(next_step_lines).strip()
-
-            if not _patch_scope_prepare_next_iteration_after_ossfuzz(st, cfg, verdict):
-                st.auto_iterate_pending = False
-                if (
-                    st.error_scope == "patch"
-                    and cfg.max_ossfuzz_runs > 1
-                    and verdict.get("status") == "ok"
-                    and verdict.get("fixed") is False
-                    and st.ossfuzz_runs_attempted >= cfg.max_ossfuzz_runs
-                ):
-                    next_step = (
-                        next_step
-                        + "\n"
-                        + f"Reached --max-ossfuzz-runs={cfg.max_ossfuzz_runs}; increase it to keep iterating automatically."
-                    ).strip()
-                return {
-                    "state": st,
-                    "final": {
-                        "type": "final",
-                        "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
-                        "summary": "Generated an override patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
-                        "next_step": next_step.strip(),
-                        "steps": st.steps,
-                        "error": _error_payload(st),
-                    },
-                }
+            return {
+                "state": st,
+                "final": {
+                    "type": "final",
+                    "thought": "Generated a patch and attempted OSS-Fuzz testing; stopping.",
+                    "summary": "Generated an override patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
+                    "next_step": next_step.strip(),
+                    "steps": _steps_for_output(st),
+                    "error": _error_payload(st),
+                },
+            }
 
         force_patch_after_read = False
         if st.pending_patch and st.last_observation and st.last_observation.tool == "read_artifact":
@@ -1607,7 +1969,7 @@ def _run_langgraph(
                         "thought": "Reached max tool steps before generating the patch.",
                         "summary": "Stopped due to max_steps.",
                         "next_step": "Increase --max-steps to allow make_error_patch_override to run after read_artifact.",
-                        "steps": st.steps,
+                        "steps": _steps_for_output(st),
                         "error": _error_payload(st),
                     },
                 }
@@ -1622,7 +1984,7 @@ def _run_langgraph(
                     "thought": "Reached max tool steps without a final decision.",
                     "summary": "Stopped after max_steps.",
                     "next_step": "Increase --max-steps or review the last observation and proceed manually.",
-                    "steps": st.steps,
+                    "steps": _steps_for_output(st),
                     "error": _error_payload(st),
                 },
             }
@@ -1669,7 +2031,7 @@ def _run_langgraph(
                 return {"state": st, "pending": forced}
         messages = _build_messages(st)
         if force_patch_after_read and st.patch_path and st.error_scope == "patch":
-            file_path, line_number = _first_error_location(st)
+            file_path, line_number = _active_override_location(st)
             base_text = _last_read_artifact_text(st)
             base_lines = len(base_text.splitlines()) if base_text else 0
             messages.append(
@@ -1679,7 +2041,7 @@ def _run_langgraph(
                         "Do NOT return a final decision yet.\n"
                         "You just read the BASE slice via read_artifact.\n"
                         f"BASE slice lines (approx): {base_lines}\n"
-                        "Now generate an override by calling make_error_patch_override with:\n"
+                        "You MUST generate a patch now by calling make_error_patch_override with:\n"
                         f'- args.patch_path="{st.patch_path}"\n'
                         f'- args.file_path="{file_path}"\n'
                         f"- args.line_number={line_number}\n"
@@ -1739,10 +2101,74 @@ def _run_langgraph(
                             "Try again, or run with --no-json-mode, or set OPENAI_MODEL/OPENAI_BASE_URL to a JSON-capable endpoint.\n"
                             + (f"Repaired raw snippet: {repaired_snippet!r}" if repaired_snippet else "")
                         ).strip(),
-                        "steps": st.steps,
+                        "steps": _steps_for_output(st),
                         "error": _error_payload(st),
                     },
                 }
+
+        if force_patch_after_read and st.patch_path and st.error_scope == "patch":
+            file_path, line_number = _active_override_location(st)
+            must_patch = (
+                isinstance(decision, dict)
+                and decision.get("type") == "tool"
+                and str(decision.get("tool", "")).strip() == "make_error_patch_override"
+            )
+            args_ok = False
+            if must_patch:
+                args = decision.get("args") or {}
+                args_ok = (
+                    isinstance(args, dict)
+                    and str(args.get("patch_path", "")).strip() == str(st.patch_path).strip()
+                    and str(args.get("file_path", "")).strip() == str(file_path).strip()
+                    and int(args.get("line_number", 0) or 0) == int(line_number or 0)
+                    and str(args.get("new_func_code", "") or "").strip()
+                )
+
+            if not args_ok:
+                base_rewrite_messages = list(messages)
+                base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                base_rewrite_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Do NOT return a final decision yet.\n"
+                            "You MUST generate a patch now by calling make_error_patch_override.\n"
+                            "Return exactly one JSON object of type tool with:\n"
+                            f'- tool="make_error_patch_override"\n'
+                            f'- args.patch_path="{st.patch_path}"\n'
+                            f'- args.file_path="{file_path}"\n'
+                            f"- args.line_number={line_number}\n"
+                            "- args.new_func_code=<the BASE slice with minimal edits only; do NOT drop unrelated lines or omit the tail>\n"
+                            "Do not include any extra text."
+                        ),
+                    }
+                )
+                try:
+                    coerced = _parse_decision(_complete(model, base_rewrite_messages, label="force_patch_after_read"))
+                except Exception:
+                    coerced = {}
+                if (
+                    isinstance(coerced, dict)
+                    and coerced.get("type") == "tool"
+                    and str(coerced.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(coerced)  # type: ignore[arg-type]
+                    decision = coerced  # type: ignore[assignment]
+                else:
+                    return {
+                        "state": st,
+                        "final": {
+                            "type": "final",
+                            "thought": "Patch generation required after reading the BASE slice, but the model did not produce a make_error_patch_override tool call.",
+                            "summary": "Stopped before patch generation.",
+                            "next_step": (
+                                "Re-run with a larger model / higher OPENAI_MAX_TOKENS, or manually call make_error_patch_override.\n"
+                                "Required: start from the latest read_artifact BASE slice and pass it as new_func_code with minimal edits."
+                            ),
+                            "steps": _steps_for_output(st),
+                            "error": _error_payload(st),
+                        },
+                    }
         if decision["type"] == "final":
             remaining = cfg.max_steps - len(st.steps)
             required = _should_force_struct_diff_tools(st)
@@ -1793,7 +2219,7 @@ def _run_langgraph(
                             "thought": "Cannot force patch generation: missing error file/line location.",
                             "summary": "Stopped before patch generation.",
                             "next_step": "Ensure the build log contains a file:line:col error location, or run with --error-scope patch on a log with mapped errors.",
-                            "steps": st.steps,
+                            "steps": _steps_for_output(st),
                             "error": _error_payload(st),
                         },
                     }
@@ -1808,13 +2234,15 @@ def _run_langgraph(
                                 "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                                 "summary": "Stopped before patch generation.",
                                 "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
-                                "steps": st.steps,
+                                "steps": _steps_for_output(st),
                                 "error": _error_payload(st),
                             },
                         }
 
-                    artifact_path = _last_artifact_path(st, "get_error_v1_code_slice", "func_code") or _last_artifact_path(
-                        st, "get_error_patch_context", "excerpt"
+                    artifact_path = (
+                        str(getattr(st, "loop_base_func_code_artifact_path", "") or "").strip()
+                        or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
+                        or _last_artifact_path(st, "get_error_patch_context", "excerpt")
                     )
                     forced_read: Decision = {
                         "type": "tool",
@@ -1867,7 +2295,7 @@ def _run_langgraph(
                             "Re-run with a larger model / higher OPENAI_MAX_TOKENS, or manually call make_error_patch_override.\n"
                             "Required: generate a full replacement function body and pass it as new_func_code."
                         ),
-                        "steps": st.steps,
+                        "steps": _steps_for_output(st),
                         "error": _error_payload(st),
                     },
                 }
@@ -1929,47 +2357,6 @@ def _run_langgraph(
                             "V2 type definition edits are out-of-policy and require human review."
                         ),
                     }
-            # Auto-iteration: if OSS-Fuzz still reports errors in patch-scope mode and we still have remaining
-            # OSS-Fuzz runs available, do not allow the model to stop with a final decision yet.
-            if st.auto_iterate_pending and st.patch_path and st.error_scope == "patch":
-                if remaining < 3:
-                    return {
-                        "state": st,
-                        "final": {
-                            "type": "final",
-                            "thought": "Not enough remaining tool steps to continue auto-iteration.",
-                            "summary": "Stopped before the next patch iteration.",
-                            "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
-                            "steps": st.steps,
-                            "error": _error_payload(st),
-                        },
-                    }
-
-                st.pending_patch = {
-                    "type": "tool",
-                    "tool": "make_error_patch_override",
-                    "args": {},
-                    "thought": "Continue patch-scope iteration.",
-                }
-                artifact_path = (
-                    str(st.base_slice_artifact_path or "").strip()
-                    or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
-                    or _last_artifact_path(st, "get_error_patch_context", "excerpt")
-                )
-                forced_read: Decision = {
-                    "type": "tool",
-                    "thought": "Continue patch-scope iteration: read the current BASE slice before generating the next override.",
-                    "tool": "read_artifact",
-                    "args": {
-                        "artifact_path": artifact_path,
-                        "start_line": 1,
-                        "max_lines": 0,
-                        "max_chars": 0,
-                    },
-                }
-                _validate_tool_decision(forced_read)
-                return {"state": st, "pending": forced_read}
-
             return {
                 "state": st,
                 "final": {
@@ -1977,7 +2364,7 @@ def _run_langgraph(
                     "thought": str(decision.get("thought", "")).strip(),
                     "summary": str(decision.get("summary", "")).strip(),
                     "next_step": str(decision.get("next_step", "")).strip(),
-                    "steps": st.steps,
+                    "steps": _steps_for_output(st),
                     "error": _error_payload(st),
                 },
             }
@@ -2028,7 +2415,7 @@ def _run_langgraph(
                                     "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
                                     "or manually construct new_func_code by editing the read_artifact BASE slice."
                                 ).strip(),
-                                "steps": st.steps,
+                                "steps": _steps_for_output(st),
                                 "error": _error_payload(st),
                             },
                         }
@@ -2055,7 +2442,7 @@ def _run_langgraph(
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch.",
                     "summary": "Stopped before patch generation.",
                     "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
-                    "steps": st.steps,
+                    "steps": _steps_for_output(st),
                     "error": _error_payload(st),
                 },
             }
@@ -2064,7 +2451,7 @@ def _run_langgraph(
             if remaining >= 3:
                 st.pending_patch = decision
                 artifact_path = (
-                    str(st.base_slice_artifact_path or "").strip()
+                    str(getattr(st, "loop_base_func_code_artifact_path", "") or "").strip()
                     or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
                     or _last_artifact_path(st, "get_error_patch_context", "excerpt")
                 )
@@ -2090,7 +2477,7 @@ def _run_langgraph(
                     "thought": "Not enough remaining tool steps to read artifacts and generate a patch in-order.",
                     "summary": "Stopped before patch generation.",
                     "next_step": "Increase --max-steps (need at least 3 remaining steps: read_artifact -> make_error_patch_override -> ossfuzz_apply_patch_and_test).",
-                    "steps": st.steps,
+                    "steps": _steps_for_output(st),
                     "error": _error_payload(st),
                 },
             }
@@ -2109,8 +2496,24 @@ def _run_langgraph(
             )
             if offloaded is not obs.output:
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
-        st.steps.append({"decision": decision, "observation": obs.__dict__})
+        step_rec = {"decision": decision, "observation": obs.__dict__}
+        st.steps.append(step_rec)
+        st.step_history.append(step_rec)
         st.last_observation = obs
+
+        if obs.ok and obs.tool == "get_error_patch_context" and isinstance(obs.output, dict):
+            st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
+            st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
+            st.active_line_number = int(obs.output.get("line_number", 0) or st.active_line_number or 0)
+            fs = obs.output.get("func_start_index")
+            fe = obs.output.get("func_end_index")
+            if isinstance(fs, int):
+                st.active_func_start_index = fs
+            if isinstance(fe, int):
+                st.active_func_end_index = fe
+            excerpt = obs.output.get("excerpt")
+            if isinstance(excerpt, dict):
+                st.active_excerpt_artifact_path = str(excerpt.get("artifact_path", "") or "").strip()
         if obs.ok and obs.tool == "get_error_v1_code_slice" and isinstance(obs.output, dict):
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
@@ -2121,18 +2524,16 @@ def _run_langgraph(
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
-            # Persist the new BASE slice (the code we just wrote into the '-' slice) so
-            # iterative patch-scope runs can preserve prior fixes.
-            try:
-                raw_new = str((decision.get("args") or {}).get("new_func_code", "") or "")
-                new_base = _extract_first_code_fence(raw_new).replace("\r\n", "\n").replace("\r", "\n")
-                if new_base and not new_base.endswith("\n"):
-                    new_base += "\n"
-                if artifact_store and new_base.strip():
-                    ref = artifact_store.write_text(name="base_slice_current", text=new_base, ext=".c")  # type: ignore[attr-defined]
-                    st.base_slice_artifact_path = str(getattr(ref, "artifact_path", "") or "").strip()
-            except Exception:
-                pass
+            if isinstance(obs.output, dict):
+                st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
+                st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
+                st.active_line_number = int(obs.output.get("line_number", 0) or st.active_line_number or 0)
+                fs = obs.output.get("func_start_index")
+                fe = obs.output.get("func_end_index")
+                if isinstance(fs, int):
+                    st.active_func_start_index = fs
+                if isinstance(fe, int):
+                    st.active_func_end_index = fe
             patch_text_path = ""
             if isinstance(st.patch_result, dict):
                 pt = st.patch_result.get("patch_text")
@@ -2142,7 +2543,8 @@ def _run_langgraph(
                 st.patch_override_paths = [patch_text_path]
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
-            st.ossfuzz_runs_attempted += 1
+            if obs.ok:
+                st.ossfuzz_runs_attempted += 1
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -2184,7 +2586,7 @@ def _run_langgraph(
         "thought": "Reached max tool steps without a final decision.",
         "summary": "Stopped after max_steps.",
         "next_step": "Increase --max-steps or review the last observation and proceed manually.",
-        "steps": state.steps,
+        "steps": _steps_for_output(state),
         "error": _error_payload(state),
     }
 
@@ -2263,12 +2665,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
-    parser.add_argument(
-        "--max-ossfuzz-runs",
-        type=int,
-        default=int(os.environ.get("REACT_AGENT_MAX_OSSFUZZ_RUNS", "1") or 1),
-        help="Maximum number of OSS-Fuzz build/test cycles to run in --error-scope patch mode (default: 1).",
-    )
     parser.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
     parser.add_argument("--ossfuzz-commit", default=os.environ.get("REACT_AGENT_OSSFUZZ_COMMIT", ""))
     parser.add_argument("--ossfuzz-build-csv", default=os.environ.get("REACT_AGENT_OSSFUZZ_BUILD_CSV", ""))
@@ -2277,6 +2673,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ossfuzz-engine", default=os.environ.get("REACT_AGENT_OSSFUZZ_ENGINE", "libfuzzer"))
     parser.add_argument("--ossfuzz-fuzz-target", default=os.environ.get("REACT_AGENT_OSSFUZZ_FUZZ_TARGET", ""))
     parser.add_argument("--ossfuzz-use-sudo", action="store_true", default=bool(os.environ.get("REACT_AGENT_OSSFUZZ_USE_SUDO", "")))
+    parser.add_argument(
+        "--auto-ossfuzz-loop",
+        action="store_true",
+        default=str(os.environ.get("REACT_AGENT_AUTO_OSSFUZZ_LOOP", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"},
+        help="After each OSS-Fuzz run, re-parse logs and keep iterating within the same patch_key until clean (patch-scope only).",
+    )
+    parser.add_argument(
+        "--ossfuzz-loop-max",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_OSSFUZZ_LOOP_MAX", "3") or 3),
+        help="Max ossfuzz_apply_patch_and_test tool calls when --auto-ossfuzz-loop is enabled (includes the first run).",
+    )
     return parser
 
 
@@ -2292,10 +2700,11 @@ def main(argv: List[str]) -> int:
         max_steps=max(args.max_steps, 1),
         tools_mode=args.tools,
         error_scope=args.error_scope,
-        max_ossfuzz_runs=max(int(getattr(args, "max_ossfuzz_runs", 1) or 1), 1),
         recursion_limit=int(getattr(args, "recursion_limit", 0) or 0),
         debug_llm=bool(getattr(args, "debug_llm", False)),
         debug_llm_dir=str(getattr(args, "debug_llm_dir", "") or "").strip(),
+        auto_ossfuzz_loop=bool(getattr(args, "auto_ossfuzz_loop", False)),
+        ossfuzz_loop_max=max(int(getattr(args, "ossfuzz_loop_max", 0) or 0), 1),
     )
 
     # Fail fast: in patch-scope runs we will generate a patch and must be able to test it.
@@ -2399,6 +2808,37 @@ def main(argv: List[str]) -> int:
 
     target_errors = _extract_target_errors(error_line=error_line, grouped_errors=grouped_errors, patch_key=patch_key)
 
+    active_patch_key = str(patch_key or "").strip()
+    active_file_path = ""
+    active_line_number = 0
+    active_func_start_index: Optional[int] = None
+    active_func_end_index: Optional[int] = None
+    if grouped_errors:
+        active_file_path = str(grouped_errors[0].get("file", "") or "").strip()
+        active_line_number = int(grouped_errors[0].get("line", 0) or 0)
+    else:
+        m = _ERROR_LOC_RE.match(str(error_line or "").strip())
+        if m:
+            active_file_path = str(m.group("file") or "").strip()
+            active_line_number = int(m.group("line") or 0)
+
+    if cfg.error_scope == "patch" and patch_path and active_file_path and active_line_number > 0:
+        try:
+            from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
+
+            mapping = map_error_patch(patch_path=patch_path, file_path=active_file_path, line_number=active_line_number)
+            if isinstance(mapping, dict):
+                if not active_patch_key:
+                    active_patch_key = str(mapping.get("patch_key") or "").strip()
+                fs = mapping.get("func_start_index")
+                fe = mapping.get("func_end_index")
+                if isinstance(fs, int):
+                    active_func_start_index = fs
+                if isinstance(fe, int):
+                    active_func_end_index = fe
+        except Exception:
+            pass
+
     artifact_store, artifacts_dir = resolve_artifact_dir(
         cli_dir=str(getattr(args, "artifact_dir", "") or ""),
         disabled=bool(args.no_artifacts),
@@ -2450,6 +2890,11 @@ def main(argv: List[str]) -> int:
             snippet=snippet,
             artifacts_dir=artifacts_dir,
             patch_key=patch_key,
+            active_patch_key=active_patch_key,
+            active_file_path=active_file_path,
+            active_line_number=active_line_number,
+            active_func_start_index=active_func_start_index,
+            active_func_end_index=active_func_end_index,
             grouped_errors=grouped_errors,
             missing_struct_members=missing_struct_members,
             target_errors=target_errors,
@@ -2462,6 +2907,7 @@ def main(argv: List[str]) -> int:
             ossfuzz_fuzz_target=str(getattr(args, "ossfuzz_fuzz_target", "") or "").strip(),
             ossfuzz_use_sudo=bool(getattr(args, "ossfuzz_use_sudo", False)),
         )
+        _record_current_error_group(state)
 
         final = _run_langgraph(
             model,
