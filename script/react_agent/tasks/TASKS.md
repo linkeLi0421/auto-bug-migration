@@ -1,11 +1,21 @@
-## Current Plan (unarchived)
+# Auto-loop: preserve and print *all* steps
 
-- [x] Stop forcing `read_file_context(context=80)` in macro-lookup guardrail (`script/react_agent/agent_langgraph.py`); keep forcing only `kb_search_symbols` (v2 → v1).
-- [x] Update the system prompt (`script/react_agent/agent_langgraph.py`) to remove “context=80” and instruct the model to choose an appropriate context window (large enough to include full `#if/#endif` blocks when needed).
-- [x] Update `script/react_agent/test_langgraph_agent.sh` to remove assumptions about `context=80` and add a small unit test ensuring the runtime doesn’t inject a fixed context value.
-- [x] If the LLM returns empty `message.content` and `--debug-llm` is enabled, dump raw HTTP JSON (`response_debug.raw_body`) and metadata in `llm_call_XXXX_response.json` (`script/react_agent/models.py`, `script/react_agent/agent_langgraph.py`).
+## Goal
+In `--auto-ossfuzz-loop` runs we intentionally trim `state.steps` (prompt context) between iterations, but the final report should still include **all tool steps across the whole run**, not just the last iteration.
 
-- [x] Patch-scope multi-error loop: don’t stop after the first `make_error_patch_override` + `ossfuzz_apply_patch_and_test` if `target_errors` still remain (e.g., `unknown type name 'xmlHashedString'` in `log/agent_log/tmp2.log`). Continue iterating until fixed or a configurable run limit is hit.
-- [x] Make the follow-up iteration actionable: after an OSS-Fuzz run, surface the remaining target errors (and top non-target errors) back into the next LLM prompt and/or set `state.error_line` to the next remaining error so the model doesn’t tunnel on the first one.
-- [x] Ensure iterative rewrites don’t lose previous fixes: when a second override is generated for the same `patch_key`, replace the prior override path and base subsequent `new_func_code` edits on the most recent BASE slice (the last applied `new_func_code`, not the original V1 slice).
-- [x] Tests: add a stub-mode regression test that simulates “fix first error → still has remaining target error” and asserts the agent continues (when enabled) instead of finalizing immediately after the first OSS-Fuzz test.
+## Tasks
+- [x] Define the output contract for “all steps” vs “prompt steps” (what goes in `final["steps"]`, and whether we add a separate field).
+- [x] Add `AgentState.step_history` (or similar) that accumulates all `{decision, observation}` entries across iterations.
+- [x] Seed `step_history` from any pre-populated `state.steps` at the start of `_run_langgraph` (tests/resumed runs).
+- [x] Update `tool_node` to append each new step to both `state.steps` and `state.step_history`.
+- [x] Keep the auto-loop trim (`state.steps = state.steps[-1:]`) but never drop `step_history`; optionally add a loop-boundary marker for readability.
+- [x] Update all “final” payload construction sites to emit the full step history (including early-exit finals).
+- [x] Update `_render_final_text()` to label the section clearly (e.g., “Steps (full run)”) and keep output bounded via existing artifact refs.
+- [x] Update regression tests: assert forbidden tools weren’t called in later iterations via `FakeRunner.calls` (not by scanning rendered steps).
+- [x] Update regression tests: assert final rendered output includes steps from before the trim (first OSS-Fuzz run + later loop steps).
+- [x] Update `script/react_agent/README.md` to document step-history output behavior (and any new fields/flags).
+
+## Done criteria
+- The final `--output-format text` output includes every tool step across all auto-loop iterations (even though `state.steps` is trimmed for prompting).
+- The auto-loop still drops prompt context between iterations.
+- Tests pass: `bash script/react_agent/test_langgraph_agent.sh`.

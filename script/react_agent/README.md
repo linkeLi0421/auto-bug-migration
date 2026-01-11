@@ -124,7 +124,7 @@ Patch bundle path notes:
 
 Artifacts (reduce prompt/output size):
 
-- Patch-related tool outputs (diff excerpts / V1-origin function bodies / generated patches) are persisted under `data/react_agent_artifacts/<patch_key>/` when `patch_key` is known (patch-aware runs). Otherwise they use `data/react_agent_artifacts/<run_id>/`.
+- Patch-related tool outputs (diff excerpts / patch slices containing V1-origin `-` lines / generated patches) are persisted under `data/react_agent_artifacts/<patch_key>/` when `patch_key` is known (patch-aware runs). Otherwise they use `data/react_agent_artifacts/<run_id>/`.
 - Files are overwritten by name within the `patch_key` directory (no `.1`, `.2`, ... accumulation).
 - Tool observations replace large fields with `{artifact_path, sha256, bytes, lines}`.
 - Configure with:
@@ -136,6 +136,7 @@ Output format:
 
 - Default: `--output-format auto` (prints human-friendly text when stdout is a TTY; otherwise prints JSON)
 - Force JSON: `--output-format json` or `--output-format json-pretty`
+- When `--auto-ossfuzz-loop` is enabled, the agent may trim internal prompt context between iterations, but the final output still reports the full tool-step history for the whole run.
 
 List tools:
 ```bash

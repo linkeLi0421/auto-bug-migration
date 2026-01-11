@@ -684,78 +684,229 @@ with tempfile.TemporaryDirectory() as td:
     assert verdict2.get("fixed") is True, verdict2
 PY
 
-# Patch-scope iteration helper: after OSS-Fuzz finds remaining target errors, state should
-# be prepared for another make_error_patch_override + ossfuzz_apply_patch_and_test cycle.
+# Auto-loop regression: after the first ossfuzz_apply_patch_and_test, refresh errors and iterate within the same patch_key
+# without re-calling get_error_patch_context/get_error_v1_code_slice (drive from build_output + last override patch_text).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import base64
+import json
+import os
+import re
 import sys
+import tempfile
 from pathlib import Path
 
 script_dir = Path(sys.argv[1]).resolve()
+repo_root = script_dir.parents[1]
 sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(repo_root))
 
-from agent_langgraph import (  # noqa: E402
-    AgentConfig,
-    AgentState,
-    _patch_scope_prepare_next_iteration_after_ossfuzz,
-)
+from agent_langgraph import AgentConfig, AgentState, _run_langgraph  # noqa: E402
+from artifacts import ArtifactStore  # noqa: E402
+from tools.artifact_tools import read_artifact as read_artifact_tool  # noqa: E402
+from tools.migration_tools import make_error_patch_override as make_error_patch_override_tool  # noqa: E402
+from tools.runner import ToolObservation  # noqa: E402
 
-cfg = AgentConfig(max_steps=10, tools_mode="fake", error_scope="patch", max_ossfuzz_runs=2)
+from script.migration_tools.patch_bundle import load_patch_bundle  # noqa: E402
 
-state = AgentState(
-    build_log_path="build.log",
-    patch_path="bundle.patch2",
-    error_scope="patch",
-    error_line="/src/libxml2/parser.c:10:1: error: unknown type name 'xmlParserNsData'",
-    snippet="",
-    patch_key="p2",
-    patch_generated=True,
-    ossfuzz_test_attempted=True,
-    ossfuzz_runs_attempted=1,
-    target_errors=[
-        {"patch_key": "p2", "msg": "unknown type name 'xmlHashedString'"},
-        {"patch_key": "p2", "msg": "unknown type name 'xmlParserNsData'"},
-    ],
-)
 
-verdict = {
-    "status": "ok",
-    "fixed": False,
-    "matched_target_errors": [
-        {
-            "raw": "/src/libxml2/parser.c:20:3: error: unknown type name 'xmlHashedString'",
-            "file": "/src/libxml2/parser.c",
-            "line": 20,
-            "col": 3,
-            "msg": "unknown type name 'xmlHashedString'",
-            "patch_key": "p2",
-        }
-    ],
-    "other_errors": [
-        {
-            "raw": "/src/libxml2/parser.c:21:3: error: something else",
-            "file": "/src/libxml2/parser.c",
-            "line": 21,
-            "col": 3,
-            "msg": "something else",
-            "patch_key": "p2",
-        }
-    ],
-}
+class FakeRunner:
+    def __init__(self, *, ossfuzz_outputs):
+        self._ossfuzz_outputs = list(ossfuzz_outputs)
+        self.calls = []
 
-assert _patch_scope_prepare_next_iteration_after_ossfuzz(state, cfg, verdict) is True
-assert state.auto_iterate_pending is True
-assert state.patch_generated is False
-assert state.patch_result is None
-assert state.ossfuzz_test_attempted is False
-assert state.grouped_errors and "xmlHashedString" in (state.grouped_errors[0].get("msg") or ""), state.grouped_errors
-assert "xmlHashedString" in state.error_line, state.error_line
+    def call(self, tool, args):
+        self.calls.append(tool)
+        if tool == "read_artifact":
+            out = read_artifact_tool(**args)
+            return ToolObservation(True, tool, args, output=out, error=None)
+        if tool == "make_error_patch_override":
+            out = make_error_patch_override_tool(**args)
+            return ToolObservation(True, tool, args, output=out, error=None)
+        if tool == "ossfuzz_apply_patch_and_test":
+            if not self._ossfuzz_outputs:
+                raise RuntimeError("Missing fake ossfuzz output")
+            out = self._ossfuzz_outputs.pop(0)
+            return ToolObservation(True, tool, args, output=out, error=None)
+        return ToolObservation(True, tool, args, output={}, error=None)
 
-# If the max run limit is reached, the helper should refuse to continue.
-state.patch_generated = True
-state.ossfuzz_test_attempted = True
-state.ossfuzz_runs_attempted = 2
-assert _patch_scope_prepare_next_iteration_after_ossfuzz(state, cfg, verdict) is False
-assert state.auto_iterate_pending is False
+
+_ERROR_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?:fatal\s+)?error:\s*(?P<msg>.*)$")
+
+
+class BasePreservingModel:
+    def complete(self, messages):
+        patch_path = ""
+        for m in messages:
+            if m.get("role") != "user":
+                continue
+            for line in str(m.get("content") or "").splitlines():
+                if line.startswith("Patch bundle path:"):
+                    patch_path = line.split(":", 1)[1].strip()
+                    break
+            if patch_path:
+                break
+
+        file_path = ""
+        line_number = 0
+        for m in messages:
+            if m.get("role") != "user":
+                continue
+            for line in str(m.get("content") or "").splitlines():
+                mm = _ERROR_RE.match(line.strip())
+                if not mm:
+                    continue
+                file_path = mm.group("file")
+                line_number = int(mm.group("line"))
+                break
+            if file_path and line_number > 0:
+                break
+
+        base = ""
+        for m in reversed(messages):
+            if m.get("role") != "user":
+                continue
+            content = str(m.get("content") or "")
+            if not content.startswith("Observation:\n"):
+                continue
+            try:
+                obs = json.loads(content.split("Observation:\n", 1)[1])
+            except Exception:
+                continue
+            if str(obs.get("tool") or "").strip() != "read_artifact":
+                continue
+            if obs.get("ok") is not True:
+                continue
+            out = obs.get("output") if isinstance(obs.get("output"), dict) else {}
+            text = out.get("text") if isinstance(out, dict) else ""
+            if isinstance(text, str) and text.strip():
+                base = text
+                break
+
+        new_code = base.rstrip("\n")
+        if new_code:
+            new_code += "\n/* react_agent auto-loop test edit */\n"
+
+        if not (patch_path and file_path and line_number > 0 and new_code.strip()):
+            return json.dumps({"type": "final", "thought": "missing inputs", "summary": "", "next_step": ""})
+
+        return json.dumps(
+            {
+                "type": "tool",
+                "thought": "Generate a minimal edit from the BASE slice.",
+                "tool": "make_error_patch_override",
+                "args": {
+                    "patch_path": patch_path,
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "new_func_code": new_code,
+                    "context_lines": 0,
+                    "max_lines": 2000,
+                    "max_chars": 200000,
+                },
+            }
+        )
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td).resolve()
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+    os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(root)
+
+    # Use the existing patch2 fixture bundle (decoded into an allowed root).
+    bundle_b64 = (script_dir / "../migration_tools/fixtures/sample.patch2.b64").resolve()
+    bundle_path = root / "sample.patch2"
+    bundle_path.write_bytes(base64.b64decode(bundle_b64.read_text(encoding="utf-8").strip()))
+
+    bundle = load_patch_bundle(str(bundle_path), allowed_roots=[str(root)])
+    assert "p2" in bundle.patches, sorted(bundle.patches.keys())
+    patch_text = str(bundle.patches["p2"].patch_text or "")
+    assert patch_text.strip()
+
+    override_path = root / "override_p2.diff"
+    override_path.write_text(patch_text + ("\n" if not patch_text.endswith("\n") else ""), encoding="utf-8")
+
+    # Fake OSS-Fuzz logs after the first patch attempt: a new error remains in the same patch_key (p2).
+    build_1 = (
+        "/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'\n"
+        "/src/libxml2/error.c:52:5: error: use of undeclared identifier 'bar'\n"
+    )
+    build_1_path = root / "ossfuzz_build_1.log"
+    check_1_path = root / "ossfuzz_check_1.log"
+    build_1_path.write_text(build_1, encoding="utf-8")
+    check_1_path.write_text("", encoding="utf-8")
+
+    # Second OSS-Fuzz run: clean (no compiler errors), so the auto-loop stops.
+    ossfuzz_2 = {"build_output": "build ok\n", "check_build_output": "check ok\n"}
+
+    cfg = AgentConfig(
+        max_steps=20,
+        tools_mode="fake",
+        error_scope="patch",
+        auto_ossfuzz_loop=True,
+        ossfuzz_loop_max=2,
+    )
+    initial_error = "/src/libxml2/error.c:51:1: error: expected ';' after top level declarator"
+    st = AgentState(
+        build_log_path="-",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line=initial_error,
+        snippet="",
+        artifacts_dir=str(root),
+        patch_key="p2",
+        active_patch_key="p2",
+        active_file_path="/src/libxml2/error.c",
+        active_line_number=52,
+        ossfuzz_project="example",
+        ossfuzz_commit="deadbeef",
+        patch_override_paths=[str(override_path)],
+        patch_generated=True,
+        ossfuzz_test_attempted=True,
+        ossfuzz_runs_attempted=1,
+        steps=[
+            {"decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}}, "observation": {"ok": True, "tool": "get_error_patch_context", "output": {}}},
+            {"decision": {"type": "tool", "tool": "get_error_v1_code_slice", "args": {}}, "observation": {"ok": True, "tool": "get_error_v1_code_slice", "output": {}}},
+            {"decision": {"type": "tool", "tool": "ossfuzz_apply_patch_and_test", "args": {}}, "observation": {"ok": True, "tool": "ossfuzz_apply_patch_and_test", "output": {"build_output": {"artifact_path": str(build_1_path)}, "check_build_output": {"artifact_path": str(check_1_path)}}}},
+        ],
+    )
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_1_path)}, "check_build_output": {"artifact_path": str(check_1_path)}},
+        error=None,
+    )
+
+    model = BasePreservingModel()
+    runner = FakeRunner(ossfuzz_outputs=[ossfuzz_2])
+    store = ArtifactStore(root, overwrite=True)
+
+    final = _run_langgraph(model, runner, st, cfg, artifact_store=store)
+    assert final.get("type") == "final", final
+
+    steps = [s for s in (final.get("steps") or []) if isinstance(s, dict)]
+    tools = [((s.get("decision") or {}).get("tool")) for s in steps]
+
+    # The second-iteration patching should not restart patch mapping; it should read the BASE slice and patch again.
+    # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
+    assert "read_artifact" in runner.calls, runner.calls
+    assert "make_error_patch_override" in runner.calls, runner.calls
+    assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 1, runner.calls
+    assert "get_error_patch_context" not in runner.calls, runner.calls
+    assert "get_error_v1_code_slice" not in runner.calls, runner.calls
+
+    # Final output should include the full step history across iterations, including steps that were trimmed
+    # from state.steps for prompt hygiene.
+    assert "get_error_patch_context" in tools, tools
+    assert "get_error_v1_code_slice" in tools, tools
+    assert len(steps) > 3, len(steps)
+
+    # Ensure we retain and render the previously handled errors even though state.steps is trimmed in auto-loop.
+    from agent_langgraph import _render_final_text  # noqa: E402
+
+    rendered = _render_final_text(final)
+    assert initial_error in rendered, rendered
+    assert "unknown type name 'foo_t'" in rendered, rendered
+    assert "tool: get_error_patch_context" in rendered, rendered
 
 print("OK")
 PY
