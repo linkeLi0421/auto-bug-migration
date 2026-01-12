@@ -266,28 +266,29 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     if not isinstance(out, dict):
         return {"status": "unknown", "reason": "Missing OSS-Fuzz tool output."}
 
-    def artifact_path(field: str) -> str:
-        v = out.get(field)
-        if isinstance(v, dict):
-            return str(v.get("artifact_path", "") or "").strip()
-        if isinstance(v, str):
-            return v.strip()
-        return ""
+    build_text, check_text, sources, read_err = _read_ossfuzz_logs(out)
+    if not build_text and not check_text:
+        return {"status": "unknown", "reason": read_err or "Empty OSS-Fuzz logs.", "log_artifacts": sources}
 
-    build_path = artifact_path("build_output")
-    check_path = artifact_path("check_build_output")
-    if not build_path and not check_path:
-        return {"status": "unknown", "reason": "No build/check_build log artifacts found."}
+    infra = _ossfuzz_infra_failure(build_text, check_text)
+    if infra:
+        payload: Dict[str, Any] = {
+            "status": "failed",
+            "reason": str(infra.get("reason") or "").strip(),
+            "targets": targets,
+            "log_artifacts": sources,
+        }
+        hint = str(infra.get("hint") or "").strip()
+        if hint:
+            payload["hint"] = hint
+        return payload
 
     combined_errors: List[Dict[str, Any]] = []
-    sources: List[str] = []
     try:
-        if build_path:
-            sources.append(build_path)
-            combined_errors.extend(iter_compiler_errors(_read_text(build_path), snippet_lines=0))
-        if check_path:
-            sources.append(check_path)
-            combined_errors.extend(iter_compiler_errors(_read_text(check_path), snippet_lines=0))
+        if build_text:
+            combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=0))
+        if check_text:
+            combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=0))
     except Exception as exc:  # noqa: BLE001
         return {"status": "unknown", "reason": f"Failed to parse logs: {exc}", "log_artifacts": sources}
 
@@ -398,6 +399,68 @@ def _ossfuzz_artifact_path(output: Any, field: str) -> str:
     return ""
 
 
+_OSSFUZZ_INFRA_ERR_PREFIX = "OSS-Fuzz infra error:"
+
+
+def _ossfuzz_infra_failure_reason(text: str) -> Optional[Dict[str, str]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    lowered = raw.lower()
+    if "/var/run/docker.sock" in raw and "permission denied" in lowered:
+        return {
+            "reason": "Docker permission denied (cannot connect to /var/run/docker.sock).",
+            "hint": "Run with --ossfuzz-use-sudo or fix Docker permissions (e.g., add your user to the docker group).",
+        }
+    if "cannot connect to the docker daemon" in lowered:
+        return {
+            "reason": "Cannot connect to the Docker daemon.",
+            "hint": "Ensure Docker is running and accessible (or run with --ossfuzz-use-sudo).",
+        }
+    if "docker: command not found" in lowered:
+        return {
+            "reason": "Docker command not found.",
+            "hint": "Install Docker or ensure the docker CLI is available in PATH.",
+        }
+    return None
+
+
+def _ossfuzz_infra_failure(build_text: str, check_text: str) -> Optional[Dict[str, str]]:
+    for blob in (build_text, check_text):
+        hit = _ossfuzz_infra_failure_reason(blob)
+        if hit:
+            return hit
+    return None
+
+
+def _read_ossfuzz_logs(output: Dict[str, Any]) -> tuple[str, str, List[str], Optional[str]]:
+    build_path = _ossfuzz_artifact_path(output, "build_output")
+    check_path = _ossfuzz_artifact_path(output, "check_build_output")
+    if not build_path and not check_path:
+        return "", "", [], "No build/check_build log artifacts found."
+
+    sources: List[str] = []
+    build_text = ""
+    check_text = ""
+    read_errors: List[str] = []
+    if build_path:
+        sources.append(build_path)
+        try:
+            build_text = _read_text(build_path)
+        except Exception as exc:  # noqa: BLE001
+            read_errors.append(f"Failed to read build log: {type(exc).__name__}: {exc}")
+    if check_path:
+        sources.append(check_path)
+        try:
+            check_text = _read_text(check_path)
+        except Exception as exc:  # noqa: BLE001
+            read_errors.append(f"Failed to read check_build log: {type(exc).__name__}: {exc}")
+
+    if read_errors and not (build_text or check_text):
+        return "", "", sources, "; ".join(read_errors)
+    return build_text, check_text, sources, ("; ".join(read_errors) if read_errors else None)
+
+
 def _reindex_patch_bundle(bundle: Any) -> Any:
     patches = getattr(bundle, "patches", None)
     if not isinstance(patches, dict):
@@ -485,20 +548,25 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
     if not isinstance(out, dict):
         return [], [], "Missing OSS-Fuzz tool output."
 
-    build_path = _ossfuzz_artifact_path(out, "build_output")
-    check_path = _ossfuzz_artifact_path(out, "check_build_output")
-    if not build_path and not check_path:
-        return [], [], "No build/check_build log artifacts found."
+    build_text, check_text, sources, read_err = _read_ossfuzz_logs(out)
+    if not build_text and not check_text:
+        return [], sources, read_err or "Empty OSS-Fuzz logs."
+
+    infra = _ossfuzz_infra_failure(build_text, check_text)
+    if infra:
+        reason = str(infra.get("reason") or "").strip()
+        hint = str(infra.get("hint") or "").strip()
+        msg = f"{_OSSFUZZ_INFRA_ERR_PREFIX} {reason}".strip()
+        if hint:
+            msg += f" Hint: {hint}"
+        return [], sources, msg
 
     combined_errors: List[Dict[str, Any]] = []
-    sources: List[str] = []
     try:
-        if build_path:
-            sources.append(build_path)
-            combined_errors.extend(iter_compiler_errors(_read_text(build_path), snippet_lines=2))
-        if check_path:
-            sources.append(check_path)
-            combined_errors.extend(iter_compiler_errors(_read_text(check_path), snippet_lines=2))
+        if build_text:
+            combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=2))
+        if check_text:
+            combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=2))
     except Exception as exc:  # noqa: BLE001
         return [], sources, f"Failed to parse OSS-Fuzz logs: {type(exc).__name__}: {exc}"
 
@@ -519,6 +587,87 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         deduped.append(err)
 
     return deduped, sources, None
+
+
+def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
+    """Summarize whether compiler errors remain for the active patch_key after the last OSS-Fuzz run."""
+    active_key = str(state.active_patch_key or state.patch_key or "").strip()
+    errors, sources, err_msg = _iter_ossfuzz_compiler_errors(state)
+    if err_msg:
+        status = "failed" if str(err_msg).strip().startswith(_OSSFUZZ_INFRA_ERR_PREFIX) else "unknown"
+        return {
+            "status": status,
+            "reason": err_msg,
+            "active_patch_key": active_key,
+            "log_artifacts": sources,
+            "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
+        }
+    if not errors:
+        return {
+            "status": "ok",
+            "active_patch_key": active_key,
+            "remaining_in_active_patch_key": 0,
+            "errors": [],
+            "log_artifacts": sources,
+            "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
+        }
+
+    bundle, bundle_err = _load_effective_patch_bundle_for_mapping(state)
+    if bundle_err or bundle is None:
+        return {
+            "status": "unknown",
+            "reason": bundle_err or "Failed to load patch bundle.",
+            "active_patch_key": active_key,
+            "log_artifacts": sources,
+            "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
+        }
+
+    try:
+        from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "unknown",
+            "reason": f"Failed to import mapping helper: {type(exc).__name__}: {exc}",
+            "active_patch_key": active_key,
+            "log_artifacts": sources,
+            "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
+        }
+
+    mapping_error: Optional[str] = None
+    enriched: List[Dict[str, Any]] = []
+    for e in errors:
+        fp = str(e.get("file", "") or "").strip()
+        ln = int(e.get("line", 0) or 0)
+        if not fp or ln <= 0:
+            continue
+        patch_key = ""
+        try:
+            mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            patch_key = str((mapping or {}).get("patch_key") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            if mapping_error is None:
+                mapping_error = f"{type(exc).__name__}: {exc}"
+        item = {
+            "raw": str(e.get("raw", "") or "").strip(),
+            "file": fp,
+            "line": ln,
+            "col": int(e.get("col", 0) or 0),
+            "msg": str(e.get("msg", "") or "").strip(),
+            "patch_key": patch_key,
+        }
+        if item["raw"]:
+            enriched.append(item)
+
+    in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key] if active_key else []
+    return {
+        "status": "ok",
+        "active_patch_key": active_key,
+        "remaining_in_active_patch_key": len(in_active),
+        "errors": in_active[:10],
+        "log_artifacts": sources,
+        "mapping_error": mapping_error,
+        "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
+    }
 
 
 def _extract_minus_slice_from_patch_text(*, patch_text: str, func_start_index: int, func_end_index: int) -> str:
@@ -1919,12 +2068,26 @@ def _run_langgraph(
                     merged_patch_file_path = str(out.get("merged_patch_file_path", "") or "").strip()
 
             verdict = _summarize_target_error_status(st)
+            patch_key_verdict: Dict[str, Any] = {}
+            if st.error_scope == "patch" and st.patch_path:
+                patch_key_verdict = _summarize_active_patch_key_status(st)
             fixed_str = "unknown"
             if verdict.get("status") == "ok":
                 fixed_str = "yes" if verdict.get("fixed") else "no"
 
             next_step_lines = [f"Target error fixed: {fixed_str}."]
-            if verdict.get("status") == "ok":
+            if verdict.get("status") == "failed":
+                reason = str(verdict.get("reason", "") or "").strip()
+                if reason:
+                    next_step_lines.append(f"OSS-Fuzz run failed: {reason}")
+                hint = str(verdict.get("hint", "") or "").strip()
+                if hint:
+                    next_step_lines.append(f"Hint: {hint}")
+            elif verdict.get("status") == "unknown":
+                reason = str(verdict.get("reason", "") or "").strip()
+                if reason:
+                    next_step_lines.append(f"OSS-Fuzz status unknown: {reason}")
+            elif verdict.get("status") == "ok":
                 matched = verdict.get("matched_target_errors") or []
                 if matched:
                     next_step_lines.append("Remaining target errors:")
@@ -1938,7 +2101,10 @@ def _run_langgraph(
                         raw = str((e or {}).get("raw", "")).strip()
                         if raw:
                             next_step_lines.append(f"- {raw}")
-            next_step_lines.append("Review OSS-Fuzz logs in artifacts and apply the merged patch file.")
+            if verdict.get("status") == "ok":
+                next_step_lines.append("Review OSS-Fuzz logs in artifacts and apply the merged patch file.")
+            else:
+                next_step_lines.append("Review OSS-Fuzz logs in artifacts and re-run once OSS-Fuzz tooling works.")
             if merged_patch_file_path:
                 next_step_lines.append(f"Merged patch: {merged_patch_file_path}")
             if patch_text_path:
@@ -1953,6 +2119,11 @@ def _run_langgraph(
                     "next_step": next_step.strip(),
                     "steps": _steps_for_output(st),
                     "error": _error_payload(st),
+                    "ossfuzz_verdict": verdict,
+                    "patch_key_verdict": patch_key_verdict,
+                    "ossfuzz_runs_attempted": int(st.ossfuzz_runs_attempted or 0),
+                    "auto_ossfuzz_loop": bool(cfg.auto_ossfuzz_loop),
+                    "ossfuzz_loop_max": int(cfg.ossfuzz_loop_max or 0),
                 },
             }
 
