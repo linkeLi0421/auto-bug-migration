@@ -107,6 +107,90 @@ assert any(i.get("kind") == "unknown_type_name" for i in parsed.get("undeclared_
 print("OK")
 PY
 
+# make_error_patch_override: if the mapped slice is exactly one function definition, ignore extra top-level
+# helpers in new_func_code and replace only the intended function.
+bundle_path="$tmp_dir/_fixture_single_func_sanitize.patch2"
+
+"$PYTHON" - "$bundle_path" <<'PY'
+import json
+import pickle
+import sys
+from pathlib import Path
+
+bundle_path = Path(sys.argv[1])
+allowed_roots = [str(bundle_path.parent)]
+
+repo_root = bundle_path.parents[4]
+script_dir = repo_root / "script"
+sys.path.insert(0, str(script_dir))
+
+from migration_tools.patch_bundle import load_patch_bundle
+from migration_tools.tools import make_error_patch_override
+from migration_tools.types import PatchInfo
+
+patch_text = "\n".join(
+    [
+        "diff --git a/x.c b/x.c",
+        "--- a/x.c",
+        "+++ b/x.c",
+        "@@ -1,4 +1,0 @@",
+        "-static int",
+        "-foo(int a) {",
+        "-    return(a);",
+        "-}",
+        "",
+    ]
+)
+
+data = {
+    "p1": PatchInfo(
+        file_path_old="x.c",
+        file_path_new="x.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=4,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type=set(["Function body change"]),
+        old_signature="static int foo(int a)",
+    )
+}
+
+bundle_path.write_bytes(pickle.dumps(data))
+bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
+assert list(bundle.patches.keys()) == ["p1"], list(bundle.patches.keys())
+
+new_func_code = "\n".join(
+    [
+        "static int g = 0;",
+        "static int helper(int x) { return x; }",
+        "static int",
+        "foo(int a) {",
+        "    return(a + 1);",
+        "}",
+    ]
+)
+
+out = make_error_patch_override(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/x.c",
+    line_number=2,
+    new_func_code=new_func_code,
+    max_lines=2000,
+    max_chars=200000,
+    allowed_roots=allowed_roots,
+)
+json.dumps(out)
+patch_text_out = out.get("patch_text") or ""
+assert "-static int g = 0;" not in patch_text_out, patch_text_out
+assert "-helper(" not in patch_text_out, patch_text_out
+assert "-foo(int a) {" in patch_text_out, patch_text_out
+assert "-    return(a + 1);" in patch_text_out, patch_text_out
+
+print("OK")
+PY
+
 # get_error_v1_code_slice: by default (max_lines=0/max_chars=0), return full text and never inject a "[truncated]" marker.
 "$PYTHON" - <<'PY'
 import json

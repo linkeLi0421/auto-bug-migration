@@ -192,8 +192,19 @@ def default_run_id() -> str:
     return f"{ts}_{os.getpid()}_{uuid.uuid4().hex[:8]}"
 
 
-def resolve_artifact_dir(*, cli_dir: str, disabled: bool, patch_key: str = "") -> Tuple[Optional[ArtifactStore], str]:
-    """Return (store, artifact_dir) or (None, '') when disabled."""
+def resolve_artifact_dir(
+    *,
+    cli_dir: str,
+    disabled: bool,
+    patch_key: str = "",
+    patch_key_overwrite: bool = True,
+) -> Tuple[Optional[ArtifactStore], str]:
+    """Return (store, artifact_dir) or (None, '') when disabled.
+
+    When selecting the default per-patch_key directory under `REACT_AGENT_ARTIFACT_ROOT`,
+    `patch_key_overwrite` controls whether repeated artifact writes reuse the same filenames
+    (overwrite=True) or allocate unique filenames (overwrite=False).
+    """
     if disabled:
         return None, ""
 
@@ -214,7 +225,7 @@ def resolve_artifact_dir(*, cli_dir: str, disabled: bool, patch_key: str = "") -
     patch_key_clean = str(patch_key or "").strip()
     if patch_key_clean:
         safe_key = _safe_filename(patch_key_clean, max_len=160)
-        store = ArtifactStore(root / safe_key, overwrite=True)
+        store = ArtifactStore(root / safe_key, overwrite=bool(patch_key_overwrite))
         return store, str(store.root)
 
     run_id = default_run_id()

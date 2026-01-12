@@ -1,87 +1,29 @@
-# Auto-loop: preserve and print *all* steps
-
-## Goal
-In `--auto-ossfuzz-loop` runs we intentionally trim `state.steps` (prompt context) between iterations, but the final report should still include **all tool steps across the whole run**, not just the last iteration.
-
-## Tasks
-- [x] Define the output contract for “all steps” vs “prompt steps” (what goes in `final["steps"]`, and whether we add a separate field).
-- [x] Add `AgentState.step_history` (or similar) that accumulates all `{decision, observation}` entries across iterations.
-- [x] Seed `step_history` from any pre-populated `state.steps` at the start of `_run_langgraph` (tests/resumed runs).
-- [x] Update `tool_node` to append each new step to both `state.steps` and `state.step_history`.
-- [x] Keep the auto-loop trim (`state.steps = state.steps[-1:]`) but never drop `step_history`; optionally add a loop-boundary marker for readability.
-- [x] Update all “final” payload construction sites to emit the full step history (including early-exit finals).
-- [x] Update `_render_final_text()` to label the section clearly (e.g., “Steps (full run)”) and keep output bounded via existing artifact refs.
-- [x] Update regression tests: assert forbidden tools weren’t called in later iterations via `FakeRunner.calls` (not by scanning rendered steps).
-- [x] Update regression tests: assert final rendered output includes steps from before the trim (first OSS-Fuzz run + later loop steps).
-- [x] Update `script/react_agent/README.md` to document step-history output behavior (and any new fields/flags).
-
-## Done criteria
-- The final `--output-format text` output includes every tool step across all auto-loop iterations (even though `state.steps` is trimmed for prompting).
-- The auto-loop still drops prompt context between iterations.
-- Tests pass: `bash script/react_agent/test_langgraph_agent.sh`.
-
-# Multi-agent: better status summary + parallel execution
-
-## Problems to solve
-- The current `multi_agent.py` summary doesn’t clearly answer: “Did this hunk get fixed?” (i.e., did OSS-Fuzz compile errors for that `patch_key` go to zero within the loop budget?).
-- `multi_agent.py` currently runs agents sequentially; I want an option to run multiple hunks in parallel (N jobs).
-
-## Tasks
-- [x] Define “fixed” for a patch_key (remaining in `active_patch_key` goes to 0; plus target error status).
-- [x] Extend `agent_langgraph.py` final JSON with `ossfuzz_verdict` and `patch_key_verdict` (structured, no string parsing).
-- [x] Update `multi_agent.py` summary to surface `hunk_fixed`/`target_fixed` plus the full verdict objects and log artifact paths.
-- [x] Add `--jobs N` to `multi_agent.py` and execute hunks concurrently.
-- [x] Avoid per-hunk output collisions by routing `--debug-llm-dir` to a per-`patch_key` subdirectory.
-- [x] Add basic progress fields per hunk (`started_at`, `finished_at`, `duration_sec`).
-- [x] Update `script/react_agent/test_multi_agent.sh` to cover `--jobs 2` and verdict propagation.
-- [x] Run tests: `bash script/react_agent/test_multi_agent.sh` and `bash script/react_agent/test_langgraph_agent.sh`.
-
-# Multi-agent: explicit success + no stdout
-
-## Problems to solve
-- `summary.json` contains raw fields, but it’s still not obvious which hunks are “done” vs “still failing”.
-- I want multi-agent to stop printing the big report to stdout by default; writing `summary.json` should be enough.
-
-## Tasks
-- [x] Add a per-hunk `task_status` + `task_success` field (e.g. `fixed`, `remaining_errors`, `agent_failed`, `unknown`) derived from `patch_key_verdict` and exit code.
-- [x] Flatten key verdict fields into the per-hunk summary (e.g. `remaining_in_active_patch_key`, `active_patch_key`, `log_artifacts`) so users don’t have to dig into nested objects.
-- [x] Add top-level aggregate counts: `hunks_fixed`, `hunks_not_fixed`, `hunks_unknown`, `agents_failed`, plus `summary_json_path`.
-- [x] Add `--output-format none` to `multi_agent.py` and make it the default (still always write `summary.json`).
-- [x] Update `script/react_agent/test_multi_agent.sh` to pass `--output-format json-pretty` explicitly (so tests still validate stdout parsing), and add a small check that `summary.json` exists under `artifacts_root`.
-- [x] Run tests: `bash script/react_agent/test_multi_agent.sh`.
-
-# Multi-agent: per-hunk artifacts directory (fix patch_key inference)
+# Auto-loop: preserve per-iteration artifacts (no overwrites)
 
 ## Problem
-In multi-agent runs, some tool artifacts (especially override diff artifacts) are being written under a global directory (e.g. `data/react_agent_artifact_dir`) instead of the per-hunk directory under the multi-run root (e.g. `data/react_agent_artifacts/multi_<run_id>/<patch_key_dirname>/...`). This breaks OSS-Fuzz tooling that infers `patch_key` from the override artifact path and errors with:
-`ValueError: Could not infer patch_key for override patch file. Put override artifacts under a directory named <patch_key> ...`.
+In multi-agent/patch-scope runs with `--auto-ossfuzz-loop`, each new loop iteration overwrites prior artifacts inside the patch_key directory (e.g.:
+`make_error_patch_override_patch_text_*.diff`, `ossfuzz_apply_patch_and_test_*_output.log`, and `ossfuzz_merged_*.diff`).
+
+This makes debugging hard and also breaks the meaning of older `step_history` entries (their `artifact_path` can end up pointing at a file whose contents are from a later loop).
 
 ## Goal
-Ensure every per-hunk agent writes *all* artifacts (including override patch_text artifacts) under:
-`data/react_agent_artifacts/multi_<run_id>/<patch_key_dirname>/`
-so patch_key inference always works and all per-hunk outputs are co-located with `agent_stdout.json`.
+Keep *every* iteration’s patch + OSS-Fuzz logs + merged patch diff so older steps remain reproducible:
+- Each loop iteration produces new artifact files (no overwrite).
+- Earlier `steps`/`step_history` artifact refs still exist and match what the agent saw at that time.
+- The latest artifacts are still easy to find (optional: keep a stable “latest” copy/symlink).
 
-## Tasks
-- [x] Confirm precedence: `REACT_AGENT_ARTIFACT_DIR` overrides `REACT_AGENT_ARTIFACT_ROOT` in both artifact storage and OSS-Fuzz tool allow-root.
-- [x] Update `multi_agent.py` to scrub inherited `REACT_AGENT_ARTIFACT_DIR` from child env so per-hunk agents always use `REACT_AGENT_ARTIFACT_ROOT=<multi_run_root>` and write under `<multi_run_root>/<patch_key>/...`.
-- [x] Avoid collisions in parallel mode by writing the OSS-Fuzz merged patch file under the inferred patch_key directory when only one patch_key is overridden.
-- [x] Add regression coverage in `script/react_agent/test_multi_agent.sh` by setting a global `REACT_AGENT_ARTIFACT_DIR` and asserting each agent’s `error.artifacts_dir` matches the per-hunk `artifacts_dir`.
-- [x] Run tests: `bash script/react_agent/test_multi_agent.sh` and `bash script/react_agent/test_langgraph_agent.sh`.
-
-## Done criteria
-- No multi-agent run writes artifacts into a global `REACT_AGENT_ARTIFACT_DIR` location.
-- Override artifacts live under the per-hunk directory beside `agent_stdout.json`.
-- OSS-Fuzz no longer errors about inferring patch_key from override artifact paths.
-
-# Follow-up: OSS-Fuzz infra failures + JSON stdout purity
-
-## Problems to solve
-- Some OSS-Fuzz runs fail before compilation (e.g., Docker socket permission denied), but the agent incorrectly reports “fixed” because no compiler errors are found.
-- In real-tools runs, the OSS-Fuzz tool printed command lines to stdout, making `agent_stdout.json` invalid JSON (multi-agent summary couldn’t parse).
-- When `REACT_AGENT_ARTIFACT_DIR` is already the per-hunk directory, the merged patch path could become `<patch_key>/<patch_key>/...`.
-
-## Tasks
-- [x] Keep OSS-Fuzz tool command logging on stderr (never stdout) so agent stdout remains valid JSON.
-- [x] Detect Docker/infra failures in OSS-Fuzz logs and report verdict `status=failed` (don’t claim “fixed”).
-- [x] Prevent merged patch path nesting when artifact allow-root is already the patch_key directory.
-- [x] Improve multi-agent `task_status` to surface `ossfuzz_failed` and `agent_output_parse_error`.
+## Plan
+- [x] Reproduce and enumerate exactly which files get overwritten in a real auto-loop run (patch_text, build/check logs, merged patch, etc.).
+- [x] Choose preservation strategy (and document the choice in-code):
+  - [x] Option A: stop using `overwrite=True` for patch_key artifact stores (or only when `--auto-ossfuzz-loop` is enabled) so `ArtifactStore` auto-allocates `*.1`, `*.2`, … instead of unlinking.
+  - [ ] Option B: write artifacts under per-loop subdirectories like `<patch_key>/loop_001/…` and optionally maintain `<patch_key>/latest/…` pointing at the newest.
+- [x] Preserve offloaded tool outputs (build/check logs + override patch_text):
+  - [x] Make `offload_patch_output()` write unique filenames per tool call (via disabling overwrite, or by adding a per-call suffix such as `loop_{ossfuzz_runs_attempted}` / `step_{n}`).
+  - [x] Ensure `state.patch_override_paths[-1]` always points at the *new* patch_text artifact for the current loop.
+- [x] Preserve merged patch output (`ossfuzz_merged_*.diff`) inside `merge_patch_bundle_with_overrides()` (avoid unlinking + reuse; allocate unique name per loop or when the destination exists).
+- [x] Keep patch_key inference working for override artifacts (must remain somewhere under `<multi_run_root>/<patch_key>/...`).
+- [x] Add regression coverage:
+  - [x] Auto-loop scenario that triggers multiple `make_error_patch_override` + `ossfuzz_apply_patch_and_test` calls.
+  - [x] Assert multiple versions of `make_error_patch_override_patch_text_*.diff` and `ossfuzz_apply_patch_and_test_*_output.log` exist after the run.
+  - [x] Assert older step entries’ `artifact_path` files still exist and differ across iterations.
+- [x] Update docs briefly (how to locate per-loop artifacts; how many are retained; any new flag/env var).

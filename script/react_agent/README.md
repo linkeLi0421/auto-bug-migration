@@ -125,7 +125,7 @@ Patch bundle path notes:
 Artifacts (reduce prompt/output size):
 
 - Patch-related tool outputs (diff excerpts / patch slices containing V1-origin `-` lines / generated patches) are persisted under `data/react_agent_artifacts/<patch_key>/` when `patch_key` is known (patch-aware runs). Otherwise they use `data/react_agent_artifacts/<run_id>/`.
-- Files are overwritten by name within the `patch_key` directory (no `.1`, `.2`, ... accumulation).
+- By default, files are overwritten by name within the `patch_key` directory (no `.1`, `.2`, ... accumulation). When `--auto-ossfuzz-loop` is enabled, the agent preserves per-iteration artifacts by allocating unique filenames instead of overwriting.
 - Tool observations replace large fields with `{artifact_path, sha256, bytes, lines}`.
 - Configure with:
   - `--artifact-dir /path/to/dir` (or `REACT_AGENT_ARTIFACT_DIR`)

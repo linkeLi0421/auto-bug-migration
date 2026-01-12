@@ -14,6 +14,7 @@ export REACT_AGENT_ARTIFACT_DIR="$tmp_dir/global_artifacts"
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
 import contextlib
 import io
+import os
 import sys
 
 from script.react_agent.tools.ossfuzz_tools import _run
@@ -26,6 +27,68 @@ with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
 assert out_buf.getvalue() == "", out_buf.getvalue()
 assert "[ossfuzz_apply_patch_and_test]" in err_buf.getvalue(), err_buf.getvalue()
 assert res["output"].strip() == "hello", res
+PY
+
+# Merged patch output should not overwrite prior iterations (unique paths).
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os
+import pickle
+import sys
+from pathlib import Path
+
+tmp_dir = Path(sys.argv[1]).resolve()
+allow_root = Path(os.environ["REACT_AGENT_ARTIFACT_DIR"]).expanduser().resolve()
+allow_root.mkdir(parents=True, exist_ok=True)
+
+sys.path.insert(0, str(Path.cwd() / "script"))
+from migration_tools.types import PatchInfo  # noqa: E402
+
+bundle_path = tmp_dir / "bundle_merge.patch2"
+patch_text = (
+    "diff --git a/libxml2/hash.c b/libxml2/hash.c\n"
+    "--- a/libxml2/hash.c\n"
+    "+++ b/libxml2/hash.c\n"
+    "@@ -1,1 +1,1 @@\n"
+    "-old\n"
+    "+new\n"
+)
+patches = {
+    "p1": PatchInfo(
+        file_path_old="libxml2/hash.c",
+        file_path_new="libxml2/hash.c",
+        patch_text=patch_text,
+        file_type="source",
+        old_start_line=1,
+        old_end_line=1,
+        new_start_line=1,
+        new_end_line=1,
+    )
+}
+bundle_path.write_bytes(pickle.dumps(patches))
+
+override_dir = allow_root / "p1"
+override_dir.mkdir(parents=True, exist_ok=True)
+override_path = override_dir / "override.diff"
+override_path.write_text(patch_text + ("\n" if not patch_text.endswith("\n") else ""), encoding="utf-8")
+
+from script.react_agent.tools.ossfuzz_tools import merge_patch_bundle_with_overrides  # noqa: E402
+
+out1 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(override_path)],
+    output_name="ossfuzz_merged.diff",
+)
+out2 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(override_path)],
+    output_name="ossfuzz_merged.diff",
+)
+
+p1 = Path(out1["merged_patch_file_path"]).resolve()
+p2 = Path(out2["merged_patch_file_path"]).resolve()
+assert p1.is_file(), p1
+assert p2.is_file(), p2
+assert p1 != p2, (p1, p2)
 PY
 
 bundle_path="$tmp_dir/bundle.patch2"

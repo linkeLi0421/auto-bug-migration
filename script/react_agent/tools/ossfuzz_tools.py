@@ -52,6 +52,19 @@ def _validate_under_root(path: Path, root: Path) -> None:
         raise ValueError(f"Path must be under artifact root: {root}") from exc
 
 
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for i in range(1, 10_000):
+        candidate = parent / f"{stem}.{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate unique artifact path for: {path}")
+
+
 def _allowed_patch_roots_from_env() -> list[str] | None:
     raw = os.environ.get("REACT_AGENT_PATCH_ALLOWED_ROOTS", "").strip()
     if not raw:
@@ -82,7 +95,7 @@ def merge_patch_bundle_with_overrides(
     - Loads `patch_path` (a `*.patch2` bundle).
     - For each override file path, infers the `patch_key` from its parent directories and replaces
       that patch entry's `patch_text`.
-    - Writes the merged patch file under the artifact allow-root, overwriting by filename.
+    - Writes the merged patch file under the artifact allow-root, allocating a unique name if needed.
     """
     bundle = load_patch_bundle(patch_path, allowed_roots=_allowed_patch_roots_from_env())
     patch_keys = set(bundle.patches.keys())
@@ -127,13 +140,8 @@ def merge_patch_bundle_with_overrides(
         if str(allow_root.name) != str(only_key):
             out_dir = (allow_root / only_key).resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = (out_dir / out_name).resolve()
+    out_path = _unique_path((out_dir / out_name).resolve())
     _validate_under_root(out_path, allow_root)
-    if out_path.exists():
-        try:
-            out_path.unlink()
-        except IsADirectoryError as exc:
-            raise RuntimeError(f"Merged patch output path is a directory: {out_path}") from exc
     out_path.write_text(merged_text, encoding="utf-8", errors="replace")
 
     return {

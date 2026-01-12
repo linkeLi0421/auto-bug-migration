@@ -834,15 +834,21 @@ with tempfile.TemporaryDirectory() as td:
     build_1_path.write_text(build_1, encoding="utf-8")
     check_1_path.write_text("", encoding="utf-8")
 
-    # Second OSS-Fuzz run: clean (no compiler errors), so the auto-loop stops.
-    ossfuzz_2 = {"build_output": "build ok\n", "check_build_output": "check ok\n"}
+    # Second OSS-Fuzz run: still has a compiler error in the same patch_key, so the auto-loop iterates again.
+    ossfuzz_2 = {
+        "build_output": "/src/libxml2/error.c:52:1: error: unknown type name 'foo2_t'\n",
+        "check_build_output": "",
+    }
+
+    # Third OSS-Fuzz run: clean (no compiler errors), so the auto-loop stops.
+    ossfuzz_3 = {"build_output": "build ok\n", "check_build_output": "check ok\n"}
 
     cfg = AgentConfig(
         max_steps=20,
         tools_mode="fake",
         error_scope="patch",
         auto_ossfuzz_loop=True,
-        ossfuzz_loop_max=2,
+        ossfuzz_loop_max=3,
     )
     initial_error = "/src/libxml2/error.c:51:1: error: expected ';' after top level declarator"
     st = AgentState(
@@ -877,8 +883,8 @@ with tempfile.TemporaryDirectory() as td:
     )
 
     model = BasePreservingModel()
-    runner = FakeRunner(ossfuzz_outputs=[ossfuzz_2])
-    store = ArtifactStore(root, overwrite=True)
+    runner = FakeRunner(ossfuzz_outputs=[ossfuzz_2, ossfuzz_3])
+    store = ArtifactStore(root, overwrite=False)
 
     final = _run_langgraph(model, runner, st, cfg, artifact_store=store)
     assert final.get("type") == "final", final
@@ -889,8 +895,8 @@ with tempfile.TemporaryDirectory() as td:
     # The second-iteration patching should not restart patch mapping; it should read the BASE slice and patch again.
     # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
     assert "read_artifact" in runner.calls, runner.calls
-    assert "make_error_patch_override" in runner.calls, runner.calls
-    assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 1, runner.calls
+    assert runner.calls.count("make_error_patch_override") >= 2, runner.calls
+    assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 2, runner.calls
     assert "get_error_patch_context" not in runner.calls, runner.calls
     assert "get_error_v1_code_slice" not in runner.calls, runner.calls
 
@@ -907,6 +913,39 @@ with tempfile.TemporaryDirectory() as td:
     assert initial_error in rendered, rendered
     assert "unknown type name 'foo_t'" in rendered, rendered
     assert "tool: get_error_patch_context" in rendered, rendered
+
+    # Artifact preservation: repeated patch/log artifacts must not overwrite prior iterations.
+    patch_text_versions = sorted(root.glob("make_error_patch_override_patch_text_error.c*.diff"))
+    assert len(patch_text_versions) >= 2, patch_text_versions
+    build_log_versions = sorted(root.glob("ossfuzz_apply_patch_and_test_build_output*.log"))
+    assert len(build_log_versions) >= 2, build_log_versions
+
+    def artifact_path(val):
+        if isinstance(val, dict):
+            return str(val.get("artifact_path") or "").strip()
+        if isinstance(val, str):
+            return val.strip()
+        return ""
+
+    patch_text_artifacts = []
+    build_output_artifacts = []
+    for s in steps:
+        obs = s.get("observation") if isinstance(s.get("observation"), dict) else {}
+        if str(obs.get("tool") or "") == "make_error_patch_override":
+            out = obs.get("output") if isinstance(obs.get("output"), dict) else {}
+            ap = artifact_path(out.get("patch_text"))
+            if ap:
+                patch_text_artifacts.append(Path(ap))
+        if str(obs.get("tool") or "") == "ossfuzz_apply_patch_and_test":
+            out = obs.get("output") if isinstance(obs.get("output"), dict) else {}
+            ap = artifact_path(out.get("build_output"))
+            if ap and "ossfuzz_apply_patch_and_test_build_output" in Path(ap).name:
+                build_output_artifacts.append(Path(ap))
+
+    assert len(set(patch_text_artifacts)) >= 2, patch_text_artifacts
+    assert all(p.is_file() for p in patch_text_artifacts), patch_text_artifacts
+    assert len(set(build_output_artifacts)) >= 2, build_output_artifacts
+    assert all(p.is_file() for p in build_output_artifacts), build_output_artifacts
 
 print("OK")
 PY
