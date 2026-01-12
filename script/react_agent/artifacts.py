@@ -194,7 +194,6 @@ def default_run_id() -> str:
 
 def resolve_artifact_dir(
     *,
-    cli_dir: str,
     disabled: bool,
     patch_key: str = "",
     patch_key_overwrite: bool = True,
@@ -207,14 +206,6 @@ def resolve_artifact_dir(
     """
     if disabled:
         return None, ""
-
-    explicit = str(cli_dir or "").strip()
-    if not explicit:
-        explicit = str(os.environ.get("REACT_AGENT_ARTIFACT_DIR", "") or "").strip()
-
-    if explicit:
-        store = ArtifactStore(explicit)
-        return store, str(store.root)
 
     root_raw = str(os.environ.get("REACT_AGENT_ARTIFACT_ROOT", "") or "").strip()
     if root_raw:

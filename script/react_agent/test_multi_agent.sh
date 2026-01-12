@@ -9,7 +9,6 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 export REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir"
 export REACT_AGENT_ARTIFACT_ROOT="$tmp_dir/artifacts"
-export REACT_AGENT_ARTIFACT_DIR="$tmp_dir/global_artifacts"
 
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
 import contextlib
@@ -37,7 +36,7 @@ import sys
 from pathlib import Path
 
 tmp_dir = Path(sys.argv[1]).resolve()
-allow_root = Path(os.environ["REACT_AGENT_ARTIFACT_DIR"]).expanduser().resolve()
+allow_root = Path(os.environ["REACT_AGENT_ARTIFACT_ROOT"]).expanduser().resolve()
 allow_root.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(Path.cwd() / "script"))
@@ -181,7 +180,6 @@ for r in obj["results"]:
     assert "target_fixed" in r, r
     assert "ossfuzz_verdict" in r, r
     assert "patch_key_verdict" in r, r
-    # Ensure the spawned agent did not inherit the global REACT_AGENT_ARTIFACT_DIR.
     agent = json.loads(Path(r["agent_stdout_path"]).read_text(encoding="utf-8", errors="replace"))
     artifacts_dir = (agent.get("error") or {}).get("artifacts_dir", "")
     assert artifacts_dir, agent

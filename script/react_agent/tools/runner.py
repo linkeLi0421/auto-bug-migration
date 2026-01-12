@@ -347,36 +347,31 @@ class ToolRunner:
 
             if tool == "get_error_v1_code_slice":
                 excerpt = args.get("excerpt")
-                patch_path = str(args.get("patch_path", "")).strip()
-                file_path = str(args.get("file_path", "")).strip()
-                line_number = _as_int(args.get("line_number"), 0)
-                max_lines = _as_int(args.get("max_lines"), 200)
-                max_chars = _as_int(args.get("max_chars"), 12000)
                 if excerpt is None:
-                    if not patch_path:
-                        return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path (or provide excerpt)")
-                    if not file_path:
-                        return ToolObservation(False, tool, args, output="", error="Missing arg: file_path (or provide excerpt)")
-                    if line_number <= 0:
-                        return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number (or provide excerpt)")
+                    return ToolObservation(
+                        False,
+                        tool,
+                        args,
+                        output="",
+                        error="Missing arg: excerpt (pass excerpt={artifact_path: ...} from get_error_patch_context).",
+                    )
+                if isinstance(excerpt, dict):
+                    ap = str(excerpt.get("artifact_path", "") or "").strip()
+                    if not ap:
+                        return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (missing artifact_path)")
+                elif isinstance(excerpt, str):
+                    if not excerpt.strip():
+                        return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (empty string)")
+                else:
+                    return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (expected string or {artifact_path})")
                 out = get_error_v1_code_slice_tool(
-                    patch_path=patch_path,
-                    file_path=file_path,
-                    line_number=line_number,
                     excerpt=excerpt,
-                    max_lines=max_lines,
-                    max_chars=max_chars,
                 )
                 return ToolObservation(
                     True,
                     tool,
                     {
-                        "excerpt": excerpt,
-                        "patch_path": patch_path,
-                        "file_path": file_path,
-                        "line_number": line_number,
-                        "max_lines": max_lines,
-                        "max_chars": max_chars,
+                        "excerpt": excerpt if not isinstance(excerpt, str) else excerpt[:2000],
                     },
                     output=out,
                 )

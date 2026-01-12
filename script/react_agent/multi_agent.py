@@ -321,10 +321,6 @@ def main(argv: List[str]) -> int:
     results: List[Dict[str, Any]] = []
     env = dict(os.environ)
     env["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
-    # Important: multi-agent runs must not inherit a global REACT_AGENT_ARTIFACT_DIR, otherwise
-    # override patch artifacts will be written outside the per-hunk patch_key directory and OSS-Fuzz
-    # tooling won't be able to infer patch_key from the override path.
-    env.pop("REACT_AGENT_ARTIFACT_DIR", None)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
     def run_one(patch_key: str, idx: int) -> tuple[int, Dict[str, Any]]:
