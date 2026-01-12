@@ -951,6 +951,91 @@ def _extract_first_code_fence(text: str) -> str:
     return raw.replace("```", "").strip()
 
 
+_C_CONTROL_KEYWORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "sizeof",
+    "case",
+    "do",
+}
+
+
+def _guess_c_function_name_from_line(line: str) -> Optional[str]:
+    """Heuristically extract a C function name from a likely signature line.
+
+    This intentionally avoids full C parsing. It's used as a defensive check to
+    prevent accidentally replacing a single-function slice with a multi-function
+    snippet (common for long "tail"/merged-function patches).
+    """
+    s = str(line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+    if "(" not in s:
+        return None
+    if s.endswith(";"):
+        # Prototype or global declaration.
+        return None
+    prefix = s.split("(", 1)[0].strip()
+    if "(*" in prefix:
+        # Likely a function pointer declaration.
+        return None
+    m = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", prefix)
+    if not m:
+        return None
+    name = str(m.group(1))
+    if name in _C_CONTROL_KEYWORDS:
+        return None
+    return name
+
+
+def _extract_top_level_c_function_by_name(code: str, func_name: str) -> Optional[str]:
+    """Extract a top-level C function definition by name (best-effort)."""
+    target = str(func_name or "").strip()
+    if not target:
+        return None
+    lines = str(code or "").replace("\r\n", "\n").replace("\r", "\n").splitlines()
+
+    depth = 0
+    for i, line in enumerate(lines):
+        if depth == 0 and _guess_c_function_name_from_line(line) == target:
+            # Include a small signature preamble (return type/attributes on prior lines).
+            start = i
+            for _ in range(12):
+                if start <= 0:
+                    break
+                prev = lines[start - 1]
+                p = prev.strip()
+                if not p or p.startswith("#") or p.endswith(";") or p.endswith("}"):
+                    break
+                start -= 1
+
+            brace_depth = 0
+            seen_open = False
+            for j in range(i, len(lines)):
+                for ch in lines[j]:
+                    if ch == "{":
+                        brace_depth += 1
+                        seen_open = True
+                    elif ch == "}":
+                        if seen_open:
+                            brace_depth -= 1
+                if seen_open and brace_depth == 0:
+                    return "\n".join(lines[start : j + 1]).rstrip("\n")
+            return None
+
+        # Update nesting depth to keep signature detection at file scope.
+        for ch in line:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth = max(depth - 1, 0)
+
+    return None
+
+
 def _truncate_text(*, text: str, max_lines: int, max_chars: int) -> Tuple[str, bool, int, int]:
     lines = (text or "").splitlines()
     total_lines = len(lines)
@@ -1055,10 +1140,37 @@ def make_error_patch_override(
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
 
-    new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
-
     def _norm_for_compare(text: str) -> str:
         return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
+
+    new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
+
+    # Defensive sanitize: the mapped slice is often a single function definition (especially for
+    # "tail"/merged-function patches). If the model returns a multi-function snippet, extract only
+    # the intended function and drop extra top-level helpers to avoid redefinition errors.
+    old_name: Optional[str] = None
+    old_name_line = next(
+        (l for l in old_func_code_full.splitlines() if _guess_c_function_name_from_line(l)), None
+    )
+    if old_name_line:
+        old_name = _guess_c_function_name_from_line(old_name_line)
+    if old_name:
+        old_extracted = _extract_top_level_c_function_by_name(old_func_code_full, old_name)
+        if old_extracted and _norm_for_compare(old_extracted) == _norm_for_compare(old_func_code_full):
+            new_extracted = _extract_top_level_c_function_by_name(new_code_norm, old_name)
+            if not new_extracted:
+                raise ValueError(
+                    f"new_func_code must contain a full definition of {old_name} (the mapped slice is a single function)"
+                )
+            if _norm_for_compare(new_extracted) != _norm_for_compare(new_code_norm):
+                new_code_norm = new_extracted
+                sanitized_new_note = f" Sanitized new_func_code to only replace {old_name}."
+            else:
+                sanitized_new_note = ""
+        else:
+            sanitized_new_note = ""
+    else:
+        sanitized_new_note = ""
 
     if _norm_for_compare(old_func_code_full) == _norm_for_compare(new_code_norm):
         raise ValueError("new_func_code is identical to the existing mapped '-' slice (no-op rewrite)")
@@ -1181,6 +1293,7 @@ def make_error_patch_override(
             "Rewrote the patch bundle's mapped patch slice by replacing '-' lines with the provided code. "
             "Use the returned patch_text to update the patch bundle entry."
             + patch_hiden_note
+            + sanitized_new_note
         ),
     }
     if hiden_func_dict_updated is not None:

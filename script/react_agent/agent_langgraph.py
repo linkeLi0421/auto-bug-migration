@@ -3014,6 +3014,7 @@ def main(argv: List[str]) -> int:
         cli_dir=str(getattr(args, "artifact_dir", "") or ""),
         disabled=bool(args.no_artifacts),
         patch_key=patch_key,
+        patch_key_overwrite=not bool(cfg.auto_ossfuzz_loop),
     )
     if artifact_store and artifacts_dir:
         os.environ["REACT_AGENT_ARTIFACT_DIR"] = artifacts_dir
