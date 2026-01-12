@@ -23,9 +23,6 @@ def _repo_root() -> Path:
 
 
 def _artifact_allow_root() -> Path:
-    explicit = str(os.environ.get("REACT_AGENT_ARTIFACT_DIR", "") or "").strip()
-    if explicit:
-        return Path(explicit).expanduser().resolve()
     root = str(os.environ.get("REACT_AGENT_ARTIFACT_ROOT", "") or "").strip()
     if root:
         return Path(root).expanduser().resolve()

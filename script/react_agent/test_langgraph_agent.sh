@@ -38,7 +38,7 @@ from script.react_agent.artifacts import resolve_artifact_dir  # noqa: E402
 
 with tempfile.TemporaryDirectory() as td:
     os.environ["REACT_AGENT_ARTIFACT_ROOT"] = td
-    store, out_dir = resolve_artifact_dir(cli_dir="", disabled=False, patch_key="_extra_encoding.c")
+    store, out_dir = resolve_artifact_dir(disabled=False, patch_key="_extra_encoding.c")
     assert Path(out_dir).name == "_extra_encoding.c", out_dir
 
 print("OK")
@@ -426,7 +426,7 @@ bundle_fixture="$SCRIPT_DIR/fixtures/definition_bundle"
 v_json="$bundle_fixture/json"
 v_src="$bundle_fixture/src"
 
-output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_DIR="$artifact_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
+output="$(REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir" REACT_AGENT_ARTIFACT_ROOT="$artifact_dir" "$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" \
   --model stub --tools real --max-steps 4 --error-scope patch --patch-path "$bundle_path" \
   --ossfuzz-project example --ossfuzz-commit deadbeef \
   --v1-json-dir "$v_json" --v2-json-dir "$v_json" --v1-src "$v_src" --v2-src "$v_src" \
@@ -443,7 +443,7 @@ script_dir = Path(sys.argv[2]).resolve()
 artifact_dir = Path(sys.argv[3]).resolve()
 
 sys.path.insert(0, str(script_dir))
-os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(artifact_dir)
+os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifact_dir)
 
 from tools.artifact_tools import read_artifact  # noqa: E402
 
@@ -493,7 +493,7 @@ state = AgentState(
 
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
-    os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(root)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(root)
 
     big = root / "big.txt"
     lines = ["HEADER"] + [f"LINE{i:05d} " + ("X" * 80) for i in range(300)] + ["TAIL"]
@@ -564,10 +564,10 @@ artifact_root = Path(sys.argv[3]).resolve()
 sys.path.insert(0, str(script_dir))
 
 os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(bundle_path.parent)
+os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifact_root)
 
 artifact_dir = (artifact_root / "p2").resolve()
 artifact_dir.mkdir(parents=True, exist_ok=True)
-os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(artifact_dir)
 
 from tools.ossfuzz_tools import merge_patch_bundle_with_overrides  # noqa: E402
 
@@ -809,7 +809,7 @@ class BasePreservingModel:
 with tempfile.TemporaryDirectory() as td:
     root = Path(td).resolve()
     os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
-    os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(root)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(root)
 
     # Use the existing patch2 fixture bundle (decoded into an allowed root).
     bundle_b64 = (script_dir / "../migration_tools/fixtures/sample.patch2.b64").resolve()

@@ -29,6 +29,7 @@ bundle_path.write_bytes(data)
 from script.migration_tools.patch_bundle import load_patch_bundle
 from script.migration_tools.tools import (
     get_error_patch,
+    get_error_patch_context,
     get_error_v1_code_slice,
     get_patch,
     list_patch_bundle,
@@ -62,17 +63,15 @@ assert err["patch_key"] == "p2", err
 assert err["old_signature"] and "bar" in err["old_signature"], err
 assert err["func_start_index"] is not None, err
 
-func = get_error_v1_code_slice(
+ctx = get_error_patch_context(
     patch_path=str(bundle_path),
     file_path="/src/libxml2/error.c",
     line_number=52,
-    max_lines=200,
-    max_chars=20000,
+    error_text="/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'",
     allowed_roots=allowed_roots,
 )
+func = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
 json.dumps(func)
-assert func["patch_key"] == "p2", func
-assert func.get("old_signature") and "bar" in func["old_signature"], func
 assert func.get("func_code") and "ctx2" in func["func_code"], func
 
 replacement = "ctx2_fixed\nctx2_extra"
@@ -107,7 +106,84 @@ assert any(i.get("kind") == "unknown_type_name" for i in parsed.get("undeclared_
 print("OK")
 PY
 
-# get_error_v1_code_slice: by default (max_lines=0/max_chars=0), return full text and never inject a "[truncated]" marker.
+# get_error_patch_context should return the entire unified-diff hunk, even if the hunk is large.
+bundle_path="$tmp_dir/_fixture_large_hunk.patch2"
+
+"$PYTHON" - "$bundle_path" <<'PY'
+import json
+import pickle
+import sys
+from pathlib import Path
+
+bundle_path = Path(sys.argv[1])
+allowed_roots = [str(bundle_path.parent)]
+
+repo_root = bundle_path.parents[4]
+script_dir = repo_root / "script"
+sys.path.insert(0, str(script_dir))
+
+from migration_tools.patch_bundle import load_patch_bundle
+from migration_tools.tools import get_error_patch_context
+from migration_tools.types import PatchInfo
+
+minus_lines = [f"-LINE{i:04d}" for i in range(1100)]
+patch_text = "\n".join(
+    [
+        "diff --git a/x.c b/x.c",
+        "--- a/x.c",
+        "+++ b/x.c",
+        "@@ -1,1100 +1,0 @@",
+        *minus_lines,
+        "",
+    ]
+)
+
+data = {
+    "p1": PatchInfo(
+        file_path_old="x.c",
+        file_path_new="x.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=1100,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type=set(["Function body change"]),
+    )
+}
+bundle_path.write_bytes(pickle.dumps(data))
+bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
+assert list(bundle.patches.keys()) == ["p1"], list(bundle.patches.keys())
+
+out = get_error_patch_context(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/x.c",
+    line_number=10,
+    context_lines=0,
+    max_total_lines=1,
+    allowed_roots=allowed_roots,
+)
+json.dumps(out)
+
+assert out.get("excerpt_truncated") is False, out
+excerpt = out.get("excerpt") or ""
+assert "@@ -1,1100 +1,0 @@" in excerpt, excerpt[:200]
+assert "-LINE0000" in excerpt and "-LINE1099" in excerpt, excerpt[-200:]
+
+hunk_total = int(out.get("hunk_lines_total") or 0)
+assert hunk_total >= 1101, hunk_total  # header + 1100 '-' lines
+
+lines = excerpt.splitlines()
+assert lines and lines[0].startswith("diff --git "), lines[:4]
+hunk_idx = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+assert hunk_idx >= 0, lines[:10]
+minus_count = sum(1 for l in lines[hunk_idx + 1 :] if l.startswith("-") and not l.startswith("---"))
+assert minus_count == 1100, minus_count
+
+print("OK")
+PY
+
+# get_error_v1_code_slice: return full text and never inject a "[truncated]" marker.
 "$PYTHON" - <<'PY'
 import json
 
@@ -133,13 +209,6 @@ assert out["func_code_truncated"] is False, out
 code = out.get("func_code") or ""
 assert "...[truncated]" not in code, code[-200:]
 
-limited = get_error_v1_code_slice(excerpt=diff_text, max_lines=3, max_chars=50)
-json.dumps(limited)
-assert limited["func_code_lines_total"] == 50, limited
-assert limited["func_code_lines_returned"] == 3, limited
-assert limited["func_code_truncated"] is True, limited
-assert "...[truncated]" not in (limited.get("func_code") or ""), limited
-
 print("OK")
 PY
 
@@ -160,7 +229,7 @@ script_dir = repo_root / "script"
 sys.path.insert(0, str(script_dir))
 
 from migration_tools.patch_bundle import load_patch_bundle
-from migration_tools.tools import get_error_patch, get_error_v1_code_slice, make_error_patch_override
+from migration_tools.tools import get_error_patch, get_error_patch_context, get_error_v1_code_slice, make_error_patch_override
 from migration_tools.types import PatchInfo
 
 patch_text = "\n".join(
@@ -202,14 +271,13 @@ json.dumps(err)
 assert err["patch_key"] == "p1", err
 assert err["func_start_index"] is not None and err["func_end_index"] is not None, err
 
-code = get_error_v1_code_slice(
+ctx = get_error_patch_context(
     patch_path=str(bundle_path),
     file_path="/src/libxml2/encoding.c",
     line_number=101,
-    max_lines=200,
-    max_chars=20000,
     allowed_roots=allowed_roots,
 )
+code = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
 json.dumps(code)
 assert "#define FOO 1" in (code.get("func_code") or ""), code
 defined = set(code.get("defined_macros") or [])
@@ -251,7 +319,7 @@ script_dir = repo_root / "script"
 sys.path.insert(0, str(script_dir))
 
 from migration_tools.patch_bundle import load_patch_bundle
-from migration_tools.tools import get_error_v1_code_slice, make_error_patch_override
+from migration_tools.tools import get_error_patch_context, get_error_v1_code_slice, make_error_patch_override
 from migration_tools.types import PatchInfo
 
 patch_text = "\n".join(
@@ -284,14 +352,13 @@ bundle_path.write_bytes(pickle.dumps(data))
 bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
 assert list(bundle.patches.keys()) == ["p1"], list(bundle.patches.keys())
 
-code = get_error_v1_code_slice(
+ctx = get_error_patch_context(
     patch_path=str(bundle_path),
     file_path="/src/libxml2/encoding.c",
     line_number=100,
-    max_lines=200,
-    max_chars=20000,
     allowed_roots=allowed_roots,
 )
+code = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
 json.dumps(code)
 missing = set(code.get("macro_tokens_not_defined_in_slice") or [])
 assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
@@ -342,7 +409,7 @@ from script.migration_tools.tools import get_error_v1_code_slice  # noqa: E402
 
 artifact_dir = tmp_dir / "artifacts"
 artifact_dir.mkdir(parents=True, exist_ok=True)
-os.environ["REACT_AGENT_ARTIFACT_DIR"] = str(artifact_dir)
+os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifact_dir)
 
 excerpt_path = artifact_dir / "excerpt.diff"
 excerpt_path.write_text(
@@ -361,7 +428,7 @@ excerpt_path.write_text(
     errors="replace",
 )
 
-out = get_error_v1_code_slice(excerpt={"artifact_path": str(excerpt_path)}, max_lines=200, max_chars=20000)
+out = get_error_v1_code_slice(excerpt={"artifact_path": str(excerpt_path)})
 code = out.get("func_code") or ""
 assert "MAKE_HANDLER" in code, code
 missing = set(out.get("macro_tokens_not_defined_in_slice") or [])

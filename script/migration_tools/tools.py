@@ -630,31 +630,44 @@ def get_error_patch_context(
             "mapping_note": "No matching patch_key; cannot derive pre-patch mapping.",
         }
 
-    ctx = max(0, min(int(context_lines or 0), 100))
-    max_total = max(0, min(int(max_total_lines or 0), 500))
-
     patch = bundle.patches[str(patch_key)]
     patch_lines = (patch.patch_text or "").splitlines()
     total = len(patch_lines)
 
-    start = 0
-    end = total
+    # Return the entire unified-diff hunk containing the mapped slice.
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+
+    anchor = first_hunk_idx if first_hunk_idx >= 0 else 0
     func_start = mapping.get("func_start_index")
-    func_end = mapping.get("func_end_index")
-    if isinstance(func_start, int) and isinstance(func_end, int) and func_start >= 0 and func_end >= 0:
-        start = max(func_start - ctx, 0)
-        end = min(func_end + ctx, total)
+    if isinstance(func_start, int) and func_start >= 0:
+        anchor = max(0, min(body_start + func_start, total - 1))
+
+    hunk_start = first_hunk_idx
+    if anchor >= 0:
+        for i in range(anchor, -1, -1):
+            if patch_lines[i].startswith("@@"):
+                hunk_start = i
+                break
+
+    file_header_end = first_hunk_idx if first_hunk_idx >= 0 else 0
+    file_header_lines = patch_lines[:file_header_end] if file_header_end > 0 else []
+
+    if hunk_start is None or hunk_start < 0:
+        # No hunks found; return the whole patch text.
+        excerpt_lines = patch_lines
+        hunk_start = 0
+        hunk_end = total
     else:
-        hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), 0)
-        start = max(hunk_idx - ctx, 0)
-        end = min(hunk_idx + ctx + 1, total)
+        hunk_end = total
+        for j in range(hunk_start + 1, total):
+            line = patch_lines[j]
+            if line.startswith("@@") or line.startswith("diff --git "):
+                hunk_end = j
+                break
+        excerpt_lines = file_header_lines + patch_lines[hunk_start:hunk_end]
 
-    original_len = max(end - start, 0)
-    if original_len > max_total:
-        end = min(start + max_total, total)
-
-    excerpt_lines = patch_lines[start:end]
-    excerpt_truncated = original_len > len(excerpt_lines)
+    excerpt_truncated = False
 
     hunks = _iter_hunks(patch.patch_text or "")
     migrated_side = _infer_migrated_side(patch.patch_text or "")
@@ -711,9 +724,15 @@ def get_error_patch_context(
     return {
         **mapping,
         "patch_text_lines_total": total,
-        "excerpt_line_range": [start, end],
+        "hunk_line_range": [hunk_start, hunk_end],
+        "hunk_lines_total": max(hunk_end - hunk_start, 0),
+        "excerpt_line_range": [hunk_start, hunk_end],
         "excerpt_truncated": excerpt_truncated,
-        "excerpt": "\n".join(excerpt_lines),
+        "excerpt": ("\n".join(excerpt_lines).rstrip("\n") + "\n") if excerpt_lines else "",
+        "excerpt_note": (
+            "Returned the full unified-diff hunk containing the mapped slice (from @@ header to next @@/diff/EOF). "
+            "The excerpt includes the file-level diff header (diff --git/---/+++) to make it applyable."
+        ),
         "symbols": symbols,
         "pre_patch_file_path": pre_patch_file_path or None,
         "pre_patch_line_number": pre_patch_line_number,
@@ -730,11 +749,8 @@ def _is_allowed_artifact_path(path: Path) -> bool:
     p = path.expanduser().resolve()
     if not p.is_file():
         return False
-    env_dir = str(os.environ.get("REACT_AGENT_ARTIFACT_DIR", "") or "").strip()
     env_root = str(os.environ.get("REACT_AGENT_ARTIFACT_ROOT", "") or "").strip()
     allowed: List[Path] = []
-    if env_dir:
-        allowed.append(Path(env_dir).expanduser().resolve())
     if env_root:
         allowed.append(Path(env_root).expanduser().resolve())
     allowed.append((_repo_root() / "data" / "react_agent_artifacts").resolve())
@@ -782,117 +798,20 @@ def _extract_minus_lines_from_unified_diff(diff_text: str) -> List[str]:
 
 def get_error_v1_code_slice(
     *,
-    patch_path: str = "",
-    file_path: str = "",
-    line_number: int = 0,
-    excerpt: Any = None,
-    max_lines: int = 0,
-    max_chars: int = 0,
+    excerpt: Any,
     allowed_roots: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Extract the V1-origin code slice for a build error from a patch bundle.
+    """Extract V1-origin code from '-' lines in a unified-diff excerpt.
 
-    This reuses the same mapping logic as `get_error_patch` to obtain
-    `(patch_key, old_signature, func_start_index, func_end_index)` and then
-    reconstructs the V1-origin code from `-` lines in that patch slice.
+    The excerpt is typically provided by `get_error_patch_context.excerpt` as either:
+    - a string containing a unified diff, or
+    - an object like {"artifact_path": "..."} pointing at a saved excerpt file.
     """
-    if excerpt is not None:
-        func_lines = _extract_minus_lines_from_unified_diff(_load_excerpt_text(excerpt))
-        total_lines = len(func_lines)
+    _ = allowed_roots  # kept for backward compatibility with other tool signatures
 
-        defined_macros: set[str] = set()
-        for line in func_lines:
-            m = re.match(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
-            if m:
-                defined_macros.add(str(m.group(1)))
-
-        referenced_macro_tokens: set[str] = set()
-        for line in func_lines:
-            stripped = re.sub(r'"([^"\\]|\\.)*"', '""', line)
-            stripped = re.sub(r"//.*$", "", stripped)
-            stripped = re.sub(r"/\*.*?\*/", "", stripped)
-            for tok in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", stripped):
-                if tok.isupper() and any(c.isalpha() for c in tok):
-                    referenced_macro_tokens.add(tok)
-
-        missing_macro_tokens = referenced_macro_tokens - defined_macros
-        defined_macros_list = sorted(defined_macros)[:200]
-        referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
-        missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
-
-        max_n_raw = int(max_lines or 0)
-        max_n = None if max_n_raw == 0 else max(0, min(max_n_raw, 1_000_000))
-        returned_lines = func_lines if max_n is None else func_lines[:max_n]
-        code = "\n".join(returned_lines)
-        truncated = total_lines > len(returned_lines)
-
-        if max_chars is not None:
-            max_c_raw = int(max_chars or 0)
-            max_c = None if max_c_raw == 0 else max(0, min(max_c_raw, 50_000_000))
-            if max_c and len(code) > max_c:
-                code = code[:max_c].rstrip("\n")
-                truncated = True
-
-        return {
-            "patch_path": str(patch_path or ""),
-            "file_path": str(file_path or ""),
-            "line_number": int(line_number or 0),
-            "patch_key": "",
-            "old_signature": "",
-            "func_start_index": None,
-            "func_end_index": None,
-            "func_code": code,
-            "func_code_lines_total": total_lines,
-            "func_code_lines_returned": len(returned_lines),
-            "func_code_truncated": truncated,
-            "defined_macros": defined_macros_list,
-            "referenced_macro_tokens": referenced_macro_tokens_list,
-            "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
-            "note": "Extracted from '-' lines in a unified-diff excerpt (typically get_error_patch_context.excerpt).",
-        }
-
-    if not patch_path:
-        raise ValueError("patch_path is required when excerpt is not provided")
-    if not file_path:
-        raise ValueError("file_path is required when excerpt is not provided")
-    if int(line_number or 0) <= 0:
-        raise ValueError("line_number must be > 0 when excerpt is not provided")
-
-    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
-    mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
-    patch_key = mapping.get("patch_key")
-
-    if not patch_key or str(patch_key) not in bundle.patches:
-        return {
-            **mapping,
-            "func_code": "",
-            "func_code_lines_total": 0,
-            "func_code_lines_returned": 0,
-            "func_code_truncated": False,
-            "note": "No matching patch_key; cannot extract V1-origin code.",
-        }
-
-    func_start = mapping.get("func_start_index")
-    func_end = mapping.get("func_end_index")
-    if not isinstance(func_start, int) or not isinstance(func_end, int) or func_start < 0 or func_end < 0:
-        return {
-            **mapping,
-            "func_code": "",
-            "func_code_lines_total": 0,
-            "func_code_lines_returned": 0,
-            "func_code_truncated": False,
-            "note": "Patch mapping lacks a rewriteable '-' slice; cannot extract V1-origin code.",
-        }
-
-    patch = bundle.patches[str(patch_key)]
-    patch_lines = (patch.patch_text or "").splitlines()
-    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
-    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
-    body = patch_lines[body_start:] if body_start < len(patch_lines) else []
-    slice_lines = body[func_start:func_end] if func_end > func_start else []
-
-    func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
+    func_lines = _extract_minus_lines_from_unified_diff(_load_excerpt_text(excerpt))
     total_lines = len(func_lines)
+
     defined_macros: set[str] = set()
     for line in func_lines:
         m = re.match(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", line)
@@ -901,7 +820,6 @@ def get_error_v1_code_slice(
 
     referenced_macro_tokens: set[str] = set()
     for line in func_lines:
-        # Drop simple strings/comments to reduce noisy tokens; this is heuristic, not a preprocessor.
         stripped = re.sub(r'"([^"\\]|\\.)*"', '""', line)
         stripped = re.sub(r"//.*$", "", stripped)
         stripped = re.sub(r"/\*.*?\*/", "", stripped)
@@ -910,34 +828,28 @@ def get_error_v1_code_slice(
                 referenced_macro_tokens.add(tok)
 
     missing_macro_tokens = referenced_macro_tokens - defined_macros
-    # Bound output size.
     defined_macros_list = sorted(defined_macros)[:200]
     referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
     missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
 
-    max_n_raw = int(max_lines or 0)
-    max_n = None if max_n_raw == 0 else max(0, min(max_n_raw, 1_000_000))
-    returned_lines = func_lines if max_n is None else func_lines[:max_n]
-    code = "\n".join(returned_lines)
-
-    truncated = total_lines > len(returned_lines)
-    if max_chars is not None:
-        max_c_raw = int(max_chars or 0)
-        max_c = None if max_c_raw == 0 else max(0, min(max_c_raw, 50_000_000))
-        if max_c and len(code) > max_c:
-            code = code[:max_c].rstrip("\n")
-            truncated = True
+    code = "\n".join(func_lines)
 
     return {
-        **mapping,
+        "patch_path": "",
+        "file_path": "",
+        "line_number": 0,
+        "patch_key": "",
+        "old_signature": "",
+        "func_start_index": None,
+        "func_end_index": None,
         "func_code": code,
         "func_code_lines_total": total_lines,
-        "func_code_lines_returned": len(returned_lines),
-        "func_code_truncated": truncated,
+        "func_code_lines_returned": total_lines,
+        "func_code_truncated": False,
         "defined_macros": defined_macros_list,
         "referenced_macro_tokens": referenced_macro_tokens_list,
         "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
-        "note": "Extracted from '-' lines in the mapped patch slice (V1-origin code; git apply --reverse adds these lines).",
+        "note": "Extracted from '-' lines in a unified-diff excerpt (typically get_error_patch_context.excerpt).",
     }
 
 
@@ -980,10 +892,9 @@ def make_error_patch_override(
 ) -> Dict[str, Any]:
     """Rewrite a mapped patch slice by replacing its `-` lines.
 
-    This is the reverse of `get_error_v1_code_slice`: it uses the same
-    `(patch_key, old_signature, func_start_index, func_end_index)` mapping and
-    rewrites the underlying patch text by replacing the `-` lines in the mapped
-    patch slice with `new_func_code` (each line prefixed with `-`).
+    This tool uses the `(patch_key, old_signature, func_start_index, func_end_index)` mapping
+    to locate the rewriteable `-` slice and rewrites the underlying patch text by replacing
+    those `-` lines with `new_func_code` (each line prefixed with `-`).
 
     The tool is read-only: it returns the updated patch text but does not apply it.
     """

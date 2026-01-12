@@ -1615,16 +1615,40 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
         }
 
     if not _has_tool_call(state, "get_error_v1_code_slice"):
+        excerpt_arg: Any = None
+        ap = str(getattr(state, "active_excerpt_artifact_path", "") or "").strip()
+        if ap:
+            excerpt_arg = {"artifact_path": ap}
+        else:
+            for step in reversed(state.steps):
+                if not isinstance(step, dict):
+                    continue
+                obs = step.get("observation")
+                if not isinstance(obs, dict):
+                    continue
+                if obs.get("ok") is not True:
+                    continue
+                if str(obs.get("tool", "")).strip() != "get_error_patch_context":
+                    continue
+                out = obs.get("output")
+                if not isinstance(out, dict):
+                    continue
+                excerpt_val = out.get("excerpt")
+                if isinstance(excerpt_val, str) and excerpt_val.strip():
+                    excerpt_arg = excerpt_val
+                    break
+                if isinstance(excerpt_val, dict):
+                    ap2 = str(excerpt_val.get("artifact_path", "") or "").strip()
+                    if ap2:
+                        excerpt_arg = {"artifact_path": ap2}
+                        break
+
         return {
             "type": "tool",
-            "thought": "Extract the V1-origin code slice from the patch before proposing a replacement.",
+            "thought": "Extract the V1-origin code slice from the get_error_patch_context excerpt before proposing a replacement.",
             "tool": "get_error_v1_code_slice",
             "args": {
-                "patch_path": state.patch_path,
-                "file_path": file_path,
-                "line_number": line_number,
-                "max_lines": 400,
-                "max_chars": 20000,
+                "excerpt": excerpt_arg,
             },
         }
 
@@ -2345,20 +2369,13 @@ def _run_langgraph(
             required = _should_force_struct_diff_tools(st)
             if required and remaining >= 2:
                 if required == "get_error_v1_code_slice":
-                    file_path, line_number = _first_error_location(st)
-                    if file_path and line_number > 0:
-                        forced: Decision = {
-                            "type": "tool",
-                            "thought": "Missing-member error in patch-scope: extract V1-origin function body from the patch before finalizing.",
-                            "tool": "get_error_v1_code_slice",
-                            "args": {
-                                "patch_path": st.patch_path,
-                                "file_path": file_path,
-                                "line_number": line_number,
-                                "max_lines": 400,
-                                "max_chars": 20000,
-                            },
-                        }
+                    prereq = _next_patch_prereq_tool(st)
+                    if prereq:
+                        forced: Decision = dict(prereq)
+                        forced["thought"] = (
+                            "Missing-member error in patch-scope: extract V1-origin code from the get_error_patch_context excerpt "
+                            "before finalizing."
+                        )
                         _validate_tool_decision(forced)
                         return {"state": st, "pending": forced}
                 elif required.startswith("search_definition:"):
@@ -2803,11 +2820,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REACT_AGENT_FOCUS_PATCH_KEY", ""),
         help="In --error-scope patch mode, select this patch_key group (hunk) instead of the default heuristic.",
     )
-    parser.add_argument(
-        "--artifact-dir",
-        default=os.environ.get("REACT_AGENT_ARTIFACT_DIR", ""),
-        help="Directory for saving large tool outputs (artifacts). Default: data/react_agent_artifacts/<run_id>/",
-    )
     parser.add_argument("--no-artifacts", action="store_true", help="Disable artifact-backed tool outputs.")
 
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
@@ -3011,13 +3023,10 @@ def main(argv: List[str]) -> int:
             pass
 
     artifact_store, artifacts_dir = resolve_artifact_dir(
-        cli_dir=str(getattr(args, "artifact_dir", "") or ""),
         disabled=bool(args.no_artifacts),
         patch_key=patch_key,
         patch_key_overwrite=not bool(cfg.auto_ossfuzz_loop),
     )
-    if artifact_store and artifacts_dir:
-        os.environ["REACT_AGENT_ARTIFACT_DIR"] = artifacts_dir
     # Patch-related tool outputs are persisted as artifacts without size thresholds.
 
     try:
