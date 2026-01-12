@@ -117,7 +117,17 @@ def merge_patch_bundle_with_overrides(
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
 
     out_name = _safe_filename(str(output_name or "ossfuzz_merged.diff"))
-    out_path = (allow_root / out_name).resolve()
+    # Avoid collisions across parallel agents by writing the merged patch file under the inferred patch_key
+    # directory when possible (single-hunk overrides are the common case). If the allow-root is already the
+    # per-hunk patch_key directory, do not nest patch_key/patch_key.
+    out_dir = allow_root
+    unique_keys = {str(o.get("patch_key", "")).strip() for o in override_files if str(o.get("patch_key", "")).strip()}
+    if len(unique_keys) == 1:
+        only_key = next(iter(unique_keys))
+        if str(allow_root.name) != str(only_key):
+            out_dir = (allow_root / only_key).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = (out_dir / out_name).resolve()
     _validate_under_root(out_path, allow_root)
     if out_path.exists():
         try:
@@ -145,7 +155,9 @@ def _run(
 ) -> Dict[str, Any]:
     rendered = shlex.join([str(x) for x in cmd])
     prefix = f"[ossfuzz_apply_patch_and_test] {label}: " if str(label or "").strip() else "[ossfuzz_apply_patch_and_test] "
-    print(prefix + rendered, flush=True)
+    # Avoid polluting stdout: the agent process may be emitting JSON on stdout.
+    sys.stderr.write(prefix + rendered + "\n")
+    sys.stderr.flush()
     proc = subprocess.run(
         [str(x) for x in cmd],
         cwd=cwd,

@@ -7,6 +7,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -52,6 +54,8 @@ def _resolve_output_format(value: str) -> str:
 
 def _emit(obj: Dict[str, Any], output_format: str) -> None:
     fmt = _resolve_output_format(output_format)
+    if fmt == "none":
+        return
     if fmt == "text":
         sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
         return
@@ -59,6 +63,22 @@ def _emit(obj: Dict[str, Any], output_format: str) -> None:
         sys.stdout.write(json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
         return
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _try_parse_agent_output(stdout: str) -> tuple[Any, Optional[str]]:
+    raw = str(stdout or "").strip()
+    if not raw:
+        return None, None
+    try:
+        return json.loads(raw), None
+    except json.JSONDecodeError as exc:
+        idx = raw.find("{")
+        if idx > 0:
+            try:
+                return json.loads(raw[idx:]), None
+            except json.JSONDecodeError:
+                pass
+        return None, f"{type(exc).__name__}: {exc}"
 
 
 def _allowed_roots_from_env() -> Optional[List[str]]:
@@ -118,10 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("build_log", nargs="?", default="-", help="Build log path, or '-' for stdin.")
     p.add_argument("--patch-path", required=True, help="Path to a tmp_patch bundle (*.patch2).")
     p.add_argument("--max-groups", type=int, default=20, help="Max patch_key groups to run (default: 20).")
-    p.add_argument("--output-format", choices=["auto", "json", "json-pretty", "text"], default="json-pretty")
+    p.add_argument("--jobs", type=int, default=1, help="Max concurrent agents to run (default: 1).")
+    p.add_argument("--output-format", choices=["none", "auto", "json", "json-pretty", "text"], default="none")
     p.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     p.add_argument("--tools", choices=["real", "fake"], default="real")
     p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument(
+        "--recursion-limit",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_RECURSION_LIMIT", "0") or 0),
+        help="Forwarded to agent_langgraph.py (LangGraph recursion_limit; 0=auto).",
+    )
     p.add_argument("--only-patch-keys", default="", help="Comma-separated patch_key allowlist.")
     p.add_argument(
         "--include-agent-output",
@@ -142,6 +169,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--openai-max-tokens", type=int, default=int(os.environ.get("OPENAI_MAX_TOKENS", "0") or 0))
     p.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
 
+    p.add_argument(
+        "--debug-llm",
+        action="store_true",
+        default=str(os.environ.get("REACT_AGENT_DEBUG_LLM", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"},
+        help="Forwarded to agent_langgraph.py (print full LLM request/response to stderr).",
+    )
+    p.add_argument(
+        "--debug-llm-dir",
+        default=os.environ.get("REACT_AGENT_DEBUG_LLM_DIR", ""),
+        help="Forwarded to agent_langgraph.py (write request/response JSON under this directory).",
+    )
+
     p.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
     p.add_argument("--ossfuzz-commit", default=os.environ.get("REACT_AGENT_OSSFUZZ_COMMIT", ""))
     p.add_argument("--ossfuzz-build-csv", default=os.environ.get("REACT_AGENT_OSSFUZZ_BUILD_CSV", ""))
@@ -150,14 +189,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ossfuzz-engine", default=os.environ.get("REACT_AGENT_OSSFUZZ_ENGINE", "libfuzzer"))
     p.add_argument("--ossfuzz-fuzz-target", default=os.environ.get("REACT_AGENT_OSSFUZZ_FUZZ_TARGET", ""))
     p.add_argument("--ossfuzz-use-sudo", action="store_true", default=bool(os.environ.get("REACT_AGENT_OSSFUZZ_USE_SUDO", "")))
+    p.add_argument(
+        "--auto-ossfuzz-loop",
+        action="store_true",
+        default=str(os.environ.get("REACT_AGENT_AUTO_OSSFUZZ_LOOP", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"},
+        help="Forwarded to agent_langgraph.py (patch-scope only: re-parse OSS-Fuzz logs and iterate within the same patch_key).",
+    )
+    p.add_argument(
+        "--ossfuzz-loop-max",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_OSSFUZZ_LOOP_MAX", "3") or 3),
+        help="Forwarded to agent_langgraph.py (max ossfuzz_apply_patch_and_test calls when --auto-ossfuzz-loop is enabled).",
+    )
     return p
 
 
-def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) -> List[str]:
+def _agent_cmd(
+    args: argparse.Namespace, *, agent_script: Path, build_log_path: str, patch_key: str, patch_key_dirname: str
+) -> List[str]:
     cmd = [
         sys.executable,
         str(agent_script),
-        str(args.build_log),
+        str(build_log_path),
         "--output-format",
         "json-pretty",
         "--model",
@@ -166,6 +219,8 @@ def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) 
         str(args.tools),
         "--max-steps",
         str(max(int(args.max_steps or 1), 1)),
+        "--recursion-limit",
+        str(int(getattr(args, "recursion_limit", 0) or 0)),
         "--error-scope",
         "patch",
         "--patch-path",
@@ -189,6 +244,9 @@ def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) 
     ]
     if args.ossfuzz_use_sudo:
         cmd.append("--ossfuzz-use-sudo")
+    if bool(getattr(args, "auto_ossfuzz_loop", False)):
+        cmd.append("--auto-ossfuzz-loop")
+        cmd.extend(["--ossfuzz-loop-max", str(max(int(getattr(args, "ossfuzz_loop_max", 0) or 0), 1))])
 
     if str(args.v1_json_dir).strip():
         cmd.extend(["--v1-json-dir", str(args.v1_json_dir)])
@@ -199,6 +257,23 @@ def _agent_cmd(args: argparse.Namespace, *, agent_script: Path, patch_key: str) 
     if str(args.v2_src).strip():
         cmd.extend(["--v2-src", str(args.v2_src)])
 
+    if bool(getattr(args, "debug_llm", False)):
+        cmd.append("--debug-llm")
+    base_debug_dir = str(getattr(args, "debug_llm_dir", "") or "").strip()
+    if base_debug_dir:
+        # Avoid collisions across concurrent agents by using a per-patch_key debug subdirectory.
+        cmd.extend(["--debug-llm-dir", str(Path(base_debug_dir) / str(patch_key_dirname))])
+
+    if str(getattr(args, "openai_api_key", "") or "").strip():
+        cmd.extend(["--openai-api-key", str(getattr(args, "openai_api_key", "")).strip()])
+    if str(getattr(args, "openai_model", "") or "").strip():
+        cmd.extend(["--openai-model", str(getattr(args, "openai_model", "")).strip()])
+    if str(getattr(args, "openai_base_url", "") or "").strip():
+        cmd.extend(["--openai-base-url", str(getattr(args, "openai_base_url", "")).strip()])
+    if str(getattr(args, "openai_org", "") or "").strip():
+        cmd.extend(["--openai-org", str(getattr(args, "openai_org", "")).strip()])
+    if str(getattr(args, "openai_project", "") or "").strip():
+        cmd.extend(["--openai-project", str(getattr(args, "openai_project", "")).strip()])
     if int(args.openai_max_tokens or 0) > 0:
         cmd.extend(["--openai-max-tokens", str(int(args.openai_max_tokens))])
     if bool(args.no_json_mode):
@@ -237,29 +312,44 @@ def main(argv: List[str]) -> int:
     run_id = default_run_id()
     artifacts_root = repo_root / "data" / "react_agent_artifacts" / f"multi_{run_id}"
     artifacts_root.mkdir(parents=True, exist_ok=True)
+    agent_build_log_path = str(args.build_log)
+    if str(args.build_log).strip() == "-":
+        out_path = artifacts_root / "build.log"
+        out_path.write_text(build_log_text + ("\n" if build_log_text and not build_log_text.endswith("\n") else ""), encoding="utf-8", errors="replace")
+        agent_build_log_path = str(out_path)
 
     results: List[Dict[str, Any]] = []
     env = dict(os.environ)
     env["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
+    # Important: multi-agent runs must not inherit a global REACT_AGENT_ARTIFACT_DIR, otherwise
+    # override patch artifacts will be written outside the per-hunk patch_key directory and OSS-Fuzz
+    # tooling won't be able to infer patch_key from the override path.
+    env.pop("REACT_AGENT_ARTIFACT_DIR", None)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-    for key in ranked:
-        errs = groups.get(key) or []
+    def run_one(patch_key: str, idx: int) -> tuple[int, Dict[str, Any]]:
+        errs = groups.get(patch_key) or []
         primary = str(errs[0].get("raw", "")).strip() if errs else ""
-        cmd = _agent_cmd(args, agent_script=agent_script, patch_key=key)
+        out_dir = artifacts_root / _safe_patch_key_dirname(patch_key)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        started_at = time.time()
+        started_mono = time.monotonic()
+        cmd = _agent_cmd(
+            args,
+            agent_script=agent_script,
+            build_log_path=agent_build_log_path,
+            patch_key=patch_key,
+            patch_key_dirname=out_dir.name,
+        )
         proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+        duration_sec = max(0.0, time.monotonic() - started_mono)
+        finished_at = time.time()
+
         stdout = (proc.stdout or "").strip()
         stderr = (proc.stderr or "").strip()
-        parsed: Any = None
-        parse_error: Optional[str] = None
-        if stdout:
-            try:
-                parsed = json.loads(stdout)
-            except json.JSONDecodeError as exc:
-                parse_error = f"{type(exc).__name__}: {exc}"
+        parsed, parse_error = _try_parse_agent_output(stdout)
 
-        out_dir = artifacts_root / _safe_patch_key_dirname(key)
-        out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
         (out_dir / "agent_stdout.json").write_text(stdout + ("\n" if stdout else ""), encoding="utf-8", errors="replace")
         if stderr:
@@ -272,8 +362,53 @@ def main(argv: List[str]) -> int:
         if isinstance(agent_error, dict):
             agent_error_line = str(agent_error.get("line", "")).strip()
 
+        ossfuzz_verdict = parsed.get("ossfuzz_verdict") if isinstance(parsed, dict) else None
+        patch_key_verdict = parsed.get("patch_key_verdict") if isinstance(parsed, dict) else None
+
+        hunk_fixed: Optional[bool] = None
+        remaining_in_active_patch_key: Optional[int] = None
+        active_patch_key: str = ""
+        log_artifacts: List[str] = []
+        if isinstance(patch_key_verdict, dict):
+            active_patch_key = str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+            la = patch_key_verdict.get("log_artifacts")
+            if isinstance(la, list):
+                log_artifacts = [str(x) for x in la if str(x).strip()]
+            if patch_key_verdict.get("status") == "ok":
+                rem = patch_key_verdict.get("remaining_in_active_patch_key")
+                if isinstance(rem, int):
+                    remaining_in_active_patch_key = rem
+                    hunk_fixed = rem == 0
+
+        target_fixed: Optional[bool] = None
+        if isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "ok":
+            fixed = ossfuzz_verdict.get("fixed")
+            if isinstance(fixed, bool):
+                target_fixed = fixed
+
+        task_status = "unknown"
+        task_success: Optional[bool] = None
+        if int(proc.returncode) != 0:
+            task_status = "agent_failed"
+            task_success = False
+        elif parse_error:
+            task_status = "agent_output_parse_error"
+            task_success = False
+        elif (
+            (isinstance(patch_key_verdict, dict) and patch_key_verdict.get("status") == "failed")
+            or (isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "failed")
+        ):
+            task_status = "ossfuzz_failed"
+            task_success = False
+        elif hunk_fixed is True:
+            task_status = "fixed"
+            task_success = True
+        elif hunk_fixed is False:
+            task_status = "remaining_errors"
+            task_success = False
+
         item: Dict[str, Any] = {
-            "patch_key": key,
+            "patch_key": patch_key,
             "patch_key_dirname": out_dir.name,
             "errors": len(errs),
             "primary_error": primary,
@@ -284,20 +419,58 @@ def main(argv: List[str]) -> int:
             "agent_output_parse_error": parse_error,
             "artifacts_dir": str(out_dir),
             "agent_stdout_path": str(out_dir / "agent_stdout.json"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_sec": duration_sec,
+            "hunk_fixed": hunk_fixed,
+            "target_fixed": target_fixed,
+            "task_status": task_status,
+            "task_success": task_success,
+            "remaining_in_active_patch_key": remaining_in_active_patch_key,
+            "active_patch_key": active_patch_key,
+            "log_artifacts": log_artifacts,
+            "ossfuzz_verdict": ossfuzz_verdict,
+            "patch_key_verdict": patch_key_verdict,
         }
         if bool(args.include_agent_output):
             item["agent_output"] = parsed
-        results.append(item)
+        return idx, item
 
+    jobs = max(1, int(args.jobs or 1))
+    if jobs == 1:
+        for idx, key in enumerate(ranked):
+            _, item = run_one(key, idx)
+            results.append(item)
+    else:
+        items: Dict[int, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            futs = [ex.submit(run_one, key, idx) for idx, key in enumerate(ranked)]
+            for fut in as_completed(futs):
+                idx, item = fut.result()
+                items[idx] = item
+        results = [items[i] for i in sorted(items.keys())]
+
+    hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
+    hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
+    hunks_unknown = sum(1 for r in results if r.get("hunk_fixed") is None)
+    agents_failed = sum(1 for r in results if int(r.get("agent_exit_code") or 0) != 0)
+
+    summary_path = artifacts_root / "summary.json"
     report = {
         "type": "multi_agent",
         "build_log": str(args.build_log),
         "patch_path": patch_path,
         "patch_keys_total": len(ranked),
+        "jobs": jobs,
         "artifacts_root": str(artifacts_root),
+        "summary_json_path": str(summary_path),
+        "hunks_fixed": hunks_fixed,
+        "hunks_not_fixed": hunks_not_fixed,
+        "hunks_unknown": hunks_unknown,
+        "agents_failed": agents_failed,
         "results": results,
     }
-    (artifacts_root / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    summary_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     _emit(report, str(args.output_format))
     return 0
 
