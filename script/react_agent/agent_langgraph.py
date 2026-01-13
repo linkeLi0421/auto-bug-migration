@@ -63,6 +63,8 @@ class AgentState:
     active_func_start_index: Optional[int] = None
     active_func_end_index: Optional[int] = None
     active_excerpt_artifact_path: str = ""
+    pre_patch_file_path: str = ""
+    pre_patch_line_number: int = 0
     grouped_errors: List[Dict[str, Any]] = field(default_factory=list)
     missing_struct_members: List[Dict[str, Any]] = field(default_factory=list)
     # Compact record of previously targeted errors (survives state.steps trimming in auto-loop).
@@ -1109,6 +1111,58 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
     return None
 
 
+def _override_location_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Rewrite make_error_patch_override args when the model mistakenly uses pre_patch_*.
+
+    make_error_patch_override must be called with the build-log /src/... error location. pre_patch_* is only for
+    read_file_context. If the model supplies (file_path,line_number) matching pre_patch_*, rewrite them back to the
+    build-log location captured as active_file_path/active_line_number.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    active_fp = str(getattr(state, "active_file_path", "") or "").strip()
+    active_ln = int(getattr(state, "active_line_number", 0) or 0)
+    pre_fp = str(getattr(state, "pre_patch_file_path", "") or "").strip()
+    pre_ln = int(getattr(state, "pre_patch_line_number", 0) or 0)
+    if not (active_fp and active_ln > 0 and pre_fp and pre_ln > 0):
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    arg_fp = str(args_obj.get("file_path", "") or "").strip()
+    arg_ln_raw = args_obj.get("line_number", 0)
+    try:
+        arg_ln = int(arg_ln_raw or 0)
+    except (TypeError, ValueError):
+        arg_ln = 0
+    if not (arg_fp and arg_ln > 0):
+        return None
+
+    def norm(p: str) -> str:
+        return str(p or "").replace("\\", "/").strip().lstrip("./").strip()
+
+    arg_fp_n = norm(arg_fp).lstrip("/")
+    pre_fp_n = norm(pre_fp).lstrip("/")
+
+    file_matches = False
+    if arg_fp_n == pre_fp_n:
+        file_matches = True
+    elif arg_fp_n.endswith("/" + pre_fp_n) or pre_fp_n.endswith("/" + arg_fp_n):
+        file_matches = True
+
+    if not file_matches or arg_ln != pre_ln:
+        return None
+
+    new_decision: Decision = dict(decision)
+    new_args = dict(args_obj)
+    new_args["file_path"] = active_fp
+    new_args["line_number"] = active_ln
+    new_decision["args"] = new_args
+    return new_decision
+
+
 def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
     t = str(token or "").strip()
     if not t:
@@ -1865,6 +1919,9 @@ def _system_prompt() -> str:
         "- Never call read_file_context with the raw build-log /src/...:line values.\n"
         "- Only call read_file_context using (a) KB-derived locations from search_definition, or\n"
         "  (b) get_error_patch_context pre_patch_file_path + pre_patch_line_number (when available).\n"
+        "- Patch tools operate on the build-log (migrated) location. When calling make_error_patch_override,\n"
+        "  ALWAYS use the /src/... file_path + line_number from the build error (same location passed to get_error_patch_context),\n"
+        "  NOT pre_patch_file_path/pre_patch_line_number (those are read_file_context-only).\n"
         "- Prefer patch-first triage: parse_build_errors -> get_error_patch_context -> search_definition.\n"
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before any macro lookup.\n"
@@ -2558,6 +2615,11 @@ def _run_langgraph(
             }
         _validate_tool_decision(decision)
 
+        # Guardrail: make_error_patch_override must use the build-log /src/... error location, not pre_patch_*.
+        fixed_loc = _override_location_guardrail_for_override(st, decision)
+        if fixed_loc:
+            decision = fixed_loc  # type: ignore[assignment]
+
         # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
         # drops large portions of it (common failure mode: model emits only a short snippet).
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
@@ -2693,6 +2755,8 @@ def _run_langgraph(
             st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
             st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
             st.active_line_number = int(obs.output.get("line_number", 0) or st.active_line_number or 0)
+            st.pre_patch_file_path = str(obs.output.get("pre_patch_file_path") or st.pre_patch_file_path or "").strip()
+            st.pre_patch_line_number = int(obs.output.get("pre_patch_line_number", 0) or st.pre_patch_line_number or 0)
             fs = obs.output.get("func_start_index")
             fe = obs.output.get("func_end_index")
             if isinstance(fs, int):

@@ -109,7 +109,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_lines": "int?",
             "max_chars": "int?",
         },
-        "description": "Rewrite the mapped patch slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') and recomputing hunk lengths.",
+        "description": "Rewrite the mapped patch slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') and recomputing hunk lengths. IMPORTANT: file_path/line_number must be the build-log /src/... error location (not pre_patch_*).",
     },
     {
         "name": "parse_build_errors",
