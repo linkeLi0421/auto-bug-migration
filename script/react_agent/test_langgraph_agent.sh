@@ -722,6 +722,11 @@ with tempfile.TemporaryDirectory() as td:
     assert verdict.get("status") == "ok", verdict
     assert verdict.get("fixed") is False, verdict
 
+    build_log.write_text("error: corrupt patch at line 402\n", encoding="utf-8")
+    verdict_bad = _summarize_target_error_status(st)
+    assert verdict_bad.get("status") == "failed", verdict_bad
+    assert "corrupt patch" in str(verdict_bad.get("reason") or ""), verdict_bad
+
     build_log.write_text(f"/src/libxml2/hash.c:554:52: error: {msg}\n", encoding="utf-8")
     verdict2 = _summarize_target_error_status(st)
     assert verdict2.get("status") == "ok", verdict2
