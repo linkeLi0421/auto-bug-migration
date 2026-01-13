@@ -285,6 +285,19 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             payload["hint"] = hint
         return payload
 
+    patch_apply = _ossfuzz_patch_apply_failure(build_text, check_text)
+    if patch_apply:
+        payload = {
+            "status": "failed",
+            "reason": str(patch_apply.get("reason") or "").strip(),
+            "targets": targets,
+            "log_artifacts": sources,
+        }
+        hint = str(patch_apply.get("hint") or "").strip()
+        if hint:
+            payload["hint"] = hint
+        return payload
+
     combined_errors: List[Dict[str, Any]] = []
     try:
         if build_text:
@@ -402,6 +415,46 @@ def _ossfuzz_artifact_path(output: Any, field: str) -> str:
 
 
 _OSSFUZZ_INFRA_ERR_PREFIX = "OSS-Fuzz infra error:"
+_OSSFUZZ_PATCH_APPLY_ERR_PREFIX = "OSS-Fuzz patch apply error:"
+
+
+_OSSFUZZ_PATCH_APPLY_ERROR_PATTERNS = [
+    re.compile(r"^error:\s+corrupt patch(?:\s+at\s+line\s+\d+)?\s*$", re.IGNORECASE),
+    re.compile(r"^error:\s+patch failed:\s+.*$", re.IGNORECASE),
+    re.compile(r"^error:\s+.*:\s+patch does not apply\s*$", re.IGNORECASE),
+    re.compile(r"^error:\s+no valid patches in input.*$", re.IGNORECASE),
+    re.compile(r"^patch:\s+\*{4}.*$", re.IGNORECASE),
+    re.compile(r"^fatal:\s+patch failed.*$", re.IGNORECASE),
+]
+
+
+def _ossfuzz_patch_apply_failure_reason(text: str) -> Optional[Dict[str, str]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+
+    hit: Optional[str] = None
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for pat in _OSSFUZZ_PATCH_APPLY_ERROR_PATTERNS:
+            if pat.search(stripped):
+                hit = stripped
+                break
+        if hit:
+            break
+
+    if not hit:
+        return None
+
+    return {
+        "reason": f"Patch failed to apply: {hit}",
+        "hint": (
+            "The override diff is malformed or truncated (e.g. missing lines in a large hunk). "
+            "Regenerate the override diff and ensure it is a complete unified diff (diff --git/---/+++ plus full @@ hunks)."
+        ),
+    }
 
 
 def _ossfuzz_infra_failure_reason(text: str) -> Optional[Dict[str, str]]:
@@ -430,6 +483,14 @@ def _ossfuzz_infra_failure_reason(text: str) -> Optional[Dict[str, str]]:
 def _ossfuzz_infra_failure(build_text: str, check_text: str) -> Optional[Dict[str, str]]:
     for blob in (build_text, check_text):
         hit = _ossfuzz_infra_failure_reason(blob)
+        if hit:
+            return hit
+    return None
+
+
+def _ossfuzz_patch_apply_failure(build_text: str, check_text: str) -> Optional[Dict[str, str]]:
+    for blob in (build_text, check_text):
+        hit = _ossfuzz_patch_apply_failure_reason(blob)
         if hit:
             return hit
     return None
@@ -563,6 +624,15 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
             msg += f" Hint: {hint}"
         return [], sources, msg
 
+    patch_apply = _ossfuzz_patch_apply_failure(build_text, check_text)
+    if patch_apply:
+        reason = str(patch_apply.get("reason") or "").strip()
+        hint = str(patch_apply.get("hint") or "").strip()
+        msg = f"{_OSSFUZZ_PATCH_APPLY_ERR_PREFIX} {reason}".strip()
+        if hint:
+            msg += f" Hint: {hint}"
+        return [], sources, msg
+
     combined_errors: List[Dict[str, Any]] = []
     try:
         if build_text:
@@ -596,7 +666,12 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
     active_key = str(state.active_patch_key or state.patch_key or "").strip()
     errors, sources, err_msg = _iter_ossfuzz_compiler_errors(state)
     if err_msg:
-        status = "failed" if str(err_msg).strip().startswith(_OSSFUZZ_INFRA_ERR_PREFIX) else "unknown"
+        msg = str(err_msg).strip()
+        status = (
+            "failed"
+            if msg.startswith(_OSSFUZZ_INFRA_ERR_PREFIX) or msg.startswith(_OSSFUZZ_PATCH_APPLY_ERR_PREFIX)
+            else "unknown"
+        )
         return {
             "status": status,
             "reason": err_msg,

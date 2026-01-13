@@ -10,6 +10,14 @@ from typing import Any, Dict, List, Optional
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_PATCH_APPLY_ERROR_PATTERNS = [
+    re.compile(r"^error:\s+corrupt patch(?:\s+at\s+line\s+\d+)?\s*$", re.IGNORECASE),
+    re.compile(r"^error:\s+patch failed:\s+.*$", re.IGNORECASE),
+    re.compile(r"^error:\s+.*:\s+patch does not apply\s*$", re.IGNORECASE),
+    re.compile(r"^error:\s+no valid patches in input.*$", re.IGNORECASE),
+    re.compile(r"^patch:\s+\*{4}.*$", re.IGNORECASE),
+    re.compile(r"^fatal:\s+patch failed.*$", re.IGNORECASE),
+]
 _SCRIPT_DIR = Path(__file__).resolve().parents[2]
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
@@ -60,6 +68,20 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"Could not allocate unique artifact path for: {path}")
+
+
+def _find_patch_apply_error(text: str) -> str:
+    raw = str(text or "")
+    if not raw.strip():
+        return ""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for pat in _PATCH_APPLY_ERROR_PATTERNS:
+            if pat.search(stripped):
+                return stripped
+    return ""
 
 
 def _allowed_patch_roots_from_env() -> list[str] | None:
@@ -253,6 +275,7 @@ def ossfuzz_apply_patch_and_test(
 
     build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
     build_ok = build_res["returncode"] == 0
+    build_patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
 
     check_build_cmd: List[str] = [
         sys.executable,
@@ -272,6 +295,9 @@ def ossfuzz_apply_patch_and_test(
 
     check_res = _run(check_build_cmd, label="check_build", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
     check_ok = check_res["returncode"] == 0
+    check_patch_apply_error = _find_patch_apply_error(check_res.get("output", ""))
+    patch_apply_error = build_patch_apply_error or check_patch_apply_error
+    patch_apply_ok = not bool(patch_apply_error)
 
     run_fuzzer_output = ""
     run_fuzzer_cmd: List[str] = []
@@ -302,6 +328,8 @@ def ossfuzz_apply_patch_and_test(
         "patch_override_paths": [str(p) for p in (patch_override_paths or []) if str(p).strip()],
         "merged_patch_file_path": str(patch_file),
         "overridden_patch_keys": merged.get("overridden_patch_keys", []),
+        "patch_apply_ok": patch_apply_ok,
+        "patch_apply_error": patch_apply_error,
         "build_ok": build_ok,
         "check_build_ok": check_ok,
         "run_fuzzer_ok": run_fuzzer_ok,

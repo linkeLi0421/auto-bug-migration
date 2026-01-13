@@ -2021,7 +2021,14 @@ def build_version(args):
   
   if args.patch:
     build_bash += f'''
-    git apply --ignore-whitespace --ignore-space-change --reverse /patch;
+    if ! git apply --check --ignore-whitespace --ignore-space-change --reverse /patch; then
+      echo "OSS-FUZZ PATCH APPLY FAILED (check)";
+      exit 1;
+    fi
+    if ! git apply --ignore-whitespace --ignore-space-change --reverse /patch; then
+      echo "OSS-FUZZ PATCH APPLY FAILED";
+      exit 1;
+    fi
     '''
     run_args.extend([
         '-v',
@@ -2060,7 +2067,7 @@ def build_version(args):
     '''
 
   if args.no_corpus:
-    build_bash += 'rm /out/*.zip;'
+    build_bash += 'rm -f /out/*.zip;'
 
   result_dir = os.path.join(HOME_DIR, 'data')
   script_dir = os.path.join(HOME_DIR, 'script')
@@ -2073,8 +2080,7 @@ def build_version(args):
       '-c', build_bash
   ])
   clean(args, out_dir)
-  docker_run(run_args, architecture=args.architecture)
-  return True
+  return docker_run(run_args, architecture=args.architecture)
 
 
 def get_crash_log_bash(commit:str, args):
