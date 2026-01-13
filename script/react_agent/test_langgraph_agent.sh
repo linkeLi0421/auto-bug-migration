@@ -167,6 +167,50 @@ assert _override_preserve_base_guardrail_error(state, ok_decision) is None, "exp
 print("OK")
 PY
 
+# Override location guardrail: make_error_patch_override must use build-log /src/... line numbers,
+# not pre_patch_* line numbers from get_error_patch_context.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_location_guardrail_for_override  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/libxml2/parser.c:17188:26: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+    snippet="",
+)
+state.active_file_path = "/src/libxml2/parser.c"
+state.active_line_number = 17188
+state.pre_patch_file_path = "parser.c"
+state.pre_patch_line_number = 15802
+
+bad = {
+    "type": "tool",
+    "tool": "make_error_patch_override",
+    "thought": "accidentally using pre_patch line numbers",
+    "args": {"patch_path": "x", "file_path": "parser.c", "line_number": 15802, "new_func_code": "int x;\\n"},
+}
+fixed = _override_location_guardrail_for_override(state, bad)
+assert fixed and (fixed.get("args") or {}).get("file_path") == "/src/libxml2/parser.c", fixed
+assert (fixed.get("args") or {}).get("line_number") == 17188, fixed
+
+good = {
+    "type": "tool",
+    "tool": "make_error_patch_override",
+    "thought": "using build error location",
+    "args": {"patch_path": "x", "file_path": "/src/libxml2/parser.c", "line_number": 17188, "new_func_code": "int x;\\n"},
+}
+assert _override_location_guardrail_for_override(state, good) is None
+
+print("OK")
+PY
+
 # Macro lookup fallback: when v2 has no matches, macro_lookup should fall back to v1 (batch mode).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
