@@ -12,7 +12,6 @@ ToolName = Literal[
     "get_patch",
     "search_patches",
     "get_error_patch_context",
-    "get_error_v1_code_slice",
     "make_error_patch_override",
     "parse_build_errors",
 ]
@@ -39,7 +38,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
     {
         "name": "search_definition",
         "args": {"symbol_name": "string", "version": "v1|v2"},
-        "description": "Return code for the best matching symbol definition in the requested version.",
+        "description": (
+            "Return code for the best matching top-level symbol definition in the requested version "
+            "(function/typedef/struct/enum/union/macro-like decls). Not intended for struct *fields*; to locate "
+            "members use kb_search_symbols(kinds=['FIELD_DECL', ...]) and/or inspect the parent struct body."
+        ),
     },
     {
         "name": "kb_search_symbols",
@@ -89,14 +92,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "context_lines": "int?",
             "max_total_lines": "int?",
         },
-        "description": "Map a build error location to a patch and return a bounded diff excerpt + pre_patch_* line mapping when available.",
-    },
-    {
-        "name": "get_error_v1_code_slice",
-        "args": {
-            "excerpt": "object",
-        },
-        "description": "Extract the V1-origin code slice (from '-' lines) from a unified-diff excerpt. Pass excerpt as either a string diff or {artifact_path: ...} (typically get_error_patch_context.excerpt). Also returns macro-token hints (defined_macros / macro_tokens_not_defined_in_slice).",
+        "description": (
+            "Map a build error location to a patch and return the full unified-diff hunk excerpt (applyable) plus "
+            "merged/tail helpers: patch_minus_code (all '-' lines) and error_func_code (the mapped '-' slice that "
+            "contains the error location). Also returns pre_patch_* line mapping when available."
+        ),
     },
     {
         "name": "make_error_patch_override",

@@ -12,8 +12,12 @@ from typing import Any, Dict, Optional, Tuple
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
-    "get_error_patch_context": {"excerpt": ".diff"},
-    "get_error_v1_code_slice": {"func_code": ".c"},
+    "get_error_patch_context": {
+        "excerpt": ".diff",
+        # Unified-diff derived helpers for merged/tail hunks.
+        "patch_minus_code": ".c",
+        "error_func_code": ".c",
+    },
     "get_patch": {"patch_text": ".diff"},
     "make_error_patch_override": {"old_func_code": ".c", "patch_text": ".diff"},
     "ossfuzz_apply_patch_and_test": {
@@ -173,14 +177,15 @@ def offload_patch_output(
             continue
         if not val.strip():
             continue
-        if terms and tool == "get_error_patch_context" and key == "excerpt":
+        if terms and tool == "get_error_patch_context":
             snippet = _focus_snippet(val, terms)
             if snippet:
-                updated.setdefault("focus_excerpt", snippet)
-        if terms and tool == "get_error_v1_code_slice" and key == "func_code":
-            snippet = _focus_snippet(val, terms)
-            if snippet:
-                updated.setdefault("focus_func_snippet", snippet)
+                if key == "excerpt":
+                    updated.setdefault("focus_excerpt", snippet)
+                elif key == "error_func_code":
+                    updated.setdefault("focus_error_func_snippet", snippet)
+                elif key == "patch_minus_code":
+                    updated.setdefault("focus_patch_minus_snippet", snippet)
         ref = store.write_text(name=_artifact_name(tool=tool, field=key, args=args), text=val, ext=ext)
         updated[key] = ref.to_dict()
         changed = True

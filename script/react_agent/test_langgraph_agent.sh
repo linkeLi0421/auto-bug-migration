@@ -113,10 +113,125 @@ assert "MACRO_DEFINITION" in (args.get("kinds") or []), forced
 print("OK")
 PY
 
-# Override guardrail: when we have a BASE slice from read_artifact, reject make_error_patch_override calls
-# that drop large portions of it (to avoid silent tail deletion).
+# Function grouping helper: for merged/tail hunks, split patch_key errors by old_signature and
+# focus the agent on one function at a time.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _select_function_group_errors  # noqa: E402
+
+errors = [
+    {"raw": "E1", "old_signature": "f1"},
+    {"raw": "E2", "old_signature": "f2"},
+    {"raw": "E3", "old_signature": "f1"},
+]
+
+sel, sig = _select_function_group_errors(errors)
+assert sig == "f1", (sig, sel)
+assert [e.get("raw") for e in sel] == ["E1", "E3"], sel
+
+sel2, sig2 = _select_function_group_errors(errors, preferred_old_signature="f2")
+assert sig2 == "f2", (sig2, sel2)
+assert [e.get("raw") for e in sel2] == ["E2"], sel2
+
+single = [{"raw": "E1", "old_signature": "f1"}, {"raw": "E2", "old_signature": "f1"}]
+sel3, sig3 = _select_function_group_errors(single)
+assert sel3 == single, sel3
+assert sig3 == "f1", sig3
+
+print("OK")
+PY
+
+# Text output should include the function-group summary (for debugging merged hunks via logs).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _render_final_text  # noqa: E402
+
+final = {
+    "type": "final",
+    "thought": "t",
+    "summary": "s",
+    "next_step": "n",
+    "steps": [],
+    "error": {
+        "line": "err",
+        "snippet": "",
+        "patch_path": "bundle.patch2",
+        "artifacts_dir": "artifacts",
+        "scope": "patch",
+        "patch_key": "p1",
+        "active_old_signature": "f1",
+        "function_groups": [
+            {"old_signature": "f1", "count": 2, "examples": ["E1", "E2"]},
+            {"old_signature": "f2", "count": 1, "examples": ["E3"]},
+        ],
+        "function_groups_total": 2,
+        "function_groups_truncated": False,
+        "function_groups_history": [
+            {"old_signature": "f1", "count": 3, "examples": ["E0", "E1", "E2"]},
+            {"old_signature": "f2", "count": 1, "examples": ["E3"]},
+        ],
+        "function_groups_history_total": 2,
+        "function_groups_history_truncated": False,
+        "grouped_errors": [{"raw": "E1"}],
+    },
+}
+
+text = _render_final_text(final)
+assert "Function grouping note:" in text, text
+assert "Current function groups (2):" in text, text
+assert "History function groups (2):" in text, text
+assert "f1 (errors=2) [active]" in text, text
+assert "f1 (unique_errors=3) [active]" in text, text
+assert "- E1" in text, text
+print("OK")
+PY
+
+# search_definition guardrail: don't try to "look up" struct fields via search_definition;
+# rewrite to kb_search_symbols for FIELD_DECL/VAR_DECL/MACRO_DEFINITION.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _struct_member_search_guardrail_for_search_definition  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/p.c:1:1: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+    snippet="",
+)
+state.missing_struct_members = [{"struct": "struct _xmlParserCtxt", "members": ["nsdb"]}]
+
+decision = {"type": "tool", "tool": "search_definition", "thought": "look for field", "args": {"symbol_name": "ctxt->nsdb", "version": "v2"}}
+rewritten = _struct_member_search_guardrail_for_search_definition(state, decision)
+assert rewritten and rewritten.get("tool") == "kb_search_symbols", rewritten
+args = rewritten.get("args") or {}
+assert args.get("symbols") == ["nsdb"], rewritten
+assert args.get("version") == "v2", rewritten
+kinds = args.get("kinds") or []
+assert "FIELD_DECL" in kinds and "VAR_DECL" in kinds and "MACRO_DEFINITION" in kinds, rewritten
+print("OK")
+PY
+
+# Override guardrail: compare new_func_code against the mapped '-' slice baseline (error_func_code / loop_base),
+# not the entire patch/hunk text (important for merged/tail hunks).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+import tempfile
 from pathlib import Path
 
 script_dir = Path(sys.argv[1]).resolve()
@@ -126,6 +241,7 @@ from agent_langgraph import AgentState, _override_preserve_base_guardrail_error 
 
 base_lines = [f"LINE{i:04d} " + ("X" * 40) for i in range(120)]
 base_text = "\n".join(base_lines) + "\n"
+patch_text = "\n".join([f"PATCH{i:04d}" for i in range(500)]) + "\n"
 
 state = AgentState(
     build_log_path="build.log",
@@ -136,33 +252,52 @@ state = AgentState(
 )
 state.steps.append(
     {
-        "decision": {"type": "tool", "tool": "read_artifact", "args": {"artifact_path": "x"}, "thought": "read base"},
+        "decision": {"type": "tool", "tool": "read_artifact", "args": {"artifact_path": "x"}, "thought": "read patch"},
         "observation": {
             "ok": True,
             "tool": "read_artifact",
             "args": {"artifact_path": "x"},
-            "output": {"text": base_text},
+            "output": {"text": patch_text},
             "error": None,
         },
     }
 )
 
-short = "\n".join(base_lines[:30]) + "\n"
-decision = {
-    "type": "tool",
-    "tool": "make_error_patch_override",
-    "thought": "oops, too short",
-    "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": short},
-}
-assert _override_preserve_base_guardrail_error(state, decision), "expected shrink guardrail to trigger"
+with tempfile.TemporaryDirectory() as td:
+    baseline_path = Path(td) / "error_func_code.c"
+    baseline_path.write_text(base_text, encoding="utf-8")
+    state.active_error_func_code_artifact_path = str(baseline_path)
 
-ok_decision = {
-    "type": "tool",
-    "tool": "make_error_patch_override",
-    "thought": "keep base",
-    "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": base_text},
-}
-assert _override_preserve_base_guardrail_error(state, ok_decision) is None, "expected guardrail to allow full base"
+    short = "\n".join(base_lines[:30]) + "\n"
+    decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "oops, too short",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": short},
+    }
+    err = _override_preserve_base_guardrail_error(state, decision)
+    assert err, "expected shrink guardrail to trigger"
+    assert "get_error_patch_context.error_func_code" in err, err
+
+    ok_decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "keep base",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": base_text},
+    }
+    assert _override_preserve_base_guardrail_error(state, ok_decision) is None, "expected guardrail to allow full base"
+
+    # Merged/tail hunk scenario: patch/hunk is large, but the mapped function slice is smaller.
+    small_lines = [f"FUNC{i:04d}" for i in range(30)]
+    small_text = "\n".join(small_lines) + "\n"
+    baseline_path.write_text(small_text, encoding="utf-8")
+    ok_small = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "rewrite mapped slice only",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": small_text},
+    }
+    assert _override_preserve_base_guardrail_error(state, ok_small) is None, "expected guardrail to use mapped slice baseline"
 
 print("OK")
 PY
@@ -289,7 +424,6 @@ allowed = {
     "get_patch",
     "search_patches",
     "get_error_patch_context",
-    "get_error_v1_code_slice",
     "make_error_patch_override",
     "parse_build_errors",
 }
@@ -384,7 +518,7 @@ for s in steps:
         versions.append(((decision.get("args") or {}).get("version")))
 
 assert tools[0] == "get_error_patch_context", tools
-assert tools[1] == "get_error_v1_code_slice", tools
+assert "get_error_v1_code_slice" not in tools, tools
 assert "v1" in versions and "v2" in versions, versions
 
 # Patch generation is followed by mandatory OSS-Fuzz test; artifact reads only happen right before patch generation.
@@ -498,14 +632,22 @@ tool = (steps[1].get("decision") or {}).get("tool")
 assert tool == "get_error_patch_context", tool
 
 obs = (steps[1].get("observation") or {}).get("output") or {}
-excerpt = obs.get("excerpt")
-assert isinstance(excerpt, dict) and excerpt.get("artifact_path"), excerpt
-ap = Path(excerpt["artifact_path"]).resolve()
-assert ap.is_file(), ap
-assert artifact_dir in ap.parents, (artifact_dir, ap)
+for field in ("excerpt", "patch_minus_code", "error_func_code"):
+    val = obs.get(field)
+    assert isinstance(val, dict) and val.get("artifact_path"), (field, val)
+    ap = Path(val["artifact_path"]).resolve()
+    assert ap.is_file(), ap
+    assert artifact_dir in ap.parents, (artifact_dir, ap)
 
-snippet = read_artifact(artifact_path=str(ap), start_line=1, max_lines=20)
-assert snippet.get("text"), snippet
+    snippet = read_artifact(artifact_path=str(ap), start_line=1, max_lines=20)
+    assert snippet.get("text"), (field, snippet)
+
+pm = obs.get("patch_minus_code") or {}
+ef = obs.get("error_func_code") or {}
+pm_text = read_artifact(artifact_path=str(pm.get("artifact_path")), start_line=1, max_lines=0, max_chars=0).get("text") or ""
+ef_text = read_artifact(artifact_path=str(ef.get("artifact_path")), start_line=1, max_lines=0, max_chars=0).get("text") or ""
+assert ef_text.strip(), ef_text
+assert ef_text.strip() in pm_text, (ef_text[:200], pm_text[:200])
 
 try:
     read_artifact(artifact_path=str(Path("/etc/hosts")), max_lines=5)
@@ -733,6 +875,90 @@ with tempfile.TemporaryDirectory() as td:
     assert verdict2.get("fixed") is True, verdict2
 PY
 
+# Target-error verdict (merged hunks): when focusing one old_signature at a time, treat "fixed" as
+# "no remaining errors mapped to (patch_key, active_old_signature)", not "(patch_key,msg)".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, ToolObservation, _summarize_target_error_status  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+sig1 = "int f1(void)"
+sig2 = "int f2(void)"
+msg = "no member named 'x' in 'struct S'"
+
+patch_text = (
+    "diff --git a/libxml2/merge.c b/libxml2/merge.c\n"
+    "--- a/libxml2/merge.c\n"
+    "+++ b/libxml2/merge.c\n"
+    "@@ -100,25 +100,25 @@\n"
+    + "".join(f"-LINE{i:02d}\n" for i in range(1, 21))
+)
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    bundle_path = root / "bundle.pkl"
+    patches = {
+        "p_merge": PatchInfo(
+            file_path_old="libxml2/merge.c",
+            file_path_new="libxml2/merge.c",
+            patch_text=patch_text,
+            file_type="source",
+            old_start_line=100,
+            old_end_line=124,
+            new_start_line=100,
+            new_end_line=124,
+            patch_type={"Recreated function", "Merged functions"},
+            old_signature=sig1,
+            hiden_func_dict={sig1: 0, sig2: 11},
+        )
+    }
+    bundle_path.write_bytes(pickle.dumps(patches))
+
+    build_log = root / "build.log"
+    st = AgentState(
+        build_log_path="-",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line=f"/src/libxml2/merge.c:105:1: error: {msg}",
+        snippet="",
+        artifacts_dir=str(root),
+        patch_key="p_merge",
+        active_patch_key="p_merge",
+        active_old_signature=sig1,
+        target_errors=[{"patch_key": "p_merge", "msg": msg}],
+    )
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_log)}},
+        error=None,
+    )
+
+    # Error remains, but only for sig2 -> should count as fixed for active sig1.
+    build_log.write_text(f"/src/libxml2/merge.c:111:1: error: {msg}\n", encoding="utf-8")
+    verdict = _summarize_target_error_status(st)
+    assert verdict.get("status") == "ok", verdict
+    assert verdict.get("fixed") is True, verdict
+    assert verdict.get("target_mode") == "active_old_signature", verdict
+
+    # Error for sig1 -> not fixed.
+    build_log.write_text(f"/src/libxml2/merge.c:105:1: error: {msg}\n", encoding="utf-8")
+    verdict2 = _summarize_target_error_status(st)
+    assert verdict2.get("status") == "ok", verdict2
+    assert verdict2.get("fixed") is False, verdict2
+PY
+
 # Auto-loop regression: after the first ossfuzz_apply_patch_and_test, refresh errors and iterate within the same patch_key
 # without re-calling get_error_patch_context/get_error_v1_code_slice (drive from build_output + last override patch_text).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -919,7 +1145,6 @@ with tempfile.TemporaryDirectory() as td:
         ossfuzz_runs_attempted=1,
         steps=[
             {"decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}}, "observation": {"ok": True, "tool": "get_error_patch_context", "output": {}}},
-            {"decision": {"type": "tool", "tool": "get_error_v1_code_slice", "args": {}}, "observation": {"ok": True, "tool": "get_error_v1_code_slice", "output": {}}},
             {"decision": {"type": "tool", "tool": "ossfuzz_apply_patch_and_test", "args": {}}, "observation": {"ok": True, "tool": "ossfuzz_apply_patch_and_test", "output": {"build_output": {"artifact_path": str(build_1_path)}, "check_build_output": {"artifact_path": str(check_1_path)}}}},
         ],
     )
@@ -952,7 +1177,6 @@ with tempfile.TemporaryDirectory() as td:
     # Final output should include the full step history across iterations, including steps that were trimmed
     # from state.steps for prompt hygiene.
     assert "get_error_patch_context" in tools, tools
-    assert "get_error_v1_code_slice" in tools, tools
     assert len(steps) > 3, len(steps)
 
     # Ensure we retain and render the previously handled errors even though state.steps is trimmed in auto-loop.
