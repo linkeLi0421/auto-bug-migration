@@ -13,7 +13,6 @@ if str(_SCRIPT_DIR) not in sys.path:
 from migration_tools.tools import (  # noqa: E402
     get_error_patch as _get_error_patch,
     get_error_patch_context as _get_error_patch_context,
-    get_error_v1_code_slice as _get_error_v1_code_slice,
     get_patch as _get_patch,
     list_patch_bundle as _list_patch_bundle,
     make_error_patch_override as _make_error_patch_override,
@@ -84,16 +83,6 @@ def get_error_patch_context(
         error_text=error_text,
         context_lines=context_lines,
         max_total_lines=max_total_lines,
-        allowed_roots=_allowed_roots_from_env(),
-    )
-
-
-def get_error_v1_code_slice(
-    *,
-    excerpt: Any,
-) -> Dict[str, Any]:
-    return _get_error_v1_code_slice(
-        excerpt=excerpt,
         allowed_roots=_allowed_roots_from_env(),
     )
 

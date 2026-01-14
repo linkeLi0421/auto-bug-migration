@@ -204,27 +204,12 @@ class StubModel(ChatModel):
                 return json.dumps(
                     {
                         "type": "tool",
-                        "thought": "Extract the V1-origin function body from the patch to understand the V1 usage.",
-                        "tool": "get_error_v1_code_slice",
-                        "args": {
-                            "patch_path": patch_path,
-                            "file_path": file_path,
-                            "line_number": line_number,
-                            "max_lines": 200,
-                            "max_chars": 12000,
-                        },
-                    }
-                )
-            if observation_count == 2:
-                return json.dumps(
-                    {
-                        "type": "tool",
                         "thought": "Fetch the struct definition in V1 (the migrated code is V1-origin).",
                         "tool": "search_definition",
                         "args": {"symbol_name": struct_symbol, "version": "v1"},
                     }
                 )
-            if observation_count == 3:
+            if observation_count == 2:
                 return json.dumps(
                     {
                         "type": "tool",
@@ -233,7 +218,7 @@ class StubModel(ChatModel):
                         "args": {"symbol_name": struct_symbol, "version": "v2"},
                     }
                 )
-            if observation_count == 4:
+            if observation_count == 3:
                 if os.environ.get("REACT_AGENT_STUB_SUGGEST_V2_TYPE_EDIT", "").strip():
                     return json.dumps(
                         {
@@ -241,8 +226,8 @@ class StubModel(ChatModel):
                             "thought": "A fast fix is to add the missing fields back, but this may be unsafe.",
                             "summary": "Option A: add missing members to the struct definition in V2 headers.",
                             "next_step": "Add the missing fields to the struct definition in the V2 header so the migrated code compiles.",
-                        }
-                    )
+                    }
+                )
                 # In the real agent flow, read_artifact should happen immediately before
                 # make_error_patch_override (enforced by runtime guardrails).
                 new_func_code = (

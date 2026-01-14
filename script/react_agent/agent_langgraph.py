@@ -62,10 +62,21 @@ class AgentState:
     active_line_number: int = 0
     active_func_start_index: Optional[int] = None
     active_func_end_index: Optional[int] = None
+    active_old_signature: str = ""
     active_excerpt_artifact_path: str = ""
+    active_patch_minus_code_artifact_path: str = ""
+    active_error_func_code_artifact_path: str = ""
     pre_patch_file_path: str = ""
     pre_patch_line_number: int = 0
     grouped_errors: List[Dict[str, Any]] = field(default_factory=list)
+    # High-level grouping summary of all errors in the active patch_key (grouped by old_signature).
+    function_groups: List[Dict[str, Any]] = field(default_factory=list)
+    function_groups_total: int = 0
+    function_groups_truncated: bool = False
+    # Union of unique error lines seen across this agent run, keyed by old_signature.
+    # Used to explain why "current" function groups may differ from earlier iterations.
+    function_error_history: Dict[str, List[str]] = field(default_factory=dict)
+    function_error_history_truncated: bool = False
     missing_struct_members: List[Dict[str, Any]] = field(default_factory=list)
     # Compact record of previously targeted errors (survives state.steps trimming in auto-loop).
     error_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -99,7 +110,7 @@ class AgentState:
     # When set, points to the current BASE slice artifact to read before generating the next override.
     loop_base_func_code_artifact_path: str = ""
 
-    # Latest macro tokens reported by get_error_v1_code_slice (used for guardrails).
+    # Latest macro tokens inferred from the active V1-origin patch slice (used for guardrails).
     macro_tokens_not_defined_in_slice: List[str] = field(default_factory=list)
 
     # Macro-lookup guardrail state when the model tries to invent missing macros.
@@ -133,6 +144,18 @@ def _error_payload(state: AgentState) -> Dict[str, Any]:
             }
             for e in state.grouped_errors
         ]
+    if str(getattr(state, "active_old_signature", "") or "").strip():
+        payload["active_old_signature"] = str(state.active_old_signature).strip()
+    if isinstance(getattr(state, "function_groups", None), list) and state.function_groups:
+        payload["function_groups"] = state.function_groups
+        payload["function_groups_total"] = int(getattr(state, "function_groups_total", 0) or 0)
+        payload["function_groups_truncated"] = bool(getattr(state, "function_groups_truncated", False))
+    hist = getattr(state, "function_error_history", None)
+    if isinstance(hist, dict) and hist:
+        hist_groups, hist_total, hist_trunc = _summarize_function_error_history(hist)
+        payload["function_groups_history"] = hist_groups
+        payload["function_groups_history_total"] = hist_total
+        payload["function_groups_history_truncated"] = bool(getattr(state, "function_error_history_truncated", False)) or hist_trunc
     if state.error_history:
         payload["error_history"] = state.error_history
     if state.target_errors:
@@ -242,6 +265,140 @@ def _record_current_error_group(state: AgentState) -> None:
     _append_error_history(state, entry)
 
 
+def _select_function_group_errors(
+    errors: List[Dict[str, Any]], *, preferred_old_signature: str = ""
+) -> tuple[List[Dict[str, Any]], str]:
+    """Select a single function's errors within a patch_key when the patch hunk is merged/tail.
+
+    We treat "merged hunk" heuristically as: multiple distinct non-empty `old_signature` values
+    appear among errors for the same patch_key. In that case, return only the errors for the
+    preferred signature if present, otherwise the first signature group in original order.
+    """
+    preferred = str(preferred_old_signature or "").strip()
+
+    sig_order: List[str] = []
+    by_sig: Dict[str, List[Dict[str, Any]]] = {}
+    for err in errors or []:
+        if not isinstance(err, dict):
+            continue
+        sig = str(err.get("old_signature", "") or "").strip()
+        if not sig:
+            continue
+        if sig not in by_sig:
+            by_sig[sig] = []
+            sig_order.append(sig)
+        by_sig[sig].append(err)
+
+    if len(by_sig) <= 1:
+        chosen = preferred or (sig_order[0] if sig_order else "")
+        return list(errors or []), chosen
+
+    chosen = preferred if preferred and preferred in by_sig else sig_order[0]
+    return by_sig[chosen], chosen
+
+
+def _summarize_function_groups(
+    errors: List[Dict[str, Any]], *, max_groups: int = 12, max_examples_per_group: int = 3
+) -> tuple[List[Dict[str, Any]], int, bool]:
+    """Summarize errors by old_signature for display/debugging (human-facing)."""
+    order: List[str] = []
+    counts: Dict[str, int] = {}
+    examples: Dict[str, List[str]] = {}
+    for err in errors or []:
+        if not isinstance(err, dict):
+            continue
+        sig = str(err.get("old_signature", "") or "").strip() or "<unknown>"
+        if sig not in counts:
+            counts[sig] = 0
+            examples[sig] = []
+            order.append(sig)
+        counts[sig] += 1
+        raw = str(err.get("raw", "") or "").strip()
+        if raw and len(examples[sig]) < max(1, int(max_examples_per_group or 0)):
+            examples[sig].append(raw)
+
+    total = len(order)
+    shown = order[: max(0, int(max_groups or 0))]
+    truncated = total > len(shown)
+    out: List[Dict[str, Any]] = []
+    for sig in shown:
+        out.append(
+            {
+                "old_signature": "" if sig == "<unknown>" else sig,
+                "count": int(counts.get(sig, 0) or 0),
+                "examples": list(examples.get(sig) or []),
+            }
+        )
+    return out, total, truncated
+
+
+def _update_function_error_history(state: AgentState, errors: List[Dict[str, Any]]) -> None:
+    """Accumulate a union of unique error lines by old_signature across the run."""
+    hist = getattr(state, "function_error_history", None)
+    if not isinstance(hist, dict):
+        hist = {}
+    truncated = bool(getattr(state, "function_error_history_truncated", False))
+
+    max_groups = 120
+    max_total_unique = 8000
+    max_per_group = 2000
+
+    total_unique = 0
+    for v in hist.values():
+        if isinstance(v, list):
+            total_unique += len(v)
+
+    for err in errors or []:
+        if not isinstance(err, dict):
+            continue
+        sig = str(err.get("old_signature", "") or "").strip() or "<unknown>"
+        raw = str(err.get("raw", "") or "").strip()
+        if not raw:
+            continue
+        if sig not in hist:
+            if len(hist) >= max_groups:
+                truncated = True
+                continue
+            hist[sig] = []
+        lst = hist.get(sig)
+        if not isinstance(lst, list):
+            lst = []
+            hist[sig] = lst
+        if raw in lst:
+            continue
+        if total_unique >= max_total_unique or len(lst) >= max_per_group:
+            truncated = True
+            continue
+        lst.append(raw)
+        total_unique += 1
+
+    state.function_error_history = hist
+    state.function_error_history_truncated = truncated
+
+
+def _summarize_function_error_history(
+    hist: Dict[str, List[str]], *, max_groups: int = 12, max_examples_per_group: int = 3
+) -> tuple[List[Dict[str, Any]], int, bool]:
+    """Summarize the union of unique error lines by old_signature."""
+    order = [str(k) for k in hist.keys()]
+    total = len(order)
+    shown = order[: max(0, int(max_groups or 0))]
+    truncated = total > len(shown)
+
+    out: List[Dict[str, Any]] = []
+    max_examples = max(0, int(max_examples_per_group or 0))
+    for sig in shown:
+        raws = hist.get(sig) if isinstance(hist.get(sig), list) else []
+        out.append(
+            {
+                "old_signature": "" if sig == "<unknown>" else sig,
+                "count": len(raws),
+                "examples": list(raws[:max_examples]) if max_examples else [],
+            }
+        )
+    return out, total, truncated
+
+
 def _read_text(path: str) -> str:
     p = Path(str(path or "").strip()).expanduser().resolve()
     return p.read_text(encoding="utf-8", errors="replace")
@@ -318,33 +475,107 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
 
     bundle: Any = None
     bundle_err: Optional[str] = None
-    load_patch_bundle: Any = None
     get_error_patch_from_bundle: Any = None
+    mapping_cache: Dict[tuple[str, int], Dict[str, Any]] = {}
 
-    def patch_key_for_error(file_path: str, line_number: int) -> str:
-        nonlocal bundle, bundle_err, load_patch_bundle, get_error_patch_from_bundle
+    def mapping_for_error(file_path: str, line_number: int) -> Dict[str, Any]:
+        nonlocal bundle, bundle_err, get_error_patch_from_bundle
         fp = str(file_path or "").strip()
         ln = int(line_number or 0)
         if not (state.patch_path and fp and ln > 0):
-            return ""
+            return {}
+        cache_key = (fp, ln)
+        cached = mapping_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
         if bundle_err is not None:
-            return ""
+            mapping_cache[cache_key] = {}
+            return {}
         try:
             if bundle is None:
+                bundle, bundle_err2 = _load_effective_patch_bundle_for_mapping(state)
+                if bundle_err2 or bundle is None:
+                    bundle_err = str(bundle_err2 or "Failed to load patch bundle.")
+                    mapping_cache[cache_key] = {}
+                    return {}
                 script_dir = Path(__file__).resolve().parents[1]
                 if str(script_dir) not in sys.path:
                     sys.path.insert(0, str(script_dir))
-                from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
                 from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
 
-                load_patch_bundle = _lpb
                 get_error_patch_from_bundle = _gepb
-                bundle = load_patch_bundle(state.patch_path, allowed_roots=_allowed_patch_roots_from_env())
             mapping = get_error_patch_from_bundle(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
-            return str(mapping.get("patch_key") or "").strip()
+            mapping_cache[cache_key] = mapping if isinstance(mapping, dict) else {}
+            return mapping_cache[cache_key]
         except Exception as exc:  # noqa: BLE001
             bundle_err = f"{type(exc).__name__}: {exc}"
+            mapping_cache[cache_key] = {}
+            return {}
+
+    def patch_key_for_error(file_path: str, line_number: int) -> str:
+        mapping = mapping_for_error(file_path, line_number)
+        if not isinstance(mapping, dict):
             return ""
+        return str(mapping.get("patch_key") or "").strip()
+
+    active_patch_key = str(getattr(state, "active_patch_key", "") or state.patch_key or "").strip()
+    active_old_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if (
+        state.error_scope == "patch"
+        and state.patch_path
+        and active_patch_key
+        and active_old_sig
+        and combined_errors
+    ):
+        remaining_in_active_func: List[Dict[str, Any]] = []
+        for err in combined_errors:
+            fp = str(err.get("file", "") or "").strip()
+            ln = int(err.get("line", 0) or 0)
+            msg = str(err.get("msg", "") or "").strip()
+            if not fp or ln <= 0 or not msg:
+                continue
+            mapping = mapping_for_error(fp, ln)
+            if not isinstance(mapping, dict):
+                continue
+            err_patch_key = str(mapping.get("patch_key") or "").strip()
+            err_sig = str(mapping.get("old_signature") or "").strip()
+            if err_patch_key != active_patch_key or err_sig != active_old_sig:
+                continue
+            remaining_in_active_func.append(
+                {
+                    "raw": err.get("raw", ""),
+                    "file": fp,
+                    "line": ln,
+                    "patch_key": err_patch_key,
+                    "old_signature": err_sig,
+                    "msg": msg,
+                }
+            )
+
+        fixed = len(remaining_in_active_func) == 0
+        other = [
+            {
+                "raw": str(e.get("raw", "") or "").strip(),
+                "file": str(e.get("file", "") or "").strip(),
+                "line": int(e.get("line", 0) or 0),
+                "patch_key": patch_key_for_error(str(e.get("file", "") or ""), int(e.get("line", 0) or 0)),
+                "msg": str(e.get("msg", "") or "").strip(),
+            }
+            for e in combined_errors
+            if str(e.get("raw", "") or "").strip()
+        ]
+        return {
+            "status": "ok",
+            "fixed": fixed,
+            "targets": targets,
+            "matched_target_errors": remaining_in_active_func,
+            "other_errors": other[:10],
+            "log_artifacts": sources,
+            "mapping_error": bundle_err,
+            "target_mode": "active_old_signature",
+            "active_patch_key": active_patch_key,
+            "active_old_signature": active_old_sig,
+        }
 
     matched: List[Dict[str, Any]] = []
     matched_keys: set[tuple[str, str]] = set()
@@ -736,11 +967,15 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             enriched.append(item)
 
     in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key] if active_key else []
+    func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     return {
         "status": "ok",
         "active_patch_key": active_key,
         "remaining_in_active_patch_key": len(in_active),
         "errors": in_active[:10],
+        "function_groups": func_groups,
+        "function_groups_total": func_total,
+        "function_groups_truncated": func_trunc,
         "log_artifacts": sources,
         "mapping_error": mapping_error,
         "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
@@ -824,10 +1059,26 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     if not in_active:
         return None
 
+    func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
+    state.function_groups = func_groups
+    state.function_groups_total = func_total
+    state.function_groups_truncated = func_trunc
+    _update_function_error_history(state, in_active)
+
     _record_current_error_group(state)
 
-    next_err = in_active[0]
-    state.grouped_errors = in_active[:10]
+    preferred_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if not preferred_sig and state.grouped_errors:
+        preferred_sig = str(state.grouped_errors[0].get("old_signature", "") or "").strip()
+
+    selected, chosen_sig = _select_function_group_errors(in_active, preferred_old_signature=preferred_sig)
+    if chosen_sig:
+        state.active_old_signature = chosen_sig
+    if not selected:
+        return None
+
+    next_err = selected[0]
+    state.grouped_errors = selected[:10]
     state.error_line = str(next_err.get("raw", "") or "").strip() or state.error_line
     state.snippet = str(next_err.get("snippet", "") or "").rstrip("\n") or state.snippet
     state.target_errors = _extract_target_errors(
@@ -1142,13 +1393,40 @@ def _last_read_artifact_text(state: AgentState) -> str:
 
 
 def _override_preserve_base_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
-    """Return an error message if new_func_code drops too much of the read_artifact base slice."""
+    """Return an error message if new_func_code drops too much of the mapped '-' slice baseline.
+
+    For merged/tail hunks, the "BASE slice" must be the mapped function slice (error_func_code / loop_base slice),
+    not the entire hunk/patch text, otherwise a correct per-function rewrite would be flagged as "too short".
+    """
     if str(decision.get("type", "")).strip() != "tool":
         return None
     if str(decision.get("tool", "")).strip() != "make_error_patch_override":
         return None
 
-    base_text = _last_read_artifact_text(state)
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
     if not base_text.strip():
         return None
 
@@ -1165,22 +1443,14 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
     if base_n <= 0 or new_n <= 0:
         return None
 
-    dropped = base_n - new_n
-    if dropped > max(20, base_n // 3):
-        return (
-            f"new_func_code is much shorter than the BASE slice from read_artifact "
-            f"(BASE lines={base_n}, new_func_code lines={new_n}). "
-            "This likely dropped tail lines and will silently delete code when rewriting the '-' slice."
-        )
-
     base_tail = [ln for ln in base_lines if ln.strip()]
     base_tail = base_tail[-6:] if len(base_tail) >= 6 else base_tail
     if base_tail:
         hits = sum(1 for ln in base_tail if ln and ln in new_text)
         if hits < min(2, len(base_tail)):
             return (
-                "new_func_code does not appear to include the tail of the BASE slice from read_artifact. "
-                "Do not drop unrelated lines; start from the BASE text and apply minimal edits."
+                f"new_func_code does not appear to include the tail of the mapped '-' slice baseline ({base_source}). "
+                "If you intend a minimal edit, start from the baseline slice and apply minimal edits."
             )
 
     return None
@@ -1477,7 +1747,7 @@ def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
                 if tool_name == "read_artifact" and key_path == ("output",) and key == "text" and isinstance(v, str):
                     out[key] = v
                     continue
-                if key in {"excerpt", "func_code", "patch_text"} and isinstance(v, str):
+                if key in {"excerpt", "func_code", "patch_text", "patch_minus_code", "error_func_code"} and isinstance(v, str):
                     out[key] = _truncate_text_around_terms(v, terms, max_chars=12000)
                 else:
                     out[key] = compact(v, depth=depth + 1, key_path=key_path + (key,))
@@ -1528,6 +1798,7 @@ def _decision_suggests_v2_type_edit(decision: Decision) -> bool:
 
 
 _MISSING_MEMBER_RE = re.compile(r"no member named '[^']+' in '([^']+)'")
+_MISSING_MEMBER_FIELD_RE = re.compile(r"no member named '([^']+)' in '([^']+)'")
 _ERROR_LOC_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):")
 
 
@@ -1608,8 +1879,8 @@ def _should_force_struct_diff_tools(state: AgentState) -> Optional[str]:
             return True
         return False
 
-    if not called("get_error_v1_code_slice"):
-        return "get_error_v1_code_slice"
+    if not called("get_error_patch_context"):
+        return "get_error_patch_context"
     if not called("search_definition", version="v1", symbol_any=queries):
         return f"search_definition:v1:{queries[0]}"
     if not called("search_definition", version="v2", symbol_any=queries):
@@ -1633,10 +1904,14 @@ def _should_require_make_error_patch_override(state: AgentState) -> bool:
     """Return True if we should force patch generation before allowing a final decision."""
     if not state.patch_path or state.error_scope != "patch":
         return False
-    # Only require this in the patch-slice rewrite workflow (we've extracted a V1-origin slice).
-    if not _has_tool_call(state, "get_error_v1_code_slice"):
+    if state.patch_generated:
         return False
-    # Do not accept final until we've attempted patch generation at least once.
+    # Require patch generation once we have enough context to rewrite a mapped '-' slice.
+    has_base = bool(str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()) or _has_tool_call(
+        state, "get_error_patch_context"
+    )
+    if not has_base:
+        return False
     return not _has_tool_call(state, "make_error_patch_override")
 
 
@@ -1670,6 +1945,62 @@ def _structs_to_compare(state: AgentState) -> List[str]:
             seen.add(s)
             out.append(s)
     return out[:8]
+
+
+def _struct_member_search_guardrail_for_search_definition(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Rewrite search_definition(member) into kb_search_symbols when member is a missing struct field.
+
+    search_definition is a symbol-definition lookup and isn't a reliable way to locate struct fields; for a missing
+    member name we prefer querying the KB for FIELD_DECL/VAR_DECL/MACRO_DEFINITION matches.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "search_definition":
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    raw_name = str(args_obj.get("symbol_name", "") or "").strip()
+    if not raw_name:
+        return None
+
+    missing: set[str] = set()
+    for item in state.missing_struct_members or []:
+        if not isinstance(item, dict):
+            continue
+        for member in item.get("members") or []:
+            m = str(member or "").strip()
+            if m:
+                missing.add(m)
+    if not missing:
+        m = _MISSING_MEMBER_FIELD_RE.search(str(state.error_line or ""))
+        if m:
+            member = str(m.group(1) or "").strip()
+            if member:
+                missing.add(member)
+    if not missing:
+        return None
+
+    # If the model passes expressions like "ctxt->nsdb" or "ctxt.nsdb", extract the last identifier.
+    toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", raw_name)
+    if not toks:
+        return None
+    candidate = str(toks[-1] or "").strip()
+    if not candidate or candidate not in missing:
+        return None
+
+    return {
+        "type": "tool",
+        "thought": (
+            "search_definition is not a struct-field lookup; query the KB for member declarations/usages instead."
+        ),
+        "tool": "kb_search_symbols",
+        "args": {
+            "symbols": [candidate],
+            "version": "v2",
+            "kinds": ["FIELD_DECL", "VAR_DECL", "MACRO_DEFINITION"],
+            "limit_per_symbol": 8,
+        },
+    }
 
 
 def _has_struct_definition(state: AgentState, struct_name: str, version: str) -> bool:
@@ -1720,7 +2051,7 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
         return None
 
     # Auto-loop iteration: the next override is driven from the latest override patch_text and a BASE slice
-    # extracted from it (loop_base_func_code_artifact_path). Do not force get_error_patch_context/get_error_v1_code_slice.
+    # extracted from it (loop_base_func_code_artifact_path). Do not force re-mapping tools.
     if str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip():
         return None
 
@@ -1740,44 +2071,6 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
                 "error_text": str(state.error_line or "")[:400],
                 "context_lines": 80,
                 "max_total_lines": 800,
-            },
-        }
-
-    if not _has_tool_call(state, "get_error_v1_code_slice"):
-        excerpt_arg: Any = None
-        ap = str(getattr(state, "active_excerpt_artifact_path", "") or "").strip()
-        if ap:
-            excerpt_arg = {"artifact_path": ap}
-        else:
-            for step in reversed(state.steps):
-                if not isinstance(step, dict):
-                    continue
-                obs = step.get("observation")
-                if not isinstance(obs, dict):
-                    continue
-                if obs.get("ok") is not True:
-                    continue
-                if str(obs.get("tool", "")).strip() != "get_error_patch_context":
-                    continue
-                out = obs.get("output")
-                if not isinstance(out, dict):
-                    continue
-                excerpt_val = out.get("excerpt")
-                if isinstance(excerpt_val, str) and excerpt_val.strip():
-                    excerpt_arg = excerpt_val
-                    break
-                if isinstance(excerpt_val, dict):
-                    ap2 = str(excerpt_val.get("artifact_path", "") or "").strip()
-                    if ap2:
-                        excerpt_arg = {"artifact_path": ap2}
-                        break
-
-        return {
-            "type": "tool",
-            "thought": "Extract the V1-origin code slice from the get_error_patch_context excerpt before proposing a replacement.",
-            "tool": "get_error_v1_code_slice",
-            "args": {
-                "excerpt": excerpt_arg,
             },
         }
 
@@ -1836,6 +2129,20 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     patch_key = str(error.get("patch_key", "")).strip()
     scope = str(error.get("scope", "")).strip()
     grouped = error.get("grouped_errors") if isinstance(error.get("grouped_errors"), list) else []
+    active_sig = str(error.get("active_old_signature", "")).strip()
+    current_groups = error.get("function_groups") if isinstance(error.get("function_groups"), list) else []
+    try:
+        current_groups_total = int(error.get("function_groups_total", 0) or 0)
+    except (TypeError, ValueError):
+        current_groups_total = 0
+    current_groups_truncated = bool(error.get("function_groups_truncated", False))
+
+    history_groups = error.get("function_groups_history") if isinstance(error.get("function_groups_history"), list) else []
+    try:
+        history_groups_total = int(error.get("function_groups_history_total", 0) or 0)
+    except (TypeError, ValueError):
+        history_groups_total = 0
+    history_groups_truncated = bool(error.get("function_groups_history_truncated", False))
     history = error.get("error_history") if isinstance(error.get("error_history"), list) else []
     if patch_path:
         lines.append(f"Patch bundle: {patch_path}")
@@ -1845,6 +2152,60 @@ def _render_final_text(final: Dict[str, Any]) -> str:
         lines.append(f"Patch key: {patch_key}")
     if scope:
         lines.append(f"Scope: {scope}")
+
+    if current_groups or history_groups:
+        lines.append("")
+        lines.append("Function grouping note:")
+        lines.append(textwrap.indent("Current = remaining compiler errors from the latest build logs.", "  "))
+        lines.append(textwrap.indent("History = union of unique error lines seen earlier in this agent run (may include fixed errors).", "  "))
+
+    if current_groups:
+        lines.append("")
+        total = current_groups_total or len(current_groups)
+        lines.append(f"Current function groups ({total}):")
+        for idx, grp in enumerate(current_groups, start=1):
+            if not isinstance(grp, dict):
+                continue
+            sig = str(grp.get("old_signature", "") or "").strip()
+            count = grp.get("count", 0)
+            try:
+                count_i = int(count or 0)
+            except (TypeError, ValueError):
+                count_i = 0
+            label = sig or "<unknown>"
+            suffix = " [active]" if active_sig and sig and sig == active_sig else ""
+            lines.append(textwrap.indent(f"{idx}. {label} (errors={count_i}){suffix}", "  "))
+            examples = grp.get("examples") if isinstance(grp.get("examples"), list) else []
+            for raw in examples[:3]:
+                r = str(raw or "").strip()
+                if r:
+                    lines.append(textwrap.indent(f"- {r}", "    "))
+        if current_groups_truncated:
+            lines.append(textwrap.indent("...(truncated)", "  "))
+
+    if history_groups:
+        lines.append("")
+        total = history_groups_total or len(history_groups)
+        lines.append(f"History function groups ({total}):")
+        for idx, grp in enumerate(history_groups, start=1):
+            if not isinstance(grp, dict):
+                continue
+            sig = str(grp.get("old_signature", "") or "").strip()
+            count = grp.get("count", 0)
+            try:
+                count_i = int(count or 0)
+            except (TypeError, ValueError):
+                count_i = 0
+            label = sig or "<unknown>"
+            suffix = " [active]" if active_sig and sig and sig == active_sig else ""
+            lines.append(textwrap.indent(f"{idx}. {label} (unique_errors={count_i}){suffix}", "  "))
+            examples = grp.get("examples") if isinstance(grp.get("examples"), list) else []
+            for raw in examples[:3]:
+                r = str(raw or "").strip()
+                if r:
+                    lines.append(textwrap.indent(f"- {r}", "    "))
+        if history_groups_truncated:
+            lines.append(textwrap.indent("...(truncated)", "  "))
     if error_line:
         if lines:
             lines.append("")
@@ -1980,7 +2341,7 @@ def _system_prompt() -> str:
         "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
         "     Avoid read_artifact unless you must inspect an artifact_path (e.g. a truncated slice) to proceed.\n"
         "  2) Patching phase (last): ensure you have a BASE slice (usually via read_artifact on the\n"
-        "     get_error_v1_code_slice.func_code.artifact_path), then call make_error_patch_override\n"
+        "     get_error_patch_context.error_func_code.artifact_path, or loop_base_func_code_artifact_path in auto-loop), then call make_error_patch_override\n"
         "     to generate an override diff,\n"
         "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
         "     then return final.\n"
@@ -2001,6 +2362,9 @@ def _system_prompt() -> str:
         "- For \"no member named 'X' in 'struct Y'\" errors, treat the failing code as V1-origin and compare definitions:\n"
         "  search_definition(symbol_name='struct Y', version='v1') and search_definition(..., version='v2') before any macro lookup.\n"
         "  If multiple members are missing for the same struct, reuse the same fetched struct definitions.\n"
+        "- Note: search_definition is NOT a struct-field lookup. Do not call search_definition on member names like \"nsdb\" or expressions like\n"
+        "  \"ctxt->nsdb\". To locate member declarations/usages, prefer kb_search_symbols(..., kinds=['FIELD_DECL','VAR_DECL','MACRO_DEFINITION']) and\n"
+        "  inspect the parent struct body.\n"
         "- When you have a concrete fix for the V1-origin code slice (functions/macros/consts/decls; often inside __revert_*), update the patch bundle slice:\n"
         "  call make_error_patch_override(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
         "  then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
@@ -2009,20 +2373,20 @@ def _system_prompt() -> str:
         "- If a missing token is likely a macro and search_definition returns nothing, use kb_search_symbols(kinds=['MACRO_DEFINITION']).\n\n"
         "- Macro/decl hunks: syntax errors like \"expected '}'\" can be caused by a macro body referencing undefined\n"
         "  placeholder macros (e.g. a slice defines `MAKE_HANDLER(... out EMPTY_ICONV EMPTY_UCONV ...)` but does not\n"
-        "  also add `EMPTY_ICONV` / `EMPTY_UCONV`). Use get_error_v1_code_slice.macro_tokens_not_defined_in_slice as a\n"
+        "  also add `EMPTY_ICONV` / `EMPTY_UCONV`). Use get_error_patch_context.macro_tokens_not_defined_in_slice as a\n"
         "  hint, locate the missing macro definitions (kb_search_symbols + read_file_context; v2 first, then v1), and include\n"
         "  the required `#define ...` lines (or a V2-equivalent adaptation) in the override `new_func_code`.\n"
         "  Example: add `#define EMPTY_ICONV` and `#define EMPTY_UCONV` above `#define MAKE_HANDLER(...)` if that matches\n"
         "  the intended V1 semantics, or copy the correct definitions from V2/V1 and adapt call sites as needed.\n\n"
         "- Guardrail (macros): do NOT invent placeholder macro definitions.\n"
-        "  If you plan to add `#define TOKEN ...` for any missing macro token (from get_error_v1_code_slice.macro_tokens_not_defined_in_slice),\n"
+        "  If you plan to add `#define TOKEN ...` for any missing macro token (from get_error_patch_context.macro_tokens_not_defined_in_slice),\n"
         "  you MUST first locate its real definition using tools:\n"
         "    - kb_search_symbols(symbols=[\"TOKEN\"], kinds=[\"MACRO_DEFINITION\"], version=\"v2\") then kb_search_symbols(..., version=\"v1\")\n"
         "    - read_file_context(version, file_path, line_number, context) on the best match to capture the full guarded block.\n"
         "  If neither V1 nor V2 defines TOKEN, do NOT add a dummy `#define`; instead remove/replace TOKEN in the macro body or adapt to V2 semantics.\n\n"
         "- Macro dependency resolution recipe (general):\n"
         "  1) From the build snippet, identify the expanded macro name (`expanded from macro 'X'`).\n"
-        "  2) From get_error_v1_code_slice.macro_tokens_not_defined_in_slice, pick the 1–3 missing tokens most relevant to X.\n"
+        "  2) From get_error_patch_context.macro_tokens_not_defined_in_slice, pick the 1–3 missing tokens most relevant to X.\n"
         "  3) For each token, locate `#define` with kb_search_symbols (v2 then v1) and confirm via read_file_context (include full #if/#endif block).\n"
         "  4) Only then rewrite the patch slice: include dependency macro blocks first, then the macro being added/modified, then call make_error_patch_override.\n\n"
         "Available tools:\n"
@@ -2045,6 +2409,8 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         )
     if state.artifacts_dir:
         header_lines.append(f"Artifacts dir: {state.artifacts_dir}")
+    if state.error_scope == "patch" and str(getattr(state, "active_old_signature", "") or "").strip():
+        header_lines.append(f"Active function (old_signature): {str(state.active_old_signature).strip()}")
     if state.ossfuzz_project and state.ossfuzz_commit:
         header_lines.append("OSS-Fuzz test config:")
         header_lines.append(f"  project: {state.ossfuzz_project}")
@@ -2500,12 +2866,12 @@ def _run_langgraph(
             remaining = cfg.max_steps - len(st.steps)
             required = _should_force_struct_diff_tools(st)
             if required and remaining >= 2:
-                if required == "get_error_v1_code_slice":
+                if required == "get_error_patch_context":
                     prereq = _next_patch_prereq_tool(st)
                     if prereq:
                         forced: Decision = dict(prereq)
                         forced["thought"] = (
-                            "Missing-member error in patch-scope: extract V1-origin code from the get_error_patch_context excerpt "
+                            "Missing-member error in patch-scope: fetch get_error_patch_context (includes V1-origin patch_minus_code + error_func_code) "
                             "before finalizing."
                         )
                         _validate_tool_decision(forced)
@@ -2561,7 +2927,8 @@ def _run_langgraph(
 
                     artifact_path = (
                         str(getattr(st, "loop_base_func_code_artifact_path", "") or "").strip()
-                        or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
+                        or _last_artifact_path(st, "get_error_patch_context", "error_func_code")
+                        or _last_artifact_path(st, "get_error_patch_context", "patch_minus_code")
                         or _last_artifact_path(st, "get_error_patch_context", "excerpt")
                     )
                     forced_read: Decision = {
@@ -2690,6 +3057,11 @@ def _run_langgraph(
             }
         _validate_tool_decision(decision)
 
+        field_rewrite = _struct_member_search_guardrail_for_search_definition(st, decision)
+        if field_rewrite:
+            _validate_tool_decision(field_rewrite)
+            decision = field_rewrite  # type: ignore[assignment]
+
         # Guardrail: make_error_patch_override must use the build-log /src/... error location, not pre_patch_*.
         fixed_loc = _override_location_guardrail_for_override(st, decision)
         if fixed_loc:
@@ -2706,10 +3078,10 @@ def _run_langgraph(
                     {
                         "role": "user",
                         "content": (
-                            "Your make_error_patch_override.new_func_code appears to drop too much of the BASE slice.\n"
+                            "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
                             f"{shrink_err}\n\n"
-                            "Fix: start from the latest read_artifact.output.text (BASE slice) and apply the smallest possible edits.\n"
-                            "Do NOT omit the tail; keep all unrelated lines.\n"
+                            "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
+                            "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
                     }
@@ -2777,7 +3149,8 @@ def _run_langgraph(
                 st.pending_patch = decision
                 artifact_path = (
                     str(getattr(st, "loop_base_func_code_artifact_path", "") or "").strip()
-                    or _last_artifact_path(st, "get_error_v1_code_slice", "func_code")
+                    or _last_artifact_path(st, "get_error_patch_context", "error_func_code")
+                    or _last_artifact_path(st, "get_error_patch_context", "patch_minus_code")
                     or _last_artifact_path(st, "get_error_patch_context", "excerpt")
                 )
                 forced: Decision = {
@@ -2830,6 +3203,7 @@ def _run_langgraph(
             st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
             st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
             st.active_line_number = int(obs.output.get("line_number", 0) or st.active_line_number or 0)
+            st.active_old_signature = str(obs.output.get("old_signature") or st.active_old_signature or "").strip()
             st.pre_patch_file_path = str(obs.output.get("pre_patch_file_path") or st.pre_patch_file_path or "").strip()
             st.pre_patch_line_number = int(obs.output.get("pre_patch_line_number", 0) or st.pre_patch_line_number or 0)
             fs = obs.output.get("func_start_index")
@@ -2841,7 +3215,12 @@ def _run_langgraph(
             excerpt = obs.output.get("excerpt")
             if isinstance(excerpt, dict):
                 st.active_excerpt_artifact_path = str(excerpt.get("artifact_path", "") or "").strip()
-        if obs.ok and obs.tool == "get_error_v1_code_slice" and isinstance(obs.output, dict):
+            patch_minus = obs.output.get("patch_minus_code")
+            if isinstance(patch_minus, dict):
+                st.active_patch_minus_code_artifact_path = str(patch_minus.get("artifact_path", "") or "").strip()
+            err_func = obs.output.get("error_func_code")
+            if isinstance(err_func, dict):
+                st.active_error_func_code_artifact_path = str(err_func.get("artifact_path", "") or "").strip()
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
                 st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
@@ -2855,6 +3234,7 @@ def _run_langgraph(
                 st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
                 st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
                 st.active_line_number = int(obs.output.get("line_number", 0) or st.active_line_number or 0)
+                st.active_old_signature = str(obs.output.get("old_signature") or st.active_old_signature or "").strip()
                 fs = obs.output.get("func_start_index")
                 fe = obs.output.get("func_end_index")
                 if isinstance(fs, int):
@@ -3056,6 +3436,12 @@ def main(argv: List[str]) -> int:
     grouped_errors: List[Dict[str, Any]] = []
     patch_key = ""
     missing_struct_members: List[Dict[str, Any]] = []
+    active_old_signature = ""
+    function_groups: List[Dict[str, Any]] = []
+    function_groups_total: int = 0
+    function_groups_truncated: bool = False
+    # Full unfiltered list of compiler errors mapped to the selected patch_key (used for history union).
+    full_grouped_for_history: List[Dict[str, Any]] = []
 
     error_line, snippet = find_first_fatal(build_log)
     if not error_line:
@@ -3089,6 +3475,8 @@ def main(argv: List[str]) -> int:
                 enriched = dict(err)
                 enriched["patch_key"] = mapping.get("patch_key")
                 enriched["old_signature"] = mapping.get("old_signature")
+                enriched["func_start_index"] = mapping.get("func_start_index")
+                enriched["func_end_index"] = mapping.get("func_end_index")
                 if key:
                     if not first_mapped_key:
                         first_mapped_key = key
@@ -3099,10 +3487,18 @@ def main(argv: List[str]) -> int:
                     patch_key = focus
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                grouped_errors = groups[patch_key]
+                full_grouped = groups[patch_key]
+                full_grouped_for_history = list(full_grouped)
+                function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
+                grouped_errors = full_grouped
+                # If this patch_key is a merged/tail hunk (multiple old_signature values), further
+                # scope to a single function at a time to keep the agent focused.
+                grouped_errors, active_old_signature = _select_function_group_errors(grouped_errors)
                 if grouped_errors:
                     error_line = str(grouped_errors[0].get("raw", error_line))
                     snippet = str(grouped_errors[0].get("snippet", snippet))
+                    if not active_old_signature:
+                        active_old_signature = str(grouped_errors[0].get("old_signature", "") or "").strip()
                 raw_block = "\n".join(str(e.get("raw", "")).strip() for e in grouped_errors if e.get("raw"))
                 if raw_block:
                     parsed = parse_build_errors_tool(build_log_text=raw_block)
@@ -3215,7 +3611,11 @@ def main(argv: List[str]) -> int:
             active_line_number=active_line_number,
             active_func_start_index=active_func_start_index,
             active_func_end_index=active_func_end_index,
+            active_old_signature=active_old_signature,
             grouped_errors=grouped_errors,
+            function_groups=function_groups,
+            function_groups_total=function_groups_total,
+            function_groups_truncated=function_groups_truncated,
             missing_struct_members=missing_struct_members,
             target_errors=target_errors,
             ossfuzz_project=ossfuzz_project,
@@ -3227,6 +3627,8 @@ def main(argv: List[str]) -> int:
             ossfuzz_fuzz_target=str(getattr(args, "ossfuzz_fuzz_target", "") or "").strip(),
             ossfuzz_use_sudo=bool(getattr(args, "ossfuzz_use_sudo", False)),
         )
+        if full_grouped_for_history:
+            _update_function_error_history(state, full_grouped_for_history)
         _record_current_error_group(state)
 
         final = _run_langgraph(

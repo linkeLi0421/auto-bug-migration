@@ -30,7 +30,6 @@ from script.migration_tools.patch_bundle import load_patch_bundle
 from script.migration_tools.tools import (
     get_error_patch,
     get_error_patch_context,
-    get_error_v1_code_slice,
     get_patch,
     list_patch_bundle,
     make_error_patch_override,
@@ -70,9 +69,11 @@ ctx = get_error_patch_context(
     error_text="/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'",
     allowed_roots=allowed_roots,
 )
-func = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
-json.dumps(func)
-assert func.get("func_code") and "ctx2" in func["func_code"], func
+func_code = ctx.get("error_func_code") or ""
+patch_minus_code = ctx.get("patch_minus_code") or ""
+json.dumps({"error_func_code": func_code, "patch_minus_code": patch_minus_code})
+assert func_code and "ctx2" in func_code, ctx
+assert func_code.strip() in patch_minus_code, (func_code[:200], patch_minus_code[:200])
 
 replacement = "ctx2_fixed\nctx2_extra"
 patch_replace = make_error_patch_override(
@@ -170,6 +171,12 @@ excerpt = out.get("excerpt") or ""
 assert "@@ -1,1100 +1,0 @@" in excerpt, excerpt[:200]
 assert "-LINE0000" in excerpt and "-LINE1099" in excerpt, excerpt[-200:]
 
+patch_minus = out.get("patch_minus_code") or ""
+assert "LINE0000" in patch_minus and "LINE1099" in patch_minus, patch_minus[:200]
+assert "...[truncated]" not in patch_minus, patch_minus[-200:]
+assert out.get("patch_minus_code_lines_total") == 1100, out.get("patch_minus_code_lines_total")
+assert len(patch_minus.splitlines()) == 1100, len(patch_minus.splitlines())
+
 hunk_total = int(out.get("hunk_lines_total") or 0)
 assert hunk_total >= 1101, hunk_total  # header + 1100 '-' lines
 
@@ -179,35 +186,6 @@ hunk_idx = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
 assert hunk_idx >= 0, lines[:10]
 minus_count = sum(1 for l in lines[hunk_idx + 1 :] if l.startswith("-") and not l.startswith("---"))
 assert minus_count == 1100, minus_count
-
-print("OK")
-PY
-
-# get_error_v1_code_slice: return full text and never inject a "[truncated]" marker.
-"$PYTHON" - <<'PY'
-import json
-
-from script.migration_tools.tools import get_error_v1_code_slice
-
-minus_lines = [f"-LINE{i:04d} " + ("X" * 40) for i in range(50)]
-diff_text = "\n".join(
-    [
-        "diff --git a/x.c b/x.c",
-        "--- a/x.c",
-        "+++ b/x.c",
-        "@@ -1,50 +1,0 @@",
-        *minus_lines,
-        "",
-    ]
-)
-
-out = get_error_v1_code_slice(excerpt=diff_text)
-json.dumps(out)
-assert out["func_code_lines_total"] == 50, out
-assert out["func_code_lines_returned"] == 50, out
-assert out["func_code_truncated"] is False, out
-code = out.get("func_code") or ""
-assert "...[truncated]" not in code, code[-200:]
 
 print("OK")
 PY
@@ -229,7 +207,7 @@ script_dir = repo_root / "script"
 sys.path.insert(0, str(script_dir))
 
 from migration_tools.patch_bundle import load_patch_bundle
-from migration_tools.tools import get_error_patch, get_error_patch_context, get_error_v1_code_slice, make_error_patch_override
+from migration_tools.tools import get_error_patch, get_error_patch_context, make_error_patch_override
 from migration_tools.types import PatchInfo
 
 patch_text = "\n".join(
@@ -277,12 +255,12 @@ ctx = get_error_patch_context(
     line_number=101,
     allowed_roots=allowed_roots,
 )
-code = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
-json.dumps(code)
-assert "#define FOO 1" in (code.get("func_code") or ""), code
-defined = set(code.get("defined_macros") or [])
+json.dumps(ctx)
+patch_minus = ctx.get("patch_minus_code") or ""
+assert "#define FOO 1" in patch_minus, patch_minus[:200]
+defined = set(ctx.get("defined_macros") or [])
 assert {"FOO", "BAR", "BAZ"} <= defined, defined
-missing = set(code.get("macro_tokens_not_defined_in_slice") or [])
+missing = set(ctx.get("macro_tokens_not_defined_in_slice") or [])
 assert not ({"FOO", "BAR", "BAZ"} & missing), missing
 
 out = make_error_patch_override(
@@ -319,7 +297,7 @@ script_dir = repo_root / "script"
 sys.path.insert(0, str(script_dir))
 
 from migration_tools.patch_bundle import load_patch_bundle
-from migration_tools.tools import get_error_patch_context, get_error_v1_code_slice, make_error_patch_override
+from migration_tools.tools import get_error_patch_context, make_error_patch_override
 from migration_tools.types import PatchInfo
 
 patch_text = "\n".join(
@@ -358,9 +336,8 @@ ctx = get_error_patch_context(
     line_number=100,
     allowed_roots=allowed_roots,
 )
-code = get_error_v1_code_slice(excerpt=ctx.get("excerpt") or "", allowed_roots=allowed_roots)
-json.dumps(code)
-missing = set(code.get("macro_tokens_not_defined_in_slice") or [])
+json.dumps(ctx)
+missing = set(ctx.get("macro_tokens_not_defined_in_slice") or [])
 assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
 
 # Guardrail: a no-op rewrite (new_func_code identical to the existing '-' slice) should be rejected.
@@ -369,7 +346,7 @@ try:
         patch_path=str(bundle_path),
         file_path="/src/libxml2/encoding.c",
         line_number=100,
-        new_func_code=code.get("func_code") or "",
+        new_func_code=ctx.get("patch_minus_code") or "",
         max_lines=2000,
         max_chars=200000,
         allowed_roots=allowed_roots,
@@ -391,48 +368,6 @@ json.dumps(out)
 patch_text_out = out.get("patch_text") or ""
 assert "@@ -100,4 +100,0 @@" in patch_text_out, patch_text_out
 assert "-#define EMPTY_ICONV" in patch_text_out and "-#define EMPTY_UCONV" in patch_text_out, patch_text_out
-
-print("OK")
-PY
-
-# Excerpt-based slicing: get_error_v1_code_slice can operate on a single-hunk excerpt artifact.
-"$PYTHON" - "$tmp_dir" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-tmp_dir = Path(sys.argv[1]).resolve()
-repo_root = tmp_dir.parents[3]
-sys.path.insert(0, str(repo_root))
-
-from script.migration_tools.tools import get_error_v1_code_slice  # noqa: E402
-
-artifact_dir = tmp_dir / "artifacts"
-artifact_dir.mkdir(parents=True, exist_ok=True)
-os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifact_dir)
-
-excerpt_path = artifact_dir / "excerpt.diff"
-excerpt_path.write_text(
-    "\n".join(
-        [
-            "diff --git a/encoding.c b/encoding.c",
-            "--- a/encoding.c",
-            "+++ b/encoding.c",
-            "@@ -100,2 +100,0 @@",
-            "-#define MAKE_HANDLER(name, in, out) \\",
-            "-    { (char *) name, in, out EMPTY_ICONV EMPTY_UCONV }",
-        ]
-    )
-    + "\n",
-    encoding="utf-8",
-    errors="replace",
-)
-
-out = get_error_v1_code_slice(excerpt={"artifact_path": str(excerpt_path)})
-code = out.get("func_code") or ""
-assert "MAKE_HANDLER" in code, code
-missing = set(out.get("macro_tokens_not_defined_in_slice") or [])
-assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
 
 print("OK")
 PY

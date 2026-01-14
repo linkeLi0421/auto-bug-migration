@@ -13,7 +13,6 @@ from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_a
 
 from .migration_tools import (  # noqa: E402
     get_error_patch_context as get_error_patch_context_tool,
-    get_error_v1_code_slice as get_error_v1_code_slice_tool,
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
     make_error_patch_override as make_error_patch_override_tool,
@@ -341,37 +340,6 @@ class ToolRunner:
                         "error_text": error_text[:2000],
                         "context_lines": context_lines,
                         "max_total_lines": max_total_lines,
-                    },
-                    output=out,
-                )
-
-            if tool == "get_error_v1_code_slice":
-                excerpt = args.get("excerpt")
-                if excerpt is None:
-                    return ToolObservation(
-                        False,
-                        tool,
-                        args,
-                        output="",
-                        error="Missing arg: excerpt (pass excerpt={artifact_path: ...} from get_error_patch_context).",
-                    )
-                if isinstance(excerpt, dict):
-                    ap = str(excerpt.get("artifact_path", "") or "").strip()
-                    if not ap:
-                        return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (missing artifact_path)")
-                elif isinstance(excerpt, str):
-                    if not excerpt.strip():
-                        return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (empty string)")
-                else:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: excerpt (expected string or {artifact_path})")
-                out = get_error_v1_code_slice_tool(
-                    excerpt=excerpt,
-                )
-                return ToolObservation(
-                    True,
-                    tool,
-                    {
-                        "excerpt": excerpt if not isinstance(excerpt, str) else excerpt[:2000],
                     },
                     output=out,
                 )
