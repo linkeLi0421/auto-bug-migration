@@ -1375,6 +1375,154 @@ def _extract_first_code_fence(text: str) -> str:
     return str(m.group(1) or "")
 
 
+def _extract_function_name_from_signature(signature: str) -> str:
+    s = str(signature or "").strip()
+    if not s:
+        return ""
+    open_paren = s.find("(")
+    if open_paren <= 0:
+        return ""
+    j = open_paren - 1
+    while j >= 0 and s[j].isspace():
+        j -= 1
+    end = j
+    while j >= 0 and (s[j].isalnum() or s[j] == "_"):
+        j -= 1
+    return s[j + 1 : end + 1]
+
+
+def _count_top_level_bodies(code: str) -> tuple[int, bool]:
+    """Count top-level bodies that look like `) {` and detect extra decls before the first body.
+
+    This is a heuristic to catch "new_func_code contains the entire hunk" in function-by-function mode.
+
+    Returns:
+      (body_count, semicolon_before_first_body)
+    """
+    text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
+    brace_depth = 0
+    bodies = 0
+    saw_semicolon_before_first = False
+
+    in_sl_comment = False
+    in_ml_comment = False
+    in_str = False
+    in_char = False
+    escape = False
+    at_line_start = True
+    last_sig_char: Optional[str] = None
+
+    i = 0
+    while i < len(text):
+        c = text[i]
+        n = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_sl_comment:
+            if c == "\n":
+                in_sl_comment = False
+                at_line_start = True
+            i += 1
+            continue
+        if in_ml_comment:
+            if c == "*" and n == "/":
+                in_ml_comment = False
+                i += 2
+                continue
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == "'":
+                in_char = False
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+
+        # Skip preprocessor directive lines at top level to avoid counting macro bodies.
+        if at_line_start and brace_depth == 0:
+            j = i
+            while j < len(text) and text[j] in " \t":
+                j += 1
+            if j < len(text) and text[j] == "#":
+                nl = text.find("\n", j)
+                if nl < 0:
+                    break
+                i = nl + 1
+                at_line_start = True
+                last_sig_char = None
+                continue
+
+        if c == "/" and n == "/":
+            in_sl_comment = True
+            i += 2
+            continue
+        if c == "/" and n == "*":
+            in_ml_comment = True
+            i += 2
+            continue
+        if c == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if c == "\n":
+            at_line_start = True
+            i += 1
+            continue
+        if c not in " \t\r":
+            at_line_start = False
+
+        if c == "{":
+            if brace_depth == 0 and last_sig_char == ")":
+                bodies += 1
+            brace_depth += 1
+            last_sig_char = "{"
+            i += 1
+            continue
+        if c == "}":
+            if brace_depth > 0:
+                brace_depth -= 1
+            last_sig_char = "}"
+            i += 1
+            continue
+
+        if brace_depth == 0 and c == ";":
+            if bodies == 0:
+                saw_semicolon_before_first = True
+            last_sig_char = ";"
+            i += 1
+            continue
+
+        if brace_depth == 0 and not c.isspace():
+            last_sig_char = c
+        i += 1
+
+    return bodies, saw_semicolon_before_first
+
+
 def _last_read_artifact_text(state: AgentState) -> str:
     for step in reversed(state.steps):
         if not isinstance(step, dict):
@@ -1452,6 +1600,105 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
                 f"new_func_code does not appear to include the tail of the mapped '-' slice baseline ({base_source}). "
                 "If you intend a minimal edit, start from the baseline slice and apply minimal edits."
             )
+
+    return None
+
+
+def _override_single_function_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error message if new_func_code looks like it rewrites more than the active slice.
+
+    For merged/tail hunks, the BASE slice may be a full function body or just a small mapped fragment. The goal is
+    to prevent the model from pasting the entire patch/hunk (multiple functions) into new_func_code.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    active_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if not active_sig:
+        return None
+
+    func_name = _extract_function_name_from_signature(active_sig)
+
+    base_text = ""
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    # Reject unified-diff content: make_error_patch_override expects raw code, not a diff.
+    if (
+        "diff --git " in new_text
+        or "\n@@ " in new_text
+        or "\n--- " in new_text
+        or "\n+++ " in new_text
+        or new_text.lstrip().startswith("--- ")
+        or new_text.lstrip().startswith("+++ ")
+    ):
+        return "new_func_code appears to be a unified diff; provide only the raw mapped code slice (no diff headers)."
+
+    new_bodies, new_semicolon_before_first = _count_top_level_bodies(new_text)
+
+    base_bodies: Optional[int] = None
+    if base_text.strip():
+        base_bodies, _ = _count_top_level_bodies(base_text)
+
+    # If we cannot infer the BASE slice (e.g. fake-tool tests), fall back to a generic guard:
+    # do not allow multi-body overrides (common sign of pasting the whole hunk).
+    if base_bodies is None:
+        if new_bodies > 1:
+            return (
+                f"new_func_code appears to contain multiple top-level bodies ({new_bodies}). "
+                "Do not paste the entire patch/hunk; rewrite only the mapped slice for this round."
+            )
+        return None
+
+    # If the BASE slice has no top-level body (fragment rewrite), reject attempts that paste full function bodies / hunks.
+    if base_bodies == 0:
+        if new_bodies > 0:
+            return (
+                "The BASE slice for this override appears to be a small fragment (no top-level `) {` body). "
+                "Do not paste whole functions or full hunks into new_func_code; rewrite only the mapped fragment."
+            )
+        return None
+
+    # BASE slice has a top-level body (likely function-scoped rewrite); require the override to remain single-body.
+    if new_bodies != 1:
+        return (
+            f"new_func_code appears to contain {new_bodies} top-level bodies, but the BASE slice contains {base_bodies}. "
+            "Rewrite only the single mapped body for this round (do not include other functions or the entire hunk)."
+        )
+
+    # Note: allow __revert_* prefixed names like "__revert_e11519_xmlParserNsPush" to match active old_signature
+    # function names like "xmlParserNsPush". Use a boundary that treats '_' as a separator (not alnum).
+    if func_name and re.search(rf"(?<![A-Za-z0-9]){re.escape(func_name)}\s*\(", new_text) is None:
+        return f"new_func_code does not appear to contain the active function name {func_name}(...) from active_old_signature."
+
+    if new_semicolon_before_first:
+        return (
+            f"new_func_code appears to include top-level declarations before {func_name or 'the active body'}."
+            " In function-scoped mode, avoid adding extra top-level decls/macros; keep the rewrite inside the mapped body."
+        )
 
     return None
 
@@ -2348,6 +2595,11 @@ def _system_prompt() -> str:
         "- Patch rewrite rule: when you call make_error_patch_override, args.new_func_code MUST be based on the latest\n"
         "  read_artifact.output.text (the BASE slice). Make only the minimal edits needed to fix the reported error.\n"
         "  Do not drop unrelated lines or omit the tail of the BASE slice.\n"
+        "- Function-by-function mode (merged/tail hunks): if the header shows `Active function (old_signature): ...`,\n"
+        "  you are fixing ONLY that function in this round. The BASE slice is that function's mapped `-` code.\n"
+        "  When calling make_error_patch_override, args.new_func_code MUST be the BASE slice with minimal edits for ONLY\n"
+        "  the active function slice; do NOT include other functions and do NOT paste unified-diff headers.\n"
+        "  Other functions/errors in the same patch_key will be handled in later rounds.\n"
         "- Policy: do NOT suggest modifying V2 type definitions (struct/typedef/enum/union),\n"
         "  especially in shared/public headers. Prefer adapting V1-origin usage to V2 semantics.\n"
         "- If the user provides a patch bundle path (patch_path), treat build-log file:line as patched/migrated code.\n"
@@ -3111,6 +3363,57 @@ def _run_langgraph(
                                     f"{shrink_err2}\n\n"
                                     "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
                                     "or manually construct new_func_code by editing the read_artifact BASE slice."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
+        # Guardrail (function-by-function): in merged/tail mode, the override should only rewrite the active function,
+        # not the entire patch hunk.
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            func_scope_err = _override_single_function_guardrail_error(st, decision)
+            if func_scope_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "In function-by-function mode (Active function (old_signature) is set), make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
+                            "for the active function from this round.\n"
+                            f"active_old_signature: {str(getattr(st, 'active_old_signature', '') or '').strip()}\n"
+                            f"{func_scope_err}\n\n"
+                            "Fix: start from the BASE slice (read_artifact output) and apply minimal edits to ONLY that active slice. "
+                            "Do NOT include other functions or unified-diff headers.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_function_scope_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    func_scope_err2 = _override_single_function_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not func_scope_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly produced a multi-function override body.",
+                                "summary": "Stopped before patch generation due to an override that is not function-scoped.",
+                                "next_step": (
+                                    f"{func_scope_err2}\n\n"
+                                    "Edit the BASE slice (read_artifact output) manually to include only the active function, then rerun the agent."
                                 ).strip(),
                                 "steps": _steps_for_output(st),
                                 "error": _error_payload(st),

@@ -1,11 +1,22 @@
-# Agent Task: Build Tools for C/C++ Migration Agent
+# react_agent: Development Notes (AGENTS.md)
 
-## Context and Objective
-I am building an automated agent to migrate C/C++ code from an older version (V1) to a newer version (V2).
-I have already generated static analysis data using `libclang`. The data is stored in many scattered JSON files.
-Your task is to write the **Python Tooling Layer** that allows an LLM Agent to query this data and read the corresponding source code from the disk.
+## What This Directory Contains
+This directory implements a langgraph-based ReAct agent that triages OSS-Fuzz build errors against a **patch bundle**
+and iteratively produces override diffs to fix compilation failures.
 
-## Input Data Format
+Key files:
+
+- `script/react_agent/agent_langgraph.py`: main agent loop + prompt + guardrails.
+- `script/react_agent/agent_tools.py`: KB + source reader helpers for `search_definition` / `kb_search_symbols` / `read_file_context`.
+- `script/react_agent/tools/`: tool registry + runner + OSS-Fuzz + artifact helpers.
+- `script/react_agent/test_langgraph_agent.sh`: offline regression tests (fast).
+
+Plans live in `script/react_agent/tasks/TASKS.md`.
+
+## Static Analysis KB (V1/V2 JSON)
+The agent can query libclang-produced JSON for V1/V2 symbol definitions and locations.
+
+### Input Data Format
 The input is a directory of JSON files (`*_analysis.json`). You can check example in /home/user/oss-fuzz-build/data/libxml2-e11519
 Each JSON file contains a list of dictionaries. The structure of a single entry is strictly based on this schema:
 
@@ -28,8 +39,9 @@ Each JSON file contains a list of dictionaries. The structure of a single entry 
 }
 ```
 
-## Required Python Implementation
-Please generate a Python module containing the following three classes.
+### Implementation Notes (KB + Source Reader)
+Historically, this repo used a 3-class split (KbIndex / SourceManager / AgentTools). The codebase still follows
+that conceptually, but the agent-facing tools are now exposed via `search_definition` / `kb_search_symbols` / `read_file_context`.
 
 1. Class: KbIndex (The Knowledge Base)
 Goal: Aggregate scattered JSON files into an efficient in-memory index.
@@ -121,3 +133,34 @@ Use pathlib for path manipulation.
 Assume the JSON files might contain duplicates; the KbIndex must handle this gracefully.
 
 Include docstrings for all methods.
+
+## Patch-Aware Workflow (Patch Bundles)
+Patch bundles (`*.patch2`) store per-hunk patch entries keyed by `patch_key`. In patch-aware runs:
+
+- Build-log locations `/src/...:line` refer to the migrated code; use patch tools to map them back into the bundle.
+- Patch bundles are applied via `git apply --reverse`: in these diffs, `-` lines become **additions**.
+- Recommended tool order:
+  - `parse_build_errors` → `get_error_patch_context` → (KB/source inspection) → `read_artifact` (BASE slice)
+  - then `make_error_patch_override` → `ossfuzz_apply_patch_and_test`
+
+### Merged/Tail Hunks (Function-by-Function)
+Some patch hunks contain multiple merged/tail functions. The agent groups errors by `old_signature` and focuses on one
+function group per round. The active group is shown in the prompt header as:
+
+- `Active function (old_signature): ...`
+
+### `make_error_patch_override` Rules (Critical)
+When generating an override diff:
+
+- `new_func_code` MUST be derived from the latest BASE slice (the most recent `read_artifact` output).
+- In merged/tail hunks, `new_func_code` MUST rewrite ONLY the mapped slice for the **active** function group.
+  Do NOT paste the entire patch/hunk, and do NOT include unified-diff headers (`diff --git`, `@@`, `---/+++`).
+- `patch_text` returned by `make_error_patch_override` must never be truncated (it becomes an applyable override diff artifact).
+
+### Symbol Lookup Gotcha
+`search_definition` is not a struct-field lookup. Do not call it on member names like `nsdb` or expressions like `ctxt->nsdb`.
+Use `kb_search_symbols(kinds=['FIELD_DECL','VAR_DECL','MACRO_DEFINITION'])` and inspect the parent struct body.
+
+## Tests
+- `bash script/react_agent/test_langgraph_agent.sh`
+- `bash script/migration_tools/test_migration_tools.sh`

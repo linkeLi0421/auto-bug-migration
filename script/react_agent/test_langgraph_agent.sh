@@ -302,6 +302,83 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# Override guardrail (function-by-function): new_func_code should only contain the active function definition.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_single_function_guardrail_error  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="",
+)
+state.active_old_signature = "int foo(int x)"
+
+import tempfile
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text("int foo(int x) { return x; }\\n", encoding="utf-8")
+    state.loop_base_func_code_artifact_path = str(base_path)
+
+    multi = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "rewrite too much",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": "int foo(int x) { return x; }\\nint bar(void) { return 0; }\\n"},
+    }
+    assert _override_single_function_guardrail_error(state, multi), "expected multi-function guardrail to trigger"
+
+    diffy = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "oops, diff",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": "diff --git a/a b/b\\n@@ -1 +1 @@\\n-foo\\n+bar\\n"},
+    }
+    assert _override_single_function_guardrail_error(state, diffy), "expected unified-diff guardrail to trigger"
+
+    decls = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "added globals",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": "static int g = 0;\\nint foo(int x) { return x; }\\n"},
+    }
+    assert _override_single_function_guardrail_error(state, decls), "expected top-level decl guardrail to trigger"
+
+    ok = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "single function",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": "int foo(int x) { return x + 1; }\\n"},
+    }
+    assert _override_single_function_guardrail_error(state, ok) is None, "expected function-scoped override to pass"
+
+    prefixed = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "single function with __revert_ prefix",
+        "args": {
+            "patch_path": "x",
+            "file_path": "y",
+            "line_number": 1,
+            "new_func_code": "int __revert_e11519_foo(int x) { return x + 1; }\\n",
+        },
+    }
+    assert _override_single_function_guardrail_error(state, prefixed) is None, "expected __revert_*_foo to satisfy name check"
+
+state.active_old_signature = ""
+assert _override_single_function_guardrail_error(state, multi) is None, "guardrail should be inactive without active_old_signature"
+
+print("OK")
+PY
+
 # Override location guardrail: make_error_patch_override must use build-log /src/... line numbers,
 # not pre_patch_* line numbers from get_error_patch_context.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

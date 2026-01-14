@@ -45,6 +45,60 @@ class StubModel(ChatModel):
         self._turn += 1
 
         user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+
+        def stub_new_func_code() -> str:
+            active_sig = ""
+            for line in user_text.splitlines():
+                if line.startswith("Active function (old_signature):"):
+                    active_sig = line.split(":", 1)[1].strip()
+                    break
+                if line.startswith("active_old_signature:"):
+                    active_sig = line.split(":", 1)[1].strip()
+                    break
+            if not active_sig:
+                return (
+                    "int __revert_stub(void) {\n"
+                    "  /* Stub replacement used by offline tests.\n"
+                    "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
+                    "   */\n"
+                    "  return 0;\n"
+                    "}\n"
+                )
+
+            sig = active_sig.strip().rstrip(";").rstrip()
+            if sig.endswith("{"):
+                sig = sig[:-1].rstrip()
+
+            func_name = ""
+            open_paren = sig.find("(")
+            if open_paren > 0:
+                j = open_paren - 1
+                while j >= 0 and sig[j].isspace():
+                    j -= 1
+                end = j
+                while j >= 0 and (sig[j].isalnum() or sig[j] == "_"):
+                    j -= 1
+                func_name = sig[j + 1 : end + 1]
+
+            returns_void = False
+            if func_name:
+                idx = sig.find(func_name)
+                before = sig[:idx].strip()
+                if re.search(r"\bvoid\s*\*$", before):
+                    returns_void = False
+                elif re.search(r"\bvoid$", before):
+                    returns_void = True
+
+            ret_line = "" if returns_void else "  return 0;\n"
+            return (
+                f"{sig} {{\n"
+                "  /* Stub replacement used by offline tests.\n"
+                "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
+                "   */\n"
+                f"{ret_line}"
+                "}\n"
+            )
+
         if "You MUST generate a patch now by calling make_error_patch_override" in user_text:
             # Runtime guardrail prompt: force a patch-generation tool call.
             match = None
@@ -69,15 +123,7 @@ class StubModel(ChatModel):
                     patch_path = line.split(":", 1)[1].strip()
                     break
 
-            # Provide a small deterministic replacement. Real runs should use the artifact content.
-            new_func_code = (
-                "int __revert_stub(void) {\n"
-                "  /* Stub replacement used by offline tests.\n"
-                "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
-                "   */\n"
-                "  return 0;\n"
-                "}\n"
-            )
+            new_func_code = stub_new_func_code()
             if patch_path and file_path and line_number > 0 and ("no member named" in msg or "unknown type name" in msg or msg):
                 return json.dumps(
                     {
@@ -230,14 +276,7 @@ class StubModel(ChatModel):
                 )
                 # In the real agent flow, read_artifact should happen immediately before
                 # make_error_patch_override (enforced by runtime guardrails).
-                new_func_code = (
-                    "int __revert_stub(void) {\n"
-                    "  /* Stub replacement used by offline tests.\n"
-                    "   * Real runs should adapt V1-origin usage to V2 semantics.\n"
-                    "   */\n"
-                    "  return 0;\n"
-                    "}\n"
-                )
+                new_func_code = stub_new_func_code()
                 return json.dumps(
                     {
                         "type": "tool",

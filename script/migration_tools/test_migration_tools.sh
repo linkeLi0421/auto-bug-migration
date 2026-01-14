@@ -95,6 +95,24 @@ assert "-ctx2_fixed" in patch_text and "-ctx2_extra" in patch_text, patch_text
 assert "+ctx2_fixed" not in patch_text, patch_text
 assert "@@ -50,6 +50,6 @@" in patch_text, patch_text
 
+# make_error_patch_override must never truncate patch_text, even if callers pass tiny limits.
+patch_replace_tiny = make_error_patch_override(
+    patch_path=str(bundle_path),
+    file_path="/src/libxml2/error.c",
+    line_number=52,
+    new_func_code=replacement,
+    context_lines=0,
+    max_lines=1,
+    max_chars=1,
+    allowed_roots=allowed_roots,
+)
+json.dumps(patch_replace_tiny)
+assert patch_replace_tiny.get("patch_text_truncated") is False, patch_replace_tiny
+assert patch_replace_tiny.get("patch_text_lines_total") == patch_replace_tiny.get("patch_text_lines_returned"), patch_replace_tiny
+patch_text_tiny = patch_replace_tiny.get("patch_text") or ""
+assert "diff --git a/error.c b/error.c" in patch_text_tiny, patch_text_tiny[:200]
+assert "-ctx2_fixed" in patch_text_tiny and "-ctx2_extra" in patch_text_tiny, patch_text_tiny
+
 patch = get_patch(patch_path=str(bundle_path), patch_key="p2", include_text=True, max_lines=3, allowed_roots=allowed_roots)
 json.dumps(patch)
 assert patch.get("patch_text_truncated") is True, patch
