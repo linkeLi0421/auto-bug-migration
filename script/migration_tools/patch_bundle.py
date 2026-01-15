@@ -14,7 +14,10 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-DEFAULT_ALLOWED_ROOTS: tuple[Path, ...] = (_repo_root() / "data" / "tmp_patch",)
+DEFAULT_ALLOWED_ROOTS: tuple[Path, ...] = (
+    _repo_root() / "data" / "tmp_patch",
+    _repo_root() / "data" / "react_agent_artifacts",
+)
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -137,4 +140,3 @@ def load_patch_bundle(path: str | Path, *, allowed_roots: Optional[Iterable[str 
         by_patch_type=by_patch_type,
         by_signature=by_signature,
     )
-
