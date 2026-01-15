@@ -56,3 +56,21 @@
 - [x] If enabled (`auto`: only when all hunks are `fixed` and `--tools real`), run `ossfuzz_apply_patch_and_test` with `patch_override_paths=[...]` and store final build/check_build outputs as artifact files; record `final_ossfuzz_test` in `summary.json`.
 - [x] Add a non-Docker regression test that validates “latest override diff selection” behavior (e.g. `.8.diff` beats `.diff`).
 - [x] Run `bash script/react_agent/test_multi_agent.sh` (and `bash script/react_agent/test_langgraph_agent.sh` if needed).
+
+## Concurrency: serialize OSS-Fuzz tests
+
+### Problem
+
+- Concurrent agent runs share `oss-fuzz/` state (`oss-fuzz/build/out/...`, `oss-fuzz/build/work/...`, and sometimes `git checkout` inside `oss-fuzz/`), causing test runs to clobber each other.
+
+### Goal
+
+- Keep multi-agent concurrency for reasoning/patch generation, but ensure only one `ossfuzz_apply_patch_and_test` runs at a time (other agents wait).
+
+### Plan
+
+- [x] Add a cross-process file lock around `ossfuzz_apply_patch_and_test` (covers `build_version`, `check_build`, and optional `run_fuzzer`).
+- [x] Use a stable repo-local lock file path (e.g. `data/react_agent_locks/ossfuzz_apply_patch_and_test.lock`) with an env override.
+- [x] Emit a short stderr message when waiting for the lock (avoid stdout).
+- [x] Add a small non-Docker regression test that two subprocesses contend for the lock and serialize.
+- [x] Run `bash script/react_agent/test_multi_agent.sh`.
