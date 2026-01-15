@@ -1024,7 +1024,7 @@ from pathlib import Path
 script_dir = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(script_dir))
 
-from agent_langgraph import AgentState, ToolObservation, _summarize_target_error_status  # noqa: E402
+from agent_langgraph import AgentState, ToolObservation, _summarize_active_patch_key_status, _summarize_target_error_status  # noqa: E402
 from migration_tools.types import PatchInfo  # noqa: E402
 
 with tempfile.TemporaryDirectory() as td:
@@ -1101,6 +1101,27 @@ with tempfile.TemporaryDirectory() as td:
     verdict_bad = _summarize_target_error_status(st)
     assert verdict_bad.get("status") == "failed", verdict_bad
     assert "corrupt patch" in str(verdict_bad.get("reason") or ""), verdict_bad
+
+    # Non-compiler OSS-Fuzz failure (e.g. build script error): if build_ok/check_build_ok is false but
+    # there are no compiler diagnostics, do not treat this as "fixed".
+    build_log.write_text("cp: cannot create regular file '/out/llvm-symbolizer': No such file or directory\n", encoding="utf-8")
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={
+            "build_output": {"artifact_path": str(build_log)},
+            "build_ok": False,
+            "check_build_ok": True,
+            "patch_apply_ok": True,
+        },
+        error=None,
+    )
+    verdict_fail = _summarize_target_error_status(st)
+    assert verdict_fail.get("status") == "failed", verdict_fail
+    assert "llvm-symbolizer" in str(verdict_fail.get("reason") or ""), verdict_fail
+    pkv_fail = _summarize_active_patch_key_status(st)
+    assert pkv_fail.get("status") == "failed", pkv_fail
 
     build_log.write_text(f"/src/libxml2/hash.c:554:52: error: {msg}\n", encoding="utf-8")
     verdict2 = _summarize_target_error_status(st)

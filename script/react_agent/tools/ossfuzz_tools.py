@@ -154,11 +154,20 @@ def merge_patch_bundle_with_overrides(
     # per-hunk patch_key directory, do not nest patch_key/patch_key.
     out_dir = allow_root
     unique_keys = {str(o.get("patch_key", "")).strip() for o in override_files if str(o.get("patch_key", "")).strip()}
+    inferred_key = ""
     if len(unique_keys) == 1:
-        only_key = next(iter(unique_keys))
-        if str(allow_root.name) != str(only_key):
-            out_dir = (allow_root / only_key).resolve()
-            out_dir.mkdir(parents=True, exist_ok=True)
+        inferred_key = next(iter(unique_keys))
+    elif not unique_keys:
+        # Common case: patch_override_paths may be empty when the caller uses an "effective" *.patch2 that already
+        # contains the updated patch_text for the active patch_key. In that scenario, infer the patch_key from the
+        # bundle path on disk so merged patch output stays under the per-hunk artifacts dir.
+        try:
+            inferred_key = _infer_patch_key_from_path(Path(patch_path).expanduser().resolve(), patch_keys)
+        except Exception:
+            inferred_key = ""
+    if inferred_key and str(allow_root.name) != str(inferred_key):
+        out_dir = (allow_root / inferred_key).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
     out_path = _unique_path((out_dir / out_name).resolve())
     _validate_under_root(out_path, allow_root)
     out_path.write_text(merged_text, encoding="utf-8", errors="replace")
