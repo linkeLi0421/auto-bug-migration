@@ -196,6 +196,68 @@ assert "- E1" in text, text
 print("OK")
 PY
 
+# Text output should show "Current function groups (0)" when the active patch_key is clean after OSS-Fuzz.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _render_final_text  # noqa: E402
+
+final = {
+    "type": "final",
+    "thought": "t",
+    "summary": "s",
+    "next_step": "n",
+    "steps": [],
+    "error": {
+        "line": "err",
+        "snippet": "",
+        "patch_path": "bundle.patch2",
+        "artifacts_dir": "artifacts",
+        "scope": "patch",
+        "patch_key": "p1",
+        "active_old_signature": "f1",
+        "function_groups": [],
+        "function_groups_total": 0,
+        "function_groups_truncated": False,
+        "function_groups_history": [
+            {"old_signature": "f1", "count": 3, "examples": ["E0", "E1", "E2"]},
+        ],
+        "function_groups_history_total": 1,
+        "function_groups_history_truncated": False,
+        "grouped_errors": [{"raw": "E1"}],
+    },
+}
+
+text = _render_final_text(final)
+assert "Current function groups (0):" in text, text
+assert "(none)" in text, text
+print("OK")
+PY
+
+# Next-top-errors formatting should include patch_key when available.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _format_other_errors_for_next_step  # noqa: E402
+
+errs = [
+    {"raw": "/src/a.c:1:1: error: boom", "patch_key": "p1"},
+    {"raw": "/src/b.c:2:2: error: kaboom", "patch_key": ""},
+]
+lines = _format_other_errors_for_next_step(errs, limit=5)
+assert lines[0].endswith("(patch_key=p1)"), lines
+assert lines[1] == "- /src/b.c:2:2: error: kaboom", lines
+print("OK")
+PY
+
 # search_definition guardrail: don't try to "look up" struct fields via search_definition;
 # rewrite to kb_search_symbols for FIELD_DECL/VAR_DECL/MACRO_DEFINITION.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -419,6 +481,100 @@ good = {
     "args": {"patch_path": "x", "file_path": "/src/libxml2/parser.c", "line_number": 17188, "new_func_code": "int x;\\n"},
 }
 assert _override_location_guardrail_for_override(state, good) is None
+
+print("OK")
+PY
+
+# Effective bundle persistence: after make_error_patch_override changes function length in a merged/tail hunk,
+# the next iteration must use updated hiden_func_dict offsets so later function errors don't get mis-attributed.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from agent_langgraph import AgentState, _write_effective_patch_bundle  # noqa: E402
+from migration_tools.patch_bundle import load_patch_bundle  # noqa: E402
+from migration_tools.tools import _get_error_patch_from_bundle, make_error_patch_override  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+import pickle
+
+with tempfile.TemporaryDirectory() as td:
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = td
+    bundle_path = Path(td) / "bundle.patch2"
+    patch_key = "tail-file.c-f1_f2_"
+
+    # Two functions in one recreated/merged hunk: f1 is 5 lines, f2 starts at offset 5.
+    patch_text = (
+        "diff --git a/file.c b/file.c\n"
+        "--- a/file.c\n"
+        "+++ b/file.c\n"
+        "@@ -10,8 +10,0 @@\n"
+        "-int f1(void) {\n"
+        "-  int x = 1;\n"
+        "-  int y = 2;\n"
+        "-  return x + y;\n"
+        "-}\n"
+        "-int f2(void) {\n"
+        "-  return 2;\n"
+        "-}\n"
+    )
+    patch = PatchInfo(
+        file_path_old="file.c",
+        file_path_new="file.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=10,
+        old_end_line=18,
+        new_start_line=10,
+        new_end_line=10,
+        patch_type={"Recreated function", "Merged functions"},
+        old_signature="int f1(void)",
+        dependent_func=set(),
+        hiden_func_dict={"int f1(void)": 0, "int f2(void)": 5},
+    )
+    bundle_path.write_bytes(pickle.dumps({patch_key: patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    # Rewrite f1 to be shorter (delta=-2), so f2's offset must shift from 5 -> 3.
+    out = make_error_patch_override(
+        patch_path=str(bundle_path),
+        file_path="/src/file.c",
+        line_number=12,
+        new_func_code="int f1(void) {\n  return 42;\n}\n",
+        allowed_roots=[td],
+    )
+    assert out.get("patch_key") == patch_key, out
+    updated_patch_text = out.get("patch_text") or ""
+    updated_hiden = out.get("hiden_func_dict_updated")
+    assert isinstance(updated_hiden, dict) and updated_hiden.get("int f2(void)") == 3, updated_hiden
+
+    # Persist an effective bundle and verify that line 14 (now inside f2) maps to f2, not f1.
+    artifacts_dir = Path(td) / "react_agent_artifacts" / patch_key
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    state = AgentState(
+        build_log_path="build.log",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line="x",
+        snippet="",
+        artifacts_dir=str(artifacts_dir),
+    )
+    effective_path, err = _write_effective_patch_bundle(
+        state,
+        patch_key=patch_key,
+        patch_text=str(updated_patch_text),
+        hiden_func_dict_updated=updated_hiden,
+    )
+    assert not err and effective_path, (effective_path, err)
+
+    bundle2 = load_patch_bundle(effective_path, allowed_roots=[td])
+    mapping = _get_error_patch_from_bundle(bundle2, patch_path=effective_path, file_path="/src/file.c", line_number=14)
+    assert mapping.get("old_signature") == "int f2(void)", mapping
 
 print("OK")
 PY
@@ -1036,8 +1192,9 @@ with tempfile.TemporaryDirectory() as td:
     assert verdict2.get("fixed") is False, verdict2
 PY
 
-# Auto-loop regression: after the first ossfuzz_apply_patch_and_test, refresh errors and iterate within the same patch_key
-# without re-calling get_error_patch_context/get_error_v1_code_slice (drive from build_output + last override patch_text).
+# Auto-loop regression: after ossfuzz_apply_patch_and_test, restart patch-scope triage for the next error by
+# forcing get_error_patch_context again (using the latest OSS-Fuzz logs + effective bundle), while trimming
+# state.steps for prompt hygiene but preserving full step_history for output/debugging.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import base64
 import json
@@ -1055,6 +1212,7 @@ sys.path.insert(0, str(repo_root))
 from agent_langgraph import AgentConfig, AgentState, _run_langgraph  # noqa: E402
 from artifacts import ArtifactStore  # noqa: E402
 from tools.artifact_tools import read_artifact as read_artifact_tool  # noqa: E402
+from tools.migration_tools import get_error_patch_context as get_error_patch_context_tool  # noqa: E402
 from tools.migration_tools import make_error_patch_override as make_error_patch_override_tool  # noqa: E402
 from tools.runner import ToolObservation  # noqa: E402
 
@@ -1070,6 +1228,9 @@ class FakeRunner:
         self.calls.append(tool)
         if tool == "read_artifact":
             out = read_artifact_tool(**args)
+            return ToolObservation(True, tool, args, output=out, error=None)
+        if tool == "get_error_patch_context":
+            out = get_error_patch_context_tool(**args)
             return ToolObservation(True, tool, args, output=out, error=None)
         if tool == "make_error_patch_override":
             out = make_error_patch_override_tool(**args)
@@ -1213,7 +1374,7 @@ with tempfile.TemporaryDirectory() as td:
         patch_key="p2",
         active_patch_key="p2",
         active_file_path="/src/libxml2/error.c",
-        active_line_number=52,
+        active_line_number=51,
         ossfuzz_project="example",
         ossfuzz_commit="deadbeef",
         patch_override_paths=[str(override_path)],
@@ -1243,18 +1404,19 @@ with tempfile.TemporaryDirectory() as td:
     steps = [s for s in (final.get("steps") or []) if isinstance(s, dict)]
     tools = [((s.get("decision") or {}).get("tool")) for s in steps]
 
-    # The second-iteration patching should not restart patch mapping; it should read the BASE slice and patch again.
+    # After the transition from the first OSS-Fuzz run, we must restart patch mapping via get_error_patch_context.
     # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
+    assert "get_error_patch_context" in runner.calls, runner.calls
     assert "read_artifact" in runner.calls, runner.calls
     assert runner.calls.count("make_error_patch_override") >= 2, runner.calls
     assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 2, runner.calls
-    assert "get_error_patch_context" not in runner.calls, runner.calls
     assert "get_error_v1_code_slice" not in runner.calls, runner.calls
 
     # Final output should include the full step history across iterations, including steps that were trimmed
     # from state.steps for prompt hygiene.
     assert "get_error_patch_context" in tools, tools
     assert len(steps) > 3, len(steps)
+    assert len(st.steps) < len(st.step_history), (len(st.steps), len(st.step_history))
 
     # Ensure we retain and render the previously handled errors even though state.steps is trimmed in auto-loop.
     from agent_langgraph import _render_final_text  # noqa: E402
@@ -1263,6 +1425,24 @@ with tempfile.TemporaryDirectory() as td:
     assert initial_error in rendered, rendered
     assert "unknown type name 'foo_t'" in rendered, rendered
     assert "tool: get_error_patch_context" in rendered, rendered
+
+    # Ensure the first forced get_error_patch_context call uses the build-log /src/... location (line 52),
+    # not the previous active_line_number (51).
+    forced = None
+    for s in steps:
+        d = s.get("decision") if isinstance(s, dict) else {}
+        if not isinstance(d, dict):
+            continue
+        if str(d.get("tool") or "") != "get_error_patch_context":
+            continue
+        args = d.get("args") if isinstance(d.get("args"), dict) else {}
+        if args.get("line_number"):
+            forced = d
+            break
+    assert forced, steps
+    forced_args = forced.get("args") or {}
+    assert forced_args.get("file_path") == "/src/libxml2/error.c", forced_args
+    assert forced_args.get("line_number") == 52, forced_args
 
     # Artifact preservation: repeated patch/log artifacts must not overwrite prior iterations.
     patch_text_versions = sorted(root.glob("make_error_patch_override_patch_text_error.c*.diff"))

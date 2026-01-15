@@ -634,6 +634,24 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     }
 
 
+def _format_other_errors_for_next_step(other_errors: Any, *, limit: int = 5) -> List[str]:
+    """Format compiler errors for inclusion in final.next_step (human-facing)."""
+    out: List[str] = []
+    lim = max(0, int(limit or 0))
+    for item in other_errors or []:
+        if lim and len(out) >= lim:
+            break
+        if not isinstance(item, dict):
+            continue
+        raw = str(item.get("raw", "") or "").strip()
+        if not raw:
+            continue
+        patch_key = str(item.get("patch_key", "") or "").strip()
+        suffix = f" (patch_key={patch_key})" if patch_key else ""
+        out.append(f"- {raw}{suffix}")
+    return out
+
+
 def _ossfuzz_artifact_path(output: Any, field: str) -> str:
     if not isinstance(output, dict):
         return ""
@@ -803,6 +821,147 @@ def _reindex_patch_bundle(bundle: Any) -> Any:
         return bundle
 
 
+_SAFE_BUNDLE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_DIFF_HUNK_HDR_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
+
+
+def _safe_bundle_name(name: str, *, max_len: int = 160) -> str:
+    raw = str(name or "").strip().replace(os.sep, "_")
+    cleaned = _SAFE_BUNDLE_NAME_RE.sub("_", raw).strip("._-")
+    if not cleaned:
+        cleaned = "artifact"
+    return cleaned[:max_len]
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    for i in range(1, 10_000):
+        candidate = parent / f"{stem}.{i}{suffix}"
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not allocate unique path for: {path}")
+
+
+def _update_patchinfo_ranges_from_diff(patch: Any, patch_text: str) -> None:
+    old_starts: List[int] = []
+    old_ends: List[int] = []
+    new_starts: List[int] = []
+    new_ends: List[int] = []
+    for line in str(patch_text or "").splitlines():
+        if not line.startswith("@@"):
+            continue
+        m = _DIFF_HUNK_HDR_RE.match(line.strip())
+        if not m:
+            continue
+        try:
+            old_start = int(m.group("old_start"))
+            old_len = int(m.group("old_len") or 1)
+            new_start = int(m.group("new_start"))
+            new_len = int(m.group("new_len") or 1)
+        except Exception:
+            continue
+        old_starts.append(old_start)
+        old_ends.append(old_start + max(old_len, 0))
+        new_starts.append(new_start)
+        new_ends.append(new_start + max(new_len, 0))
+    if not old_starts or not new_starts:
+        return
+    try:
+        patch.old_start_line = min(old_starts)
+        patch.old_end_line = max(old_ends)
+        patch.new_start_line = min(new_starts)
+        patch.new_end_line = max(new_ends)
+    except Exception:
+        return
+
+
+def _write_effective_patch_bundle(
+    state: AgentState,
+    *,
+    patch_key: str,
+    patch_text: str,
+    hiden_func_dict_updated: Any = None,
+) -> tuple[str, Optional[str]]:
+    """Persist an updated *.patch2 bundle with a single patch_key entry replaced.
+
+    This keeps merged/tail metadata (notably hiden_func_dict + hunk line ranges) in sync with the
+    rewritten patch_text so subsequent error→function mapping remains correct after line shifts.
+    """
+    src_patch_path = str(state.patch_path or "").strip()
+    key = str(patch_key or "").strip()
+    text = str(patch_text or "")
+    if not src_patch_path:
+        return "", "missing patch_path"
+    if not key:
+        return "", "missing patch_key"
+    if not text.strip():
+        return "", "missing patch_text"
+
+    script_dir = Path(__file__).resolve().parents[1]
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+
+    try:
+        from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to import patch_bundle: {type(exc).__name__}: {exc}"
+
+    try:
+        bundle = _lpb(src_patch_path, allowed_roots=_allowed_patch_roots_from_env())
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to load patch bundle: {type(exc).__name__}: {exc}"
+
+    if not isinstance(getattr(bundle, "patches", None), dict) or key not in bundle.patches:
+        return "", f"unknown patch_key in bundle: {key}"
+
+    patch_obj = bundle.patches[key]
+    patch_obj.patch_text = text.rstrip("\n") + "\n"
+
+    if isinstance(hiden_func_dict_updated, dict):
+        try:
+            patch_obj.hiden_func_dict = {str(k): int(v) for k, v in hiden_func_dict_updated.items()}
+        except Exception:
+            pass
+
+    _update_patchinfo_ranges_from_diff(patch_obj, patch_obj.patch_text)
+
+    src_path = Path(src_patch_path).expanduser().resolve()
+    safe_key = _safe_bundle_name(key, max_len=160)
+
+    artifacts_dir_raw = str(getattr(state, "artifacts_dir", "") or "").strip()
+    if artifacts_dir_raw:
+        out_dir = Path(artifacts_dir_raw).expanduser().resolve()
+        if safe_key not in out_dir.parts and out_dir.name != safe_key:
+            out_dir = (out_dir / safe_key).resolve()
+    else:
+        repo_root = Path(__file__).resolve().parents[2]
+        out_dir = (repo_root / "data" / "react_agent_artifacts" / safe_key).resolve()
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to create effective bundle dir: {type(exc).__name__}: {exc}"
+
+    stem = src_path.stem or "bundle"
+    while stem.endswith(".effective"):
+        stem = stem[: -len(".effective")]
+    base_name = f"{stem}.effective.patch2"
+    out_path = _unique_path((out_dir / base_name).resolve())
+
+    try:
+        import pickle  # noqa: PLC0415
+
+        out_path.write_bytes(pickle.dumps(dict(bundle.patches), protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to write effective patch bundle: {type(exc).__name__}: {exc}"
+
+    return str(out_path), None
+
+
 def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | None, Optional[str]]:
     """Load the patch bundle, optionally overlaying the latest override patch_text for active_patch_key."""
     if not state.patch_path:
@@ -831,6 +990,16 @@ def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | N
                 bundle.patches[active_key].patch_text = override_text
         except Exception:
             pass
+
+    # If make_error_patch_override returned an updated merged/tail offset map, overlay it as well so
+    # error→function mapping stays correct even when the bundle on disk hasn't been rewritten yet.
+    if active_key and isinstance(getattr(bundle, "patches", None), dict) and active_key in bundle.patches:
+        updated = state.patch_result.get("hiden_func_dict_updated") if isinstance(state.patch_result, dict) else None
+        if isinstance(updated, dict):
+            try:
+                bundle.patches[active_key].hiden_func_dict = {str(k): int(v) for k, v in updated.items()}
+            except Exception:
+                pass
 
     bundle = _reindex_patch_bundle(bundle)
     return bundle, None
@@ -1004,7 +1173,14 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     *,
     artifact_store: Any = None,
 ) -> Optional[Decision]:
-    """If auto-loop is enabled and errors remain in the active patch_key, refresh state and force a BASE-slice read."""
+    """If auto-loop is enabled and errors remain in the active patch_key, restart patch-scope triage for the next error.
+
+    Strategy: treat each loop iteration like a fresh patch-scope run using:
+      - patch_path = latest effective *.patch2 bundle
+      - build error = next compiler error from the latest OSS-Fuzz logs
+
+    Then force get_error_patch_context as the first tool call to refresh mapping + BASE slice artifacts.
+    """
     if not cfg.auto_ossfuzz_loop:
         return None
     if state.error_scope != "patch":
@@ -1012,8 +1188,6 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     if state.ossfuzz_runs_attempted >= max(int(cfg.ossfuzz_loop_max or 0), 1):
         return None
     if not state.patch_path:
-        return None
-    if not state.patch_override_paths:
         return None
 
     active_key = str(state.active_patch_key or state.patch_key or "").strip()
@@ -1118,80 +1292,65 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     state.macro_tokens_not_defined_in_slice = []
     state.macro_lookup = None
 
-    # Extract the current BASE slice from the latest override patch_text (no get_error_patch_context/v1 slice tools).
-    fp, ln = _active_override_location(state)
-    if not fp or ln <= 0:
-        fp = str(next_err.get("file", "") or "").strip()
-        ln = int(next_err.get("line", 0) or 0)
-    if not fp or ln <= 0:
-        return None
+    # Update the active build-error location for guardrails and for the forced get_error_patch_context.
+    fp = str(next_err.get("file", "") or "").strip()
+    ln = int(next_err.get("line", 0) or 0)
+    if fp and ln > 0:
+        state.active_file_path = fp
+        state.active_line_number = ln
+
+    # Ensure active_old_signature matches the selected error, even when only one signature remains.
+    sig = str(next_err.get("old_signature", "") or "").strip()
+    if sig:
+        state.active_old_signature = sig
+
+    # Treat the latest OSS-Fuzz build output as the new "build log" for this round (for display/debugging).
+    build_log_path = sources[0] if sources else ""
     try:
-        mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+        obs_out = state.last_observation.output if isinstance(state.last_observation, ToolObservation) else None
+        if isinstance(obs_out, dict):
+            build_log_path = _ossfuzz_artifact_path(obs_out, "build_output") or build_log_path
     except Exception:
-        mapping = {}
-    fs = mapping.get("func_start_index") if isinstance(mapping, dict) else None
-    fe = mapping.get("func_end_index") if isinstance(mapping, dict) else None
-    if isinstance(fs, int):
-        state.active_func_start_index = fs
-    if isinstance(fe, int):
-        state.active_func_end_index = fe
-    if not isinstance(fs, int) or not isinstance(fe, int):
-        return None
+        build_log_path = build_log_path
+    if build_log_path:
+        state.build_log_path = build_log_path
 
-    override_path = str(state.patch_override_paths[-1] or "").strip()
-    if not override_path:
-        return None
-    try:
-        override_text = _read_text(override_path)
-    except Exception:
-        return None
-    base_code = _extract_minus_slice_from_patch_text(patch_text=override_text, func_start_index=fs, func_end_index=fe)
-    if not base_code.strip():
-        return None
+    # Clear per-round patch context artifacts so we re-run patch-context tools like the first round.
+    state.active_func_start_index = None
+    state.active_func_end_index = None
+    state.active_excerpt_artifact_path = ""
+    state.active_patch_minus_code_artifact_path = ""
+    state.active_error_func_code_artifact_path = ""
+    state.loop_base_func_code_artifact_path = ""
+    state.pending_patch = None
 
-    base_artifact_path = ""
-    if artifact_store:
-        try:
-            ref = artifact_store.write_text(
-                name=f"loop_base_slice_{active_key}_{state.ossfuzz_runs_attempted}",
-                text=base_code + ("\n" if not base_code.endswith("\n") else ""),
-                ext=".c",
-            )
-            base_artifact_path = str(ref.artifact_path or "").strip()
-        except Exception:
-            base_artifact_path = ""
-    if not base_artifact_path and state.artifacts_dir:
-        try:
-            out_path = Path(state.artifacts_dir) / f"loop_base_slice_{active_key}_{state.ossfuzz_runs_attempted}.c"
-            out_path.write_text(base_code + ("\n" if not base_code.endswith("\n") else ""), encoding="utf-8", errors="replace")
-            base_artifact_path = str(out_path)
-        except Exception:
-            base_artifact_path = ""
-    if not base_artifact_path:
-        return None
-
-    state.loop_base_func_code_artifact_path = base_artifact_path
-
-    # Drop most prior context before looping.
-    state.steps = state.steps[-1:] if state.steps else []
+    # Drop most prior context before restarting the triage loop.
+    state.steps = []
 
     # Reset patch/test state for the next iteration.
     state.patch_generated = False
     state.patch_result = None
+    state.patch_override_paths = []
     state.ossfuzz_test_attempted = False
     state.last_observation = None
 
-    # Force the next step to read the BASE slice, then force make_error_patch_override.
-    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}, "thought": "auto-loop sentinel"}
+    if not fp or ln <= 0:
+        return None
+
+    err_text = str(next_err.get("msg", "") or "").strip() or str(state.error_line or "")[:400]
     forced: Decision = {
         "type": "tool",
-        "thought": f"Auto-loop: read the current BASE slice (from last override) and generate the next override. Sources: {', '.join(sources)}",
-        "tool": "read_artifact",
+        "thought": (
+            f"Auto-loop restart: start next round from latest OSS-Fuzz logs and the updated patch bundle; refresh patch context for {fp}:{ln}."
+        ),
+        "tool": "get_error_patch_context",
         "args": {
-            "artifact_path": base_artifact_path,
-            "start_line": 1,
-            "max_lines": 800,
-            "max_chars": 200000,
+            "patch_path": state.patch_path,
+            "file_path": fp,
+            "line_number": ln,
+            "error_text": err_text,
+            "context_lines": 200,
+            "max_total_lines": 8000,
         },
     }
     return forced
@@ -2400,16 +2559,19 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     if scope:
         lines.append(f"Scope: {scope}")
 
-    if current_groups or history_groups:
+    show_grouping = bool(current_groups or history_groups)
+    if show_grouping:
         lines.append("")
         lines.append("Function grouping note:")
         lines.append(textwrap.indent("Current = remaining compiler errors from the latest build logs.", "  "))
         lines.append(textwrap.indent("History = union of unique error lines seen earlier in this agent run (may include fixed errors).", "  "))
 
-    if current_groups:
+    if current_groups or (show_grouping and scope == "patch" and patch_key):
         lines.append("")
         total = current_groups_total or len(current_groups)
         lines.append(f"Current function groups ({total}):")
+        if not current_groups:
+            lines.append(textwrap.indent("(none)", "  "))
         for idx, grp in enumerate(current_groups, start=1):
             if not isinstance(grp, dict):
                 continue
@@ -2845,6 +3007,11 @@ def _run_langgraph(
             patch_key_verdict: Dict[str, Any] = {}
             if st.error_scope == "patch" and st.patch_path:
                 patch_key_verdict = _summarize_active_patch_key_status(st)
+                if isinstance(patch_key_verdict, dict) and patch_key_verdict.get("status") == "ok":
+                    fg = patch_key_verdict.get("function_groups")
+                    st.function_groups = fg if isinstance(fg, list) else []
+                    st.function_groups_total = int(patch_key_verdict.get("function_groups_total", 0) or 0)
+                    st.function_groups_truncated = bool(patch_key_verdict.get("function_groups_truncated", False))
             fixed_str = "unknown"
             if verdict.get("status") == "ok":
                 fixed_str = "yes" if verdict.get("fixed") else "no"
@@ -2871,10 +3038,7 @@ def _run_langgraph(
                             next_step_lines.append(f"- {raw}")
                 elif verdict.get("other_errors"):
                     next_step_lines.append("Next top errors:")
-                    for e in (verdict.get("other_errors") or [])[:5]:
-                        raw = str((e or {}).get("raw", "")).strip()
-                        if raw:
-                            next_step_lines.append(f"- {raw}")
+                    next_step_lines.extend(_format_other_errors_for_next_step(verdict.get("other_errors") or [], limit=5))
             if verdict.get("status") == "ok":
                 next_step_lines.append("Review OSS-Fuzz logs in artifacts and apply the merged patch file.")
             else:
@@ -3544,12 +3708,37 @@ def _run_langgraph(
                     st.active_func_start_index = fs
                 if isinstance(fe, int):
                     st.active_func_end_index = fe
+
+            patch_text = ""
             patch_text_path = ""
+            hiden_func_dict_updated = None
             if isinstance(st.patch_result, dict):
+                hiden_func_dict_updated = st.patch_result.get("hiden_func_dict_updated")
                 pt = st.patch_result.get("patch_text")
                 if isinstance(pt, dict):
                     patch_text_path = str(pt.get("artifact_path", "") or "").strip()
-            if patch_text_path:
+                    if patch_text_path:
+                        try:
+                            patch_text = _read_text(patch_text_path)
+                        except Exception:
+                            patch_text = ""
+                elif isinstance(pt, str):
+                    patch_text = pt
+
+            if patch_text.strip():
+                effective_path, effective_err = _write_effective_patch_bundle(
+                    st,
+                    patch_key=str(st.active_patch_key or st.patch_key or "").strip(),
+                    patch_text=patch_text,
+                    hiden_func_dict_updated=hiden_func_dict_updated,
+                )
+                if effective_path and not effective_err:
+                    st.patch_path = effective_path
+                    # The bundle now contains the rewritten patch_text; no separate override diff is required.
+                    st.patch_override_paths = []
+                elif patch_text_path:
+                    st.patch_override_paths = [patch_text_path]
+            elif patch_text_path:
                 st.patch_override_paths = [patch_text_path]
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
