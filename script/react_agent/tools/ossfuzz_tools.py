@@ -30,6 +30,78 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _ossfuzz_lock_path() -> Path:
+    """Return a stable lock path for OSS-Fuzz Docker test runs.
+
+    This lock is used to serialize `ossfuzz_apply_patch_and_test` calls across concurrent agent processes that share
+    the same repo checkout (and therefore the same `oss-fuzz/` working tree and `oss-fuzz/build/*` directories).
+
+    Override with:
+      - `REACT_AGENT_OSSFUZZ_LOCK_PATH`: absolute/relative lock file path
+      - `REACT_AGENT_OSSFUZZ_LOCK_DIR`: directory to place the default lock file in
+    """
+    raw_path = str(os.environ.get("REACT_AGENT_OSSFUZZ_LOCK_PATH", "") or "").strip()
+    if raw_path:
+        return Path(raw_path).expanduser().resolve()
+
+    raw_dir = str(os.environ.get("REACT_AGENT_OSSFUZZ_LOCK_DIR", "") or "").strip()
+    lock_dir = Path(raw_dir).expanduser().resolve() if raw_dir else (_repo_root() / "data" / "react_agent_locks").resolve()
+    return (lock_dir / "ossfuzz_apply_patch_and_test.lock").resolve()
+
+
+class _FileLock:
+    """Cross-process advisory file lock (best-effort, blocks until acquired)."""
+
+    def __init__(self, lock_path: Path, *, wait_message: str) -> None:
+        """Initialize a lock over `lock_path`."""
+        self.lock_path = Path(lock_path)
+        self.wait_message = str(wait_message or "").rstrip("\n")
+        self._fd: Optional[int] = None
+
+    def __enter__(self) -> "_FileLock":
+        """Acquire the lock, blocking until available."""
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        self._fd = fd
+
+        try:
+            import fcntl  # Unix-only
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if self.wait_message:
+                    sys.stderr.write(self.wait_message + "\n")
+                    sys.stderr.flush()
+                fcntl.flock(fd, fcntl.LOCK_EX)
+        except Exception:
+            # If locking is unavailable (e.g., non-Unix), proceed without blocking; callers still work,
+            # but OSS-Fuzz runs may clobber shared build/out directories when concurrent.
+            pass
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        """Release the lock."""
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            import fcntl  # Unix-only
+
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def _artifact_allow_root() -> Path:
     root = str(os.environ.get("REACT_AGENT_ARTIFACT_ROOT", "") or "").strip()
     if root:
@@ -261,6 +333,11 @@ def ossfuzz_apply_patch_and_test(
     fuzz_helper = script_dir / "fuzz_helper.py"
     helper_py = oss_fuzz_dir / "infra" / "helper.py"
 
+    lock_path = _ossfuzz_lock_path()
+    wait_message = (
+        f"[ossfuzz_apply_patch_and_test] waiting for OSS-Fuzz lock (another agent is testing): {lock_path}"
+    )
+
     build_cmd: List[str] = [
         sys.executable,
         str(fuzz_helper),
@@ -282,53 +359,54 @@ def ossfuzz_apply_patch_and_test(
     build_cmd.append(project_name)
     build_cmd = _maybe_prefix_sudo(build_cmd, use_sudo=use_sudo)
 
-    build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
-    build_ok = build_res["returncode"] == 0
-    build_patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
+    with _FileLock(lock_path, wait_message=wait_message):
+        build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
+        build_ok = build_res["returncode"] == 0
+        build_patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
 
-    check_build_cmd: List[str] = [
-        sys.executable,
-        str(helper_py),
-        "check_build",
-        "--sanitizer",
-        str(sanitizer or "address"),
-        "--engine",
-        str(engine or "libfuzzer"),
-        "--architecture",
-        str(architecture or "x86_64"),
-        "-e",
-        "ASAN_OPTIONS=detect_leaks=0",
-        project_name,
-    ]
-    check_build_cmd = _maybe_prefix_sudo(check_build_cmd, use_sudo=use_sudo)
-
-    check_res = _run(check_build_cmd, label="check_build", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
-    check_ok = check_res["returncode"] == 0
-    check_patch_apply_error = _find_patch_apply_error(check_res.get("output", ""))
-    patch_apply_error = build_patch_apply_error or check_patch_apply_error
-    patch_apply_ok = not bool(patch_apply_error)
-
-    run_fuzzer_output = ""
-    run_fuzzer_cmd: List[str] = []
-    run_fuzzer_ok: Optional[bool] = None
-    if fuzz_target:
-        secs = max(1, min(int(run_fuzzer_seconds or 0), 600))
-        run_fuzzer_cmd = [
+        check_build_cmd: List[str] = [
             sys.executable,
             str(helper_py),
-            "run_fuzzer",
+            "check_build",
+            "--sanitizer",
+            str(sanitizer or "address"),
+            "--engine",
+            str(engine or "libfuzzer"),
+            "--architecture",
+            str(architecture or "x86_64"),
             "-e",
             "ASAN_OPTIONS=detect_leaks=0",
             project_name,
-            str(fuzz_target),
-            "--",
-            f"-max_total_time={secs}",
-            "-timeout=5",
         ]
-        run_fuzzer_cmd = _maybe_prefix_sudo(run_fuzzer_cmd, use_sudo=use_sudo)
-        run_res = _run(run_fuzzer_cmd, label="run_fuzzer", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
-        run_fuzzer_output = run_res["output"]
-        run_fuzzer_ok = run_res["returncode"] == 0
+        check_build_cmd = _maybe_prefix_sudo(check_build_cmd, use_sudo=use_sudo)
+
+        check_res = _run(check_build_cmd, label="check_build", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
+        check_ok = check_res["returncode"] == 0
+        check_patch_apply_error = _find_patch_apply_error(check_res.get("output", ""))
+        patch_apply_error = build_patch_apply_error or check_patch_apply_error
+        patch_apply_ok = not bool(patch_apply_error)
+
+        run_fuzzer_output = ""
+        run_fuzzer_cmd: List[str] = []
+        run_fuzzer_ok: Optional[bool] = None
+        if fuzz_target:
+            secs = max(1, min(int(run_fuzzer_seconds or 0), 600))
+            run_fuzzer_cmd = [
+                sys.executable,
+                str(helper_py),
+                "run_fuzzer",
+                "-e",
+                "ASAN_OPTIONS=detect_leaks=0",
+                project_name,
+                str(fuzz_target),
+                "--",
+                f"-max_total_time={secs}",
+                "-timeout=5",
+            ]
+            run_fuzzer_cmd = _maybe_prefix_sudo(run_fuzzer_cmd, use_sudo=use_sudo)
+            run_res = _run(run_fuzzer_cmd, label="run_fuzzer", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
+            run_fuzzer_output = run_res["output"]
+            run_fuzzer_ok = run_res["returncode"] == 0
 
     return {
         "project": project_name,

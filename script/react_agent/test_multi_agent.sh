@@ -9,6 +9,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 export REACT_AGENT_PATCH_ALLOWED_ROOTS="$tmp_dir"
 export REACT_AGENT_ARTIFACT_ROOT="$tmp_dir/artifacts"
+export REACT_AGENT_OSSFUZZ_LOCK_PATH="$tmp_dir/ossfuzz_apply_patch_and_test.lock"
 
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
 import contextlib
@@ -26,6 +27,67 @@ with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
 assert out_buf.getvalue() == "", out_buf.getvalue()
 assert "[ossfuzz_apply_patch_and_test]" in err_buf.getvalue(), err_buf.getvalue()
 assert res["output"].strip() == "hello", res
+PY
+
+# Cross-process lock: concurrent OSS-Fuzz tool calls should serialize.
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+lock_path = os.environ.get("REACT_AGENT_OSSFUZZ_LOCK_PATH")
+assert lock_path, "missing REACT_AGENT_OSSFUZZ_LOCK_PATH"
+
+child_code = r"""
+import sys
+import time
+from script.react_agent.tools.ossfuzz_tools import _FileLock, _ossfuzz_lock_path
+
+label = sys.argv[1]
+lock = _ossfuzz_lock_path()
+with _FileLock(lock, wait_message=""):
+    acquired = time.time()
+    print(f"{label} acquired {acquired}", flush=True)
+    time.sleep(0.4)
+    releasing = time.time()
+    print(f"{label} releasing {releasing}", flush=True)
+"""
+
+env = dict(os.environ)
+p1 = subprocess.Popen([sys.executable, "-c", child_code, "p1"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+time.sleep(0.05)
+p2 = subprocess.Popen([sys.executable, "-c", child_code, "p2"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+
+out1, err1 = p1.communicate(timeout=10)
+out2, err2 = p2.communicate(timeout=10)
+assert p1.returncode == 0, (p1.returncode, out1, err1)
+assert p2.returncode == 0, (p2.returncode, out2, err2)
+
+def parse_times(out: str) -> tuple[float, float]:
+    acquired = None
+    releasing = None
+    for line in (out or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) != 3:
+            continue
+        if parts[1] == "acquired":
+            acquired = float(parts[2])
+        elif parts[1] == "releasing":
+            releasing = float(parts[2])
+    assert acquired is not None and releasing is not None, out
+    return acquired, releasing
+
+a1, r1 = parse_times(out1)
+a2, r2 = parse_times(out2)
+
+if a1 <= a2:
+    first_acq, first_rel, second_acq = a1, r1, a2
+else:
+    first_acq, first_rel, second_acq = a2, r2, a1
+
+assert second_acq >= first_rel, (out1, out2, err1, err2)
+assert (second_acq - first_acq) >= 0.25, (out1, out2, err1, err2)
 PY
 
 # Pick the latest make_error_patch_override override diff (e.g. ".8.diff" beats ".diff").
