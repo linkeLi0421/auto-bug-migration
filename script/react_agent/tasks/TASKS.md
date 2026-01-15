@@ -41,3 +41,18 @@
 - [x] Wire this into both `ossfuzz_verdict` (`_summarize_target_error_status`) and `patch_key_verdict` (`_summarize_active_patch_key_status` / `_iter_ossfuzz_compiler_errors`) so multi-agent won’t mark the hunk as fixed.
 - [x] Add regression test coverage for a non-compiler failure line (e.g. `cp: cannot create regular file '/out/llvm-symbolizer'`).
 - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
+
+## Multi-agent: final merged patch + final OSS-Fuzz test
+
+### Goal
+
+- After `multi_agent.py` finishes all patch_key hunks, collect each hunk’s final `make_error_patch_override_patch_text*.diff` and run a single OSS-Fuzz build/check_build using the combined overrides.
+
+### Plan
+
+- [x] Add `--final-ossfuzz-test {auto,always,never}` to `multi_agent.py` (default `auto`).
+- [x] After all hunks complete, find the latest override diff per hunk (prefer the path referenced in `agent_stdout.json.next_step`, else pick the highest-version `make_error_patch_override_patch_text*.diff` in the hunk artifacts dir).
+- [x] Write a debug artifact `combined_override_diffs.diff` under `data/react_agent_artifacts/multi_<run_id>/` that concatenates all per-hunk override diffs.
+- [x] If enabled (`auto`: only when all hunks are `fixed` and `--tools real`), run `ossfuzz_apply_patch_and_test` with `patch_override_paths=[...]` and store final build/check_build outputs as artifact files; record `final_ossfuzz_test` in `summary.json`.
+- [x] Add a non-Docker regression test that validates “latest override diff selection” behavior (e.g. `.8.diff` beats `.diff`).
+- [x] Run `bash script/react_agent/test_multi_agent.sh` (and `bash script/react_agent/test_langgraph_agent.sh` if needed).

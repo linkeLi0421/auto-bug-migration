@@ -82,6 +82,115 @@ def _try_parse_agent_output(stdout: str) -> tuple[Any, Optional[str]]:
         return None, f"{type(exc).__name__}: {exc}"
 
 
+def _extract_next_step_path(text: str, *, prefix: str) -> str:
+    want = str(prefix or "").strip()
+    if not want:
+        return ""
+    for raw in str(text or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if line.startswith(want):
+            return line[len(want) :].strip()
+    return ""
+
+
+def _extract_override_diff_from_agent_stdout(agent_stdout_path: Path) -> str:
+    try:
+        payload = json.loads(agent_stdout_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ""
+    next_step = payload.get("next_step") if isinstance(payload, dict) else None
+    override = _extract_next_step_path(str(next_step or ""), prefix="Override diff:")
+    if not override:
+        return ""
+    p = Path(override).expanduser()
+    if p.is_file():
+        return str(p.resolve())
+    return ""
+
+
+def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path]:
+    patterns = [
+        "make_error_patch_override_patch_text_*.diff",
+        "make_error_patch_override_patch_text*.diff",
+    ]
+    candidates: List[Path] = []
+    for pat in patterns:
+        candidates.extend([p for p in artifacts_dir.glob(pat) if p.is_file()])
+    if not candidates:
+        return None
+
+    def version(p: Path) -> int:
+        name = p.name
+        if not name.endswith(".diff"):
+            return 0
+        base = name[: -len(".diff")]
+        last = base.rsplit(".", 1)[-1]
+        if last.isdigit():
+            try:
+                return int(last)
+            except ValueError:
+                return 0
+        return 0
+
+    # Prefer the latest timestamp; break ties by numeric suffix (e.g. ".8.diff" > ".diff").
+    return max(candidates, key=lambda p: (p.stat().st_mtime, version(p), p.name))
+
+
+def _collect_final_override_diffs(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    override_paths: List[str] = []
+    per_hunk: List[Dict[str, Any]] = []
+    missing: List[str] = []
+
+    for r in results or []:
+        patch_key = str(r.get("patch_key", "") or "").strip()
+        artifacts_dir_raw = str(r.get("artifacts_dir", "") or "").strip()
+        if not patch_key or not artifacts_dir_raw:
+            continue
+        artifacts_dir = Path(artifacts_dir_raw).expanduser().resolve()
+        if not artifacts_dir.is_dir():
+            missing.append(patch_key)
+            continue
+
+        chosen = ""
+        method = ""
+        agent_stdout_path = artifacts_dir / "agent_stdout.json"
+        if agent_stdout_path.is_file():
+            chosen = _extract_override_diff_from_agent_stdout(agent_stdout_path)
+            if chosen:
+                method = "agent_stdout.next_step"
+
+        if not chosen:
+            latest = _latest_make_error_patch_override_diff(artifacts_dir)
+            if latest is not None:
+                chosen = str(latest.resolve())
+                method = "glob_latest"
+
+        if not chosen:
+            missing.append(patch_key)
+            continue
+
+        override_paths.append(chosen)
+        per_hunk.append({"patch_key": patch_key, "override_diff": chosen, "method": method})
+
+    # De-dup while preserving order.
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for p in override_paths:
+        rp = str(Path(p).expanduser().resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        deduped.append(rp)
+
+    return {
+        "override_paths": deduped,
+        "per_hunk": per_hunk,
+        "missing_patch_keys": missing,
+    }
+
+
 def _allowed_roots_from_env() -> Optional[List[str]]:
     raw = os.environ.get("REACT_AGENT_PATCH_ALLOWED_ROOTS", "").strip()
     if not raw:
@@ -161,6 +270,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-agent-output",
         action="store_true",
         help="Include full per-agent JSON output in the multi-agent report (default: store full output in artifacts only).",
+    )
+    p.add_argument(
+        "--final-ossfuzz-test",
+        choices=["auto", "always", "never"],
+        default=str(os.environ.get("REACT_AGENT_FINAL_OSSFUZZ_TEST", "auto") or "auto"),
+        help=(
+            "After all hunks complete, run a single OSS-Fuzz build/check_build using the combined override diffs. "
+            "auto=only when all hunks are fixed and --tools real; always=run regardless of per-hunk status; never=skip."
+        ),
     )
 
     p.add_argument("--v1-json-dir", default="", help="Root directory containing V1 *_analysis.json files")
@@ -526,6 +644,100 @@ def main(argv: List[str]) -> int:
                 }
             )
 
+    overrides = _collect_final_override_diffs(results)
+    combined_override_paths: List[str] = list(overrides.get("override_paths") or [])
+    combined_override_paths_count = len(combined_override_paths)
+    combined_override_diffs_path = ""
+    if combined_override_paths:
+        parts: List[str] = []
+        for raw in combined_override_paths:
+            p = Path(str(raw)).expanduser()
+            if not p.is_file():
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace").rstrip("\n")
+            if text.strip():
+                parts.append(text)
+        combined_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
+        combined_path = (artifacts_root / "combined_override_diffs.diff").resolve()
+        combined_path.write_text(combined_text, encoding="utf-8", errors="replace")
+        combined_override_diffs_path = str(combined_path)
+
+    final_mode = str(getattr(args, "final_ossfuzz_test", "auto") or "auto").strip().lower()
+    final_ossfuzz_test: Dict[str, Any] = {
+        "status": "skipped",
+        "mode": final_mode,
+        "reason": "",
+        "override_paths_count": combined_override_paths_count,
+        "override_paths": combined_override_paths,
+        "combined_override_diffs_path": combined_override_diffs_path,
+        "override_diffs_per_hunk": list(overrides.get("per_hunk") or []),
+        "override_diffs_missing_patch_keys": list(overrides.get("missing_patch_keys") or []),
+    }
+    if final_mode not in {"auto", "always", "never"}:
+        final_mode = "auto"
+        final_ossfuzz_test["mode"] = final_mode
+    if final_mode == "never":
+        final_ossfuzz_test["reason"] = "final-ossfuzz-test=never"
+    elif str(args.tools) != "real":
+        final_ossfuzz_test["reason"] = f"--tools {args.tools} (final OSS-Fuzz test requires --tools real)"
+    else:
+        all_fixed = all(str(r.get("task_status", "") or "").strip() == "fixed" for r in results or [])
+        if final_mode == "auto" and not all_fixed:
+            final_ossfuzz_test["reason"] = "Not all hunks are fixed (auto mode)."
+        else:
+            try:
+                os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
+                from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test  # type: ignore
+
+                res = ossfuzz_apply_patch_and_test(
+                    project=str(args.ossfuzz_project),
+                    commit=str(args.ossfuzz_commit),
+                    patch_path=str(args.patch_path),
+                    patch_override_paths=combined_override_paths,
+                    build_csv=str(args.ossfuzz_build_csv),
+                    sanitizer=str(args.ossfuzz_sanitizer),
+                    architecture=str(args.ossfuzz_arch),
+                    engine=str(args.ossfuzz_engine),
+                    fuzz_target=str(args.ossfuzz_fuzz_target),
+                    use_sudo=bool(args.ossfuzz_use_sudo),
+                )
+
+                build_log_path = (artifacts_root / "final_ossfuzz_build_output.log").resolve()
+                check_log_path = (artifacts_root / "final_ossfuzz_check_build_output.log").resolve()
+                build_log_path.write_text(str(res.get("build_output", "") or ""), encoding="utf-8", errors="replace")
+                check_log_path.write_text(str(res.get("check_build_output", "") or ""), encoding="utf-8", errors="replace")
+
+                run_fuzzer_output = str(res.get("run_fuzzer_output", "") or "")
+                run_fuzzer_path = ""
+                if run_fuzzer_output.strip():
+                    p = (artifacts_root / "final_ossfuzz_run_fuzzer_output.log").resolve()
+                    p.write_text(run_fuzzer_output, encoding="utf-8", errors="replace")
+                    run_fuzzer_path = str(p)
+
+                patch_apply_ok = bool(res.get("patch_apply_ok"))
+                build_ok = bool(res.get("build_ok"))
+                check_ok = bool(res.get("check_build_ok"))
+                run_ok = res.get("run_fuzzer_ok")
+                ok = patch_apply_ok and build_ok and check_ok and (run_ok is not False)
+                final_ossfuzz_test.update(
+                    {
+                        "status": "ok" if ok else "failed",
+                        "reason": str(res.get("patch_apply_error", "") or "").strip(),
+                        "merged_patch_file_path": str(res.get("merged_patch_file_path", "") or "").strip(),
+                        "patch_apply_ok": patch_apply_ok,
+                        "build_ok": build_ok,
+                        "check_build_ok": check_ok,
+                        "run_fuzzer_ok": run_ok,
+                        "build_output_path": str(build_log_path),
+                        "check_build_output_path": str(check_log_path),
+                        "run_fuzzer_output_path": run_fuzzer_path,
+                    }
+                )
+                if not final_ossfuzz_test["reason"] and not ok:
+                    final_ossfuzz_test["reason"] = "OSS-Fuzz build/check_build failed."
+            except Exception as exc:
+                final_ossfuzz_test.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
+
     summary_path = artifacts_root / "summary.json"
     report = {
         "type": "multi_agent",
@@ -533,6 +745,7 @@ def main(argv: List[str]) -> int:
         "patch_path": patch_path,
         "max_groups_requested": max_groups_requested,
         "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
+        "final_ossfuzz_test": final_ossfuzz_test,
         "patch_key_groups_found": patch_key_groups_found,
         "patch_key_groups_after_allowlist": patch_key_groups_after_allowlist,
         "patch_key_groups_selected": patch_key_groups_selected,
