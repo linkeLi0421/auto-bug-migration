@@ -1,102 +1,43 @@
-# TASKS
+## Multi-agent: store merged patch under patch_key + clarify `--max-groups` vs hunks fixed
 
-## Never truncate `make_error_patch_override` output (full override diff must be valid)
+### Goals
 
-### Context / Repro
-
-- In `log/agent_log/tmp1.log`, `make_error_patch_override` returned `patch_text_truncated=true`, which produced a truncated
-  override diff artifact and led to patch-apply failures / corrupt merged patches.
-- The override diff artifact must always contain the *full* unified diff for the patch_key; truncation is only useful
-  for previews, not for the actual patch file.
+- When running via `script/react_agent/multi_agent.py`, store `merged_patch_file_path` inside the per-hunk artifacts dir:
+  `data/react_agent_artifacts/multi_<run_id>/<patch_key>/...`
+- Make it obvious why `--max-groups N` can yield `< N` fixed hunks (or even `< N` groups selected).
 
 ### Plan
 
-- [x] Update `script/migration_tools/tools.py:make_error_patch_override` to always return the full `patch_text` (ignore `max_lines`/`max_chars` for the diff itself).
-- [x] Keep `old_func_code` bounded (it’s only for debugging), but ensure `patch_text_truncated` is always `False` and `patch_text_lines_returned == patch_text_lines_total`.
-- [x] Add a regression test in `script/migration_tools/test_migration_tools.sh` that calls `make_error_patch_override` with absurdly small `max_lines/max_chars` and asserts the returned diff is still complete/valid.
-- [x] Run `bash script/migration_tools/test_migration_tools.sh` and `bash script/react_agent/test_langgraph_agent.sh`.
+- [x] `ossfuzz_tools.merge_patch_bundle_with_overrides`: when `patch_override_paths` is empty, infer `patch_key` from `patch_path` location (if the bundle lives under `<artifact_root>/<patch_key>/...`) and write `merged_patch_file_path` under that patch_key folder.
+- [x] Add a regression test (non-Docker) that verifies the merged patch file is written under the inferred `<patch_key>/` directory even with zero override paths.
+- [x] `multi_agent.py`: add explicit selection fields to `summary.json` (`max_groups_requested`, groups found/selected after filters) and add a short `task_status_counts` + `not_fixed` list so it’s clear why `hunks_fixed != groups_selected`.
+- [x] Update `script/react_agent/test_multi_agent.sh` assertions for the new summary fields.
+- [x] Run `bash script/react_agent/test_multi_agent.sh` and `bash script/react_agent/test_langgraph_agent.sh`.
 
-## Clarify `make_error_patch_override.new_func_code` (function-by-function mode)
-
-### Context / Goal
-
-- In merged/tail hunk mode, the agent now iterates **per function** (`active_old_signature`).
-- The model sometimes treats `make_error_patch_override.new_func_code` as “rewrite the whole patch/hunk” and emits code for multiple functions (or even diff-ish content).
-- Desired behavior: for a given round, `new_func_code` is **only** the full C definition of the **active** function; other functions will be handled in later rounds.
-
-### Plan
-
-- [x] Update the system prompt + tool description to explicitly state: in merged/tail hunks, `make_error_patch_override.new_func_code` must rewrite only the mapped slice for the active function (no other functions; no unified-diff headers).
-- [x] Add an agent-side guardrail for `make_error_patch_override` in function mode that rejects multi-function / diff-like `new_func_code` and forces a retry scoped to the active slice.
-- [x] Add a regression test in `script/react_agent/test_langgraph_agent.sh` for the new guardrail (multi-function input should trigger; single-function should pass).
-- [x] Run `bash script/react_agent/test_langgraph_agent.sh` (and any other relevant tests).
-
-## Fix merged/tail auto-loop mis-attribution (keep `hiden_func_dict` + line mapping in sync)
-
-### Problem
-
-- In merged/tail hunks, after the first override changes function length, subsequent OSS-Fuzz errors are mapped to the wrong function because we update `patch_text` (override diff) but do **not** persist the corresponding `hiden_func_dict` / line-range metadata.
-- This causes the next error (e.g., `xmlParserNsLookup`) to be treated as part of the previous function (e.g., `xmlParserNsPush`).
-
-### Plan
-
-- [x] Persist an **effective patch bundle** after each `make_error_patch_override`: copy the current `*.patch2` bundle and replace only the active `patch_key` entry with the returned `patch_text` + updated metadata.
-- [x] Update the effective entry’s metadata fields (`hiden_func_dict`, `old_start_line/old_end_line/new_start_line/new_end_line`) by re-parsing the rewritten unified diff.
-- [x] Switch the auto-loop to use the **patch bundle’s** `patch_text` as the source-of-truth for the next BASE slice (no longer require `patch_override_paths` to exist).
-- [x] Add a regression test that simulates a merged/tail hunk rewrite that changes slice length and asserts subsequent error→function mapping stays correct.
-- [x] Run `bash script/react_agent/test_langgraph_agent.sh` and any relevant migration tool tests.
-
-## Post-OSS-Fuzz output: refresh function groups + show patch_key for “Next top errors”
-
-### Problem
-
-- After an OSS-Fuzz run where the active function/patch_key is fixed, the final output still prints the *old* “Current function groups” from the start of the run (stale).
-- “Next top errors” may come from a *different* patch hunk, but the log doesn’t show which `patch_key` those errors map to.
-
-### Plan
-
-- [x] After `ossfuzz_apply_patch_and_test`, refresh `state.function_groups` from the latest OSS-Fuzz build logs (use `patch_key_verdict.function_groups`), even when we are about to stop (no auto-loop).
-- [x] Print `patch_key` next to each “Next top errors” entry (or group them by patch_key) so it’s obvious when they’re from another hunk.
-- [x] Update text rendering so “Current function groups (0)” is shown when the active patch_key is clean (avoid hiding the section when the list is empty).
-- [x] Add a small regression test for the “0 groups” rendering and patch_key-annotated next errors.
-- [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
-
-## Store effective `*.patch2` under per-hunk artifacts dir
+## Multi-agent: restart a hunk when not fixed
 
 ### Goal
 
-- When we persist the “effective” patch bundle after `make_error_patch_override`, store it under the same per-hunk
-  artifacts directory as other outputs (e.g. `data/react_agent_artifacts/<patch_key>/...`) instead of `data/tmp_patch/...`.
+- In `script/react_agent/multi_agent.py`, if a per-hunk agent run ends with `task_status != fixed`, delete that hunk’s artifact directory and re-run the agent from scratch, up to a configurable limit.
 
 ### Plan
 
-- [x] Change `_write_effective_patch_bundle` to write to `state.artifacts_dir` when available (fallback: default artifact root).
-- [x] Ensure `migration_tools.patch_bundle.DEFAULT_ALLOWED_ROOTS` includes `data/react_agent_artifacts` so the agent/tools can reload the effective bundle without extra env vars.
-- [x] Update regression tests and run `bash script/react_agent/test_langgraph_agent.sh`.
+- [x] Add `--max-restarts-per-hunk` (default 0) to `multi_agent.py`.
+- [x] Implement per-hunk retry loop: if final status is not `fixed`, `rm -rf <artifacts_root>/<patch_key>/` and rerun (up to `1 + max_restarts_per_hunk` total attempts).
+- [x] Record restart metadata in `summary.json` and per-result fields (`attempts`, `restarts_attempted`, `attempt_history`), while keeping only the final attempt’s on-disk artifacts.
+- [x] Add regression coverage in `script/react_agent/test_multi_agent.sh` (enable restarts and assert `attempts==2` when a hunk is not fixed).
+- [x] Run `bash script/react_agent/test_multi_agent.sh`.
 
-## Auto-loop v2: restart patch-scope triage each round (use latest OSS-Fuzz logs + effective bundle)
+## OSS-Fuzz verdict: avoid “fixed” when build failed without compiler errors
 
 ### Problem
 
-- First round (function fix + OSS-Fuzz test) works.
-- Next round often fails because we keep too much stale state and we skip the normal “first round” workflow
-  (`get_error_patch_context` → BASE slice → `make_error_patch_override`). This can leave stale `active_file_path/line_number`
-  and other mapping state, causing the next function/error to be patched incorrectly.
-
-### Goal
-
-- After each OSS-Fuzz run, if there are still errors for the active `patch_key`, **clear context** and restart the triage loop
-  as if it were a fresh run:
-  - input patch bundle = the newly written effective `*.patch2`
-  - input build log = the last OSS-Fuzz build output
-  - first tool call in the new round should be `get_error_patch_context`
+- Some OSS-Fuzz failures don’t produce `file:line:col: error:` compiler diagnostics (e.g. `cp: cannot create ... /out/...`).
+- The agent currently treats “no parsed compiler errors” as “fixed”, which is wrong when `ossfuzz_apply_patch_and_test` actually failed.
 
 ### Plan
 
-- [x] In `_prepare_next_patch_scope_iteration_after_ossfuzz`, stop using `loop_base_slice_*` extraction for subsequent rounds.
-- [x] Instead: pick the next error (still within `active_patch_key`, still grouped by function for merged/tail hunks),
-  set `state.error_line/snippet/grouped_errors/active_old_signature`, and reset stale per-round state.
-- [x] Clear `state.steps` (keep `step_history`) and clear `loop_base_func_code_artifact_path` so prereq tools run again.
-- [x] Force a `get_error_patch_context` tool call for the new round using the latest error location + the effective bundle path.
-- [x] Add a regression test that ensures after a round transition, `active_file_path/line_number` reflect the new error (not the previous one).
+- [x] In `agent_langgraph.py`, treat OSS-Fuzz run as `failed` when `build_ok`/`check_build_ok` is `False` and no compiler errors were parsed (also respect `patch_apply_ok=False` even if logs don’t match known patterns).
+- [x] Wire this into both `ossfuzz_verdict` (`_summarize_target_error_status`) and `patch_key_verdict` (`_summarize_active_patch_key_status` / `_iter_ossfuzz_compiler_errors`) so multi-agent won’t mark the hunk as fixed.
+- [x] Add regression test coverage for a non-compiler failure line (e.g. `cp: cannot create regular file '/out/llvm-symbolizer'`).
 - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.

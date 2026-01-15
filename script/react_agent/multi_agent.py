@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -138,6 +139,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("build_log", nargs="?", default="-", help="Build log path, or '-' for stdin.")
     p.add_argument("--patch-path", required=True, help="Path to a tmp_patch bundle (*.patch2).")
     p.add_argument("--max-groups", type=int, default=20, help="Max patch_key groups to run (default: 20).")
+    p.add_argument(
+        "--max-restarts-per-hunk",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_RESTARTS_PER_HUNK", "0") or 0),
+        help="If a hunk is not fixed, delete its artifacts dir and rerun (default: 0).",
+    )
     p.add_argument("--jobs", type=int, default=1, help="Max concurrent agents to run (default: 1).")
     p.add_argument("--output-format", choices=["none", "auto", "json", "json-pretty", "text"], default="none")
     p.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
@@ -293,16 +300,20 @@ def main(argv: List[str]) -> int:
 
     build_log_text = load_build_log(str(args.build_log))
     groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=patch_path)
-    ranked = _rank_patch_keys(groups)
+    ranked_all = _rank_patch_keys(groups)
+    patch_key_groups_found = len(ranked_all)
 
     allow_raw = str(args.only_patch_keys or "").strip()
     allow = {s.strip() for s in allow_raw.split(",") if s.strip()} if allow_raw else set()
     if allow:
-        ranked = [k for k in ranked if k in allow]
+        ranked_all = [k for k in ranked_all if k in allow]
+    patch_key_groups_after_allowlist = len(ranked_all)
 
-    max_groups = max(0, int(args.max_groups or 0))
-    if max_groups:
-        ranked = ranked[:max_groups]
+    max_groups_requested = max(0, int(args.max_groups or 0))
+    ranked = ranked_all
+    if max_groups_requested:
+        ranked = ranked[:max_groups_requested]
+    patch_key_groups_selected = len(ranked)
 
     repo_root = Path(__file__).resolve().parents[2]
     agent_script = repo_root / "script" / "react_agent" / "agent_langgraph.py"
@@ -323,113 +334,159 @@ def main(argv: List[str]) -> int:
     env["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
+    def reset_out_dir(out_dir: Path) -> None:
+        resolved = out_dir.resolve()
+        root_resolved = artifacts_root.resolve()
+        try:
+            resolved.relative_to(root_resolved)
+        except ValueError as exc:
+            raise ValueError(f"Refusing to delete non-artifact directory: {resolved}") from exc
+        if resolved == root_resolved:
+            raise ValueError(f"Refusing to delete artifacts_root itself: {resolved}")
+        if resolved.exists():
+            shutil.rmtree(resolved)
+        resolved.mkdir(parents=True, exist_ok=True)
+
     def run_one(patch_key: str, idx: int) -> tuple[int, Dict[str, Any]]:
         errs = groups.get(patch_key) or []
         primary = str(errs[0].get("raw", "")).strip() if errs else ""
         out_dir = artifacts_root / _safe_patch_key_dirname(patch_key)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        started_at = time.time()
-        started_mono = time.monotonic()
-        cmd = _agent_cmd(
-            args,
-            agent_script=agent_script,
-            build_log_path=agent_build_log_path,
-            patch_key=patch_key,
-            patch_key_dirname=out_dir.name,
-        )
-        proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
-        duration_sec = max(0.0, time.monotonic() - started_mono)
-        finished_at = time.time()
+        attempt_history: List[Dict[str, Any]] = []
+        max_restarts = max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0))
+        attempt = 0
+        item: Dict[str, Any] = {}
+        while True:
+            attempt += 1
+            if attempt > 1:
+                reset_out_dir(out_dir)
 
-        stdout = (proc.stdout or "").strip()
-        stderr = (proc.stderr or "").strip()
-        parsed, parse_error = _try_parse_agent_output(stdout)
+            started_at = time.time()
+            started_mono = time.monotonic()
+            cmd = _agent_cmd(
+                args,
+                agent_script=agent_script,
+                build_log_path=agent_build_log_path,
+                patch_key=patch_key,
+                patch_key_dirname=out_dir.name,
+            )
+            proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+            duration_sec = max(0.0, time.monotonic() - started_mono)
+            finished_at = time.time()
 
-        (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
-        (out_dir / "agent_stdout.json").write_text(stdout + ("\n" if stdout else ""), encoding="utf-8", errors="replace")
-        if stderr:
-            (out_dir / "agent_stderr.log").write_text(stderr + "\n", encoding="utf-8", errors="replace")
+            stdout = (proc.stdout or "").strip()
+            stderr = (proc.stderr or "").strip()
+            parsed, parse_error = _try_parse_agent_output(stdout)
 
-        agent_summary = str(parsed.get("summary", "")).strip() if isinstance(parsed, dict) else ""
-        agent_next_step = str(parsed.get("next_step", "")).strip() if isinstance(parsed, dict) else ""
-        agent_error = parsed.get("error") if isinstance(parsed, dict) else None
-        agent_error_line = ""
-        if isinstance(agent_error, dict):
-            agent_error_line = str(agent_error.get("line", "")).strip()
+            (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
+            (out_dir / "agent_stdout.json").write_text(stdout + ("\n" if stdout else ""), encoding="utf-8", errors="replace")
+            if stderr:
+                (out_dir / "agent_stderr.log").write_text(stderr + "\n", encoding="utf-8", errors="replace")
 
-        ossfuzz_verdict = parsed.get("ossfuzz_verdict") if isinstance(parsed, dict) else None
-        patch_key_verdict = parsed.get("patch_key_verdict") if isinstance(parsed, dict) else None
+            agent_summary = str(parsed.get("summary", "")).strip() if isinstance(parsed, dict) else ""
+            agent_next_step = str(parsed.get("next_step", "")).strip() if isinstance(parsed, dict) else ""
+            agent_error = parsed.get("error") if isinstance(parsed, dict) else None
+            agent_error_line = ""
+            if isinstance(agent_error, dict):
+                agent_error_line = str(agent_error.get("line", "")).strip()
 
-        hunk_fixed: Optional[bool] = None
-        remaining_in_active_patch_key: Optional[int] = None
-        active_patch_key: str = ""
-        log_artifacts: List[str] = []
-        if isinstance(patch_key_verdict, dict):
-            active_patch_key = str(patch_key_verdict.get("active_patch_key", "") or "").strip()
-            la = patch_key_verdict.get("log_artifacts")
-            if isinstance(la, list):
-                log_artifacts = [str(x) for x in la if str(x).strip()]
-            if patch_key_verdict.get("status") == "ok":
-                rem = patch_key_verdict.get("remaining_in_active_patch_key")
-                if isinstance(rem, int):
-                    remaining_in_active_patch_key = rem
-                    hunk_fixed = rem == 0
+            ossfuzz_verdict = parsed.get("ossfuzz_verdict") if isinstance(parsed, dict) else None
+            patch_key_verdict = parsed.get("patch_key_verdict") if isinstance(parsed, dict) else None
 
-        target_fixed: Optional[bool] = None
-        if isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "ok":
-            fixed = ossfuzz_verdict.get("fixed")
-            if isinstance(fixed, bool):
-                target_fixed = fixed
+            hunk_fixed: Optional[bool] = None
+            remaining_in_active_patch_key: Optional[int] = None
+            active_patch_key: str = ""
+            log_artifacts: List[str] = []
+            if isinstance(patch_key_verdict, dict):
+                active_patch_key = str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+                la = patch_key_verdict.get("log_artifacts")
+                if isinstance(la, list):
+                    log_artifacts = [str(x) for x in la if str(x).strip()]
+                if patch_key_verdict.get("status") == "ok":
+                    rem = patch_key_verdict.get("remaining_in_active_patch_key")
+                    if isinstance(rem, int):
+                        remaining_in_active_patch_key = rem
+                        hunk_fixed = rem == 0
 
-        task_status = "unknown"
-        task_success: Optional[bool] = None
-        if int(proc.returncode) != 0:
-            task_status = "agent_failed"
-            task_success = False
-        elif parse_error:
-            task_status = "agent_output_parse_error"
-            task_success = False
-        elif (
-            (isinstance(patch_key_verdict, dict) and patch_key_verdict.get("status") == "failed")
-            or (isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "failed")
-        ):
-            task_status = "ossfuzz_failed"
-            task_success = False
-        elif hunk_fixed is True:
-            task_status = "fixed"
-            task_success = True
-        elif hunk_fixed is False:
-            task_status = "remaining_errors"
-            task_success = False
+            target_fixed: Optional[bool] = None
+            if isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "ok":
+                fixed = ossfuzz_verdict.get("fixed")
+                if isinstance(fixed, bool):
+                    target_fixed = fixed
 
-        item: Dict[str, Any] = {
-            "patch_key": patch_key,
-            "patch_key_dirname": out_dir.name,
-            "errors": len(errs),
-            "primary_error": primary,
-            "agent_exit_code": int(proc.returncode),
-            "agent_summary": agent_summary,
-            "agent_next_step": agent_next_step,
-            "agent_error_line": agent_error_line,
-            "agent_output_parse_error": parse_error,
-            "artifacts_dir": str(out_dir),
-            "agent_stdout_path": str(out_dir / "agent_stdout.json"),
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "duration_sec": duration_sec,
-            "hunk_fixed": hunk_fixed,
-            "target_fixed": target_fixed,
-            "task_status": task_status,
-            "task_success": task_success,
-            "remaining_in_active_patch_key": remaining_in_active_patch_key,
-            "active_patch_key": active_patch_key,
-            "log_artifacts": log_artifacts,
-            "ossfuzz_verdict": ossfuzz_verdict,
-            "patch_key_verdict": patch_key_verdict,
-        }
-        if bool(args.include_agent_output):
-            item["agent_output"] = parsed
+            task_status = "unknown"
+            task_success: Optional[bool] = None
+            if int(proc.returncode) != 0:
+                task_status = "agent_failed"
+                task_success = False
+            elif parse_error:
+                task_status = "agent_output_parse_error"
+                task_success = False
+            elif (
+                (isinstance(patch_key_verdict, dict) and patch_key_verdict.get("status") == "failed")
+                or (isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "failed")
+            ):
+                task_status = "ossfuzz_failed"
+                task_success = False
+            elif hunk_fixed is True:
+                task_status = "fixed"
+                task_success = True
+            elif hunk_fixed is False:
+                task_status = "remaining_errors"
+                task_success = False
+
+            attempt_history.append(
+                {
+                    "attempt": attempt,
+                    "agent_exit_code": int(proc.returncode),
+                    "agent_output_parse_error": parse_error,
+                    "task_status": task_status,
+                    "task_success": task_success,
+                    "hunk_fixed": hunk_fixed,
+                    "remaining_in_active_patch_key": remaining_in_active_patch_key,
+                    "duration_sec": duration_sec,
+                }
+            )
+
+            item = {
+                "patch_key": patch_key,
+                "patch_key_dirname": out_dir.name,
+                "errors": len(errs),
+                "primary_error": primary,
+                "agent_exit_code": int(proc.returncode),
+                "agent_summary": agent_summary,
+                "agent_next_step": agent_next_step,
+                "agent_error_line": agent_error_line,
+                "agent_output_parse_error": parse_error,
+                "artifacts_dir": str(out_dir),
+                "agent_stdout_path": str(out_dir / "agent_stdout.json"),
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_sec": duration_sec,
+                "hunk_fixed": hunk_fixed,
+                "target_fixed": target_fixed,
+                "task_status": task_status,
+                "task_success": task_success,
+                "remaining_in_active_patch_key": remaining_in_active_patch_key,
+                "active_patch_key": active_patch_key,
+                "log_artifacts": log_artifacts,
+                "ossfuzz_verdict": ossfuzz_verdict,
+                "patch_key_verdict": patch_key_verdict,
+                "attempts": attempt,
+                "restarts_attempted": max(0, attempt - 1),
+                "attempt_history": attempt_history,
+            }
+            if bool(args.include_agent_output):
+                item["agent_output"] = parsed
+
+            if task_status == "fixed":
+                break
+            if attempt >= max_restarts + 1:
+                break
+            # Not fixed: restart from scratch with a clean artifact directory.
+            continue
+
         return idx, item
 
     jobs = max(1, int(args.jobs or 1))
@@ -450,12 +507,35 @@ def main(argv: List[str]) -> int:
     hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
     hunks_unknown = sum(1 for r in results if r.get("hunk_fixed") is None)
     agents_failed = sum(1 for r in results if int(r.get("agent_exit_code") or 0) != 0)
+    restarts_attempted_total = sum(int(r.get("restarts_attempted") or 0) for r in results)
+    hunks_restarted = sum(1 for r in results if int(r.get("restarts_attempted") or 0) > 0)
+    task_status_counts: Dict[str, int] = {}
+    not_fixed: List[Dict[str, Any]] = []
+    for r in results:
+        status = str(r.get("task_status", "") or "").strip() or "unknown"
+        task_status_counts[status] = task_status_counts.get(status, 0) + 1
+        if status != "fixed":
+            not_fixed.append(
+                {
+                    "patch_key": r.get("patch_key"),
+                    "task_status": status,
+                    "hunk_fixed": r.get("hunk_fixed"),
+                    "remaining_in_active_patch_key": r.get("remaining_in_active_patch_key"),
+                    "agent_exit_code": r.get("agent_exit_code"),
+                    "agent_output_parse_error": r.get("agent_output_parse_error"),
+                }
+            )
 
     summary_path = artifacts_root / "summary.json"
     report = {
         "type": "multi_agent",
         "build_log": str(args.build_log),
         "patch_path": patch_path,
+        "max_groups_requested": max_groups_requested,
+        "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
+        "patch_key_groups_found": patch_key_groups_found,
+        "patch_key_groups_after_allowlist": patch_key_groups_after_allowlist,
+        "patch_key_groups_selected": patch_key_groups_selected,
         "patch_keys_total": len(ranked),
         "jobs": jobs,
         "artifacts_root": str(artifacts_root),
@@ -464,6 +544,10 @@ def main(argv: List[str]) -> int:
         "hunks_not_fixed": hunks_not_fixed,
         "hunks_unknown": hunks_unknown,
         "agents_failed": agents_failed,
+        "hunks_restarted": hunks_restarted,
+        "restarts_attempted_total": restarts_attempted_total,
+        "task_status_counts": task_status_counts,
+        "not_fixed": not_fixed[:50],
         "results": results,
     }
     summary_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

@@ -88,6 +88,19 @@ p2 = Path(out2["merged_patch_file_path"]).resolve()
 assert p1.is_file(), p1
 assert p2.is_file(), p2
 assert p1 != p2, (p1, p2)
+
+# When patch_override_paths is empty (effective bundle contains the updated patch_text),
+# still write merged_patch_file_path under the bundle's patch_key directory.
+bundle_path2 = override_dir / "bundle_inferred.patch2"
+bundle_path2.write_bytes(pickle.dumps(patches))
+out3 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path2),
+    patch_override_paths=[],
+    output_name="ossfuzz_merged.diff",
+)
+p3 = Path(out3["merged_patch_file_path"]).resolve()
+assert p3.is_file(), p3
+assert p3.parent == override_dir.resolve(), (p3, override_dir)
 PY
 
 bundle_path="$tmp_dir/bundle.patch2"
@@ -153,6 +166,7 @@ out_path="$tmp_dir/out.json"
 "$PYTHON" "$SCRIPT_DIR/multi_agent.py" "$build_log" \
   --patch-path "$bundle_path" \
   --jobs 2 \
+  --max-restarts-per-hunk 0 \
   --auto-ossfuzz-loop --ossfuzz-loop-max 2 \
   --recursion-limit 123 \
   --openai-api-key dummy_key_for_test \
@@ -170,6 +184,13 @@ obj = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
 assert obj["type"] == "multi_agent", obj
 assert obj.get("summary_json_path"), obj
 assert Path(obj["summary_json_path"]).is_file(), obj["summary_json_path"]
+assert obj.get("max_groups_requested") == 20, obj.get("max_groups_requested")
+assert obj.get("max_restarts_per_hunk") == 0, obj.get("max_restarts_per_hunk")
+assert obj.get("patch_key_groups_found") == 2, obj.get("patch_key_groups_found")
+assert obj.get("patch_key_groups_after_allowlist") == 2, obj.get("patch_key_groups_after_allowlist")
+assert obj.get("patch_key_groups_selected") == 2, obj.get("patch_key_groups_selected")
+assert isinstance(obj.get("task_status_counts"), dict), obj.get("task_status_counts")
+assert isinstance(obj.get("not_fixed"), list), obj.get("not_fixed")
 keys = [r["patch_key"] for r in obj.get("results") or []]
 assert set(keys) >= {"p1", "p2"}, keys
 for r in obj["results"]:
@@ -180,6 +201,9 @@ for r in obj["results"]:
     assert "target_fixed" in r, r
     assert "ossfuzz_verdict" in r, r
     assert "patch_key_verdict" in r, r
+    assert r.get("attempts") == 1, r.get("attempts")
+    assert r.get("restarts_attempted") == 0, r.get("restarts_attempted")
+    assert isinstance(r.get("attempt_history"), list) and len(r.get("attempt_history") or []) == 1, r.get("attempt_history")
     agent = json.loads(Path(r["agent_stdout_path"]).read_text(encoding="utf-8", errors="replace"))
     artifacts_dir = (agent.get("error") or {}).get("artifacts_dir", "")
     assert artifacts_dir, agent
@@ -191,6 +215,33 @@ for r in obj["results"]:
     assert "--recursion-limit 123" in cmd, cmd
     assert "--openai-api-key REDACTED" in cmd, cmd
     assert "--openai-model dummy-model" in cmd, cmd
+PY
+
+# Restart mode: with --max-restarts-per-hunk 1, retry non-fixed hunks once and keep only the final attempt's artifacts.
+out_path2="$tmp_dir/out_restart.json"
+"$PYTHON" "$SCRIPT_DIR/multi_agent.py" "$build_log" \
+  --patch-path "$bundle_path" \
+  --jobs 2 \
+  --max-restarts-per-hunk 1 \
+  --model stub --tools fake --max-steps 1 \
+  --ossfuzz-project libxml2 --ossfuzz-commit f0fd1b \
+  --output-format json-pretty >"$out_path2"
+
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$out_path2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+obj = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace"))
+assert obj["type"] == "multi_agent", obj
+assert obj.get("max_restarts_per_hunk") == 1, obj.get("max_restarts_per_hunk")
+assert obj.get("hunks_restarted") == 2, obj.get("hunks_restarted")
+assert obj.get("restarts_attempted_total") == 2, obj.get("restarts_attempted_total")
+for r in obj.get("results") or []:
+    assert r.get("attempts") == 2, r.get("attempts")
+    assert r.get("restarts_attempted") == 1, r.get("restarts_attempted")
+    hist = r.get("attempt_history") or []
+    assert isinstance(hist, list) and len(hist) == 2, hist
 PY
 
 echo "OK"
