@@ -28,6 +28,33 @@ assert "[ossfuzz_apply_patch_and_test]" in err_buf.getvalue(), err_buf.getvalue(
 assert res["output"].strip() == "hello", res
 PY
 
+# Pick the latest make_error_patch_override override diff (e.g. ".8.diff" beats ".diff").
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
+import os
+import tempfile
+from pathlib import Path
+
+import sys
+
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+import multi_agent  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td).resolve()
+    diff0 = root / "make_error_patch_override_patch_text_parser.c.diff"
+    diff8 = root / "make_error_patch_override_patch_text_parser.c.8.diff"
+    diff0.write_text("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-old\n+new\n", encoding="utf-8")
+    diff8.write_text("diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-old\n+new\n", encoding="utf-8")
+
+    # Ensure predictable ordering across filesystems.
+    os.utime(diff0, (1, 1))
+    os.utime(diff8, (2, 2))
+
+    picked = multi_agent._latest_make_error_patch_override_diff(root)
+    assert picked is not None, picked
+    assert picked.name.endswith(".8.diff"), picked.name
+PY
+
 # Merged patch output should not overwrite prior iterations (unique paths).
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
 import os

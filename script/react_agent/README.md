@@ -100,7 +100,8 @@ Debugging LLM I/O:
 ## Multi-hunk driver (one agent per patch_key)
 
 `script/react_agent/multi_agent.py` parses a build log, maps errors to patch hunks (`patch_key`), and runs one patch-scope
-agent per hunk. It does **not** automatically merge/apply all results; review the per-hunk outputs and decide what to keep.
+agent per hunk. By default it writes only `summary.json` (no stdout); use `--output-format json-pretty` if you want it to
+print the report.
 
 ```bash
 python3 script/react_agent/multi_agent.py tmp1 \
@@ -114,7 +115,19 @@ python3 script/react_agent/multi_agent.py tmp1 \
 Notes:
 - Limit fan-out: `--max-groups 10`
 - Run only specific hunks: `--only-patch-keys p1,p2,p3`
+- Retry a failing hunk from a clean slate: `--max-restarts-per-hunk 1`
+- Run one final OSS-Fuzz build/check_build with *all* hunks’ overrides:
+  - `--final-ossfuzz-test auto` (default): only when all hunks are `fixed` and `--tools real`
+  - `--final-ossfuzz-test always`: run regardless of per-hunk status (still requires `--tools real`)
+  - `--final-ossfuzz-test never`: skip
 - Multi-run artifacts: `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` plus a top-level `summary.json`
+
+Final combined overrides:
+
+- `multi_agent.py` selects the “latest” override diff per hunk (prefers `agent_stdout.json.next_step`’s `Override diff: ...`,
+  otherwise picks the newest `make_error_patch_override_patch_text*.diff` file).
+- It also writes a combined debug artifact: `data/react_agent_artifacts/multi_<run_id>/combined_override_diffs.diff`.
+- If `--final-ossfuzz-test` runs, its results and log paths are recorded under `final_ossfuzz_test` in `summary.json`.
 
 Patch bundle path notes:
 

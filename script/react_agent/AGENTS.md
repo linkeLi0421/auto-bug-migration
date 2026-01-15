@@ -164,3 +164,9 @@ Use `kb_search_symbols(kinds=['FIELD_DECL','VAR_DECL','MACRO_DEFINITION'])` and 
 ## Tests
 - `bash script/react_agent/test_langgraph_agent.sh`
 - `bash script/migration_tools/test_migration_tools.sh`
+
+## Multi-agent (multi-hunk) notes
+
+- `script/react_agent/multi_agent.py` writes per-hunk artifacts under `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` and a top-level `summary.json`.
+- Default output is quiet (no stdout). Use `--output-format json-pretty` if you want the full report on stdout.
+- To produce one “final patch” test run across all hunks, use `--final-ossfuzz-test auto|always` (requires `--tools real`); results are stored under `final_ossfuzz_test` in `summary.json`.
