@@ -125,7 +125,8 @@ Notes:
 Final combined overrides:
 
 - `multi_agent.py` selects the “latest” override diff per hunk (prefers `agent_stdout.json.next_step`’s `Override diff: ...`,
-  otherwise picks the newest `make_error_patch_override_patch_text*.diff` file).
+  otherwise picks the newest `make_error_patch_override_patch_text*.diff` file), and sorts hunks bottom-up using the
+  patch bundle’s `new_start_line` (same ordering as `script/revert_patch_test.py`).
 - It also writes a combined debug artifact: `data/react_agent_artifacts/multi_<run_id>/combined_override_diffs.diff`.
 - If `--final-ossfuzz-test` runs, its results and log paths are recorded under `final_ossfuzz_test` in `summary.json`.
 

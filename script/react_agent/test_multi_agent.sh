@@ -117,6 +117,64 @@ with tempfile.TemporaryDirectory() as td:
     assert picked.name.endswith(".8.diff"), picked.name
 PY
 
+# Combined overrides should be ordered bottom-up (PatchInfo.new_start_line desc), like script/revert_patch_test.py.
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os
+import pickle
+import sys
+from pathlib import Path
+
+tmp_dir = Path(sys.argv[1]).resolve()
+
+sys.path.insert(0, str(Path.cwd() / "script"))
+from migration_tools.types import PatchInfo  # noqa: E402
+
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+import multi_agent  # noqa: E402
+
+bundle_path = tmp_dir / "bundle_override_order.patch2"
+patch_text = "diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1 +1 @@\n-old\n+new\n"
+patches = {
+    "p_low": PatchInfo(
+        file_path_old="a.c",
+        file_path_new="a.c",
+        patch_text=patch_text,
+        file_type="source",
+        old_start_line=10,
+        old_end_line=10,
+        new_start_line=10,
+        new_end_line=10,
+    ),
+    "p_high": PatchInfo(
+        file_path_old="a.c",
+        file_path_new="a.c",
+        patch_text=patch_text,
+        file_type="source",
+        old_start_line=100,
+        old_end_line=100,
+        new_start_line=100,
+        new_end_line=100,
+    ),
+}
+bundle_path.write_bytes(pickle.dumps(patches))
+
+art_low = tmp_dir / "art_low"
+art_high = tmp_dir / "art_high"
+art_low.mkdir(parents=True, exist_ok=True)
+art_high.mkdir(parents=True, exist_ok=True)
+(art_low / "make_error_patch_override_patch_text_x.diff").write_text(patch_text, encoding="utf-8")
+(art_high / "make_error_patch_override_patch_text_x.diff").write_text(patch_text, encoding="utf-8")
+
+# Reverse the input order on purpose; output should still be p_high then p_low.
+results = [
+    {"patch_key": "p_low", "artifacts_dir": str(art_low)},
+    {"patch_key": "p_high", "artifacts_dir": str(art_high)},
+]
+out = multi_agent._collect_final_override_diffs(results, patch_path=str(bundle_path))
+ordered = [x.get("patch_key") for x in (out.get("per_hunk") or [])]
+assert ordered[:2] == ["p_high", "p_low"], ordered
+PY
+
 # Merged patch output should not overwrite prior iterations (unique paths).
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
 import os
