@@ -1948,6 +1948,180 @@ def _override_single_function_guardrail_error(state: AgentState, decision: Decis
     return None
 
 
+def _brace_balance(code: str) -> tuple[int, bool]:
+    """Return (final_brace_depth, saw_underflow) while ignoring braces in strings/comments."""
+    text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
+    brace_depth = 0
+    saw_underflow = False
+
+    in_sl_comment = False
+    in_ml_comment = False
+    in_str = False
+    in_char = False
+    escape = False
+    at_line_start = True
+
+    i = 0
+    while i < len(text):
+        c = text[i]
+        n = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_sl_comment:
+            if c == "\n":
+                in_sl_comment = False
+                at_line_start = True
+            i += 1
+            continue
+        if in_ml_comment:
+            if c == "*" and n == "/":
+                in_ml_comment = False
+                i += 2
+                continue
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+        if in_str:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == '"':
+                in_str = False
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif c == "\\":
+                escape = True
+            elif c == "'":
+                in_char = False
+            if c == "\n":
+                at_line_start = True
+            i += 1
+            continue
+
+        # Skip preprocessor directive lines at top level to avoid counting macro bodies.
+        if at_line_start and brace_depth == 0:
+            j = i
+            while j < len(text) and text[j] in " \t":
+                j += 1
+            if j < len(text) and text[j] == "#":
+                nl = text.find("\n", j)
+                if nl < 0:
+                    break
+                i = nl + 1
+                at_line_start = True
+                continue
+
+        if c == "/" and n == "/":
+            in_sl_comment = True
+            i += 2
+            continue
+        if c == "/" and n == "*":
+            in_ml_comment = True
+            i += 2
+            continue
+        if c == '"':
+            in_str = True
+            escape = False
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            escape = False
+            i += 1
+            continue
+
+        if c == "\n":
+            at_line_start = True
+            i += 1
+            continue
+        if c not in " \t\r":
+            at_line_start = False
+
+        if c == "{":
+            brace_depth += 1
+            i += 1
+            continue
+        if c == "}":
+            if brace_depth == 0:
+                saw_underflow = True
+            else:
+                brace_depth -= 1
+            i += 1
+            continue
+
+        i += 1
+
+    return brace_depth, saw_underflow
+
+
+def _override_complete_function_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if new_func_code looks like an incomplete/truncated function body.
+
+    Only applies when the BASE slice is function-scoped (has a top-level `) {` body). For small fragment rewrites,
+    the override may legitimately be unbalanced.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
+    if not base_text.strip():
+        return None
+
+    base_bodies, _ = _count_top_level_bodies(base_text)
+    if base_bodies <= 0:
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    new_bodies, _ = _count_top_level_bodies(new_text)
+    if new_bodies <= 0:
+        return f"new_func_code does not appear to contain a full function body (BASE slice source: {base_source})."
+
+    depth, underflow = _brace_balance(new_text)
+    if underflow or depth != 0:
+        return (
+            f"new_func_code appears to be an incomplete function body (unbalanced braces: depth={depth}, underflow={underflow}). "
+            f"BASE slice source: {base_source}."
+        )
+
+    return None
+
+
 def _override_location_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Rewrite make_error_patch_override args when the model mistakenly uses pre_patch_*.
 
@@ -3664,6 +3838,54 @@ def _run_langgraph(
                                 "next_step": (
                                     f"{func_scope_err2}\n\n"
                                     "Edit the BASE slice (read_artifact output) manually to include only the active function, then rerun the agent."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
+        # Guardrail: when the BASE slice is function-scoped, new_func_code must be a complete function body.
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            complete_err = _override_complete_function_guardrail_error(st, decision)
+            if complete_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your make_error_patch_override.new_func_code appears to be an incomplete/truncated function body.\n"
+                            f"{complete_err}\n\n"
+                            "Fix: output the FULL function body as raw C code (balanced braces; include the final return/closing `}`), "
+                            "still scoped to the mapped '-' slice for this round. Do NOT include unified-diff headers.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_complete_body_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    complete_err2 = _override_complete_function_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not complete_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly produced an incomplete function body for the override.",
+                                "summary": "Stopped before patch generation due to an incomplete override function body.",
+                                "next_step": (
+                                    f"{complete_err2}\n\n"
+                                    "Increase the model output token budget and try again, or manually edit the BASE slice (read_artifact output) to produce a complete function body."
                                 ).strip(),
                                 "steps": _steps_for_output(st),
                                 "error": _error_payload(st),

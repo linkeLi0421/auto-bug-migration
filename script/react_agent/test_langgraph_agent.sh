@@ -441,6 +441,52 @@ assert _override_single_function_guardrail_error(state, multi) is None, "guardra
 print("OK")
 PY
 
+# Override guardrail: when the BASE slice is function-scoped, new_func_code must be a complete function body.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_complete_function_guardrail_error  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="",
+)
+
+base_text = "int foo(int x) {\\n  if (x) { x++; }\\n  return x;\\n}\\n"
+bad_text = "int foo(int x) {\\n  if (x) { x++; }\\n  return x;\\n"  # missing final '}'
+
+with tempfile.TemporaryDirectory() as td:
+    baseline_path = Path(td) / "error_func_code.c"
+    baseline_path.write_text(base_text, encoding="utf-8")
+    state.active_error_func_code_artifact_path = str(baseline_path)
+
+    bad = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "missing closing brace",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": bad_text},
+    }
+    assert _override_complete_function_guardrail_error(state, bad), "expected incomplete-body guardrail to trigger"
+
+    ok = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "complete body",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": base_text},
+    }
+    assert _override_complete_function_guardrail_error(state, ok) is None, "expected complete-body guardrail to pass"
+
+print("OK")
+PY
+
 # Override location guardrail: make_error_patch_override must use build-log /src/... line numbers,
 # not pre_patch_* line numbers from get_error_patch_context.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
