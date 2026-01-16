@@ -138,10 +138,26 @@ def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path
     return max(candidates, key=lambda p: (p.stat().st_mtime, version(p), p.name))
 
 
-def _collect_final_override_diffs(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: str) -> Dict[str, Any]:
     override_paths: List[str] = []
     per_hunk: List[Dict[str, Any]] = []
     missing: List[str] = []
+    sort_err = ""
+    patch_key_new_start_line: Dict[str, int] = {}
+
+    try:
+        bundle, _ = _load_bundle(str(patch_path))
+        patches = getattr(bundle, "patches", None)
+        if isinstance(patches, dict):
+            for k, v in patches.items():
+                if not isinstance(k, str):
+                    continue
+                try:
+                    patch_key_new_start_line[k] = int(getattr(v, "new_start_line", 0) or 0)
+                except Exception:
+                    patch_key_new_start_line[k] = 0
+    except Exception as exc:  # noqa: BLE001
+        sort_err = f"failed to load patch bundle for ordering: {type(exc).__name__}: {exc}"
 
     for r in results or []:
         patch_key = str(r.get("patch_key", "") or "").strip()
@@ -172,7 +188,18 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]]) -> Dict[str, An
             continue
 
         override_paths.append(chosen)
-        per_hunk.append({"patch_key": patch_key, "override_diff": chosen, "method": method})
+        per_hunk.append(
+            {
+                "patch_key": patch_key,
+                "override_diff": chosen,
+                "method": method,
+                "new_start_line": patch_key_new_start_line.get(patch_key, 0),
+            }
+        )
+
+    # Sort like script/revert_patch_test.py: newer hunks first (bottom-up application).
+    per_hunk.sort(key=lambda item: (-int(item.get("new_start_line", 0) or 0), str(item.get("patch_key", "") or "")))
+    override_paths = [str(item.get("override_diff", "") or "").strip() for item in per_hunk if str(item.get("override_diff", "") or "").strip()]
 
     # De-dup while preserving order.
     seen: set[str] = set()
@@ -188,6 +215,7 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]]) -> Dict[str, An
         "override_paths": deduped,
         "per_hunk": per_hunk,
         "missing_patch_keys": missing,
+        "sort_error": sort_err,
     }
 
 
@@ -644,7 +672,7 @@ def main(argv: List[str]) -> int:
                 }
             )
 
-    overrides = _collect_final_override_diffs(results)
+    overrides = _collect_final_override_diffs(results, patch_path=patch_path)
     combined_override_paths: List[str] = list(overrides.get("override_paths") or [])
     combined_override_paths_count = len(combined_override_paths)
     combined_override_diffs_path = ""
@@ -669,9 +697,16 @@ def main(argv: List[str]) -> int:
         "reason": "",
         "override_paths_count": combined_override_paths_count,
         "override_paths": combined_override_paths,
+        "override_paths_sorted_by": "PatchInfo.new_start_line(desc)",
         "combined_override_diffs_path": combined_override_diffs_path,
+        "combined_override_diffs_note": (
+            "Debug-only artifact containing ONLY per-hunk override diffs (not the full merged patch). "
+            "If you need a single applyable patch including all hunks, use final_ossfuzz_test.merged_patch_file_path (when present) "
+            "or run ossfuzz_tools.merge_patch_bundle_with_overrides on the patch bundle."
+        ),
         "override_diffs_per_hunk": list(overrides.get("per_hunk") or []),
         "override_diffs_missing_patch_keys": list(overrides.get("missing_patch_keys") or []),
+        "override_diffs_sort_error": str(overrides.get("sort_error") or "").strip(),
     }
     if final_mode not in {"auto", "always", "never"}:
         final_mode = "auto"

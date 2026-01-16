@@ -57,6 +57,25 @@
 - [x] Add a non-Docker regression test that validates “latest override diff selection” behavior (e.g. `.8.diff` beats `.diff`).
 - [x] Run `bash script/react_agent/test_multi_agent.sh` (and `bash script/react_agent/test_langgraph_agent.sh` if needed).
 
+## Multi-agent: sort combined override diffs (and clarify purpose)
+
+### Problem
+
+- `combined_override_diffs.diff` is a debug artifact that concatenates per-hunk override diffs; today it is written in “agent run order” (roughly by error-count ranking), which can be confusing and can make patch application harder to reason about.
+
+### Goal
+
+- Keep `combined_override_diffs.diff` (useful for debugging), but:
+  - sort hunks the same way as `script/revert_patch_test.py` (by `new_start_line` descending, i.e. bottom-up),
+  - clarify in `summary.json`/docs that it is overrides-only (not the full merged patch).
+
+### Plan
+
+- [x] Sort per-hunk override diffs by patch bundle order (`PatchInfo.new_start_line` descending) before writing `combined_override_diffs.diff`.
+- [x] Record extra metadata in `final_ossfuzz_test` explaining what `combined_override_diffs.diff` is and what file to use for the full patch (`merged_patch_file_path`).
+- [x] Add a regression test for the sorted override selection order.
+- [x] Run `bash script/react_agent/test_multi_agent.sh`.
+
 ## Concurrency: serialize OSS-Fuzz tests
 
 ### Problem
