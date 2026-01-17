@@ -254,6 +254,120 @@ def merge_patch_bundle_with_overrides(
     }
 
 
+def _update_patchinfo_ranges_from_diff(patch: Any, patch_text: str) -> None:
+    """Best-effort refresh of PatchInfo old/new line ranges from unified-diff hunk headers."""
+    old_starts: list[int] = []
+    old_ends: list[int] = []
+    new_starts: list[int] = []
+    new_ends: list[int] = []
+
+    hdr = re.compile(
+        r"^@@\s+-(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@"
+    )
+    for line in str(patch_text or "").splitlines():
+        if not line.startswith("@@"):
+            continue
+        m = hdr.match(line.strip())
+        if not m:
+            continue
+        try:
+            old_start = int(m.group("old_start"))
+            old_len = int(m.group("old_len") or 1)
+            new_start = int(m.group("new_start"))
+            new_len = int(m.group("new_len") or 1)
+        except Exception:
+            continue
+        old_starts.append(old_start)
+        old_ends.append(old_start + max(old_len, 0))
+        new_starts.append(new_start)
+        new_ends.append(new_start + max(new_len, 0))
+
+    if not old_starts or not new_starts:
+        return
+    try:
+        patch.old_start_line = min(old_starts)
+        patch.old_end_line = max(old_ends)
+        patch.new_start_line = min(new_starts)
+        patch.new_end_line = max(new_ends)
+    except Exception:
+        return
+
+
+def write_patch_bundle_with_overrides(
+    *,
+    patch_path: str,
+    patch_override_paths: List[str],
+    output_name: str,
+) -> Dict[str, Any]:
+    """Write an updated `*.patch2` bundle with per-hunk override diffs applied.
+
+    This is like `merge_patch_bundle_with_overrides`, but instead of returning a single merged unified-diff
+    (applyable patch), it persists a new patch bundle (pickle) with selected patch entries replaced.
+    """
+    bundle = load_patch_bundle(patch_path, allowed_roots=_allowed_patch_roots_from_env())
+    patch_keys = set(bundle.patches.keys())
+
+    allow_root = _artifact_allow_root()
+    allow_root.mkdir(parents=True, exist_ok=True)
+
+    overrides: dict[str, str] = {}
+    override_files: list[Dict[str, Any]] = []
+    for raw in patch_override_paths or []:
+        rp = str(raw or "").strip()
+        if not rp:
+            continue
+        p = Path(rp).expanduser().resolve()
+        _validate_under_root(p, allow_root)
+        if not p.is_file():
+            raise FileNotFoundError(f"Override patch file not found: {p}")
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if "diff --git " not in text:
+            raise ValueError(f"Override patch file does not look like a unified diff (missing 'diff --git'): {p}")
+        patch_key = _infer_patch_key_from_path(p, patch_keys)
+        overrides[patch_key] = text
+        override_files.append({"patch_key": patch_key, "path": str(p)})
+
+    for key, text in overrides.items():
+        patch = bundle.patches.get(key)
+        if patch is None:
+            continue
+        patch.patch_text = str(text or "").rstrip("\n") + "\n"
+        _update_patchinfo_ranges_from_diff(patch, patch.patch_text)
+
+    out_name = str(output_name or "").strip() or "merged_bundle.patch2"
+    if not out_name.endswith(".patch2"):
+        out_name += ".patch2"
+    out_name = _safe_filename(out_name, max_len=200)
+    if not out_name.endswith(".patch2"):
+        out_name += ".patch2"
+
+    out_dir = allow_root
+    unique_keys = {str(o.get("patch_key", "")).strip() for o in override_files if str(o.get("patch_key", "")).strip()}
+    if len(unique_keys) == 1:
+        inferred_key = next(iter(unique_keys))
+        if inferred_key and str(allow_root.name) != str(inferred_key):
+            out_dir = (allow_root / inferred_key).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = _unique_path((out_dir / out_name).resolve())
+    _validate_under_root(out_path, allow_root)
+
+    try:
+        import pickle  # noqa: PLC0415
+
+        out_path.write_bytes(pickle.dumps(dict(bundle.patches), protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to write patch bundle: {type(exc).__name__}: {exc}") from exc
+
+    return {
+        "patch_path": str(Path(patch_path).expanduser().resolve()),
+        "merged_patch_bundle_path": str(out_path),
+        "patch_count_total": len(bundle.patches),
+        "override_count": len(override_files),
+        "override_files": override_files,
+        "overridden_patch_keys": sorted({o["patch_key"] for o in override_files}),
+    }
+
+
 def _run(
     cmd: List[str],
     *,
