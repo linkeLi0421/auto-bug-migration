@@ -675,20 +675,24 @@ def main(argv: List[str]) -> int:
     overrides = _collect_final_override_diffs(results, patch_path=patch_path)
     combined_override_paths: List[str] = list(overrides.get("override_paths") or [])
     combined_override_paths_count = len(combined_override_paths)
-    combined_override_diffs_path = ""
+    merged_patch_bundle_path = ""
+    merged_patch_bundle_error = ""
     if combined_override_paths:
-        parts: List[str] = []
-        for raw in combined_override_paths:
-            p = Path(str(raw)).expanduser()
-            if not p.is_file():
-                continue
-            text = p.read_text(encoding="utf-8", errors="replace").rstrip("\n")
-            if text.strip():
-                parts.append(text)
-        combined_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
-        combined_path = (artifacts_root / "combined_override_diffs.diff").resolve()
-        combined_path.write_text(combined_text, encoding="utf-8", errors="replace")
-        combined_override_diffs_path = str(combined_path)
+        try:
+            # Ensure the bundle writer validates override paths under the multi-run artifact root.
+            os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
+            from tools.ossfuzz_tools import write_patch_bundle_with_overrides  # type: ignore
+
+            base = Path(patch_path).stem or "bundle"
+            out = write_patch_bundle_with_overrides(
+                patch_path=str(patch_path),
+                patch_override_paths=combined_override_paths,
+                output_name=f"{base}.merged_overrides.patch2",
+            )
+            merged_patch_bundle_path = str(out.get("merged_patch_bundle_path", "") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            merged_patch_bundle_error = f"{type(exc).__name__}: {exc}"
+            merged_patch_bundle_path = ""
 
     final_mode = str(getattr(args, "final_ossfuzz_test", "auto") or "auto").strip().lower()
     final_ossfuzz_test: Dict[str, Any] = {
@@ -698,11 +702,13 @@ def main(argv: List[str]) -> int:
         "override_paths_count": combined_override_paths_count,
         "override_paths": combined_override_paths,
         "override_paths_sorted_by": "PatchInfo.new_start_line(desc)",
-        "combined_override_diffs_path": combined_override_diffs_path,
-        "combined_override_diffs_note": (
-            "Debug-only artifact containing ONLY per-hunk override diffs (not the full merged patch). "
-            "If you need a single applyable patch including all hunks, use final_ossfuzz_test.merged_patch_file_path (when present) "
-            "or run ossfuzz_tools.merge_patch_bundle_with_overrides on the patch bundle."
+        "combined_override_diffs_path": "",
+        "combined_override_diffs_note": "Disabled: multi_agent now writes a merged patch bundle instead of concatenating override diffs.",
+        "merged_patch_bundle_path": merged_patch_bundle_path,
+        "merged_patch_bundle_error": merged_patch_bundle_error,
+        "merged_patch_bundle_note": (
+            "Patch bundle (pickle) with per-hunk override diffs applied. "
+            "Use this as --patch-path for future patch-scope runs, or pass it to ossfuzz_apply_patch_and_test with patch_override_paths=[]."
         ),
         "override_diffs_per_hunk": list(overrides.get("per_hunk") or []),
         "override_diffs_missing_patch_keys": list(overrides.get("missing_patch_keys") or []),
@@ -724,11 +730,16 @@ def main(argv: List[str]) -> int:
                 os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
                 from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test  # type: ignore
 
+                patch_path_for_test = (
+                    merged_patch_bundle_path if merged_patch_bundle_path and not merged_patch_bundle_error else str(args.patch_path)
+                )
+                override_paths_for_test: List[str] = [] if patch_path_for_test != str(args.patch_path) else combined_override_paths
+
                 res = ossfuzz_apply_patch_and_test(
                     project=str(args.ossfuzz_project),
                     commit=str(args.ossfuzz_commit),
-                    patch_path=str(args.patch_path),
-                    patch_override_paths=combined_override_paths,
+                    patch_path=str(patch_path_for_test),
+                    patch_override_paths=override_paths_for_test,
                     build_csv=str(args.ossfuzz_build_csv),
                     sanitizer=str(args.ossfuzz_sanitizer),
                     architecture=str(args.ossfuzz_arch),

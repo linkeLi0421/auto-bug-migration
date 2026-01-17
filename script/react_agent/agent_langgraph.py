@@ -918,6 +918,61 @@ def _unique_path(path: Path) -> Path:
     raise RuntimeError(f"Could not allocate unique path for: {path}")
 
 
+def _enforce_patch_key_scope(state: AgentState, obs: ToolObservation) -> ToolObservation:
+    """Prevent patch-scope runs from drifting across patch_keys.
+
+    In patch-aware mode, multi-agent runs execute one agent per patch_key and store artifacts under
+    `.../<patch_key>/`. If the model calls get_error_patch_context/make_error_patch_override for a
+    different patch_key mid-run, the resulting override diff is written under the wrong directory
+    and later applied to the wrong patch entry during the final merge.
+
+    This helper converts such cross-patch_key tool outputs into errors so the model can recover
+    without mutating state.
+    """
+    pinned = str(getattr(state, "patch_key", "") or "").strip()
+    if state.error_scope != "patch" or not pinned:
+        return obs
+    if not obs.ok:
+        return obs
+    if obs.tool not in {"get_error_patch_context", "make_error_patch_override"}:
+        return obs
+    if not isinstance(obs.output, dict):
+        return obs
+
+    observed = str(obs.output.get("patch_key", "") or "").strip()
+    if not observed or observed == pinned:
+        return obs
+
+    fp = str(obs.output.get("file_path", "") or obs.args.get("file_path", "") or "").strip()
+    ln = obs.output.get("line_number") if isinstance(obs.output.get("line_number"), int) else obs.args.get("line_number")
+    loc = f"{fp}:{ln}" if fp and ln else fp or ""
+    msg = (
+        f"Out of scope for this run: requested location {loc or '<unknown>'} maps to patch_key={observed!r}, "
+        f"but this agent run is pinned to patch_key={pinned!r}. "
+        "Do not switch patch_keys mid-run; pick an error location within the pinned patch_key "
+        f"or rerun with --focus-patch-key {observed}."
+    )
+    slim_output: Dict[str, Any] = {"patch_key": observed}
+    if fp:
+        slim_output["file_path"] = fp
+    if ln:
+        slim_output["line_number"] = ln
+    sig = str(obs.output.get("old_signature", "") or "").strip()
+    if sig:
+        slim_output["old_signature"] = sig
+    return ToolObservation(False, obs.tool, obs.args, output=slim_output, error=msg)
+
+
+_PATCH_TOOLS_WITH_PATCH_PATH: set[str] = {
+    "list_patch_bundle",
+    "get_patch",
+    "search_patches",
+    "get_error_patch",
+    "get_error_patch_context",
+    "make_error_patch_override",
+}
+
+
 def _update_patchinfo_ranges_from_diff(patch: Any, patch_text: str) -> None:
     old_starts: List[int] = []
     old_ends: List[int] = []
@@ -1019,8 +1074,13 @@ def _write_effective_patch_bundle(
         return "", f"failed to create effective bundle dir: {type(exc).__name__}: {exc}"
 
     stem = src_path.stem or "bundle"
-    while stem.endswith(".effective"):
-        stem = stem[: -len(".effective")]
+    # Normalize repeated ".effective" suffix chains from earlier iterations:
+    # e.g. "libxml2.effective.1.effective.1" -> "libxml2".
+    while True:
+        m = re.match(r"^(?P<base>.*)\.effective(?:\.\d+)?$", stem)
+        if not m:
+            break
+        stem = str(m.group("base") or "")
     base_name = f"{stem}.effective.patch2"
     out_path = _unique_path((out_dir / base_name).resolve())
 
@@ -3961,8 +4021,17 @@ def _run_langgraph(
         st = gs["state"]
         decision = gs["pending"]
         tool = str(decision["tool"])
+        # Patch-scope: always run patch tools against the current effective patch bundle.
+        if st.error_scope == "patch" and st.patch_path and tool in _PATCH_TOOLS_WITH_PATCH_PATH:
+            args_obj = decision.get("args")
+            if not isinstance(args_obj, dict):
+                args_obj = {}
+                decision["args"] = args_obj
+            args_obj["patch_path"] = str(st.patch_path)
+
         args = dict(decision.get("args", {}))
         obs = runner.call(tool, args)
+        obs = _enforce_patch_key_scope(st, obs)
         if artifact_store and obs.ok and obs.tool != "read_artifact":
             offloaded = offload_patch_output(
                 store=artifact_store, tool=obs.tool, args=obs.args, output=obs.output, focus_terms=_collect_focus_terms(st)

@@ -146,6 +146,76 @@ assert sig3 == "f1", sig3
 print("OK")
 PY
 
+# Patch-scope pinning: in patch-aware runs, do not allow get_error_patch_context/make_error_patch_override
+# to drift to another patch_key mid-run (multi-agent stores artifacts under a fixed per-patch_key directory).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentConfig, AgentState, ToolObservation, _run_langgraph  # noqa: E402
+from models import ChatModel  # noqa: E402
+
+
+class TwoTurnModel(ChatModel):
+    def __init__(self) -> None:
+        self.turn = 0
+
+    def complete(self, messages):
+        self.turn += 1
+        if self.turn == 1:
+            return json.dumps(
+                {
+                    "type": "tool",
+                    "thought": "Probe patch context at the reported location.",
+                    "tool": "get_error_patch_context",
+                    "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/hash.c", "line_number": 555},
+                }
+            )
+        return json.dumps({"type": "final", "thought": "Stop.", "summary": "done", "next_step": ""})
+
+
+class FakeRunner:
+    def call(self, tool, args):
+        assert tool == "get_error_patch_context", tool
+        # Simulate a mapping to a *different* patch_key than the pinned one.
+        return ToolObservation(
+            ok=True,
+            tool=tool,
+            args=args,
+            output={"patch_key": "p_other", "file_path": "/src/libxml2/hash.c", "line_number": 555, "old_signature": "f"},
+            error=None,
+        )
+
+
+cfg = AgentConfig(max_steps=2, tools_mode="fake", error_scope="patch")
+st = AgentState(
+    build_log_path="-",
+    patch_path="",
+    error_scope="patch",
+    error_line="/src/libxml2/hash.c:295:11: error: expected ';' after top level declarator",
+    snippet="",
+    artifacts_dir="artifacts",
+    patch_key="p_target",
+    active_patch_key="p_target",
+    active_file_path="/src/libxml2/hash.c",
+    active_line_number=295,
+)
+
+final = _run_langgraph(TwoTurnModel(), FakeRunner(), st, cfg, artifact_store=None)
+steps = [s for s in (final.get("steps") or []) if isinstance(s, dict)]
+assert steps, final
+obs = steps[0].get("observation") if isinstance(steps[0].get("observation"), dict) else {}
+assert obs.get("ok") is False, obs
+assert "Out of scope" in str(obs.get("error") or ""), obs
+assert st.active_patch_key == "p_target", st.active_patch_key
+
+print("OK")
+PY
+
 # Text output should include the function-group summary (for debugging merged hunks via logs).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
@@ -1034,7 +1104,8 @@ os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifact_root)
 artifact_dir = (artifact_root / "p2").resolve()
 artifact_dir.mkdir(parents=True, exist_ok=True)
 
-from tools.ossfuzz_tools import merge_patch_bundle_with_overrides  # noqa: E402
+from tools.ossfuzz_tools import merge_patch_bundle_with_overrides, write_patch_bundle_with_overrides  # noqa: E402
+from migration_tools.patch_bundle import load_patch_bundle  # noqa: E402
 
 override_path = artifact_dir / "override_p2.diff"
 override_text = (
@@ -1057,6 +1128,17 @@ assert merged_path.is_file(), out
 merged_text = merged_path.read_text(encoding="utf-8", errors="replace")
 assert "OVERRIDE_LINE" in merged_text, merged_path
 assert "p2" in (out.get("overridden_patch_keys") or []), out
+
+bundle_out = write_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(override_path)],
+    output_name="merged_test.patch2",
+)
+merged_bundle_path = Path(bundle_out.get("merged_patch_bundle_path", "")).resolve()
+assert merged_bundle_path.is_file(), bundle_out
+merged_bundle = load_patch_bundle(str(merged_bundle_path), allowed_roots=[str(bundle_path.parent)])
+assert "p2" in merged_bundle.patches, merged_bundle_path
+assert "OVERRIDE_LINE" in (merged_bundle.patches["p2"].patch_text or ""), merged_bundle_path
 PY
 
 # Target-error verdict helper (non-Docker): verify we can detect whether the original error remains in OSS-Fuzz logs.
