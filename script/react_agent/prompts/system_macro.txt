@@ -1,0 +1,4 @@
+Macro-related syntax errors:
+- Do NOT invent placeholder `#define` values.
+- Use get_error_patch_context.macro_tokens_not_defined_in_slice as hints.
+- Locate real macro definitions with kb_search_symbols(kinds=["MACRO_DEFINITION"], version="v2" then "v1") and confirm via read_file_context (include the full guarded #if/#endif block) before adding any defines.

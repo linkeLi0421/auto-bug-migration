@@ -13,6 +13,7 @@ _FUNC_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _HUNK_RE = re.compile(
     r"^@@\s+-(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@"
 )
+_CONTROL_STMT_RE = re.compile(r"^(?:if|for|while|switch|return|goto|break|continue|else|do)\b")
 
 
 def _repo_root() -> Path:
@@ -113,6 +114,64 @@ def _rewrite_first_function_name(lines: List[str], *, old: str, new: str) -> Lis
     return out
 
 
+def _rewrite_first_identifier(lines: List[str], *, old: str, new: str) -> List[str]:
+    """Replace the first whole-identifier occurrence of `old` with `new`."""
+    if not lines or not old or not new or old == new:
+        return lines
+    pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(old)}(?![A-Za-z0-9_])")
+    out: List[str] = []
+    replaced = False
+    for line in lines:
+        if not replaced:
+            m = pat.search(line)
+            if m:
+                line = pat.sub(new, line, count=1)
+                replaced = True
+        out.append(line)
+    return out
+
+
+def _looks_like_statement(code_line: str) -> bool:
+    stripped = str(code_line or "").lstrip()
+    if not stripped:
+        return False
+    if stripped.startswith("#"):
+        return True
+    if _CONTROL_STMT_RE.match(stripped):
+        return True
+    return False
+
+
+def _is_valid_function_prototype(lines: List[str], *, symbol_name: str) -> bool:
+    if not lines:
+        return False
+    want = str(symbol_name or "").strip()
+    if not want:
+        return False
+    last = next((l for l in reversed(lines) if str(l).strip()), "")
+    if not str(last).strip().endswith(";"):
+        return False
+
+    joined = "\n".join(str(l) for l in lines)
+    if "{" in joined or "}" in joined:
+        return False
+    if want not in joined:
+        return False
+    if "=" in joined:
+        return False
+
+    needle = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
+    for line in lines:
+        text = str(line or "")
+        if not needle.search(text):
+            continue
+        if _looks_like_statement(text):
+            return False
+        return True
+
+    return False
+
+
 def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) -> List[str]:
     """Try to find a function definition for `symbol_name` inside the patch bundle and derive a prototype."""
     want = str(symbol_name or "").strip()
@@ -122,7 +181,8 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
     if not isinstance(patches, dict):
         return []
 
-    # Scan all patch_texts for a line that contains "<symbol_name>(" inside a '-' insertion line.
+    # Scan all patch_texts for a line that looks like a file-scope prototype/definition for "<symbol_name>(".
+    # Do not match call sites inside other functions (those often lead to nonsense like `if (...) ;` at file scope).
     needle = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
     for patch in patches.values():
         patch_text = str(getattr(patch, "patch_text", "") or "")
@@ -132,8 +192,12 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
         for idx, line in enumerate(lines):
             if not line.startswith("-") or line.startswith("---"):
                 continue
-            candidate = _strip_diff_prefix(line).strip()
-            if not needle.search(candidate):
+            code = _strip_diff_prefix(line).rstrip()
+            if not needle.search(code):
+                continue
+            if code[:1] in {" ", "\t"}:
+                continue
+            if _looks_like_statement(code):
                 continue
             # Walk backward to include leading decl/attribute lines (but stop at '}' / blank / headers).
             start = idx
@@ -143,6 +207,8 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
                     break
                 prev_code = _strip_diff_prefix(prev).rstrip()
                 if not prev_code.strip():
+                    break
+                if "{" in prev_code:
                     break
                 if prev_code.strip() in {"}", "};"} or prev_code.strip().endswith("}"):
                     break
@@ -160,7 +226,7 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
 
             block = [_strip_diff_prefix(l).rstrip() for l in lines[start : end + 1]]
             proto = _extract_c_declaration_from_function_code("\n".join(block) + "\n")
-            if proto:
+            if proto and _is_valid_function_prototype(proto, symbol_name=want):
                 return proto
     return []
 
@@ -263,6 +329,12 @@ def _symbol_underlying_name(symbol: str) -> Tuple[str, str]:
     m = re.match(r"^__revert_[0-9a-fA-F]+_(?P<name>[A-Za-z_][A-Za-z0-9_]*)$", s)
     if m:
         return "revert_function", str(m.group("name") or "")
+    m = re.match(r"^__revert_var_[0-9a-fA-F]+_(?P<name>[A-Za-z_][A-Za-z0-9_]*)$", s)
+    if m:
+        return "revert_var", str(m.group("name") or "")
+    m = re.match(r"^__rervert_var_[0-9a-fA-F]+_(?P<name>[A-Za-z_][A-Za-z0-9_]*)$", s)
+    if m:
+        return "revert_var", str(m.group("name") or "")
     m = re.match(r"^__revert_cons_[0-9a-fA-F]+_(?P<name>[A-Za-z_][A-Za-z0-9_]*)$", s)
     if m:
         return "revert_const", str(m.group("name") or "")
@@ -483,8 +555,11 @@ def make_extra_patch_override(
                     decl_lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
                 decl_lines = [l.rstrip() for l in decl_lines if l is not None and str(l).strip()]
                 if decl_lines:
-                    if underlying and kind == "revert_function":
-                        decl_lines = _rewrite_first_function_name(decl_lines, old=underlying, new=symbol)
+                    if underlying:
+                        if kind == "revert_function":
+                            decl_lines = _rewrite_first_function_name(decl_lines, old=underlying, new=symbol)
+                        elif kind in {"revert_var", "revert_const"}:
+                            decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
                     inserted_lines = decl_lines
                     insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
 

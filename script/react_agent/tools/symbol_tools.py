@@ -220,6 +220,16 @@ class AgentTools:
 
         limit_n = max(0, min(int(limit_per_symbol or 0), 50))
         kind_set = {str(k).strip() for k in (kinds or []) if str(k).strip()} or None
+        if kind_set is not None:
+            aliases = {
+                # Convenience alias: callers often think in terms of "FUNCTION" rather than the clang JSON
+                # spellings ("FUNCTION_DECL"/"FUNCTION_DEFI"/...).
+                "FUNCTION": {"FUNCTION_DECL", "FUNCTION_DEFI", "FUNCTION_TEMPLATE", "CXX_METHOD"},
+            }
+            expanded: set[str] = set()
+            for k in kind_set:
+                expanded |= aliases.get(k, {k})
+            kind_set = expanded or None
 
         def is_definition(node: dict) -> bool:
             kind = str(node.get("kind", "") or "")
