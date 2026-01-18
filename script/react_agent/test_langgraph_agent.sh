@@ -21,6 +21,60 @@ tools = obj.get("tools") or []
 names = {t.get("name") for t in tools if isinstance(t, dict)}
 assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
 assert "make_extra_patch_override" in names, sorted(n for n in names if n)
+assert "kb_search_symbols" not in names, sorted(n for n in names if n)
+PY
+
+# Backward compatibility: if a model still emits tool=kb_search_symbols, rewrite to search_definition instead of crashing.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentConfig, AgentState, _run_langgraph  # noqa: E402
+from models import ChatModel  # noqa: E402
+from tools.runner import ToolObservation  # noqa: E402
+
+
+class OneKbSearchModel(ChatModel):
+    def __init__(self) -> None:
+        self.turn = 0
+
+    def complete(self, messages):
+        self.turn += 1
+        if self.turn == 1:
+            return json.dumps(
+                {
+                    "type": "tool",
+                    "thought": "Legacy tool call (should be rewritten).",
+                    "tool": "kb_search_symbols",
+                    "args": {"symbols": ["xmlRngMutex"], "version": "v1"},
+                }
+            )
+        return json.dumps({"type": "final", "thought": "Done.", "summary": "ok", "next_step": ""})
+
+
+class Runner:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def call(self, tool, args):
+        self.calls.append(tool)
+        assert tool == "search_definition", tool
+        return ToolObservation(True, tool, args, output="ok", error=None)
+
+
+st = AgentState(build_log_path="-", patch_path="", error_scope="first", error_line="/src/x.c:1:1: error: x", snippet="")
+cfg = AgentConfig(max_steps=3, tools_mode="fake", error_scope="first")
+model = OneKbSearchModel()
+runner = Runner()
+
+final = _run_langgraph(model, runner, st, cfg, artifact_store=None)
+assert final.get("type") == "final", final
+assert runner.calls == ["search_definition"], runner.calls
+print("OK")
 PY
 
 # System prompt composition: keep the default prompt small by only including relevant sections.
@@ -270,12 +324,8 @@ with tempfile.TemporaryDirectory() as td_raw:
 
     tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
 
-    kb = tools.kb_search_symbols(["xmlRngMutex"], version="v1", kinds=["VAR_DECL"], limit_per_symbol=5)
-    item = (kb.get("results") or [])[0]
-    assert item.get("symbol") == "xmlRngMutex", item
-    assert item.get("exists") is True, item
-    matches = item.get("matches") or []
-    assert any("static xmlMutex xmlRngMutex;" in str(m.get("code") or "") for m in matches), matches
+    defs = tools.search_definition("xmlRngMutex", version="v1")
+    assert "static xmlMutex xmlRngMutex;" in defs, defs
 
     bundle_path = td / "bundle.patch2"
     extra_key = "_extra_dict.c"
@@ -358,7 +408,7 @@ print("OK")
 PY
 
 # Macro guardrail: if the override tries to add a #define for a missing macro token without source evidence,
-# agent_langgraph should force kb_search_symbols(TOKEN,kinds=[MACRO_DEFINITION]) first.
+# agent_langgraph should force make_extra_patch_override(symbol_name=<TOKEN>) instead.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -385,15 +435,15 @@ decision = {
 }
 
 forced = _macro_define_guardrail_for_override(state, decision)
-assert forced and forced.get("tool") == "kb_search_symbols", forced
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
 args = forced.get("args") or {}
-assert "EMPTY_ICONV" in (args.get("symbols") or []), forced
-assert "MACRO_DEFINITION" in (args.get("kinds") or []), forced
+assert args.get("symbol_name") == "EMPTY_ICONV", forced
+assert args.get("file_path") == "/src/libxml2/encoding.c", forced
 print("OK")
 PY
 
-# Undeclared-symbol guardrail: if KB shows a missing symbol exists as a file-scope decl in V1,
-# prefer make_extra_patch_override over rewriting the function to remove references.
+# Undeclared-symbol guardrail: try make_extra_patch_override once per symbol before allowing a
+# function rewrite that removes/replaces the missing symbol.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -416,26 +466,6 @@ state.steps = [
     {
         "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
         "observation": {"ok": True, "tool": "get_error_patch_context", "args": {}, "output": {"patch_key": "p"}, "error": None},
-    },
-    {
-        "decision": {"type": "tool", "tool": "kb_search_symbols", "args": {"symbols": ["xmlRngMutex"], "version": "v1"}},
-        "observation": {
-            "ok": True,
-            "tool": "kb_search_symbols",
-            "args": {"symbols": ["xmlRngMutex"], "version": "v1"},
-            "output": {
-                "version": "v1",
-                "results": [
-                    {
-                        "symbol": "xmlRngMutex",
-                        "exists": True,
-                        "matches": [{"kind": "VAR_DECL", "file": "dict.c", "line": 907, "column": 1, "code": "static xmlMutex xmlRngMutex;"}],
-                        "truncated": False,
-                    }
-                ],
-            },
-            "error": None,
-        },
     },
 ]
 state.step_history = list(state.steps)
@@ -664,7 +694,7 @@ print("OK")
 PY
 
 # search_definition guardrail: don't try to "look up" struct fields via search_definition;
-# rewrite to kb_search_symbols for FIELD_DECL/VAR_DECL/MACRO_DEFINITION.
+# rewrite to search_definition(struct) so the model can inspect the field list.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -685,12 +715,10 @@ state.missing_struct_members = [{"struct": "struct _xmlParserCtxt", "members": [
 
 decision = {"type": "tool", "tool": "search_definition", "thought": "look for field", "args": {"symbol_name": "ctxt->nsdb", "version": "v2"}}
 rewritten = _struct_member_search_guardrail_for_search_definition(state, decision)
-assert rewritten and rewritten.get("tool") == "kb_search_symbols", rewritten
+assert rewritten and rewritten.get("tool") == "search_definition", rewritten
 args = rewritten.get("args") or {}
-assert args.get("symbols") == ["nsdb"], rewritten
+assert args.get("symbol_name") == "struct _xmlParserCtxt", rewritten
 assert args.get("version") == "v2", rewritten
-kinds = args.get("kinds") or []
-assert "FIELD_DECL" in kinds and "VAR_DECL" in kinds and "MACRO_DEFINITION" in kinds, rewritten
 print("OK")
 PY
 
@@ -1030,61 +1058,6 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
-# Macro lookup fallback: when v2 has no matches, macro_lookup should fall back to v1 (batch mode).
-"$PYTHON" - "$SCRIPT_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-script_dir = Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(script_dir))
-
-from agent_langgraph import AgentState, _macro_lookup_update_from_kb_search_output  # noqa: E402
-
-state = AgentState(
-    build_log_path="build.log",
-    patch_path="bundle.patch2",
-    error_scope="patch",
-    error_line="x:1:1: error: y",
-    snippet="expanded from macro 'MAKE_HANDLER'",
-)
-state.macro_lookup = {"tokens": ["EMPTY_ICONV"], "search_tokens": ["EMPTY_ICONV"], "queue_read": [], "stage": "need_kb_search", "version": "v2"}
-_macro_lookup_update_from_kb_search_output(state, {"results": [{"symbol": "EMPTY_ICONV", "matches": [], "truncated": False}]})
-assert state.macro_lookup and state.macro_lookup.get("version") == "v1", state.macro_lookup
-assert state.macro_lookup.get("stage") == "need_kb_search", state.macro_lookup
-assert state.macro_lookup.get("search_tokens") == ["EMPTY_ICONV"], state.macro_lookup
-
-print("OK")
-PY
-
-# Macro lookup should not force read_file_context or hard-code a context window.
-"$PYTHON" - "$SCRIPT_DIR" <<'PY'
-import sys
-from pathlib import Path
-
-script_dir = Path(sys.argv[1]).resolve()
-sys.path.insert(0, str(script_dir))
-
-from agent_langgraph import AgentState, _macro_lookup_update_from_kb_search_output  # noqa: E402
-
-state = AgentState(
-    build_log_path="build.log",
-    patch_path="bundle.patch2",
-    error_scope="patch",
-    error_line="x:1:1: error: y",
-    snippet="expanded from macro 'MAKE_HANDLER'",
-)
-state.macro_lookup = {"tokens": ["EMPTY_ICONV"], "search_tokens": ["EMPTY_ICONV"], "stage": "need_kb_search", "version": "v1"}
-_macro_lookup_update_from_kb_search_output(
-    state,
-    {"results": [{"symbol": "EMPTY_ICONV", "matches": [{"kind": "MACRO_DEFINITION", "file": "encoding.c", "line": 123, "column": 1, "code": "#define EMPTY_ICONV"}]}]},
-)
-
-assert state.macro_lookup and state.macro_lookup.get("stage") == "done", state.macro_lookup
-assert "queue_read" not in state.macro_lookup, state.macro_lookup
-
-print("OK")
-PY
-
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
@@ -1103,7 +1076,6 @@ allowed = {
     "read_artifact",
     "read_file_context",
     "search_definition",
-    "kb_search_symbols",
     "list_patch_bundle",
     "get_patch",
     "search_patches",
@@ -1212,8 +1184,8 @@ idx_patch = tools.index("make_error_patch_override")
 assert idx_patch > 0 and tools[idx_patch - 1] == "read_artifact", tools
 assert "ossfuzz_apply_patch_and_test" in tools[idx_patch + 1 :], tools
 
-# kb_search_symbols may appear in macro-expansion flows; ordering is enforced by macro_lookup guardrails,
-# not by this patch-scope missing-member fixture.
+# Macro-expansion flows use make_extra_patch_override; this patch-scope missing-member fixture doesn't
+# exercise macro handling.
 PY
 
 # Guardrail: block suggestions to edit V2 type definitions by default.

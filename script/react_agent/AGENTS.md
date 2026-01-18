@@ -7,7 +7,7 @@ and iteratively produces override diffs to fix compilation failures.
 Key files:
 
 - `script/react_agent/agent_langgraph.py`: main agent loop + prompt + guardrails.
-- `script/react_agent/agent_tools.py`: KB + source reader helpers for `search_definition` / `kb_search_symbols` / `read_file_context`.
+- `script/react_agent/agent_tools.py`: compatibility shim (re-exports `KbIndex`, `SourceManager`, `AgentTools`).
 - `script/react_agent/tools/`: tool registry + runner + OSS-Fuzz + artifact helpers.
 - `script/react_agent/test_langgraph_agent.sh`: offline regression tests (fast).
 
@@ -41,7 +41,7 @@ Each JSON file contains a list of dictionaries. The structure of a single entry 
 
 ### Implementation Notes (KB + Source Reader)
 Historically, this repo used a 3-class split (KbIndex / SourceManager / AgentTools). The codebase still follows
-that conceptually, but the agent-facing tools are now exposed via `search_definition` / `kb_search_symbols` / `read_file_context`.
+that conceptually, but the agent-facing tools are now exposed via `search_definition` / `read_file_context` and deterministic patch tools.
 
 1. Class: KbIndex (The Knowledge Base)
 Goal: Aggregate scattered JSON files into an efficient in-memory index.
@@ -159,7 +159,8 @@ When generating an override diff:
 
 ### Symbol Lookup Gotcha
 `search_definition` is not a struct-field lookup. Do not call it on member names like `nsdb` or expressions like `ctxt->nsdb`.
-Use `kb_search_symbols(kinds=['FIELD_DECL','VAR_DECL','MACRO_DEFINITION'])` and inspect the parent struct body.
+Instead: call `search_definition(symbol_name="struct <Name>", version="v1")` and `search_definition(..., version="v2")`,
+then inspect the returned struct body (fields, nesting, `#if` guards) to infer the correct field mapping.
 
 ## Tests
 - `bash script/react_agent/test_langgraph_agent.sh`

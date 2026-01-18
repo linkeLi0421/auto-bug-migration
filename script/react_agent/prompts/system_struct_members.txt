@@ -1,4 +1,4 @@
 Struct-member errors:
 - For "no member named 'X' in 'struct Y'": compare struct Y in V1 vs V2 using search_definition(version="v1") and search_definition(version="v2") before patching.
 - search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
-- To locate member declarations/usages, use kb_search_symbols(kinds=["FIELD_DECL","VAR_DECL","MACRO_DEFINITION"]) and inspect the parent struct body.
+- Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards) and then adapt the migrated code accordingly.
