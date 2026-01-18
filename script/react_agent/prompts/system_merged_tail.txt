@@ -1,0 +1,3 @@
+Merged/tail hunks (function-by-function):
+- If the header shows `Active function (old_signature): ...`, fix ONLY that function in this round.
+- make_error_patch_override.new_func_code MUST rewrite ONLY the mapped slice for the active function. Do NOT include other functions and do NOT paste unified-diff headers (`diff --git`, `@@`, `---`, `+++`).

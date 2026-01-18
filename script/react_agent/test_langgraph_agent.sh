@@ -23,6 +23,39 @@ assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
 assert "make_extra_patch_override" in names, sorted(n for n in names if n)
 PY
 
+# System prompt composition: keep the default prompt small by only including relevant sections.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState  # noqa: E402
+from prompting import build_system_prompt  # noqa: E402
+from tools.registry import TOOL_SPECS  # noqa: E402
+
+st_first = AgentState(build_log_path="-", patch_path="", error_scope="first", error_line="x", snippet="")
+p_first = build_system_prompt(st_first, tool_specs=TOOL_SPECS)
+assert "Patch-scope mode:" not in p_first, p_first
+assert "Merged/tail hunks" not in p_first, p_first
+
+st_patch = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+p_patch = build_system_prompt(st_patch, tool_specs=TOOL_SPECS)
+assert "Patch-scope mode:" in p_patch, p_patch
+
+st_macro = AgentState(build_log_path="-", patch_path="", error_scope="first", error_line="x", snippet="note: expanded from macro 'X'")
+p_macro = build_system_prompt(st_macro, tool_specs=TOOL_SPECS)
+assert "Macro-related syntax errors:" in p_macro, p_macro
+
+st_tail = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+st_tail.active_old_signature = "int f(int x)"
+p_tail = build_system_prompt(st_tail, tool_specs=TOOL_SPECS)
+assert "Merged/tail hunks" in p_tail, p_tail
+
+print("OK")
+PY
+
 # Build-log parsing: include a small subset of warning diagnostics (undeclared function) so
 # patch-scope workflows can deterministically fix them.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -100,7 +133,14 @@ with tempfile.TemporaryDirectory() as td:
         "diff --git a/dict.c b/dict.c\n"
         "--- a/dict.c\n"
         "+++ b/dict.c\n"
-        "@@ -10,3 +10,0 @@\n"
+        "@@ -10,10 +10,0 @@\n"
+        "-static int caller(int prefix) {\n"
+        "-\n"
+        "-  if (prefix == 0) {\n"
+        "-    return __revert_deadbeef_myfunc(123);\n"
+        "-  }\n"
+        "-  return 0;\n"
+        "-}\n"
         "-int __revert_deadbeef_myfunc(int x) {\n"
         "-  return x;\n"
         "-}\n"
