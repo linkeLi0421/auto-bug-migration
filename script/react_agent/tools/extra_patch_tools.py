@@ -535,12 +535,15 @@ def make_extra_patch_override(
 
     # 2) Fallback to KB/JSON: locate underlying symbol code and synthesize a declaration.
     if not inserted_lines and agent_tools is not None:
-        ver = str(version or "v1").strip().lower()
-        if ver not in {"v1", "v2"}:
-            ver = "v1"
+        requested = str(version or "v1").strip().lower()
+        if requested not in {"v1", "v2"}:
+            requested = "v1"
+        versions_to_try = [requested, ("v2" if requested == "v1" else "v1")]
         query = underlying or symbol
-        chosen = _kb_pick_insertable_node(agent_tools, symbol=query, version=ver)
-        if chosen is not None:
+        for ver in versions_to_try:
+            chosen = _kb_pick_insertable_node(agent_tools, symbol=query, version=ver)
+            if chosen is None:
+                continue
             chosen_kind = str(chosen.get("kind", "") or "").strip()
             reason = str(chosen.get("__reason", "") or "").strip()
             reason_suffix = f":{reason}" if reason else ""
@@ -548,20 +551,25 @@ def make_extra_patch_override(
             code = ""
             if source_manager is not None:
                 code = str(source_manager.get_function_code(chosen, ver) or "")
-            if code.strip():
-                if "FUNCTION" in chosen_kind:
-                    decl_lines = _extract_c_declaration_from_function_code(code)
-                else:
-                    decl_lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
-                decl_lines = [l.rstrip() for l in decl_lines if l is not None and str(l).strip()]
-                if decl_lines:
-                    if underlying:
-                        if kind == "revert_function":
-                            decl_lines = _rewrite_first_function_name(decl_lines, old=underlying, new=symbol)
-                        elif kind in {"revert_var", "revert_const"}:
-                            decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
-                    inserted_lines = decl_lines
-                    insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
+            if not code.strip():
+                continue
+
+            if "FUNCTION" in chosen_kind:
+                decl_lines = _extract_c_declaration_from_function_code(code)
+            else:
+                decl_lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+            decl_lines = [l.rstrip() for l in decl_lines if l is not None and str(l).strip()]
+            if not decl_lines:
+                continue
+
+            if underlying:
+                if kind == "revert_function":
+                    decl_lines = _rewrite_first_function_name(decl_lines, old=underlying, new=symbol)
+                elif kind in {"revert_var", "revert_const"}:
+                    decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
+            inserted_lines = decl_lines
+            insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
+            break
 
     if not inserted_lines:
         return {

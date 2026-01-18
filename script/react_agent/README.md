@@ -35,7 +35,6 @@ See `script/react_agent/tests/README.md` for a concrete run log and example comm
   - `read_artifact(artifact_path, start_line?, max_lines?, query?, context_lines?, max_chars?)`
   - `read_file_context(file_path, line_number, context, version)`
   - `search_definition(symbol_name, version)` (use `version=v1|v2`)
-  - `kb_search_symbols(symbols, version, kinds?, limit_per_symbol?)` (KB lookup for macros/types/functions; includes `MACRO_DEFINITION`)
 - OSS-Fuzz Docker testing (opt-in):
   - `ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths?, build_csv?, sanitizer?, architecture?, engine?, fuzz_target?, run_fuzzer_seconds?, timeout_seconds?, use_sudo?)`
   - It writes a merged `.diff` file (bundle + overrides) under the artifact directory and uses it as the OSS-Fuzz `--patch` input.

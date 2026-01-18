@@ -3,7 +3,7 @@
   - [x] Add tool `make_extra_patch_override(...)`:
     - [x] Infer `_extra_<file>` patch_key from the build error’s `file_path` (e.g. `dict.c` → `_extra_dict.c`).
     - [x] For `__revert_*` function names: extract a prototype from an existing `__revert_*` definition in the patch bundle when possible (KB won’t contain generated names).
-    - [x] Fallback: use KB/JSON (`kb_search_symbols`) to locate a definition/decl/macro/typedef and synthesize a safe insertion block (prototype / `#define` / `typedef`).
+    - [x] Fallback: use KB/JSON (via `KbIndex` + `search_definition`-style extents) to locate a definition/decl/macro/typedef and synthesize a safe insertion block (prototype / `#define` / `typedef`).
     - [x] Insert the generated block into the extra patch hunk and recompute hunk header lengths; return a full override diff (never truncated).
   - [x] Integrate into patch-scope flow:
     - [x] Register tool in `tools/registry.py` + `tools/runner.py` and ensure patch tools use the effective `state.patch_path`.
@@ -51,4 +51,22 @@
     - [x] If bundle-extraction is invalid, fall back to KB-derived signature (underlying symbol) and rename to `__revert_*`.
   - [x] Add regression test covering the call-site-before-definition case (pre-fix fails; post-fix extracts correct prototype).
   - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
+  - [x] Post reminder to `#report`.
+
+[x] Struct-member workflow: stop using `kb_search_symbols` for fields
+  - [x] Update `system_struct_members` prompt to rely on `search_definition(struct)` + field-list inspection, not `kb_search_symbols`.
+  - [x] Flip `_struct_member_search_guardrail_for_search_definition`: rewrite `search_definition(ctxt->field)` → `search_definition(struct ...)` instead of `kb_search_symbols`.
+  - [x] Make `kb_search_symbols.kinds` tolerant to LLM-style aliases (`VARIABLE/OBJECT/TYPE/...`) so non-struct cases don't fail due to invalid kind strings.
+  - [x] Update regression tests and run `bash script/react_agent/test_langgraph_agent.sh`.
+  - [x] Post reminder to `#report`.
+
+[x] Remove `kb_search_symbols` tool entirely (use `search_definition` + deterministic patch tools instead)
+  - [x] Remove `kb_search_symbols` from the tool registry and runner (so it is not exposed/usable as a tool).
+  - [x] Add a compatibility rewrite: if the model still outputs `tool=kb_search_symbols`, rewrite to `search_definition` (first symbol) instead of crashing.
+  - [x] Replace macro-lookup guardrails that depended on `kb_search_symbols`:
+    - [x] Remove the kb_search_symbols-driven `macro_lookup` state machine.
+    - [x] For macro-expansion errors: prefer `make_extra_patch_override(symbol_name=<TOKEN>)` rather than inventing `#define`.
+  - [x] Simplify undeclared-symbol guardrail: for “undeclared identifier/function/type name …”, force `make_extra_patch_override` once per symbol before allowing `make_error_patch_override`.
+  - [x] Update prompt fragments + docs to stop mentioning `kb_search_symbols` (`system_macro.txt`, `README.md`, `AGENTS.md`).
+  - [x] Update regression tests and run `bash script/react_agent/test_langgraph_agent.sh`.
   - [x] Post reminder to `#report`.

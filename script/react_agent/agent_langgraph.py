@@ -2257,89 +2257,34 @@ def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
 
 
 def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
-    """Return a forced KB lookup decision when the override invents missing macros without source evidence."""
+    """Block invented #defines by forcing deterministic `_extra_*` insertion."""
     if str(decision.get("type", "")).strip() != "tool":
         return None
     if str(decision.get("tool", "")).strip() != "make_error_patch_override":
         return None
-    def _has_kb_macro_definition_for_token(token: str) -> bool:
-        t = str(token or "").strip()
-        if not t:
-            return False
-        for step in state.steps:
-            if not isinstance(step, dict):
-                continue
-            decision_obj = step.get("decision") or {}
-            if not isinstance(decision_obj, dict) or str(decision_obj.get("tool", "")).strip() != "kb_search_symbols":
-                continue
-            args_obj = decision_obj.get("args") if isinstance(decision_obj.get("args"), dict) else {}
-            kinds = args_obj.get("kinds")
-            if kinds is not None:
-                if isinstance(kinds, str):
-                    kinds_list = [kinds]
-                elif isinstance(kinds, list):
-                    kinds_list = [str(k) for k in kinds]
-                else:
-                    kinds_list = []
-                if "MACRO_DEFINITION" not in kinds_list:
-                    continue
-            obs = step.get("observation") or {}
-            out = obs.get("output")
-            if not isinstance(out, dict):
-                continue
-            results = out.get("results") if isinstance(out.get("results"), list) else []
-            for item in results:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("symbol", "") or "").strip() != t:
-                    continue
-                matches = item.get("matches") if isinstance(item.get("matches"), list) else []
-                if matches:
-                    return True
-        return False
 
     args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
     new_code = str(args_obj.get("new_func_code", "") or "")
     defines = set(_extract_defined_macros_from_code(new_code))
     missing = set(str(t) for t in (state.macro_tokens_not_defined_in_slice or []) if str(t).strip())
-    # We require some tool-based evidence before defining a missing macro:
-    # - Prefer read_file_context evidence; but if the KB already returned a MACRO_DEFINITION match, allow it
-    #   (the model may decide the appropriate read_file_context window itself).
-    tokens = [
-        t
-        for t in sorted(defines & missing)
-        if t and (not _has_read_file_context_for_token(state, t)) and (not _has_kb_macro_definition_for_token(t))
-    ]
+    tokens = [t for t in sorted(defines & missing) if t and (not _has_read_file_context_for_token(state, t))]
     if not tokens:
         return None
-    # Keep this bounded; if we ever see a giant list, the agent can repeat the lookup later.
-    tokens = tokens[:10]
-    state.macro_lookup = {
-        "tokens": tokens,
-        "search_tokens": tokens,
-        "queue_read": [],
-        "stage": "need_kb_search",
-        "version": "v2",
-    }
+
+    file_path, _ = _first_error_location(state)
+    if not file_path:
+        return None
+
+    token = tokens[0]
+    if _has_make_extra_patch_override_for_symbol(state, token):
+        return None
+
     return {
         "type": "tool",
-        "thought": f"Macro guardrail: locate the real #define blocks for {', '.join(tokens)} (v2 then v1) before adding them.",
-        "tool": "kb_search_symbols",
-        "args": {"symbols": tokens, "version": "v2", "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
+        "thought": f"Macro guardrail: add the real definition for {token} via the file's _extra_* hunk (do not invent #define values in the function body).",
+        "tool": "make_extra_patch_override",
+        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": token, "version": "v1"},
     }
-    return None
-
-
-_KB_INSERTABLE_DECL_KINDS = {
-    "ENUM_DECL",
-    "FUNCTION_DECL",
-    "FUNCTION_DEFI",
-    "MACRO_DEFINITION",
-    "STRUCT_DECL",
-    "TYPEDEF_DECL",
-    "UNION_DECL",
-    "VAR_DECL",
-}
 
 
 def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> bool:
@@ -2360,56 +2305,11 @@ def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) ->
     return False
 
 
-def _last_kb_search_symbols_item(state: AgentState, *, symbol: str, version: str) -> Optional[dict]:
-    want = str(symbol or "").strip()
-    if not want:
-        return None
-    ver = str(version or "").strip().lower()
-    if ver not in {"v1", "v2"}:
-        return None
-
-    for step in reversed(state.step_history or []):
-        if not isinstance(step, dict):
-            continue
-        decision = step.get("decision")
-        if not isinstance(decision, dict) or str(decision.get("tool", "")).strip() != "kb_search_symbols":
-            continue
-        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
-        if str(args.get("version", "")).strip().lower() != ver:
-            continue
-        obs = step.get("observation") or {}
-        if not isinstance(obs, dict) or obs.get("ok") is not True or str(obs.get("tool", "")).strip() != "kb_search_symbols":
-            continue
-        out = obs.get("output")
-        if not isinstance(out, dict):
-            continue
-        results = out.get("results") if isinstance(out.get("results"), list) else []
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("symbol", "") or "").strip() != want:
-                continue
-            return item
-    return None
-
-
-def _kb_search_item_has_insertable_match(item: dict) -> bool:
-    matches = item.get("matches") if isinstance(item.get("matches"), list) else []
-    for m in matches:
-        if not isinstance(m, dict):
-            continue
-        kind = str(m.get("kind", "") or "").strip()
-        if kind in _KB_INSERTABLE_DECL_KINDS:
-            return True
-    return False
-
-
 def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Prefer deterministic `_extra_*` insertions over function rewrites that delete missing symbols.
 
-    If the current diagnostic is an undeclared symbol/type/macro and the KB indicates it exists in V1 as an
-    insertable file-scope declaration/define/typedef, force make_extra_patch_override instead of allowing
-    make_error_patch_override to "fix" the compile by removing references.
+    If the current diagnostic is an undeclared symbol/type/macro, try make_extra_patch_override once per
+    symbol before allowing make_error_patch_override to "fix" the compile by removing references.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -2431,24 +2331,19 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     if not file_path:
         return None
 
-    item = _last_kb_search_symbols_item(state, symbol=undeclared, version="v1")
-    if item is None:
-        return None
-
-    if item.get("exists") is True and _kb_search_item_has_insertable_match(item):
-        return {
-            "type": "tool",
-            "thought": "Undeclared symbol exists in V1: add it to the file's _extra_* hunk (deterministic extra patch strategy) instead of rewriting the function to remove it.",
-            "tool": "make_extra_patch_override",
-            "args": {
-                "patch_path": state.patch_path,
-                "file_path": file_path,
-                "symbol_name": undeclared,
-                "version": "v1",
-            },
-        }
-
-    return None
+    # Prefer trying make_extra_patch_override once (deterministic KB-backed insertion) before allowing a
+    # function rewrite that "fixes" the build by deleting/replacing the symbol (e.g. turning globals into locals).
+    return {
+        "type": "tool",
+        "thought": "Undeclared symbol guardrail: try a deterministic file-scope insertion via the file's _extra_* hunk before rewriting the function.",
+        "tool": "make_extra_patch_override",
+        "args": {
+            "patch_path": state.patch_path,
+            "file_path": file_path,
+            "symbol_name": undeclared,
+            "version": "v1",
+        },
+    }
 
 
 def _macro_lookup_pick_token(state: AgentState) -> str:
@@ -2481,89 +2376,34 @@ def _macro_lookup_pick_tokens(state: AgentState, *, max_tokens: int = 3) -> List
     return ordered[: max(0, int(max_tokens or 0))]
 
 
-def _macro_lookup_update_from_kb_search_output(state: AgentState, output: Any) -> None:
-    """Advance macro_lookup state based on a kb_search_symbols tool output."""
-    if not isinstance(state.macro_lookup, dict):
-        return
-    stage = str(state.macro_lookup.get("stage", "") or "").strip()
-    version = str(state.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
-    if stage != "need_kb_search":
-        return
-    if not isinstance(output, dict):
-        return
-    search_tokens = [str(t) for t in (state.macro_lookup.get("search_tokens") or []) if str(t).strip()]
-    found_locations: List[Dict[str, Any]] = []
+def _maybe_rewrite_deprecated_kb_search(decision: Decision) -> Optional[Decision]:
+    """Compatibility: rewrite deprecated kb_search_symbols calls into search_definition.
 
-    results = output.get("results") if isinstance(output.get("results"), list) else []
-    found_tokens: set[str] = set()
-    missing_tokens: List[str] = []
-
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        tok = str(item.get("symbol", "") or "").strip()
-        if not tok:
-            continue
-        matches = item.get("matches") if isinstance(item.get("matches"), list) else []
-        first = matches[0] if matches else None
-        if isinstance(first, dict) and first.get("file") and first.get("line"):
-            found_tokens.add(tok)
-            found_locations.append(
-                {
-                    "token": tok,
-                    "version": version,
-                    "file_path": str(first.get("file")),
-                    "line_number": int(first.get("line") or 0),
-                    "kind": str(first.get("kind", "") or "").strip() or None,
-                }
-            )
-        else:
-            missing_tokens.append(tok)
-
-    # If KB didn't return per-symbol entries, fall back to the requested list.
-    if not results and search_tokens:
-        missing_tokens = list(search_tokens)
-
-    # For anything not explicitly returned, treat it as missing in this version.
-    for tok in search_tokens:
-        if tok not in found_tokens and tok not in missing_tokens:
-            missing_tokens.append(tok)
-
-    # Dedupe found locations by token+version+file+line, keep order.
-    seen_loc: set[tuple[str, str, str, int]] = set()
-    found_locations_dedup: List[Dict[str, Any]] = []
-    for loc in found_locations:
-        if not isinstance(loc, dict):
-            continue
-        key = (
-            str(loc.get("token") or "").strip(),
-            str(loc.get("version") or "").strip(),
-            str(loc.get("file_path") or "").strip(),
-            int(loc.get("line_number") or 0),
-        )
-        if key in seen_loc:
-            continue
-        seen_loc.add(key)
-        found_locations_dedup.append(loc)
-    found_locations = found_locations_dedup
-
-    # No matches at all: try the other version (v2 -> v1), then mark done.
-    if version == "v2" and missing_tokens:
-        state.macro_lookup = {
-            "tokens": list(state.macro_lookup.get("tokens") or []),
-            "search_tokens": missing_tokens,
-            "stage": "need_kb_search",
-            "version": "v1",
+    We no longer expose kb_search_symbols as a tool. If a model still emits it, rewrite the request
+    into a single search_definition call (first symbol) so runs don't crash.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "kb_search_symbols":
+        return None
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    syms = args_obj.get("symbols")
+    symbols = [str(s) for s in (syms if isinstance(syms, list) else [syms]) if str(s).strip()]
+    if not symbols:
+        return {
+            "type": "final",
+            "thought": "Deprecated tool call had no symbols.",
+            "summary": "kb_search_symbols is removed; no symbols provided to rewrite.",
+            "next_step": "Call search_definition(symbol_name=...) or make_extra_patch_override(symbol_name=...) instead.",
         }
-        return
-
-    state.macro_lookup = {
-        "tokens": list(state.macro_lookup.get("tokens") or []),
-        "search_tokens": [],
-        "stage": "done",
-        "version": version,
-        "found_locations": found_locations,
-        "not_found_tokens": missing_tokens,
+    ver = str(args_obj.get("version", "v2") or "v2").strip().lower()
+    if ver not in {"v1", "v2"}:
+        ver = "v2"
+    return {
+        "type": "tool",
+        "thought": "Rewrite deprecated kb_search_symbols into a single search_definition call.",
+        "tool": "search_definition",
+        "args": {"symbol_name": symbols[0], "version": ver},
     }
 
 
@@ -2825,10 +2665,11 @@ def _structs_to_compare(state: AgentState) -> List[str]:
 
 
 def _struct_member_search_guardrail_for_search_definition(state: AgentState, decision: Decision) -> Optional[Decision]:
-    """Rewrite search_definition(member) into kb_search_symbols when member is a missing struct field.
+    """Rewrite search_definition(member) into search_definition(struct) for missing-member errors.
 
-    search_definition is a symbol-definition lookup and isn't a reliable way to locate struct fields; for a missing
-    member name we prefer querying the KB for FIELD_DECL/VAR_DECL/MACRO_DEFINITION matches.
+    search_definition is a symbol-definition lookup and isn't a reliable way to locate struct fields directly; when
+    the model asks for a member name like `nsdb`, fetch the parent struct definition instead so the model can
+    compare the V1 vs V2 field lists and adapt call sites.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -2865,18 +2706,20 @@ def _struct_member_search_guardrail_for_search_definition(state: AgentState, dec
     if not candidate or candidate not in missing:
         return None
 
+    structs = _structs_to_compare(state)
+    if not structs:
+        return None
+    struct_name = structs[0]
+
+    ver = str(args_obj.get("version", "v2") or "v2").strip().lower()
+    if ver not in {"v1", "v2"}:
+        ver = "v2"
+
     return {
         "type": "tool",
-        "thought": (
-            "search_definition is not a struct-field lookup; query the KB for member declarations/usages instead."
-        ),
-        "tool": "kb_search_symbols",
-        "args": {
-            "symbols": [candidate],
-            "version": "v2",
-            "kinds": ["FIELD_DECL", "VAR_DECL", "MACRO_DEFINITION"],
-            "limit_per_symbol": 8,
-        },
+        "thought": "search_definition is not a struct-field lookup; fetch the parent struct definition instead.",
+        "tool": "search_definition",
+        "args": {"symbol_name": _normalize_struct_queries(struct_name)[0], "version": ver},
     }
 
 
@@ -3485,46 +3328,22 @@ def _run_langgraph(
                 },
             }
 
-        # Macro-expansion preflight: if we have missing macro tokens for a macro-expansion error,
-        # force an evidence-gathering lookup (v2 then v1) before the model decides to define/remove tokens.
-        if (
-            not st.macro_lookup
-            and st.macro_tokens_not_defined_in_slice
-            and "expanded from macro" in str(st.snippet or "")
-        ):
-            tokens = _macro_lookup_pick_tokens(st, max_tokens=3)
-            if tokens:
-                st.macro_lookup = {
-                    "tokens": tokens,
-                    "search_tokens": tokens,
-                    "queue_read": [],
-                    "stage": "need_kb_search",
-                    "version": "v2",
-                }
-                forced: Decision = {
-                    "type": "tool",
-                    "thought": f"Macro preflight: locate the real #define blocks for {', '.join(tokens)} (v2 then v1) before rewriting the patch.",
-                    "tool": "kb_search_symbols",
-                    "args": {"symbols": tokens, "version": "v2", "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
-                }
-                _validate_tool_decision(forced)
-                return {"state": st, "pending": forced}
-
-        if isinstance(st.macro_lookup, dict):
-            stage = str(st.macro_lookup.get("stage", "") or "").strip()
-            version = str(st.macro_lookup.get("version", "v2") or "v2").strip() or "v2"
-            if stage == "need_kb_search":
-                search_tokens = [str(t) for t in (st.macro_lookup.get("search_tokens") or []) if str(t).strip()]
-                if not search_tokens:
-                    search_tokens = [str(t) for t in (st.macro_lookup.get("tokens") or []) if str(t).strip()]
-                forced: Decision = {
-                    "type": "tool",
-                    "thought": f"Macro guardrail: locate the real #define blocks for {', '.join(search_tokens)} before adding/removing/adapting them.",
-                    "tool": "kb_search_symbols",
-                    "args": {"symbols": search_tokens, "version": version, "kinds": ["MACRO_DEFINITION"], "limit_per_symbol": 5},
-                }
-                _validate_tool_decision(forced)
-                return {"state": st, "pending": forced}
+        # Macro-expansion preflight: do not invent #defines inside the function body. Prefer adding
+        # the missing macro at file scope via the file's `_extra_*` hunk.
+        if st.macro_tokens_not_defined_in_slice and "expanded from macro" in str(st.snippet or ""):
+            file_path, _ = _first_error_location(st)
+            if file_path:
+                tokens = _macro_lookup_pick_tokens(st, max_tokens=3)
+                token = tokens[0] if tokens else ""
+                if token and not _has_make_extra_patch_override_for_symbol(st, token):
+                    forced: Decision = {
+                        "type": "tool",
+                        "thought": f"Macro preflight: add the real definition for {token} via the file's _extra_* hunk (do not invent #define values).",
+                        "tool": "make_extra_patch_override",
+                        "args": {"patch_path": st.patch_path, "file_path": file_path, "symbol_name": token, "version": "v1"},
+                    }
+                    _validate_tool_decision(forced)
+                    return {"state": st, "pending": forced}
         messages = _build_messages(st)
         if force_patch_after_read and st.patch_path and st.error_scope == "patch":
             file_path, line_number = _active_override_location(st)
@@ -3665,6 +3484,9 @@ def _run_langgraph(
                             "error": _error_payload(st),
                         },
                     }
+        deprecated = _maybe_rewrite_deprecated_kb_search(decision)
+        if deprecated is not None:
+            decision = deprecated  # type: ignore[assignment]
         if decision["type"] == "final":
             remaining = cfg.max_steps - len(st.steps)
             required = _should_force_struct_diff_tools(st)
@@ -4174,8 +3996,6 @@ def _run_langgraph(
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
                 st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
-        if obs.ok and obs.tool == "kb_search_symbols" and isinstance(st.macro_lookup, dict):
-            _macro_lookup_update_from_kb_search_output(st, obs.output)
         if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None

@@ -121,32 +121,6 @@ class ToolRunner:
                 out = self._agent_tools.search_definition(symbol_name, version=version)
                 return ToolObservation(True, tool, {"symbol_name": symbol_name, "version": version}, output=out)
 
-            if tool == "kb_search_symbols":
-                if not self._agent_tools:
-                    return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
-                symbols = args.get("symbols", [])
-                version = str(args.get("version", "v2")).strip() or "v2"
-                kinds = args.get("kinds")
-                limit_per_symbol = _as_int(args.get("limit_per_symbol"), 5)
-                if not isinstance(symbols, list):
-                    symbols = [symbols]
-                if kinds is not None and not isinstance(kinds, list):
-                    kinds = [kinds]
-                if version not in {"v1", "v2"}:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
-                out = self._agent_tools.kb_search_symbols(
-                    [str(s) for s in symbols],
-                    version=version,
-                    kinds=[str(k) for k in kinds] if kinds is not None else None,
-                    limit_per_symbol=limit_per_symbol,
-                )
-                return ToolObservation(
-                    True,
-                    tool,
-                    {"symbols": [str(s) for s in symbols], "version": version, "kinds": kinds, "limit_per_symbol": limit_per_symbol},
-                    output=out,
-                )
-
             if tool == "read_file_context":
                 if not self._agent_tools:
                     return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
@@ -390,15 +364,18 @@ class ToolRunner:
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 symbol_name = str(args.get("symbol_name", "")).strip()
-                version = str(args.get("version", "v1")).strip() or "v1"
+                version_raw = str(args.get("version", "v1")).strip() or "v1"
+                version = version_raw
                 if not patch_path:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
                 if not file_path:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
                 if not symbol_name:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
+                # Some model outputs confuse "version" with an OSS-Fuzz commit hash. Be tolerant and coerce to v1;
+                # the tool will fall back across versions when it can't find a definition in the requested one.
                 if version not in {"v1", "v2"}:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
+                    version = "v1"
                 out = make_extra_patch_override_tool(
                     self._agent_tools,
                     patch_path=patch_path,
@@ -409,7 +386,13 @@ class ToolRunner:
                 return ToolObservation(
                     True,
                     tool,
-                    {"patch_path": patch_path, "file_path": file_path, "symbol_name": symbol_name, "version": version},
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "symbol_name": symbol_name,
+                        "version": version,
+                        **({"version_raw": version_raw} if version_raw != version else {}),
+                    },
                     output=out,
                 )
 
