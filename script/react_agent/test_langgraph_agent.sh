@@ -20,6 +20,26 @@ obj = json.loads(sys.argv[1])
 tools = obj.get("tools") or []
 names = {t.get("name") for t in tools if isinstance(t, dict)}
 assert "ossfuzz_apply_patch_and_test" in names, sorted(n for n in names if n)
+assert "make_extra_patch_override" in names, sorted(n for n in names if n)
+PY
+
+# Build-log parsing: include a small subset of warning diagnostics (undeclared function) so
+# patch-scope workflows can deterministically fix them.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from build_log import iter_compiler_errors  # noqa: E402
+
+log = "/src/libxml2/dict.c:1519:21: warning: call to undeclared function '__revert_e11519_xmlDictHashName'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]\\n"
+errs = iter_compiler_errors(log, snippet_lines=0)
+assert errs and errs[0].get("level") == "warning", errs
+assert errs[0].get("file") == "/src/libxml2/dict.c", errs
+assert "__revert_e11519_xmlDictHashName" in str(errs[0].get("msg") or ""), errs
+print("OK")
 PY
 
 # Artifact directories must preserve patch_key (including leading/trailing "_"),
@@ -40,6 +60,225 @@ with tempfile.TemporaryDirectory() as td:
     os.environ["REACT_AGENT_ARTIFACT_ROOT"] = td
     store, out_dir = resolve_artifact_dir(disabled=False, patch_key="_extra_encoding.c")
     assert Path(out_dir).name == "_extra_encoding.c", out_dir
+
+print("OK")
+PY
+
+# Extra patch override tool: insert a forward declaration into an `_extra_*` hunk
+# by extracting a prototype from an existing `__revert_*` definition in the bundle.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+
+import pickle
+
+with tempfile.TemporaryDirectory() as td:
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = td
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(Path(td) / "artifacts")
+    bundle_path = Path(td) / "bundle.patch2"
+
+    extra_key = "_extra_dict.c"
+    main_key = "tail-dict.c-f1_"
+
+    extra_patch_text = (
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -1,1 +1,0 @@\n"
+        "-/* extra decls */\n"
+    )
+    main_patch_text = (
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -10,3 +10,0 @@\n"
+        "-int __revert_deadbeef_myfunc(int x) {\n"
+        "-  return x;\n"
+        "-}\n"
+    )
+
+    extra_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    main_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=main_patch_text,
+        file_type="c",
+        old_start_line=10,
+        old_end_line=13,
+        new_start_line=10,
+        new_end_line=10,
+        patch_type={"Recreated function"},
+        old_signature="int myfunc(int x)",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+
+    bundle_path.write_bytes(
+        pickle.dumps(
+            {
+                extra_key: extra_patch,
+                main_key: main_patch,
+            },
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+    )
+
+    out = make_extra_patch_override(
+        None,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="__revert_deadbeef_myfunc",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    ref = out.get("patch_text") or {}
+    assert isinstance(ref, dict) and ref.get("artifact_path"), out
+    p = Path(str(ref.get("artifact_path"))).resolve()
+    assert p.is_file(), p
+    assert p.parent.name == extra_key, p
+    text = p.read_text(encoding="utf-8", errors="replace")
+    assert "int __revert_deadbeef_myfunc(int x);" in text, text
+
+print("OK")
+PY
+
+# Extra patch override tool: for non-generated symbols that only appear as DECL_REF_EXPR,
+# use type_ref.typedef_extent to insert a VAR_DECL (not a statement) into the `_extra_*` hunk.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    # Minimal KB: only a reference node with a type_ref.typedef_extent pointing at the real VAR_DECL.
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+    node = {
+        "kind": "DECL_REF_EXPR",
+        "spelling": "xmlRngMutex",
+        "location": {"file": "dict.c", "line": 921, "column": 19},
+        "type_ref": {
+            "target_kind": "VAR_DECL",
+            "target_name": "xmlRngMutex",
+            "usr": "c:dict.c@xmlRngMutex",
+            "canonical_type": "struct _xmlMutex",
+            "decl_location": None,
+            "typedef_extent": {
+                "start": {"file": "dict.c", "line": 907, "column": 1},
+                "end": {"file": "dict.c", "line": 907, "column": 28},
+            },
+        },
+        "extent": {
+            "start": {"file": "dict.c", "line": 921, "column": 19},
+            "end": {"file": "dict.c", "line": 921, "column": 30},
+        },
+    }
+    (kb_v1 / "dict.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    # Minimal sources: provide the VAR_DECL at line 907.
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+    lines = ["/* filler */"] * 950
+    lines[906] = "static xmlMutex xmlRngMutex;"
+    lines[920] = "    xmlInitMutex(&xmlRngMutex);"
+    text = "\n".join(lines) + "\n"
+    (src_v1 / "dict.c").write_text(text, encoding="utf-8")
+    (src_v2 / "dict.c").write_text(text, encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    kb = tools.kb_search_symbols(["xmlRngMutex"], version="v1", kinds=["VAR_DECL"], limit_per_symbol=5)
+    item = (kb.get("results") or [])[0]
+    assert item.get("symbol") == "xmlRngMutex", item
+    assert item.get("exists") is True, item
+    matches = item.get("matches") or []
+    assert any("static xmlMutex xmlRngMutex;" in str(m.get("code") or "") for m in matches), matches
+
+    bundle_path = td / "bundle.patch2"
+    extra_key = "_extra_dict.c"
+    extra_patch_text = (
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -1,1 +1,0 @@\n"
+        "-/* extra decls */\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({extra_key: extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="xmlRngMutex",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    inserted = str(out.get("inserted_code") or "")
+    assert "static xmlMutex xmlRngMutex;" in inserted, inserted
+    assert "xmlInitMutex" not in inserted, inserted
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    assert "static xmlMutex xmlRngMutex;" in text_out, text_out
+    assert "xmlInitMutex" not in text_out, text_out
 
 print("OK")
 PY
@@ -110,6 +349,62 @@ assert forced and forced.get("tool") == "kb_search_symbols", forced
 args = forced.get("args") or {}
 assert "EMPTY_ICONV" in (args.get("symbols") or []), forced
 assert "MACRO_DEFINITION" in (args.get("kinds") or []), forced
+print("OK")
+PY
+
+# Undeclared-symbol guardrail: if KB shows a missing symbol exists as a file-scope decl in V1,
+# prefer make_extra_patch_override over rewriting the function to remove references.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _undeclared_symbol_extra_patch_guardrail_for_override  # noqa: E402
+
+err = "/src/libxml2/dict.c:1519:21: error: use of undeclared identifier 'xmlRngMutex'"
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err,
+    snippet="",
+)
+state.grouped_errors = [{"raw": err, "file": "/src/libxml2/dict.c", "line": 1519, "col": 21}]
+state.steps = [
+    {
+        "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
+        "observation": {"ok": True, "tool": "get_error_patch_context", "args": {}, "output": {"patch_key": "p"}, "error": None},
+    },
+    {
+        "decision": {"type": "tool", "tool": "kb_search_symbols", "args": {"symbols": ["xmlRngMutex"], "version": "v1"}},
+        "observation": {
+            "ok": True,
+            "tool": "kb_search_symbols",
+            "args": {"symbols": ["xmlRngMutex"], "version": "v1"},
+            "output": {
+                "version": "v1",
+                "results": [
+                    {
+                        "symbol": "xmlRngMutex",
+                        "exists": True,
+                        "matches": [{"kind": "VAR_DECL", "file": "dict.c", "line": 907, "column": 1, "code": "static xmlMutex xmlRngMutex;"}],
+                        "truncated": False,
+                    }
+                ],
+            },
+            "error": None,
+        },
+    },
+]
+state.step_history = list(state.steps)
+
+decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "remove missing global", "args": {}}
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
+assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
+assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
 print("OK")
 PY
 
@@ -773,6 +1068,7 @@ allowed = {
     "get_patch",
     "search_patches",
     "get_error_patch_context",
+    "make_extra_patch_override",
     "make_error_patch_override",
     "parse_build_errors",
 }

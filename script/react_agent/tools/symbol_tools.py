@@ -247,15 +247,58 @@ class AgentTools:
             col = int(loc.get("column", 0) or 0)
             return fp, ln, col
 
+        def node_key(node: dict) -> str:
+            kind = str(node.get("kind", "") or "").strip()
+            spelling = str(node.get("spelling", "") or "").strip()
+            usr = str(node.get("usr", "") or "").strip()
+            reason = str(node.get("__reason", "") or "").strip()
+
+            extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+            start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+            end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+            fp = str(start.get("file", "") or "").strip()
+            sl = int(start.get("line", 0) or 0)
+            sc = int(start.get("column", 0) or 0)
+            el = int(end.get("line", 0) or 0)
+            ec = int(end.get("column", 0) or 0)
+
+            if not fp or sl <= 0:
+                loc_fp, loc_ln, loc_col = loc_tuple(node)
+                fp = fp or loc_fp
+                sl = sl or loc_ln
+                sc = sc or loc_col
+                el = el or sl
+                ec = ec or sc
+
+            # Include extent even when a USR is present to avoid dropping real bodies when
+            # multiple pseudo nodes share the same USR (e.g. type_ref.typedef_extent).
+            return f"{usr}:{kind}:{spelling}:{fp}:{sl}:{sc}:{el}:{ec}:{reason}"
+
         results: List[Dict[str, Any]] = []
         for raw in symbols or []:
             sym = str(raw or "").strip()
             if not sym:
                 continue
 
-            nodes = self.kb_index.query_all(sym).get(ver, [])
+            base_nodes = [n for n in (self.kb_index.query_all(sym).get(ver, []) or []) if isinstance(n, dict)]
+
+            # Expand candidates using derived definition extents (e.g. a DECL_REF_EXPR with
+            # type_ref.typedef_extent that points at the actual VAR_DECL line). This has to
+            # run *before* `kinds=` filtering, otherwise users won't see the real declaration.
+            nodes: List[dict] = []
+            seen: set[str] = set()
+            for n in base_nodes[:200]:
+                for cand in [n] + list(self.kb_index.related_definition_candidates(n, ver, max_depth=2) or []):
+                    if not isinstance(cand, dict):
+                        continue
+                    k = node_key(cand)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    nodes.append(cand)
+
             if kind_set is not None:
-                nodes = [n for n in nodes if isinstance(n, dict) and str(n.get("kind", "") or "").strip() in kind_set]
+                nodes = [n for n in nodes if str(n.get("kind", "") or "").strip() in kind_set]
 
             def rank(n: dict) -> Tuple[int, int, int, int]:
                 fp, ln, col = loc_tuple(n)

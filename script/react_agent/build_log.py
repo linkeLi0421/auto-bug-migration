@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 _COMPILER_ERROR_RE = re.compile(
     r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*(?:fatal\s+)?error:\s*(?P<msg>.*)$"
 )
+_COMPILER_WARNING_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*warning:\s*(?P<msg>.*)$")
 
 def load_build_log(path_or_stdin: Optional[str]) -> str:
     """Load a build log from a file path, or stdin when path_or_stdin is '-' / None."""
@@ -52,9 +53,19 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        level = "error"
         m = _COMPILER_ERROR_RE.match(stripped)
         if not m:
-            continue
+            # Include only a small subset of warnings that frequently represent hard build
+            # failures in OSS-Fuzz (e.g. -Werror=implicit-function-declaration).
+            mw = _COMPILER_WARNING_RE.match(stripped)
+            if not mw:
+                continue
+            msg = str(mw.group("msg") or "")
+            if "undeclared function" not in msg and "implicit declaration of function" not in msg:
+                continue
+            level = "warning"
+            m = mw
         file_path = str(m.group("file"))
         line_no = int(m.group("line"))
         col_no = int(m.group("col"))
@@ -74,6 +85,7 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
                 "col": col_no,
                 "msg": msg,
                 "raw": stripped,
+                "level": level,
                 "snippet": "\n".join(lines[start:end]),
             }
         )
