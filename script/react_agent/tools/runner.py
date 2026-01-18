@@ -9,6 +9,8 @@ from .registry import ALLOWED_TOOLS
 
 from .artifact_tools import read_artifact as read_artifact_tool
 
+from .extra_patch_tools import make_extra_patch_override as make_extra_patch_override_tool
+
 from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_and_test_tool
 
 from .migration_tools import (  # noqa: E402
@@ -381,6 +383,33 @@ class ToolRunner:
                         "max_chars": max_chars,
                         "new_func_code": str(new_func_code)[:2000],
                     },
+                    output=out,
+                )
+
+            if tool == "make_extra_patch_override":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                symbol_name = str(args.get("symbol_name", "")).strip()
+                version = str(args.get("version", "v1")).strip() or "v1"
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if not symbol_name:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
+                if version not in {"v1", "v2"}:
+                    return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
+                out = make_extra_patch_override_tool(
+                    self._agent_tools,
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    symbol_name=symbol_name,
+                    version=version,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {"patch_path": patch_path, "file_path": file_path, "symbol_name": symbol_name, "version": version},
                     output=out,
                 )
 

@@ -12,6 +12,7 @@ ToolName = Literal[
     "get_patch",
     "search_patches",
     "get_error_patch_context",
+    "make_extra_patch_override",
     "make_error_patch_override",
     "parse_build_errors",
 ]
@@ -115,6 +116,15 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "In merged/tail hunks (function-by-function mode), new_func_code MUST rewrite only the mapped slice for the active function (do not include other functions; "
             "do not paste unified-diff headers). patch_text is always returned in full (max_lines/max_chars do not truncate the diff) "
             "to avoid corrupt override patches."
+        ),
+    },
+    {
+        "name": "make_extra_patch_override",
+        "args": {"patch_path": "string", "file_path": "string", "symbol_name": "string", "version": "v1|v2?"},
+        "description": (
+            "Deterministically extend a file's `_extra_*` hunk to provide a missing declaration/define/typedef. "
+            "Use for undeclared function/type/macro issues (including warning-level diagnostics like 'call to undeclared function ...'). "
+            "The tool infers the `_extra_<file>` patch_key from file_path and returns a full override diff (never truncated)."
         ),
     },
     {

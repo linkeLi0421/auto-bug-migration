@@ -969,6 +969,7 @@ _PATCH_TOOLS_WITH_PATCH_PATH: set[str] = {
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
+    "make_extra_patch_override",
     "make_error_patch_override",
 }
 
@@ -2328,6 +2329,127 @@ def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) 
     return None
 
 
+_KB_INSERTABLE_DECL_KINDS = {
+    "ENUM_DECL",
+    "FUNCTION_DECL",
+    "FUNCTION_DEFI",
+    "MACRO_DEFINITION",
+    "STRUCT_DECL",
+    "TYPEDEF_DECL",
+    "UNION_DECL",
+    "VAR_DECL",
+}
+
+
+def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> bool:
+    want = str(symbol or "").strip()
+    if not want:
+        return False
+    for step in (state.step_history or []):
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+            continue
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        if str(args.get("symbol_name", "")).strip() == want:
+            return True
+    return False
+
+
+def _last_kb_search_symbols_item(state: AgentState, *, symbol: str, version: str) -> Optional[dict]:
+    want = str(symbol or "").strip()
+    if not want:
+        return None
+    ver = str(version or "").strip().lower()
+    if ver not in {"v1", "v2"}:
+        return None
+
+    for step in reversed(state.step_history or []):
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict) or str(decision.get("tool", "")).strip() != "kb_search_symbols":
+            continue
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        if str(args.get("version", "")).strip().lower() != ver:
+            continue
+        obs = step.get("observation") or {}
+        if not isinstance(obs, dict) or obs.get("ok") is not True or str(obs.get("tool", "")).strip() != "kb_search_symbols":
+            continue
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            continue
+        results = out.get("results") if isinstance(out.get("results"), list) else []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("symbol", "") or "").strip() != want:
+                continue
+            return item
+    return None
+
+
+def _kb_search_item_has_insertable_match(item: dict) -> bool:
+    matches = item.get("matches") if isinstance(item.get("matches"), list) else []
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        kind = str(m.get("kind", "") or "").strip()
+        if kind in _KB_INSERTABLE_DECL_KINDS:
+            return True
+    return False
+
+
+def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Prefer deterministic `_extra_*` insertions over function rewrites that delete missing symbols.
+
+    If the current diagnostic is an undeclared symbol/type/macro and the KB indicates it exists in V1 as an
+    insertable file-scope declaration/define/typedef, force make_extra_patch_override instead of allowing
+    make_error_patch_override to "fix" the compile by removing references.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    # Only run after patch prereqs (mapping) are satisfied, otherwise let tool ordering drive.
+    if _next_patch_prereq_tool(state) is not None:
+        return None
+
+    undeclared = _extract_undeclared_symbol_name(state)
+    if not undeclared:
+        return None
+    if _has_make_extra_patch_override_for_symbol(state, undeclared):
+        return None
+
+    file_path, _ = _first_error_location(state)
+    if not file_path:
+        return None
+
+    item = _last_kb_search_symbols_item(state, symbol=undeclared, version="v1")
+    if item is None:
+        return None
+
+    if item.get("exists") is True and _kb_search_item_has_insertable_match(item):
+        return {
+            "type": "tool",
+            "thought": "Undeclared symbol exists in V1: add it to the file's _extra_* hunk (deterministic extra patch strategy) instead of rewriting the function to remove it.",
+            "tool": "make_extra_patch_override",
+            "args": {
+                "patch_path": state.patch_path,
+                "file_path": file_path,
+                "symbol_name": undeclared,
+                "version": "v1",
+            },
+        }
+
+    return None
+
+
 def _macro_lookup_pick_token(state: AgentState) -> str:
     """Pick the most relevant missing macro token for the current macro-expansion snippet."""
     snippet = str(state.snippet or "")
@@ -2526,6 +2648,34 @@ def _decision_suggests_v2_type_edit(decision: Decision) -> bool:
 _MISSING_MEMBER_RE = re.compile(r"no member named '[^']+' in '([^']+)'")
 _MISSING_MEMBER_FIELD_RE = re.compile(r"no member named '([^']+)' in '([^']+)'")
 _ERROR_LOC_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):")
+_UNDECLARED_SYMBOL_RE = re.compile(
+    r"(?:use of undeclared identifier|call to undeclared function|implicit declaration of function|unknown type name|undeclared function)\s*'(?P<symbol>[^']+)'"
+)
+_CONFLICTING_TYPES_RE = re.compile(r"conflicting types for\s*'(?P<symbol>[^']+)'")
+
+
+def _extract_undeclared_symbol_name(state: AgentState) -> str:
+    """Best-effort extraction of an undeclared symbol/type/macro name from current error context."""
+    candidates: List[str] = []
+    for e in state.grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if raw:
+            candidates.append(raw)
+    if str(state.error_line or "").strip():
+        candidates.append(str(state.error_line))
+    if str(state.snippet or "").strip():
+        candidates.append(str(state.snippet))
+
+    for text in candidates:
+        for pat in (_UNDECLARED_SYMBOL_RE, _CONFLICTING_TYPES_RE):
+            m = pat.search(text)
+            if m:
+                sym = str(m.group("symbol") or "").strip()
+                if sym:
+                    return sym
+    return ""
 
 
 def _first_error_location(state: AgentState) -> tuple[str, int]:
@@ -2638,7 +2788,7 @@ def _should_require_make_error_patch_override(state: AgentState) -> bool:
     )
     if not has_base:
         return False
-    return not _has_tool_call(state, "make_error_patch_override")
+    return True
 
 
 def _last_tool_call_name(state: AgentState) -> str:
@@ -3069,11 +3219,13 @@ def _system_prompt() -> str:
         "- Tool ordering (two-phase workflow):\n"
         "  1) Analysis phase: map error -> patch context, extract V1-origin code, fetch V1+V2 definitions.\n"
         "     Avoid read_artifact unless you must inspect an artifact_path (e.g. a truncated slice) to proceed.\n"
-        "  2) Patching phase (last): ensure you have a BASE slice (usually via read_artifact on the\n"
-        "     get_error_patch_context.error_func_code.artifact_path, or loop_base_func_code_artifact_path in auto-loop), then call make_error_patch_override\n"
-        "     to generate an override diff,\n"
-        "     then call ossfuzz_apply_patch_and_test to validate it in OSS-Fuzz,\n"
-        "     then return final.\n"
+        "  2) Patching phase (last):\n"
+        "     - If you are rewriting the mapped function slice: ensure you have a BASE slice (usually via read_artifact on the\n"
+        "       get_error_patch_context.error_func_code.artifact_path, or loop_base_func_code_artifact_path in auto-loop), then call make_error_patch_override.\n"
+        "     - If the diagnostic is an undeclared symbol/type/macro that should be provided via an `_extra_*` hunk (e.g. \"call to undeclared function 'X'\"),\n"
+        "       prefer make_extra_patch_override(patch_path, file_path, symbol_name) to add a forward declaration/define/typedef instead of inlining declarations inside a function body.\n"
+        "       Do NOT \"fix\" undeclared-symbol errors by rewriting the function to remove the symbol usage (that can silently delete behavior).\n"
+        "     Then call ossfuzz_apply_patch_and_test to validate in OSS-Fuzz, then return final.\n"
         "- Patch rewrite rule: when you call make_error_patch_override, args.new_func_code MUST be based on the latest\n"
         "  read_artifact.output.text (the BASE slice). Make only the minimal edits needed to fix the reported error.\n"
         "  Do not drop unrelated lines or omit the tail of the BASE slice.\n"
@@ -3100,10 +3252,11 @@ def _system_prompt() -> str:
         "  \"ctxt->nsdb\". To locate member declarations/usages, prefer kb_search_symbols(..., kinds=['FIELD_DECL','VAR_DECL','MACRO_DEFINITION']) and\n"
         "  inspect the parent struct body.\n"
         "- When you have a concrete fix for the V1-origin code slice (functions/macros/consts/decls; often inside __revert_*), update the patch bundle slice:\n"
-        "  call make_error_patch_override(patch_path, file_path, line_number, new_func_code) to generate an override diff,\n"
-        "  then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
-        "  This tool rewrites the patch bundle diff (it does not edit source files directly); do NOT modify V2 type definitions.\n"
-        "- After generating a patch (make_error_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
+        "  - For mapped-slice rewrites: call make_error_patch_override(patch_path, file_path, line_number, new_func_code).\n"
+        "  - For undeclared symbol/type/macro issues: call make_extra_patch_override(patch_path, file_path, symbol_name) to extend the file's `_extra_*` hunk.\n"
+        "  Then call ossfuzz_apply_patch_and_test(project, commit, patch_path, patch_override_paths=[patch_text.artifact_path]).\n"
+        "  These tools rewrite the patch bundle diff (they do not edit source files directly); do NOT modify V2 type definitions.\n"
+        "- After generating a patch (make_error_patch_override or make_extra_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.\n"
         "- If a missing token is likely a macro and search_definition returns nothing, use kb_search_symbols(kinds=['MACRO_DEFINITION']).\n\n"
         "- Macro/decl hunks: syntax errors like \"expected '}'\" can be caused by a macro body referencing undefined\n"
         "  placeholder macros (e.g. a slice defines `MAKE_HANDLER(... out EMPTY_ICONV EMPTY_UCONV ...)` but does not\n"
@@ -3646,6 +3799,40 @@ def _run_langgraph(
                         },
                     }
 
+                undeclared_symbol = _extract_undeclared_symbol_name(st)
+                if (
+                    undeclared_symbol
+                    and undeclared_symbol.startswith("__revert_")
+                    and not _has_tool_call(st, "make_extra_patch_override")
+                ):
+                    if remaining < 2:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Not enough remaining tool steps to generate and test an extra patch override.",
+                                "summary": "Stopped before patch generation.",
+                                "next_step": (
+                                    "Increase --max-steps (need at least 2 remaining steps: make_extra_patch_override -> ossfuzz_apply_patch_and_test)."
+                                ),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+                    forced_extra: Decision = {
+                        "type": "tool",
+                        "thought": "Undeclared symbol/type detected: add a forward declaration/define in the file's _extra_* hunk (deterministic extra patch strategy).",
+                        "tool": "make_extra_patch_override",
+                        "args": {
+                            "patch_path": st.patch_path,
+                            "file_path": file_path,
+                            "symbol_name": undeclared_symbol,
+                            "version": "v1",
+                        },
+                    }
+                    _validate_tool_decision(forced_extra)
+                    return {"state": st, "pending": forced_extra}
+
                 # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
                 if last_tool != "read_artifact":
                     if remaining < 3:
@@ -3952,6 +4139,11 @@ def _run_langgraph(
                             },
                         }
 
+        forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
+        if forced_undeclared:
+            _validate_tool_decision(forced_undeclared)
+            return {"state": st, "pending": forced_undeclared}
+
         forced_macro = _macro_define_guardrail_for_override(st, decision)
         if forced_macro:
             _validate_tool_decision(forced_macro)
@@ -3960,7 +4152,7 @@ def _run_langgraph(
         # Enforce tool ordering: analysis first, patching last.
         remaining = cfg.max_steps - len(st.steps)
         tool = str(decision.get("tool", "")).strip()
-        if tool in {"read_artifact", "make_error_patch_override"}:
+        if tool in {"read_artifact", "make_error_patch_override", "make_extra_patch_override"}:
             prereq = _next_patch_prereq_tool(st)
             if prereq:
                 _validate_tool_decision(prereq)
@@ -4117,6 +4309,46 @@ def _run_langgraph(
                     st.patch_override_paths = [patch_text_path]
             elif patch_text_path:
                 st.patch_override_paths = [patch_text_path]
+        if obs.ok and obs.tool == "make_extra_patch_override":
+            st.patch_result = obs.output if isinstance(obs.output, dict) else None
+            st.pending_patch = None
+
+            patch_text = ""
+            patch_text_path = ""
+            extra_patch_key = ""
+            if isinstance(st.patch_result, dict):
+                extra_patch_key = str(st.patch_result.get("patch_key", "") or "").strip()
+                pt = st.patch_result.get("patch_text")
+                if isinstance(pt, dict):
+                    patch_text_path = str(pt.get("artifact_path", "") or "").strip()
+                    if patch_text_path:
+                        try:
+                            patch_text = _read_text(patch_text_path)
+                        except Exception:
+                            patch_text = ""
+                elif isinstance(pt, str):
+                    patch_text = pt
+
+            has_patch = bool(patch_text.strip()) or bool(patch_text_path)
+            if not has_patch:
+                # Tool ran but did not emit an override diff (e.g. symbol not found); do not trigger OSS-Fuzz test.
+                st.patch_generated = False
+            else:
+                st.patch_generated = True
+
+            if patch_text.strip() and extra_patch_key:
+                effective_path, effective_err = _write_effective_patch_bundle(
+                    st,
+                    patch_key=extra_patch_key,
+                    patch_text=patch_text,
+                )
+                if effective_path and not effective_err:
+                    st.patch_path = effective_path
+                    st.patch_override_paths = []
+                elif patch_text_path and patch_text_path not in st.patch_override_paths:
+                    st.patch_override_paths.append(patch_text_path)
+            elif patch_text_path and patch_text_path not in st.patch_override_paths:
+                st.patch_override_paths.append(patch_text_path)
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
             if obs.ok:
