@@ -175,6 +175,89 @@ ordered = [x.get("patch_key") for x in (out.get("per_hunk") or [])]
 assert ordered[:2] == ["p_high", "p_low"], ordered
 PY
 
+# Collect override diffs from agent_stdout steps (not just next_step) so we don't miss a main-hunk
+# make_error_patch_override when the run ends on a make_extra_patch_override.
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import json
+import os
+import pickle
+import sys
+from pathlib import Path
+
+tmp_dir = Path(sys.argv[1]).resolve()
+
+sys.path.insert(0, str(Path.cwd() / "script"))
+from migration_tools.types import PatchInfo  # noqa: E402
+
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+import multi_agent  # noqa: E402
+
+bundle_path = tmp_dir / "bundle_override_steps.patch2"
+patch_text = "diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1 +1 @@\n-old\n+new\n"
+patches = {
+    "p_main": PatchInfo(
+        file_path_old="a.c",
+        file_path_new="a.c",
+        patch_text=patch_text,
+        file_type="source",
+        old_start_line=10,
+        old_end_line=10,
+        new_start_line=100,
+        new_end_line=100,
+    ),
+    "_extra_a.c": PatchInfo(
+        file_path_old="a.c",
+        file_path_new="a.c",
+        patch_text=patch_text,
+        file_type="source",
+        old_start_line=1,
+        old_end_line=1,
+        new_start_line=5,
+        new_end_line=5,
+    ),
+}
+bundle_path.write_bytes(pickle.dumps(patches))
+
+root = tmp_dir / "override_steps_artifacts"
+root.mkdir(parents=True, exist_ok=True)
+art_main = root / "p_main"
+art_extra = root / "_extra_a.c"
+art_main.mkdir(parents=True, exist_ok=True)
+art_extra.mkdir(parents=True, exist_ok=True)
+
+main_diff = art_main / "make_error_patch_override_patch_text_a.c.5.diff"
+extra_diff = art_extra / "make_extra_patch_override_patch_text_a.c_HASH_ROR.diff"
+main_diff.write_text(patch_text, encoding="utf-8")
+extra_diff.write_text(patch_text, encoding="utf-8")
+
+agent_payload = {
+    "type": "final",
+    "summary": "x",
+    "next_step": f"Override diff: {extra_diff}",
+    "steps": [
+        {
+            "decision": {"type": "tool", "tool": "make_error_patch_override", "args": {}},
+            "observation": {"ok": True, "tool": "make_error_patch_override", "args": {}, "output": {"patch_key": "p_main", "patch_text": {"artifact_path": str(main_diff)}}},
+        },
+        {
+            "decision": {"type": "tool", "tool": "make_extra_patch_override", "args": {}},
+            "observation": {"ok": True, "tool": "make_extra_patch_override", "args": {}, "output": {"patch_key": "_extra_a.c", "patch_text": {"artifact_path": str(extra_diff)}}},
+        },
+    ],
+}
+(art_main / "agent_stdout.json").write_text(json.dumps(agent_payload), encoding="utf-8")
+
+results = [{"patch_key": "p_main", "artifacts_dir": str(art_main)}]
+out = multi_agent._collect_final_override_diffs(results, patch_path=str(bundle_path))
+paths = out.get("override_paths") or []
+assert str(main_diff.resolve()) in paths, paths
+assert str(extra_diff.resolve()) in paths, paths
+
+ordered = [x.get("patch_key") for x in (out.get("per_hunk") or [])]
+# Both patch keys should appear, ordered by new_start_line desc (p_main before _extra_a.c).
+assert ordered[:2] == ["p_main", "_extra_a.c"], ordered
+PY
+
 # Merged patch output should not overwrite prior iterations (unique paths).
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
 import os
