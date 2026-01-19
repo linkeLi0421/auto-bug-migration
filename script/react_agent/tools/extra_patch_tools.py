@@ -71,6 +71,269 @@ def _strip_diff_prefix(line: str) -> str:
     return line
 
 
+def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
+    """Return True if the `_extra_*` hunk already provides a definition/decl for symbol_name.
+
+    This must be conservative: a symbol can appear in macro bodies or call sites without being defined.
+    """
+    want = str(symbol_name or "").strip()
+    if not want:
+        return False
+
+    for raw in str(patch_text or "").splitlines():
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        code = _strip_diff_prefix(raw).rstrip()
+        stripped = code.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith(("/*", "//")):
+            continue
+
+        # Macros: only treat as defined if we see a matching '#define NAME ...' line.
+        m = re.match(r"^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b", stripped)
+        if m:
+            if m.group(1) == want:
+                return True
+            # Other macros can reference `want` in their bodies; do not treat as a definition.
+            continue
+
+        # Do not treat macro continuation/body lines as definitions (they typically end with '\').
+        if stripped.rstrip().endswith("\\"):
+            continue
+
+        # Function prototypes/defs at file scope.
+        if not stripped.startswith("#"):
+            fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
+            if fn_pat.search(stripped) and not _looks_like_statement(stripped):
+                if stripped.rstrip().endswith(";") or "{" in stripped:
+                    return True
+
+        # Variable/type declarations at file scope.
+        ident_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}(?![A-Za-z0-9_])")
+        if not stripped.startswith("#") and stripped.rstrip().endswith(";") and ident_pat.search(stripped):
+            return True
+        if stripped.startswith("typedef") and ident_pat.search(stripped):
+            return True
+        if re.match(rf"^(?:struct|enum|union)\s+{re.escape(want)}\b", stripped):
+            return True
+
+    return False
+
+
+def _is_header_path(file_path: str) -> bool:
+    suffix = Path(str(file_path or "")).suffix.lower()
+    return suffix in {".h", ".hh", ".hpp", ".hxx"}
+
+
+def _kb_all_candidates(agent_tools: Any, *, symbol: str, version: str, max_nodes: int = 200) -> List[dict]:
+    ver = str(version or "").strip().lower()
+    if ver not in {"v1", "v2"}:
+        return []
+    name = str(symbol or "").strip()
+    if not name:
+        return []
+    kb_index = getattr(agent_tools, "kb_index", None)
+    if kb_index is None:
+        return []
+
+    try:
+        nodes = (kb_index.query_all(name) or {}).get(ver, [])
+    except Exception:
+        nodes = []
+    nodes = [n for n in nodes if isinstance(n, dict)]
+
+    candidates: List[dict] = []
+    seen: set[str] = set()
+    for n in nodes[: max(0, int(max_nodes or 0))]:
+        for cand in [n] + list(kb_index.related_definition_candidates(n, ver, max_depth=3) or []):
+            if not isinstance(cand, dict):
+                continue
+            k = _kb_node_key(cand)
+            if k in seen:
+                continue
+            seen.add(k)
+            candidates.append(cand)
+    return candidates
+
+
+def _kb_pick_kind_node(agent_tools: Any, *, symbol: str, version: str, kind: str) -> Optional[dict]:
+    want_kind = str(kind or "").strip()
+    if not want_kind:
+        return None
+    candidates = _kb_all_candidates(agent_tools, symbol=symbol, version=version)
+    filtered = [c for c in candidates if str(c.get("kind", "") or "").strip() == want_kind]
+    if not filtered:
+        return None
+
+    def rank(node: dict) -> Tuple[int, int, int, int, int]:
+        fp, ln, col = _kb_node_location_tuple(node)
+        return (
+            1 if _is_header_path(fp) else 0,
+            _kb_node_extent_lines(node),
+            1 if str(node.get("spelling", "") or "").strip() == str(symbol or "").strip() else 0,
+            -ln,
+            -col,
+        )
+
+    return max(filtered, key=rank)
+
+
+_TYPEDEF_STRUCT_ALIAS_RE = re.compile(
+    r"^\s*typedef\s+struct\s+(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;\s*$"
+)
+
+
+def _opaque_ptr_type_for_typedef(agent_tools: Any, *, typedef_name: str, version: str = "v2") -> str:
+    """Return a pointer type name if typedef_name is opaque in the requested version.
+
+    Heuristic: if `typedef struct TAG T;` exists but `struct TAG` is not defined in a header file in this version,
+    treat T as opaque and prefer using a pointer (`TPtr` when available, else `T *`).
+    """
+    ver = str(version or "").strip().lower()
+    if ver not in {"v1", "v2"}:
+        ver = "v2"
+    name = str(typedef_name or "").strip()
+    if not name:
+        return ""
+
+    # Locate the typedef declaration for T.
+    td = _kb_pick_kind_node(agent_tools, symbol=name, version=ver, kind="TYPEDEF_DECL")
+    if td is None:
+        return ""
+    source_manager = getattr(agent_tools, "source_manager", None)
+    if source_manager is None:
+        return ""
+    td_code = str(source_manager.get_function_code(td, ver) or "").replace("\r\n", "\n").replace("\r", "\n")
+    td_line = next((l for l in td_code.splitlines() if str(l).strip()), "")
+    if not td_line:
+        return ""
+
+    # If the typedef itself defines the struct body, it is not opaque.
+    if "{" in td_code and "}" in td_code:
+        return ""
+
+    m = _TYPEDEF_STRUCT_ALIAS_RE.match(td_line)
+    if not m or str(m.group("name") or "") != name:
+        return ""
+    tag = str(m.group("tag") or "").strip()
+    if not tag:
+        return ""
+
+    # If the struct definition is available in a header, treat it as non-opaque.
+    struct_header_defs = False
+    for q in (f"struct {tag}", tag):
+        for cand in _kb_all_candidates(agent_tools, symbol=q, version=ver):
+            if str(cand.get("kind", "") or "").strip() != "STRUCT_DECL":
+                continue
+            fp, _, _ = _kb_node_location_tuple(cand)
+            if not _is_header_path(fp):
+                continue
+            code = str(source_manager.get_function_code(cand, ver) or "")
+            if "{" in code and "}" in code:
+                struct_header_defs = True
+                break
+        if struct_header_defs:
+            break
+    if struct_header_defs:
+        return ""
+
+    # Prefer a conventional pointer typedef (e.g. xmlMutexPtr) if it exists.
+    ptr_name = f"{name}Ptr"
+    ptr_td = _kb_pick_kind_node(agent_tools, symbol=ptr_name, version=ver, kind="TYPEDEF_DECL")
+    if ptr_td is not None:
+        return ptr_name
+    return f"{name} *"
+
+
+def _parse_simple_var_decl(line: str) -> Optional[Tuple[str, str]]:
+    """Parse a simple file-scope var declaration line into (type_name, var_name)."""
+    text = str(line or "").strip()
+    if not text or not text.endswith(";"):
+        return None
+    if text.startswith("#"):
+        return None
+    if "(" in text or ")" in text:
+        return None
+    if "{" in text or "}" in text:
+        return None
+    if "=" in text:
+        return None
+    if "[" in text or "]" in text:
+        return None
+
+    body = text[:-1].strip()
+    # Normalize '*' tokens to make pointer detection easy.
+    tokens = body.replace("*", " * ").split()
+    if len(tokens) < 2:
+        return None
+    var_name = tokens[-1]
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", var_name):
+        return None
+
+    # If the variable is already a pointer, do not rewrite.
+    if len(tokens) >= 2 and tokens[-2] == "*":
+        return None
+
+    type_name = tokens[-2]
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", type_name):
+        return None
+    return type_name, var_name
+
+
+def _rewrite_opaque_var_decl_line(agent_tools: Any, *, code_line: str, version_for_type: str = "v2") -> str:
+    parsed = _parse_simple_var_decl(code_line)
+    if not parsed:
+        return code_line
+    type_name, var_name = parsed
+    ptr_type = _opaque_ptr_type_for_typedef(agent_tools, typedef_name=type_name, version=version_for_type)
+    if not ptr_type:
+        return code_line
+
+    # Preserve leading indentation (rare in file-scope decls, but avoid changing formatting).
+    prefix = code_line[: len(code_line) - len(code_line.lstrip())]
+    # Preserve any leading qualifiers before the type token.
+    body = code_line.strip()[:-1].strip()
+    tokens = body.replace("*", " * ").split()
+    # Replace only the final type token (the one immediately before var_name).
+    if len(tokens) < 2 or tokens[-1] != var_name:
+        return code_line
+    tokens[-2] = ptr_type
+    rewritten = " ".join(tokens) + ";"
+    return prefix + rewritten
+
+
+def _rewrite_existing_opaque_var_decl_in_extra_hunk(agent_tools: Any, *, patch_text: str, symbol_name: str) -> str:
+    """If the extra hunk already defines symbol_name with an unsafe by-value opaque type, rewrite it."""
+    want = str(symbol_name or "").strip()
+    if not want or not patch_text.strip():
+        return ""
+
+    lines = str(patch_text or "").splitlines()
+    updated = list(lines)
+    changed = False
+    ident_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}(?![A-Za-z0-9_])")
+    for i, raw in enumerate(lines):
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        code = _strip_diff_prefix(raw).rstrip()
+        stripped = code.strip()
+        if not stripped or not stripped.endswith(";"):
+            continue
+        if not ident_pat.search(stripped):
+            continue
+        rewritten = _rewrite_opaque_var_decl_line(agent_tools, code_line=stripped, version_for_type="v2")
+        if rewritten != stripped:
+            updated[i] = "-" + rewritten
+            changed = True
+            break
+
+    if not changed:
+        return ""
+    updated = _recompute_hunk_headers(updated)
+    return "\n".join(updated).rstrip("\n") + "\n"
+
+
 def _extract_c_declaration_from_function_code(code: str) -> List[str]:
     """Best-effort extraction of a function declaration/prototype from a C function body."""
     text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -512,7 +775,31 @@ def make_extra_patch_override(
         }
 
     existing = str(getattr(patch, "patch_text", "") or "")
-    if symbol in existing:
+    if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
+        # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.
+        updated_existing = ""
+        if agent_tools is not None:
+            updated_existing = _rewrite_existing_opaque_var_decl_in_extra_hunk(agent_tools, patch_text=existing, symbol_name=symbol)
+        if updated_existing:
+            store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
+            ref = store.write_text(
+                name=f"make_extra_patch_override_patch_text_{_normalize_file_basename(file_path_s)}_{symbol}",
+                text=updated_existing,
+                ext=".diff",
+            )
+            return {
+                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
+                "file_path": file_path_s,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "insert_kind": "rewrite_existing_opaque_var_decl",
+                "inserted_code": "",
+                "patch_text": ref.to_dict(),
+                "patch_text_truncated": False,
+                "patch_text_lines_total": len(updated_existing.splitlines()),
+                "note": "Symbol already present, but rewrote an unsafe by-value opaque type declaration in the extra hunk.",
+            }
+
         return {
             "patch_path": str(Path(patch_path_s).expanduser().resolve()),
             "file_path": file_path_s,
@@ -580,6 +867,14 @@ def make_extra_patch_override(
             "patch_text": "",
             "note": "Failed to locate a definition/decl for the symbol (bundle+KB).",
         }
+
+    # If we are inserting a by-value global of an opaque type (common with typedef'd structs),
+    # rewrite it to a pointer form to avoid incomplete-type build errors.
+    if agent_tools is not None and len(inserted_lines) == 1:
+        rewritten = _rewrite_opaque_var_decl_line(agent_tools, code_line=str(inserted_lines[0] or "").rstrip(), version_for_type="v2")
+        if rewritten != str(inserted_lines[0] or "").rstrip():
+            inserted_lines = [rewritten]
+            insert_kind = (insert_kind + ":opaque_by_value_rewritten_to_ptr").strip(":")
 
     # Ensure a blank line separator before the inserted block for readability.
     block_lines = [""] + [l.rstrip() for l in inserted_lines if l is not None]

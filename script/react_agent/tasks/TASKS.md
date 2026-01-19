@@ -70,3 +70,21 @@
   - [x] Update prompt fragments + docs to stop mentioning `kb_search_symbols` (`system_macro.txt`, `README.md`, `AGENTS.md`).
   - [x] Update regression tests and run `bash script/react_agent/test_langgraph_agent.sh`.
   - [x] Post reminder to `#report`.
+
+[x] multi_agent: include all required override diffs in `summary.json`
+  - [x] Parse `agent_stdout.json.steps` to collect override diff artifacts from `make_error_patch_override` and `make_extra_patch_override` (do not rely on only `next_step`).
+  - [x] When a hunk run ends on `make_extra_patch_override`, still include the hunk’s latest `make_error_patch_override` diff (e.g. `.../209443265285/make_error_patch_override_patch_text_dict.c.5.diff`).
+  - [x] Pick one “latest” override diff per patch_key (mtime + numeric suffix) and sort by `PatchInfo.new_start_line(desc)` for bottom-up application.
+  - [x] Add regression test in `script/react_agent/test_multi_agent.sh`.
+  - [x] Run `bash script/react_agent/test_multi_agent.sh`.
+  - [x] Post reminder to `#report`.
+
+[x] make_extra_patch_override: avoid inserting opaque-by-value globals (e.g. `xmlMutex`)
+  - [x] Detect when the chosen `VAR_DECL` defines an object of an opaque typedef in V2 (common pattern: `typedef struct TAG T;` where `struct TAG` is only defined in a `.c` file).
+  - [x] Rewrite inserted code to a pointer form (prefer `TPtr` typedef when it exists, else `T *`) to avoid errors like “tentative definition has type 'T' that is never completed”.
+  - [x] If the symbol is already present in the `_extra_*` hunk but uses an unsafe by-value opaque type, rewrite that existing line and emit a new override diff (do not no-op).
+  - [x] Add regression tests for:
+    - [x] initial insertion rewrite (v1 var decl → v2 pointer decl)
+    - [x] “already present” rewrite (upgrade existing unsafe decl)
+  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
+  - [x] Post reminder to `#report`.

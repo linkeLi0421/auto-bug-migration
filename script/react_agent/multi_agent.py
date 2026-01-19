@@ -110,6 +110,71 @@ def _extract_override_diff_from_agent_stdout(agent_stdout_path: Path) -> str:
     return ""
 
 
+def _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path: Path) -> List[Dict[str, Any]]:
+    """Extract override diff artifacts emitted by patch tools from an agent_stdout.json file.
+
+    We prefer parsing tool observations over next_step text because patch-scope agents may generate multiple
+    override diffs (e.g. a make_error_patch_override for the primary hunk plus make_extra_patch_override
+    diffs for `_extra_*` hunks). next_step typically only reports the *last* override diff.
+    """
+    try:
+        payload = json.loads(agent_stdout_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    steps = payload.get("steps")
+    if not isinstance(steps, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    def normalize_path(value: Any) -> str:
+        p = str(value or "").strip()
+        if not p:
+            return ""
+        path = Path(p).expanduser()
+        if not path.is_absolute():
+            # Most runs emit absolute artifact paths; best-effort resolve relative ones from the cwd.
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+        return str(path) if path.is_file() else ""
+
+    def maybe_add(output: Any, *, method: str) -> None:
+        if not isinstance(output, dict):
+            return
+        patch_key = str(output.get("patch_key", "") or "").strip()
+        patch_text = output.get("patch_text")
+        override_path = ""
+        if isinstance(patch_text, dict):
+            override_path = normalize_path(patch_text.get("artifact_path"))
+        elif isinstance(patch_text, str):
+            # Some "no change" cases return the current patch text as a string. That's not an override diff.
+            override_path = normalize_path(patch_text)
+        if not override_path:
+            return
+        if not patch_key:
+            # Last resort: infer from directory name (expected to match patch_key for override diffs).
+            patch_key = Path(override_path).resolve().parent.name
+        if not patch_key:
+            return
+        out.append({"patch_key": patch_key, "override_diff": override_path, "method": method})
+
+    for idx, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        obs = step.get("observation")
+        if not isinstance(obs, dict) or obs.get("ok") is not True:
+            continue
+        tool = str(obs.get("tool", "") or "").strip()
+        if tool not in {"make_error_patch_override", "make_extra_patch_override"}:
+            continue
+        maybe_add(obs.get("output"), method=f"agent_stdout.steps:{tool}:{idx}")
+
+    return out
+
+
 def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path]:
     patterns = [
         "make_error_patch_override_patch_text_*.diff",
@@ -139,8 +204,7 @@ def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path
 
 
 def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: str) -> Dict[str, Any]:
-    override_paths: List[str] = []
-    per_hunk: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
     missing: List[str] = []
     sort_err = ""
     patch_key_new_start_line: Dict[str, int] = {}
@@ -169,37 +233,87 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
             missing.append(patch_key)
             continue
 
-        chosen = ""
-        method = ""
+        found_any = False
         agent_stdout_path = artifacts_dir / "agent_stdout.json"
         if agent_stdout_path.is_file():
-            chosen = _extract_override_diff_from_agent_stdout(agent_stdout_path)
-            if chosen:
-                method = "agent_stdout.next_step"
+            extracted = _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path)
+            if extracted:
+                candidates.extend(extracted)
+                found_any = True
+            else:
+                # Fallback: parse the override diff path from next_step text (older agent outputs).
+                chosen = _extract_override_diff_from_agent_stdout(agent_stdout_path)
+                if chosen:
+                    inferred_key = Path(chosen).resolve().parent.name
+                    candidates.append(
+                        {
+                            "patch_key": inferred_key or patch_key,
+                            "override_diff": str(Path(chosen).resolve()),
+                            "method": "agent_stdout.next_step",
+                        }
+                    )
+                    found_any = True
 
-        if not chosen:
-            latest = _latest_make_error_patch_override_diff(artifacts_dir)
-            if latest is not None:
-                chosen = str(latest.resolve())
-                method = "glob_latest"
+        # Always include the latest make_error_patch_override diff in the per-hunk artifact dir if present;
+        # many patch-scope runs end with a make_extra_patch_override, so next_step may not mention the
+        # main hunk's last make_error_patch_override diff.
+        latest = _latest_make_error_patch_override_diff(artifacts_dir)
+        if latest is not None:
+            candidates.append(
+                {"patch_key": patch_key, "override_diff": str(latest.resolve()), "method": "glob_latest"}
+            )
+            found_any = True
 
-        if not chosen:
+        if not found_any:
             missing.append(patch_key)
             continue
 
-        override_paths.append(chosen)
-        per_hunk.append(
-            {
-                "patch_key": patch_key,
-                "override_diff": chosen,
-                "method": method,
-                "new_start_line": patch_key_new_start_line.get(patch_key, 0),
-            }
-        )
+    # Pick the best (latest) override per patch_key.
+    per_hunk: List[Dict[str, Any]] = []
+    by_key: Dict[str, Dict[str, Any]] = {}
+
+    def version_suffix(p: Path) -> int:
+        name = p.name
+        if not name.endswith(".diff"):
+            return 0
+        base = name[: -len(".diff")]
+        last = base.rsplit(".", 1)[-1]
+        if last.isdigit():
+            try:
+                return int(last)
+            except ValueError:
+                return 0
+        return 0
+
+    def score(path: str) -> Tuple[float, int, str]:
+        try:
+            p = Path(path).expanduser().resolve()
+            st = p.stat()
+            return (float(st.st_mtime), version_suffix(p), str(p))
+        except Exception:
+            return (0.0, 0, str(path))
+
+    for c in candidates:
+        key = str(c.get("patch_key", "") or "").strip()
+        path = str(c.get("override_diff", "") or "").strip()
+        if not key or not path:
+            continue
+        rp = str(Path(path).expanduser().resolve())
+        existing = by_key.get(key)
+        if existing is None or score(rp) > score(str(existing.get("override_diff", "") or "")):
+            by_key[key] = {"patch_key": key, "override_diff": rp, "method": str(c.get("method", "") or "").strip()}
+
+    for key, item in by_key.items():
+        item["new_start_line"] = patch_key_new_start_line.get(key, 0)
+        per_hunk.append(item)
 
     # Sort like script/revert_patch_test.py: newer hunks first (bottom-up application).
     per_hunk.sort(key=lambda item: (-int(item.get("new_start_line", 0) or 0), str(item.get("patch_key", "") or "")))
-    override_paths = [str(item.get("override_diff", "") or "").strip() for item in per_hunk if str(item.get("override_diff", "") or "").strip()]
+    override_paths = [
+        str(item.get("override_diff", "") or "").strip()
+        for item in per_hunk
+        if str(item.get("override_diff", "") or "").strip()
+    ]
 
     # De-dup while preserving order.
     seen: set[str] = set()

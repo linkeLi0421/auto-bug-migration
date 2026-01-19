@@ -310,6 +310,29 @@ with tempfile.TemporaryDirectory() as td_raw:
     }
     (kb_v1 / "dict.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
 
+    # V2 KB: xmlMutex is an opaque typedef (struct body not in headers) but provides xmlMutexPtr.
+    v2_typedefs = [
+        {
+            "kind": "TYPEDEF_DECL",
+            "spelling": "xmlMutex",
+            "location": {"file": "threads.h", "line": 1, "column": 1},
+            "extent": {"start": {"file": "threads.h", "line": 1, "column": 1}, "end": {"file": "threads.h", "line": 1, "column": 40}},
+        },
+        {
+            "kind": "TYPEDEF_DECL",
+            "spelling": "xmlMutexPtr",
+            "location": {"file": "threads.h", "line": 2, "column": 1},
+            "extent": {"start": {"file": "threads.h", "line": 2, "column": 1}, "end": {"file": "threads.h", "line": 2, "column": 40}},
+        },
+        {
+            "kind": "STRUCT_DECL",
+            "spelling": "_xmlMutex",
+            "location": {"file": "threads.c", "line": 1, "column": 1},
+            "extent": {"start": {"file": "threads.c", "line": 1, "column": 1}, "end": {"file": "threads.c", "line": 6, "column": 1}},
+        },
+    ]
+    (kb_v2 / "threads.h_analysis.json").write_text(json.dumps(v2_typedefs), encoding="utf-8")
+
     # Minimal sources: provide the VAR_DECL at line 907.
     src_v1 = td / "src_v1"
     src_v2 = td / "src_v2"
@@ -321,6 +344,8 @@ with tempfile.TemporaryDirectory() as td_raw:
     text = "\n".join(lines) + "\n"
     (src_v1 / "dict.c").write_text(text, encoding="utf-8")
     (src_v2 / "dict.c").write_text(text, encoding="utf-8")
+    (src_v2 / "threads.h").write_text("typedef struct _xmlMutex xmlMutex;\ntypedef xmlMutex *xmlMutexPtr;\n", encoding="utf-8")
+    (src_v2 / "threads.c").write_text("struct _xmlMutex {\n  int x;\n};\n", encoding="utf-8")
 
     tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
 
@@ -361,14 +386,220 @@ with tempfile.TemporaryDirectory() as td_raw:
     )
     assert out.get("patch_key") == extra_key, out
     inserted = str(out.get("inserted_code") or "")
-    assert "static xmlMutex xmlRngMutex;" in inserted, inserted
+    assert "static xmlMutexPtr xmlRngMutex;" in inserted, inserted
     assert "xmlInitMutex" not in inserted, inserted
     ref = out.get("patch_text") or {}
     p = Path(str(ref.get("artifact_path") or "")).resolve()
     assert p.is_file(), p
     text_out = p.read_text(encoding="utf-8", errors="replace")
-    assert "static xmlMutex xmlRngMutex;" in text_out, text_out
+    assert "static xmlMutexPtr xmlRngMutex;" in text_out, text_out
     assert "xmlInitMutex" not in text_out, text_out
+
+print("OK")
+PY
+
+# Extra patch override tool: if the symbol is already present in the `_extra_*` hunk but the declaration
+# uses an unsafe by-value opaque typedef (e.g. `static xmlMutex xmlRngMutex;` in V2), rewrite it to a
+# pointer form and emit an override diff (do not no-op).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    v2_typedefs = [
+        {
+            "kind": "TYPEDEF_DECL",
+            "spelling": "xmlMutex",
+            "location": {"file": "threads.h", "line": 1, "column": 1},
+            "extent": {
+                "start": {"file": "threads.h", "line": 1, "column": 1},
+                "end": {"file": "threads.h", "line": 1, "column": 40},
+            },
+        },
+        {
+            "kind": "TYPEDEF_DECL",
+            "spelling": "xmlMutexPtr",
+            "location": {"file": "threads.h", "line": 2, "column": 1},
+            "extent": {
+                "start": {"file": "threads.h", "line": 2, "column": 1},
+                "end": {"file": "threads.h", "line": 2, "column": 40},
+            },
+        },
+        {
+            "kind": "STRUCT_DECL",
+            "spelling": "_xmlMutex",
+            "location": {"file": "threads.c", "line": 1, "column": 1},
+            "extent": {"start": {"file": "threads.c", "line": 1, "column": 1}, "end": {"file": "threads.c", "line": 6, "column": 1}},
+        },
+    ]
+    (kb_v2 / "threads.h_analysis.json").write_text(json.dumps(v2_typedefs), encoding="utf-8")
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+    (src_v2 / "threads.h").write_text("typedef struct _xmlMutex xmlMutex;\ntypedef xmlMutex *xmlMutexPtr;\n", encoding="utf-8")
+    (src_v2 / "threads.c").write_text("struct _xmlMutex {\n  int x;\n};\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    extra_key = "_extra_dict.c"
+    extra_patch_text = (
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -1,2 +1,0 @@\n"
+        "-/* extra decls */\n"
+        "-static xmlMutex xmlRngMutex;\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=3,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({extra_key: extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="xmlRngMutex",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    assert out.get("insert_kind") == "rewrite_existing_opaque_var_decl", out
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    assert "-static xmlMutexPtr xmlRngMutex;" in text_out, text_out
+    assert "-static xmlMutex xmlRngMutex;" not in text_out, text_out
+
+print("OK")
+PY
+
+# Extra patch override tool: do not treat macro *usage* as a definition. If a macro token appears
+# inside other macro bodies (e.g. HASH_FINISH uses HASH_ROR) but isn't defined, we should still
+# insert the real definition via KB.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    macro_node = {
+        "kind": "MACRO_DEFINITION",
+        "spelling": "HASH_ROR",
+        "location": {"file": "dict.c", "line": 1, "column": 1},
+        "extent": {"start": {"file": "dict.c", "line": 1, "column": 1}, "end": {"file": "dict.c", "line": 1, "column": 80}},
+    }
+    (kb_v1 / "dict.c_analysis.json").write_text(json.dumps([macro_node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+    (src_v1 / "dict.c").write_text("#define HASH_ROR(x,n) ((x) >> (n) | ((x) & 0xFFFFFFFF) << (32 - (n)))\n", encoding="utf-8")
+    (src_v2 / "dict.c").write_text("/* v2 */\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    extra_key = "_extra_dict.c"
+    bundle_path = td / "bundle.patch2"
+    # Existing extra hunk references HASH_ROR but does not define it.
+    existing = (
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -1,2 +1,0 @@\n"
+        "-#define HASH_FINISH(h1, h2) do { (h2) += HASH_ROR((h1), 6); } while (0)\n"
+        "-/* extra */\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=existing,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({extra_key: extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="HASH_ROR",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    inserted = str(out.get("inserted_code") or "")
+    assert inserted.startswith("#define HASH_ROR"), inserted
+    ref = out.get("patch_text") or {}
+    assert isinstance(ref, dict) and ref.get("artifact_path"), out
+    text_out = Path(str(ref.get("artifact_path"))).read_text(encoding="utf-8", errors="replace")
+    assert "#define HASH_ROR" in text_out, text_out
 
 print("OK")
 PY
