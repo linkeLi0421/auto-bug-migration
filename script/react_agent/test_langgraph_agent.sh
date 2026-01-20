@@ -126,6 +126,12 @@ errs = iter_compiler_errors(log, snippet_lines=0)
 assert errs and errs[0].get("level") == "warning", errs
 assert errs[0].get("file") == "/src/libxml2/dict.c", errs
 assert "__revert_e11519_xmlDictHashName" in str(errs[0].get("msg") or ""), errs
+
+log2 = "/src/libxml2/parser.c:16941:1: warning: no previous prototype for function '__revert_e11519_xmlParserNsCreate' [-Wmissing-prototypes]\\n"
+errs2 = iter_compiler_errors(log2, snippet_lines=0)
+assert errs2 and errs2[0].get("level") == "warning", errs2
+assert errs2[0].get("file") == "/src/libxml2/parser.c", errs2
+assert "__revert_e11519_xmlParserNsCreate" in str(errs2[0].get("msg") or ""), errs2
 print("OK")
 PY
 
@@ -1185,6 +1191,64 @@ forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
 assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+print("OK")
+PY
+
+# Missing-prototype guardrail: for -Wmissing-prototypes warnings ("no previous prototype for function ..."),
+# force make_extra_patch_override(symbol_name=<function>) so the prototype is inserted into `_extra_*`.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _missing_prototype_extra_patch_guardrail  # noqa: E402
+
+warn = "/src/libxml2/parser.c:16941:1: warning: no previous prototype for function '__revert_e11519_xmlParserNsCreate' [-Wmissing-prototypes]"
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=warn,
+    snippet="",
+)
+state.grouped_errors = [{"raw": warn, "file": "/src/libxml2/parser.c", "line": 16941, "col": 1, "level": "warning"}]
+state.steps = [
+    {
+        "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
+        "observation": {"ok": True, "tool": "get_error_patch_context", "args": {}, "output": {"patch_key": "p"}, "error": None},
+    },
+]
+state.step_history = list(state.steps)
+
+decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "rewrite function", "args": {}}
+forced = _missing_prototype_extra_patch_guardrail(state, decision)
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
+assert forced.get("args", {}).get("symbol_name") == "__revert_e11519_xmlParserNsCreate", forced
+assert forced.get("args", {}).get("file_path") == "/src/libxml2/parser.c", forced
+
+print("OK")
+PY
+
+# Patch-scope ordering: within a patch hunk, prioritize warnings (and missing-prototype warnings first)
+# before errors when picking the next grouped error to solve.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _prioritize_warnings_within_hunk  # noqa: E402
+
+errs = [
+    {"raw": "E", "level": "error", "msg": "something bad"},
+    {"raw": "W1", "level": "warning", "msg": "call to undeclared function '__revert_x' [-Wimplicit-function-declaration]"},
+    {"raw": "W2", "level": "warning", "msg": "no previous prototype for function '__revert_y' [-Wmissing-prototypes]"},
+]
+out = _prioritize_warnings_within_hunk(errs)
+assert [e.get("raw") for e in out] == ["W2", "W1", "E"], out
 print("OK")
 PY
 
