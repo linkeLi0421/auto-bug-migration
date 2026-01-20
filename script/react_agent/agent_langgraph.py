@@ -298,6 +298,24 @@ def _select_function_group_errors(
     return by_sig[chosen], chosen
 
 
+def _prioritize_warnings_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable ordering helper: warnings first, then errors.
+
+    Within warnings, prioritize missing-prototype warnings first (they are deterministic to fix via _extra_* prototypes).
+    """
+    ranked: List[tuple[int, int, int, Dict[str, Any]]] = []
+    for idx, err in enumerate(errors or []):
+        if not isinstance(err, dict):
+            continue
+        level = str(err.get("level", "error") or "error").strip().lower()
+        msg = str(err.get("msg", "") or "")
+        is_warning = level == "warning"
+        is_missing_proto = is_warning and ("no previous prototype for function" in msg)
+        ranked.append((0 if is_warning else 1, 0 if is_missing_proto else 1, idx, err))
+    ranked.sort(key=lambda t: (t[0], t[1], t[2]))
+    return [e for _, _, _, e in ranked]
+
+
 def _summarize_function_groups(
     errors: List[Dict[str, Any]], *, max_groups: int = 12, max_examples_per_group: int = 3
 ) -> tuple[List[Dict[str, Any]], int, bool]:
@@ -1446,7 +1464,9 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
                     item[k] = mapping.get(k)
         enriched.append(item)
 
-    in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
+    in_active = _prioritize_warnings_within_hunk(
+        [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
+    )
     if not in_active:
         return None
 
@@ -2483,6 +2503,46 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
     return None
 
 
+def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Handle -Wmissing-prototypes warnings by inserting a prototype via `_extra_*`.
+
+    In patch-scope mode, prefer make_extra_patch_override to add a file-scope prototype for the reported
+    function (often a generated `__revert_*`), rather than rewriting the function body.
+    """
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    # Only run after patch prereqs (mapping) are satisfied, otherwise let tool ordering drive.
+    if _next_patch_prereq_tool(state) is not None:
+        return None
+
+    sym = _extract_missing_prototype_symbol_name(state)
+    if not sym:
+        return None
+    if _has_make_extra_patch_override_for_symbol(state, sym):
+        return None
+    if (
+        str(decision.get("type", "")).strip() == "tool"
+        and str(decision.get("tool", "")).strip() == "make_extra_patch_override"
+        and isinstance(decision.get("args"), dict)
+        and str((decision.get("args") or {}).get("symbol_name", "")).strip() == sym
+    ):
+        return None
+
+    file_path, _ = _first_error_location(state)
+    if not file_path:
+        return None
+
+    return {
+        "type": "tool",
+        "thought": (
+            f"Missing-prototype warning: add a file-scope prototype for {sym} via the file's _extra_* hunk "
+            "(deterministic extra patch strategy)."
+        ),
+        "tool": "make_extra_patch_override",
+        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": sym, "version": "v1"},
+    }
+
+
 def _macro_lookup_pick_token(state: AgentState) -> str:
     """Pick the most relevant missing macro token for the current macro-expansion snippet."""
     snippet = str(state.snippet or "")
@@ -2634,6 +2694,7 @@ _INCOMPLETE_TYPE_RE = re.compile(
     r"(?:incomplete definition of type|incomplete type|dereferencing pointer to incomplete type|invalid application of 'sizeof' to an incomplete type)\s*'(?P<type>[^']+)'",
     re.IGNORECASE,
 )
+_MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<symbol>[^']+)'", re.IGNORECASE)
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -2712,6 +2773,29 @@ def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
 
     return out
 
+
+def _extract_missing_prototype_symbol_name(state: AgentState) -> str:
+    """Best-effort extraction of a function name from -Wmissing-prototypes warnings."""
+    candidates: List[str] = []
+    for e in state.grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if raw:
+            candidates.append(raw)
+    if str(state.error_line or "").strip():
+        candidates.append(str(state.error_line))
+    if str(state.snippet or "").strip():
+        candidates.append(str(state.snippet))
+
+    for text in candidates:
+        m = _MISSING_PROTOTYPE_RE.search(str(text or ""))
+        if not m:
+            continue
+        sym = str(m.group("symbol") or "").strip()
+        if sym:
+            return sym
+    return ""
 
 def _first_error_location(state: AgentState) -> tuple[str, int]:
     if state.grouped_errors:
@@ -4069,6 +4153,11 @@ def _run_langgraph(
                             },
                         }
 
+        forced_missing_proto = _missing_prototype_extra_patch_guardrail(st, decision)
+        if forced_missing_proto:
+            _validate_tool_decision(forced_missing_proto)
+            return {"state": st, "pending": forced_missing_proto}
+
         forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
         if forced_undeclared:
             _validate_tool_decision(forced_undeclared)
@@ -4521,7 +4610,7 @@ def main(argv: List[str]) -> int:
                     patch_key = focus
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                full_grouped = groups[patch_key]
+                full_grouped = _prioritize_warnings_within_hunk(groups[patch_key])
                 full_grouped_for_history = list(full_grouped)
                 function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
                 grouped_errors = full_grouped

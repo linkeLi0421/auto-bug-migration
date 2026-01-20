@@ -40,3 +40,14 @@
   - [x] Add regression test for the new guardrail.
   - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
   - [x] Post reminder to `#report`.
+
+[x] Handle `-Wmissing-prototypes` warnings (`no previous prototype for function ...`)
+  - [x] Extend `build_log.iter_compiler_errors` to include `warning: no previous prototype for function '...'` diagnostics.
+  - [x] Add a patch-scope guardrail: when the current diagnostic is missing-prototype, force `make_extra_patch_override(symbol_name=<function>)` (prototype insertion) before allowing function rewrites.
+  - [x] Apply a deterministic within-hunk ordering: prioritize warnings (missing-prototype/implicit-decl) before errors when selecting the next `grouped_errors[0]` (both initial patch-scope grouping and auto-loop).
+  - [x] Add regression tests:
+    - [x] build_log warning parsing includes `no previous prototype ...`
+    - [x] guardrail triggers and produces `make_extra_patch_override` for missing-prototype warning
+    - [x] ordering: warnings are selected before errors in patch-scope grouping
+  - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
+  - [x] Post reminder to `#report`.

@@ -62,7 +62,11 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
             if not mw:
                 continue
             msg = str(mw.group("msg") or "")
-            if "undeclared function" not in msg and "implicit declaration of function" not in msg:
+            if (
+                "undeclared function" not in msg
+                and "implicit declaration of function" not in msg
+                and "no previous prototype for function" not in msg
+            ):
                 continue
             level = "warning"
             m = mw
