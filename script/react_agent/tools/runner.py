@@ -113,13 +113,18 @@ class ToolRunner:
                 if not self._agent_tools:
                     return ToolObservation(False, tool, args, output="", error="Tool runner not configured")
                 symbol_name = str(args.get("symbol_name", "")).strip()
-                version = str(args.get("version", "v1")).strip() or "v1"
+                version_raw = str(args.get("version", "v1")).strip() or "v1"
+                version = version_raw.strip().lower()
                 if not symbol_name:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
                 if version not in {"v1", "v2"}:
-                    return ToolObservation(False, tool, args, output="", error="Invalid arg: version (expected v1|v2)")
+                    # Common model mistake: pass a commit hash or patch_key. Default to v2 (target build).
+                    version = "v2"
                 out = self._agent_tools.search_definition(symbol_name, version=version)
-                return ToolObservation(True, tool, {"symbol_name": symbol_name, "version": version}, output=out)
+                args_out: Dict[str, Any] = {"symbol_name": symbol_name, "version": version}
+                if version_raw.strip().lower() != version:
+                    args_out["version_raw"] = version_raw
+                return ToolObservation(True, tool, args_out, output=out)
 
             if tool == "read_file_context":
                 if not self._agent_tools:

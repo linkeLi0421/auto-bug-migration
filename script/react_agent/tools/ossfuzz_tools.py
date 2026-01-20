@@ -169,6 +169,8 @@ def _infer_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
         name = str(parent.name or "").strip()
         if name and name in patch_keys:
             return name
+        if name.startswith("_extra_"):
+            return name
     raise ValueError(
         "Could not infer patch_key for override patch file. "
         "Put override artifacts under a directory named <patch_key> (e.g. data/react_agent_artifacts/<patch_key>/...)."
@@ -211,8 +213,66 @@ def merge_patch_bundle_with_overrides(
         overrides[patch_key] = text
         override_files.append({"patch_key": patch_key, "path": str(p)})
 
+    # If we have override diffs for a patch_key not present in the base bundle (common for brand-new `_extra_*` hunks),
+    # create a new PatchInfo entry so the merged unified diff includes it.
+    for key, text in list(overrides.items()):
+        if key in bundle.patches:
+            continue
+        if not str(key).startswith("_extra_"):
+            continue
+        try:
+            from migration_tools.types import PatchInfo  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to import PatchInfo for new patch_key: {type(exc).__name__}: {exc}") from exc
+
+        old_fp = ""
+        new_fp = ""
+        for line in str(text or "").splitlines():
+            if line.startswith("diff --git "):
+                m = re.match(r"^diff --git a/(?P<old>\\S+) b/(?P<new>\\S+)$", line.strip())
+                if m:
+                    old_fp = str(m.group("old") or "")
+                    new_fp = str(m.group("new") or "")
+                    break
+        if not new_fp:
+            for line in str(text or "").splitlines():
+                if line.startswith("--- "):
+                    old_fp = line[len("--- ") :].strip()
+                    if old_fp.startswith("a/"):
+                        old_fp = old_fp[2:]
+                if line.startswith("+++ "):
+                    new_fp = line[len("+++ ") :].strip()
+                    if new_fp.startswith("b/"):
+                        new_fp = new_fp[2:]
+                if old_fp and new_fp:
+                    break
+        old_fp = str(old_fp or "").strip() or str(new_fp or "").strip()
+        new_fp = str(new_fp or "").strip()
+        if not new_fp or new_fp == "/dev/null":
+            continue
+
+        suffix = Path(new_fp).suffix.lower()
+        file_type = suffix.lstrip(".") if suffix else "unknown"
+        patch = PatchInfo(
+            file_path_old=old_fp,
+            file_path_new=new_fp,
+            patch_text=str(text or "").rstrip("\n") + "\n",
+            file_type=file_type,
+            old_start_line=1,
+            old_end_line=1,
+            new_start_line=1,
+            new_end_line=1,
+            patch_type={"Extra"},
+            old_signature="",
+            dependent_func=set(),
+            hiden_func_dict={},
+        )
+        _update_patchinfo_ranges_from_diff(patch, patch.patch_text)
+        bundle.patches[key] = patch
+
     parts: list[str] = []
-    for key in bundle.keys_sorted:
+    keys_sorted = sorted(bundle.patches.keys(), key=lambda k: (-int(getattr(bundle.patches[k], "new_start_line", 0) or 0), str(k)))
+    for key in keys_sorted:
         patch_text = overrides.get(key, bundle.patches[key].patch_text or "")
         patch_text = str(patch_text or "").rstrip("\n")
         if patch_text:
@@ -326,6 +386,62 @@ def write_patch_bundle_with_overrides(
         patch_key = _infer_patch_key_from_path(p, patch_keys)
         overrides[patch_key] = text
         override_files.append({"patch_key": patch_key, "path": str(p)})
+
+    # Brand-new `_extra_*` keys can appear as override diffs even when the base bundle lacks them; add PatchInfo entries.
+    for key, text in list(overrides.items()):
+        if key in bundle.patches:
+            continue
+        if not str(key).startswith("_extra_"):
+            continue
+        try:
+            from migration_tools.types import PatchInfo  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Failed to import PatchInfo for new patch_key: {type(exc).__name__}: {exc}") from exc
+
+        old_fp = ""
+        new_fp = ""
+        for line in str(text or "").splitlines():
+            if line.startswith("diff --git "):
+                m = re.match(r"^diff --git a/(?P<old>\\S+) b/(?P<new>\\S+)$", line.strip())
+                if m:
+                    old_fp = str(m.group("old") or "")
+                    new_fp = str(m.group("new") or "")
+                    break
+        if not new_fp:
+            for line in str(text or "").splitlines():
+                if line.startswith("--- "):
+                    old_fp = line[len("--- ") :].strip()
+                    if old_fp.startswith("a/"):
+                        old_fp = old_fp[2:]
+                if line.startswith("+++ "):
+                    new_fp = line[len("+++ ") :].strip()
+                    if new_fp.startswith("b/"):
+                        new_fp = new_fp[2:]
+                if old_fp and new_fp:
+                    break
+        old_fp = str(old_fp or "").strip() or str(new_fp or "").strip()
+        new_fp = str(new_fp or "").strip()
+        if not new_fp or new_fp == "/dev/null":
+            continue
+
+        suffix = Path(new_fp).suffix.lower()
+        file_type = suffix.lstrip(".") if suffix else "unknown"
+        patch = PatchInfo(
+            file_path_old=old_fp,
+            file_path_new=new_fp,
+            patch_text=str(text or "").rstrip("\n") + "\n",
+            file_type=file_type,
+            old_start_line=1,
+            old_end_line=1,
+            new_start_line=1,
+            new_end_line=1,
+            patch_type={"Extra"},
+            old_signature="",
+            dependent_func=set(),
+            hiden_func_dict={},
+        )
+        _update_patchinfo_ranges_from_diff(patch, patch.patch_text)
+        bundle.patches[key] = patch
 
     for key, text in overrides.items():
         patch = bundle.patches.get(key)
