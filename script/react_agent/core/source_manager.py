@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -12,6 +14,7 @@ class SourceManager:
         self.local_v1_path = Path(local_v1_path).resolve()
         self.local_v2_path = Path(local_v2_path).resolve()
         self._include_cache: Dict[Tuple[str, str], Optional[Path]] = {}
+        self._git_file_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
         self._include_dirs = {
             "v1": self._default_include_dirs(self.local_v1_path),
             "v2": self._default_include_dirs(self.local_v2_path),
@@ -39,6 +42,43 @@ class SourceManager:
 
     def _repo_root(self, version: str) -> Path:
         return self.local_v1_path if version == "v1" else self.local_v2_path
+
+    def _git_commit_hint(self, version: str) -> str:
+        name = "REACT_AGENT_V1_SRC_COMMIT" if version == "v1" else "REACT_AGENT_V2_SRC_COMMIT"
+        return str(os.environ.get(name, "") or "").strip()
+
+    def _git_show_file(self, rel_path: str, version: str) -> str:
+        """Return file content from `git show <commit>:<path>` when the working tree lacks the file."""
+        rel = str(rel_path or "").lstrip("/").replace("\\", "/").strip()
+        if not rel:
+            return ""
+        commit = self._git_commit_hint(version)
+        if not commit:
+            return ""
+
+        repo_root = self._repo_root(version)
+        cache_key = (version, commit, rel)
+        if cache_key in self._git_file_cache:
+            return self._git_file_cache[cache_key] or ""
+
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root), "show", f"{commit}:{rel}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            self._git_file_cache[cache_key] = None
+            return ""
+
+        if int(proc.returncode) != 0:
+            self._git_file_cache[cache_key] = None
+            return ""
+        text = str(proc.stdout or "")
+        self._git_file_cache[cache_key] = text
+        return text
 
     def _resolve_path(self, json_path: str, version: str) -> Optional[Path]:
         """Resolve a JSON path to a local file path."""
@@ -70,9 +110,44 @@ class SourceManager:
     def get_code_segment(self, file_path: str, start_line: int, end_line: int, version: str) -> str:
         """Read a code segment between start_line and end_line (inclusive)."""
         resolved = self._resolve_path(file_path, version)
-        if not resolved or not resolved.exists():
-            return ""
-        text = resolved.read_text(encoding="utf-8", errors="replace")
+        text = ""
+
+        # Prefer git-object reads when a commit hint is configured. This avoids subtle mismatches where
+        # the configured --v1-src/--v2-src worktrees exist but are checked out at a different revision
+        # than the KB JSON (line numbers/extents drift and we extract the wrong lines).
+        rel = ""
+        if self._git_commit_hint(version):
+            if resolved is not None:
+                try:
+                    rel = resolved.resolve().relative_to(self._repo_root(version).resolve()).as_posix()
+                except Exception:
+                    rel = ""
+            if not rel:
+                rel = str(file_path or "").lstrip("/").replace("\\", "/").strip()
+                if rel.startswith("src/"):
+                    rel = rel[len("src/") :]
+            if rel:
+                text = self._git_show_file(rel, version)
+
+        if not text:
+            if resolved and resolved.exists():
+                text = resolved.read_text(encoding="utf-8", errors="replace")
+            else:
+                # Fallback: if the file isn't present in the working tree, try reading from git objects
+                # using REACT_AGENT_V1_SRC_COMMIT / REACT_AGENT_V2_SRC_COMMIT.
+                if not rel:
+                    if resolved is not None:
+                        try:
+                            rel = resolved.resolve().relative_to(self._repo_root(version).resolve()).as_posix()
+                        except Exception:
+                            rel = ""
+                    if not rel:
+                        rel = str(file_path or "").lstrip("/").replace("\\", "/").strip()
+                        if rel.startswith("src/"):
+                            rel = rel[len("src/") :]
+                text = self._git_show_file(rel, version)
+                if not text:
+                    return ""
         lines = text.splitlines()
         start = max(start_line - 1, 0)
         end = min(end_line, len(lines))
@@ -89,4 +164,3 @@ class SourceManager:
         start_line = int(start.get("line", 1))
         end_line = int(end.get("line", start_line))
         return self.get_code_segment(file_path, start_line, end_line, version)
-

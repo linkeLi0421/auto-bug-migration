@@ -896,6 +896,18 @@ def _reindex_patch_bundle(bundle: Any) -> Any:
 
 _SAFE_BUNDLE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _DIFF_HUNK_HDR_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
+_COMMITISH_RE = re.compile(r"[0-9a-fA-F]{5,40}")
+
+
+def _infer_commitish_from_path(path: str) -> str:
+    """Best-effort infer a git commit-ish from a directory name like `project-<sha>`."""
+    name = str(Path(str(path or "")).name or "").strip()
+    if not name:
+        return ""
+    matches = _COMMITISH_RE.findall(name)
+    if not matches:
+        return ""
+    return str(matches[-1]).strip()
 
 
 def _safe_bundle_name(name: str, *, max_len: int = 160) -> str:
@@ -1044,10 +1056,67 @@ def _write_effective_patch_bundle(
     except Exception as exc:  # noqa: BLE001
         return "", f"failed to load patch bundle: {type(exc).__name__}: {exc}"
 
-    if not isinstance(getattr(bundle, "patches", None), dict) or key not in bundle.patches:
-        return "", f"unknown patch_key in bundle: {key}"
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return "", "patch bundle has invalid patches map"
+    if key not in patches:
+        if not key.startswith("_extra_"):
+            return "", f"unknown patch_key in bundle: {key}"
 
-    patch_obj = bundle.patches[key]
+        def parse_diff_paths(text: str) -> tuple[str, str]:
+            old_fp = ""
+            new_fp = ""
+            for line in str(text or "").splitlines():
+                if line.startswith("diff --git "):
+                    m = re.match(r"^diff --git a/(?P<old>\\S+) b/(?P<new>\\S+)$", line.strip())
+                    if m:
+                        old_fp = str(m.group("old") or "")
+                        new_fp = str(m.group("new") or "")
+                        break
+            if old_fp and new_fp:
+                return old_fp, new_fp
+            for line in str(text or "").splitlines():
+                if line.startswith("--- "):
+                    old_fp = line[len("--- ") :].strip()
+                    if old_fp.startswith("a/"):
+                        old_fp = old_fp[2:]
+                if line.startswith("+++ "):
+                    new_fp = line[len("+++ ") :].strip()
+                    if new_fp.startswith("b/"):
+                        new_fp = new_fp[2:]
+                if old_fp and new_fp:
+                    break
+            return old_fp, new_fp
+
+        old_fp, new_fp = parse_diff_paths(text)
+        new_fp = str(new_fp or "").strip()
+        old_fp = str(old_fp or "").strip() or new_fp
+        if not new_fp or new_fp == "/dev/null":
+            return "", f"cannot create new patch_key without file paths: {key}"
+
+        try:
+            from migration_tools.types import PatchInfo  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            return "", f"failed to import PatchInfo: {type(exc).__name__}: {exc}"
+
+        suffix = Path(new_fp).suffix.lower()
+        file_type = suffix.lstrip(".") if suffix else "unknown"
+        patches[key] = PatchInfo(
+            file_path_old=old_fp,
+            file_path_new=new_fp,
+            patch_text="",
+            file_type=file_type,
+            old_start_line=1,
+            old_end_line=1,
+            new_start_line=1,
+            new_end_line=1,
+            patch_type={"Extra"},
+            old_signature="",
+            dependent_func=set(),
+            hiden_func_dict={},
+        )
+
+    patch_obj = patches[key]
     patch_obj.patch_text = text.rstrip("\n") + "\n"
 
     if isinstance(hiden_func_dict_updated, dict):
@@ -2305,6 +2374,25 @@ def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) ->
     return False
 
 
+def _count_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> int:
+    want = str(symbol or "").strip()
+    if not want:
+        return 0
+    count = 0
+    for step in (state.step_history or []):
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+            continue
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        if str(args.get("symbol_name", "")).strip() == want:
+            count += 1
+    return count
+
+
 def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Prefer deterministic `_extra_*` insertions over function rewrites that delete missing symbols.
 
@@ -2344,6 +2432,55 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
             "version": "v1",
         },
     }
+
+
+def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Prefer deterministic `_extra_*` type definitions over semantic no-op function rewrites.
+
+    If the current diagnostic indicates an incomplete type, force make_extra_patch_override before allowing
+    make_error_patch_override to "fix" the compile by deleting field accesses/sizeof usage.
+
+    We allow up to 2 attempts per type symbol to support the common sequence:
+      1) insert forward typedef (unknown type) then
+      2) insert tag body definition (incomplete type).
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    # Only run after patch prereqs (mapping) are satisfied, otherwise let tool ordering drive.
+    if _next_patch_prereq_tool(state) is not None:
+        return None
+
+    candidates = _extract_incomplete_type_symbol_candidates(state)
+    if not candidates:
+        return None
+
+    file_path, _ = _first_error_location(state)
+    if not file_path:
+        return None
+
+    for sym in candidates:
+        if _count_make_extra_patch_override_for_symbol(state, sym) >= 2:
+            continue
+        return {
+            "type": "tool",
+            "thought": (
+                f"Incomplete-type guardrail: add the real definition for {sym} via the file's _extra_* hunk "
+                "(do not rewrite the function to remove field access/sizeof usage)."
+            ),
+            "tool": "make_extra_patch_override",
+            "args": {
+                "patch_path": state.patch_path,
+                "file_path": file_path,
+                "symbol_name": sym,
+                "version": "v1",
+            },
+        }
+
+    return None
 
 
 def _macro_lookup_pick_token(state: AgentState) -> str:
@@ -2493,6 +2630,11 @@ _UNDECLARED_SYMBOL_RE = re.compile(
     r"(?:use of undeclared identifier|call to undeclared function|implicit declaration of function|unknown type name|undeclared function)\s*'(?P<symbol>[^']+)'"
 )
 _CONFLICTING_TYPES_RE = re.compile(r"conflicting types for\s*'(?P<symbol>[^']+)'")
+_INCOMPLETE_TYPE_RE = re.compile(
+    r"(?:incomplete definition of type|incomplete type|dereferencing pointer to incomplete type|invalid application of 'sizeof' to an incomplete type)\s*'(?P<type>[^']+)'",
+    re.IGNORECASE,
+)
+_C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _extract_undeclared_symbol_name(state: AgentState) -> str:
@@ -2517,6 +2659,58 @@ def _extract_undeclared_symbol_name(state: AgentState) -> str:
                 if sym:
                     return sym
     return ""
+
+
+def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
+    """Best-effort extraction of incomplete type names from current error context.
+
+    Returns a prioritized list of candidate symbol names to try with make_extra_patch_override.
+    """
+    texts: List[str] = []
+    for e in state.grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if raw:
+            texts.append(raw)
+    if str(state.error_line or "").strip():
+        texts.append(str(state.error_line))
+    if str(state.snippet or "").strip():
+        texts.append(str(state.snippet))
+
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(sym: str) -> None:
+        s = str(sym or "").strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    for text in texts:
+        m = _INCOMPLETE_TYPE_RE.search(text)
+        if not m:
+            continue
+        raw_type = str(m.group("type") or "").strip()
+        if not raw_type:
+            continue
+
+        parts = raw_type.split()
+        # Normalize "struct TAG" -> "TAG"
+        if len(parts) >= 2 and parts[0] in {"struct", "union", "enum"}:
+            tag = parts[-1].strip()
+            if _C_IDENT_RE.match(tag):
+                # Common C style: `struct _Foo` is typedef'd as `Foo`. Prefer the alias first.
+                if tag.startswith("_") and _C_IDENT_RE.match(tag[1:]):
+                    add(tag[1:])
+                add(tag)
+            continue
+
+        if _C_IDENT_RE.match(raw_type):
+            add(raw_type)
+
+    return out
 
 
 def _first_error_location(state: AgentState) -> tuple[str, int]:
@@ -3880,6 +4074,11 @@ def _run_langgraph(
             _validate_tool_decision(forced_undeclared)
             return {"state": st, "pending": forced_undeclared}
 
+        forced_incomplete = _incomplete_type_extra_patch_guardrail_for_override(st, decision)
+        if forced_incomplete:
+            _validate_tool_decision(forced_incomplete)
+            return {"state": st, "pending": forced_incomplete}
+
         forced_macro = _macro_define_guardrail_for_override(st, decision)
         if forced_macro:
             _validate_tool_decision(forced_macro)
@@ -4428,6 +4627,17 @@ def main(argv: List[str]) -> int:
                     "Missing required args for --tools real: "
                     + ", ".join("--" + m.replace("_", "-") for m in missing)
                 )
+            # When users point both --v1-src/--v2-src at the same worktree (or use a checkout at a different
+            # revision than the KB JSON), SourceManager may not be able to read KB-referenced files. Provide
+            # best-effort git commit hints so SourceManager can fall back to `git show <commit>:<path>`.
+            if not str(os.environ.get("REACT_AGENT_V1_SRC_COMMIT", "") or "").strip():
+                inferred = _infer_commitish_from_path(str(args.v1_json_dir))
+                if inferred:
+                    os.environ["REACT_AGENT_V1_SRC_COMMIT"] = inferred
+            if not str(os.environ.get("REACT_AGENT_V2_SRC_COMMIT", "") or "").strip():
+                inferred = _infer_commitish_from_path(str(args.v2_json_dir)) or str(ossfuzz_commit or "").strip()
+                if inferred:
+                    os.environ["REACT_AGENT_V2_SRC_COMMIT"] = inferred
             kb = KbIndex(args.v1_json_dir, args.v2_json_dir)
             sm = SourceManager(args.v1_src, args.v2_src)
             agent_tools = AgentTools(kb, sm)

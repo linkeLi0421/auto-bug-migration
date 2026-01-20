@@ -60,7 +60,122 @@ def _infer_extra_patch_key(*, bundle: Any, file_path: str) -> str:
             fp_old = str(getattr(patch, "file_path_old", "") or "")
             if Path(fp_new).name == base or Path(fp_old).name == base:
                 return key
-    return ""
+    # If no extra hunk exists in the bundle, default to a synthesized patch_key.
+    return candidate
+
+
+def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str = "v2") -> str:
+    """Best-effort derive the repo-relative path used by patch_text diff headers."""
+    sm = getattr(agent_tools, "source_manager", None)
+    raw = str(file_path or "").strip()
+    if not raw:
+        return ""
+    if sm is not None:
+        try:
+            resolved = sm._resolve_path(raw, version)  # type: ignore[attr-defined]
+        except Exception:
+            resolved = None
+        if resolved is not None:
+            try:
+                root = sm._repo_root(version)  # type: ignore[attr-defined]
+                rel = resolved.resolve().relative_to(root.resolve())
+                return rel.as_posix()
+            except Exception:
+                pass
+
+    # Fallback: strip the /src/<repo>/ prefix when present.
+    if raw.startswith("/src"):
+        rel = raw[len("/src") :].lstrip("/")
+        if sm is not None:
+            try:
+                repo = sm._repo_root(version)  # type: ignore[attr-defined]
+                repo_name = str(getattr(repo, "name", "") or "").strip()
+                if repo_name and rel.replace("\\", "/").startswith(repo_name + "/"):
+                    rel = rel.replace("\\", "/")[len(repo_name) + 1 :]
+            except Exception:
+                pass
+        return rel.replace("\\", "/")
+    return raw.replace("\\", "/")
+
+
+_PP_IF_RE = re.compile(r"^#\s*(?:if|ifdef|ifndef)\b")
+_PP_ENDIF_RE = re.compile(r"^#\s*endif\b")
+
+
+def _find_file_scope_insertion_index(lines: List[str]) -> int:
+    """Return a 0-based index where file-scope decls can be inserted safely.
+
+    Heuristic: place insertions after leading comment + preprocessor/header region, but never inside an
+    unterminated preprocessor conditional block.
+    """
+    in_block_comment = False
+    pp_nesting = 0
+    for idx, raw in enumerate(lines):
+        stripped = str(raw or "").lstrip()
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
+            continue
+        if stripped.startswith("//"):
+            continue
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            if _PP_IF_RE.match(stripped):
+                pp_nesting += 1
+            elif _PP_ENDIF_RE.match(stripped):
+                pp_nesting = max(pp_nesting - 1, 0)
+            continue
+        if pp_nesting > 0:
+            continue
+        return idx
+    return 0
+
+
+def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3) -> str:
+    """Create a minimal unified diff skeleton for a brand-new `_extra_*` patch key."""
+    sm = getattr(agent_tools, "source_manager", None)
+    if sm is None:
+        return ""
+
+    resolved = None
+    try:
+        resolved = sm._resolve_path(str(file_path or "").strip(), "v2")  # type: ignore[attr-defined]
+    except Exception:
+        resolved = None
+    if resolved is None or not resolved.exists():
+        return ""
+    text = resolved.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines:
+        return ""
+
+    insert_at = _find_file_scope_insertion_index(lines)
+    start_line = insert_at + 1
+    ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
+    if not ctx:
+        ctx = [lines[0]]
+        start_line = 1
+
+    rel = _normalize_repo_rel_path(agent_tools, file_path=str(file_path or "").strip(), version="v2")
+    if not rel:
+        rel = _normalize_file_basename(file_path)
+    if not rel:
+        return ""
+
+    hdr = f"@@ -{start_line},{len(ctx)} +{start_line},{len(ctx)} @@"
+    body = "\n".join(" " + l for l in ctx)
+    return (
+        f"diff --git a/{rel} b/{rel}\n"
+        f"--- a/{rel}\n"
+        f"+++ b/{rel}\n"
+        f"{hdr}\n"
+        f"{body}\n"
+    )
 
 
 def _strip_diff_prefix(line: str) -> str:
@@ -118,6 +233,50 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
         if re.match(rf"^(?:struct|enum|union)\s+{re.escape(want)}\b", stripped):
             return True
 
+    return False
+
+
+_FORWARD_TYPEDEF_RE = re.compile(
+    r"^typedef\s+(?P<tag_kind>struct|union|enum)\s+"
+    r"(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\s+"
+    r"(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+)
+
+
+def _find_forward_typedef_tag(patch_text: str, *, alias: str) -> Tuple[str, str]:
+    """Return (tag_kind, tag_name) if patch_text contains `typedef <tag_kind> <tag> <alias>;`."""
+    want = str(alias or "").strip()
+    if not want:
+        return "", ""
+    for raw in str(patch_text or "").splitlines():
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        code = _strip_diff_prefix(raw).strip()
+        if not code or code.startswith(("/*", "//")):
+            continue
+        m = _FORWARD_TYPEDEF_RE.match(code)
+        if not m:
+            continue
+        if str(m.group("alias") or "") == want:
+            return str(m.group("tag_kind") or ""), str(m.group("tag") or "")
+    return "", ""
+
+
+def _tag_definition_present_in_extra_hunk(patch_text: str, *, tag_kind: str, tag_name: str) -> bool:
+    """Return True if patch_text already includes a tag definition like `struct TAG {`."""
+    kind = str(tag_kind or "").strip()
+    tag = str(tag_name or "").strip()
+    if not kind or not tag:
+        return False
+    pat = re.compile(rf"^(?:{re.escape(kind)})\s+{re.escape(tag)}\s*\{{")
+    for raw in str(patch_text or "").splitlines():
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        code = _strip_diff_prefix(raw).strip()
+        if not code:
+            continue
+        if pat.match(code):
+            return True
     return False
 
 
@@ -725,6 +884,140 @@ def _kb_pick_insertable_node(agent_tools: Any, *, symbol: str, version: str, max
     return max(insertable, key=rank)
 
 
+def _kb_pick_insertable_node_filtered(
+    agent_tools: Any,
+    *,
+    symbol: str,
+    version: str,
+    allowed_kinds: set[str],
+    max_nodes: int = 200,
+) -> Optional[dict]:
+    """Like _kb_pick_insertable_node, but restrict candidates to allowed_kinds."""
+    ver = str(version or "").strip().lower()
+    if ver not in {"v1", "v2"}:
+        return None
+    name = str(symbol or "").strip()
+    if not name:
+        return None
+    kinds = {str(k or "").strip() for k in (allowed_kinds or set()) if str(k or "").strip()}
+    if not kinds:
+        return None
+
+    kb_index = getattr(agent_tools, "kb_index", None)
+    if kb_index is None:
+        return None
+
+    nodes = []
+    try:
+        nodes = (kb_index.query_all(name) or {}).get(ver, [])
+    except Exception:
+        nodes = []
+    nodes = [n for n in nodes if isinstance(n, dict)]
+
+    candidates: List[dict] = []
+    seen: set[str] = set()
+
+    for n in nodes[: max(0, int(max_nodes or 0))]:
+        for cand in [n] + list(kb_index.related_definition_candidates(n, ver, max_depth=2) or []):
+            if not isinstance(cand, dict):
+                continue
+            k = _kb_node_key(cand)
+            if k in seen:
+                continue
+            seen.add(k)
+            candidates.append(cand)
+
+    insertable = [c for c in candidates if str(c.get("kind", "") or "").strip() in kinds]
+    if not insertable:
+        return None
+
+    def rank(node: dict) -> Tuple[int, int, int, int, int]:
+        kind = str(node.get("kind", "") or "").strip()
+        reason = str(node.get("__reason", "") or "").strip()
+        fp, ln, col = _kb_node_location_tuple(node)
+        return (
+            _kb_node_extent_lines(node),
+            1 if reason else 0,
+            1 if fp else 0,
+            -ln,
+            -col,
+        )
+
+    return max(insertable, key=rank)
+
+
+def _upgrade_existing_forward_typedef_in_extra_hunk(
+    agent_tools: Any,
+    *,
+    patch_text: str,
+    symbol_name: str,
+    requested_version: str,
+) -> Tuple[str, str, str]:
+    """If patch_text already contains a forward typedef, insert the tag body (struct/union/enum) from KB.
+
+    Returns (updated_patch_text, inserted_code, insert_kind). Empty updated_patch_text means no change.
+    """
+    if agent_tools is None:
+        return "", "", ""
+    sym = str(symbol_name or "").strip()
+    if not sym:
+        return "", "", ""
+
+    tag_kind, tag = _find_forward_typedef_tag(patch_text, alias=sym)
+    if not tag_kind or not tag:
+        return "", "", ""
+    if _tag_definition_present_in_extra_hunk(patch_text, tag_kind=tag_kind, tag_name=tag):
+        return "", "", ""
+
+    kind_map = {"struct": "STRUCT_DECL", "union": "UNION_DECL", "enum": "ENUM_DECL"}
+    want_kind = kind_map.get(tag_kind)
+    if not want_kind:
+        return "", "", ""
+
+    requested = str(requested_version or "v1").strip().lower()
+    if requested not in {"v1", "v2"}:
+        requested = "v1"
+    versions_to_try = [requested, ("v2" if requested == "v1" else "v1")]
+
+    source_manager = getattr(agent_tools, "source_manager", None)
+    if source_manager is None:
+        return "", "", ""
+
+    struct_code = ""
+    used_ver = ""
+    chosen_kind = ""
+    for ver in versions_to_try:
+        chosen = _kb_pick_insertable_node_filtered(agent_tools, symbol=tag, version=ver, allowed_kinds={want_kind})
+        if chosen is None:
+            continue
+        code = str(source_manager.get_function_code(chosen, ver) or "")
+        if not code.strip():
+            continue
+        # Ensure this is a real tag body definition.
+        if "{" not in code:
+            continue
+        if f"{tag_kind} {tag}" not in code:
+            # Be tolerant of formatting, but require the tag identifier to show up.
+            if tag not in code:
+                continue
+        struct_code = code
+        used_ver = ver
+        chosen_kind = str(chosen.get("kind", "") or "").strip()
+        break
+
+    if not struct_code.strip():
+        return "", "", ""
+
+    inserted_lines = [l.rstrip("\n") for l in struct_code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+    inserted_lines = [l.rstrip() for l in inserted_lines if l is not None]
+    if not inserted_lines:
+        return "", "", ""
+
+    updated = _insert_minus_block_into_patch_text(patch_text, insert_lines=[""] + inserted_lines)
+    insert_kind = f"tag_definition_from_kb:{used_ver}:{chosen_kind or want_kind}"
+    return updated, "\n".join(inserted_lines).rstrip("\n") + "\n", insert_kind
+
+
 def make_extra_patch_override(
     agent_tools: Any,
     *,
@@ -763,18 +1056,21 @@ def make_extra_patch_override(
             "note": "No matching _extra_* patch_key found for this file.",
         }
 
-    patch = bundle.patches.get(extra_key) if isinstance(getattr(bundle, "patches", None), dict) else None
+    patches = bundle.patches if isinstance(getattr(bundle, "patches", None), dict) else {}
+    patch = patches.get(extra_key)
     if patch is None:
-        return {
-            "patch_path": str(Path(patch_path_s).expanduser().resolve()),
-            "file_path": file_path_s,
-            "symbol_name": symbol,
-            "patch_key": extra_key,
-            "patch_text": "",
-            "note": "Extra patch_key is missing from the bundle.",
-        }
-
-    existing = str(getattr(patch, "patch_text", "") or "")
+        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s)
+        if not existing.strip():
+            return {
+                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
+                "file_path": file_path_s,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "patch_text": "",
+                "note": "Failed to create a new _extra_* patch hunk skeleton (could not read V2 source for file).",
+            }
+    else:
+        existing = str(getattr(patch, "patch_text", "") or "")
     if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
         # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.
         updated_existing = ""
@@ -798,6 +1094,34 @@ def make_extra_patch_override(
                 "patch_text_truncated": False,
                 "patch_text_lines_total": len(updated_existing.splitlines()),
                 "note": "Symbol already present, but rewrote an unsafe by-value opaque type declaration in the extra hunk.",
+            }
+
+        # If the symbol exists only as a forward typedef (e.g. `typedef struct TAG Name;`),
+        # inserting the tag body can be required for field access (`ptr->field` needs a complete type).
+        updated_existing, inserted_code, insert_kind = _upgrade_existing_forward_typedef_in_extra_hunk(
+            agent_tools,
+            patch_text=existing,
+            symbol_name=symbol,
+            requested_version=str(version or "v1"),
+        )
+        if updated_existing:
+            store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
+            ref = store.write_text(
+                name=f"make_extra_patch_override_patch_text_{_normalize_file_basename(file_path_s)}_{symbol}",
+                text=updated_existing,
+                ext=".diff",
+            )
+            return {
+                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
+                "file_path": file_path_s,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "insert_kind": insert_kind or "upgrade_forward_typedef_with_tag_body",
+                "inserted_code": inserted_code or "",
+                "patch_text": ref.to_dict(),
+                "patch_text_truncated": False,
+                "patch_text_lines_total": len(updated_existing.splitlines()),
+                "note": "Symbol already present as a forward typedef; inserted the tag body definition into the extra hunk.",
             }
 
         return {
@@ -859,13 +1183,31 @@ def make_extra_patch_override(
             break
 
     if not inserted_lines:
+        note = "Failed to locate a definition/decl for the symbol (bundle+KB)."
+        if agent_tools is not None:
+            kb_index = getattr(agent_tools, "kb_index", None)
+            query = underlying or symbol
+            if kb_index is not None:
+                try:
+                    v1_nodes = list((kb_index.query_all(query) or {}).get("v1", []))
+                    v2_nodes = list((kb_index.query_all(query) or {}).get("v2", []))
+                    if v1_nodes or v2_nodes:
+                        note = (
+                            f"KB has nodes for {query!r} (v1={len(v1_nodes)}, v2={len(v2_nodes)}), "
+                            "but none produced readable source code. "
+                            "This often means the configured --v1-src/--v2-src working trees don't match the KB JSON "
+                            "file layout/revision. Fix the src paths or set REACT_AGENT_V1_SRC_COMMIT/"
+                            "REACT_AGENT_V2_SRC_COMMIT so SourceManager can fall back to `git show <commit>:<path>`."
+                        )
+                except Exception:
+                    pass
         return {
             "patch_path": str(Path(patch_path_s).expanduser().resolve()),
             "file_path": file_path_s,
             "symbol_name": symbol,
             "patch_key": extra_key,
             "patch_text": "",
-            "note": "Failed to locate a definition/decl for the symbol (bundle+KB).",
+            "note": note,
         }
 
     # If we are inserting a by-value global of an opaque type (common with typedef'd structs),

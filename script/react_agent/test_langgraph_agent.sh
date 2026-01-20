@@ -511,6 +511,485 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override tool: if the symbol is already present but only as a forward typedef
+# (e.g. `typedef struct TAG Name;`), insert the tag body definition (struct/union/enum) from KB.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # Only the underlying tag body exists in KB (mirrors real libxml2 where the alias is in a header).
+    tag_node = {
+        "kind": "STRUCT_DECL",
+        "spelling": "_xmlParserNsData",
+        "location": {"file": "parser.c", "line": 1, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 1, "column": 1}, "end": {"file": "parser.c", "line": 6, "column": 1}},
+    }
+    (kb_v1 / "parser.c_analysis.json").write_text(json.dumps([tag_node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+    (src_v1 / "parser.c").write_text(
+        "struct _xmlParserNsData {\n"
+        "    unsigned elementId;\n"
+        "    int defaultNsIndex;\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    extra_key = "_extra_parser.c"
+    # Existing extra hunk: only a forward typedef, which is insufficient for field access.
+    existing = (
+        "diff --git a/parser.c b/parser.c\n"
+        "--- a/parser.c\n"
+        "+++ b/parser.c\n"
+        "@@ -1,2 +1,0 @@\n"
+        "-typedef struct _xmlParserNsData xmlParserNsData;\n"
+        "-int marker = 0;\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text=existing,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=3,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({extra_key: extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlParserNsData",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    inserted = str(out.get("inserted_code") or "")
+    assert "struct _xmlParserNsData" in inserted and "{" in inserted, inserted
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    assert "struct _xmlParserNsData" in text_out, text_out
+    assert "typedef struct _xmlParserNsData xmlParserNsData;" in text_out, text_out
+
+print("OK")
+PY
+
+# Extra patch override tool: if the patch bundle has no `_extra_*` entries,
+# synthesize a new `_extra_<file>` patch_key and emit an override diff anchored after includes.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from agent_langgraph import AgentState, _write_effective_patch_bundle  # noqa: E402
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.patch_bundle import load_patch_bundle  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # V1 KB provides a typedef for the missing type.
+    node = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlHashedString",
+        "location": {"file": "parser.c", "line": 10, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 10, "column": 1}, "end": {"file": "parser.c", "line": 10, "column": 40}},
+    }
+    (kb_v1 / "parser.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    # V1: definition snippet.
+    v1_lines = ["/* filler */"] * 20
+    v1_lines[9] = "typedef int xmlHashedString;"
+    (src_v1 / "parser.c").write_text("\n".join(v1_lines) + "\n", encoding="utf-8")
+
+    # V2: insertion anchor should be after comment + preprocessor region.
+    v2_text = (
+        "/* header */\n"
+        "#include \"x.h\"\n"
+        "#define X 1\n"
+        "int marker = 0;\n"
+        "int other = 1;\n"
+    )
+    (src_v2 / "parser.c").write_text(v2_text, encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    # Bundle has no `_extra_*` keys.
+    bundle_path = td / "bundle.patch2"
+    main_key = "p_main"
+    main_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text="diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({main_key: main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlHashedString",
+        version="v1",
+    )
+    assert out.get("patch_key") == "_extra_parser.c", out
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    assert "diff --git a/parser.c b/parser.c" in text_out, text_out
+    assert "typedef int xmlHashedString;" in text_out, text_out
+    assert "@@ -4," in text_out, text_out
+    assert " int marker = 0;" in text_out, text_out
+
+    # Agent integration: effective bundle writer must add the new key.
+    state = AgentState(
+        build_log_path="build.log",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line="x",
+        snippet="",
+        artifacts_dir=str(td / "artifacts" / "p_main"),
+    )
+    effective_path, err = _write_effective_patch_bundle(
+        state,
+        patch_key=str(out.get("patch_key") or ""),
+        patch_text=text_out,
+    )
+    assert not err and effective_path, (effective_path, err)
+    bundle2 = load_patch_bundle(effective_path, allowed_roots=[td])
+    assert "_extra_parser.c" in bundle2.patches, bundle2.patches.keys()
+    assert "typedef int xmlHashedString;" in (bundle2.patches["_extra_parser.c"].patch_text or ""), bundle2.patches["_extra_parser.c"]
+
+print("OK")
+PY
+
+# Extra patch override tool: if the KB points at a file that doesn't exist in the current v1-src working tree,
+# SourceManager should still be able to extract it deterministically from git objects using REACT_AGENT_V1_SRC_COMMIT.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # KB node points at include/private/dict.h (mirrors real libxml2-e11519 KB),
+    # but the v1-src working tree will not have that file.
+    node = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlHashedString",
+        "location": {"file": "include/private/dict.h", "line": 1, "column": 1},
+        "extent": {"start": {"file": "include/private/dict.h", "line": 1, "column": 1}, "end": {"file": "include/private/dict.h", "line": 1, "column": 28}},
+    }
+    (kb_v1 / "dict.h_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    # v1-src is a git repo; commit A contains include/private/dict.h, commit B removes it (HEAD lacks the file).
+    subprocess.run(["git", "init"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_v1, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=src_v1, check=True)
+    inc = src_v1 / "include" / "private"
+    inc.mkdir(parents=True)
+    (inc / "dict.h").write_text("typedef int xmlHashedString;\n", encoding="utf-8")
+    subprocess.run(["git", "add", "include/private/dict.h"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "commit", "-m", "add dict.h"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    commit_with_file = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src_v1, text=True).strip()
+    (inc / "dict.h").unlink()
+    subprocess.run(["git", "add", "-A"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "commit", "-m", "remove dict.h"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+
+    os.environ["REACT_AGENT_V1_SRC_COMMIT"] = commit_with_file
+
+    # v2-src provides a stable insertion anchor.
+    (src_v2 / "parser.c").write_text("#include \"x.h\"\nint marker = 0;\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    main_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text="diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({"p_main": main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlHashedString",
+        version="v1",
+    )
+    assert out.get("patch_key") == "_extra_parser.c", out
+    inserted = str(out.get("inserted_code") or "")
+    assert "typedef int xmlHashedString;" in inserted, inserted
+
+print("OK")
+PY
+
+# SourceManager: when a commit hint is configured, prefer `git show <commit>:<path>` even if the file exists
+# in the working tree. This avoids extracting the wrong lines when the worktree is checked out at a different
+# revision than the KB JSON (line numbers drift).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    node = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlParserNsData",
+        "location": {"file": "include/libxml/parser.h", "line": 175, "column": 1},
+        "extent": {
+            "start": {"file": "include/libxml/parser.h", "line": 175, "column": 1},
+            "end": {"file": "include/libxml/parser.h", "line": 175, "column": 80},
+        },
+    }
+    (kb_v1 / "parser.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    # v1-src is a git repo; commit A has the typedef at line 175, but HEAD will have different content at that line.
+    subprocess.run(["git", "init"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=src_v1, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=src_v1, check=True)
+
+    hdr = src_v1 / "include" / "libxml"
+    hdr.mkdir(parents=True)
+    parser_h = hdr / "parser.h"
+
+    lines = ["/* filler */"] * 200
+    lines[174] = "typedef struct _xmlParserNsData xmlParserNsData;"
+    parser_h.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "include/libxml/parser.h"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "commit", "-m", "add typedef at line 175"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    commit_with_typedef = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src_v1, text=True).strip()
+
+    # Now change the *same* line in the working tree (file still exists, but the KB extent line points to a different token).
+    lines[171] = "/**"
+    lines[172] = " * xmlParserCtxt:"
+    lines[173] = " *"
+    lines[174] = " * The parser context."
+    lines[175] = " */"
+    parser_h.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "include/libxml/parser.h"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+    subprocess.run(["git", "commit", "-m", "move typedef away (line drift)"], cwd=src_v1, check=True, stdout=subprocess.DEVNULL)
+
+    os.environ["REACT_AGENT_V1_SRC_COMMIT"] = commit_with_typedef
+
+    # v2-src provides a stable insertion anchor for `_extra_parser.c`.
+    (src_v2 / "parser.c").write_text("#include \"x.h\"\nint marker = 0;\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    main_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text="diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({"p_main": main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlParserNsData",
+        version="v1",
+    )
+    inserted = str(out.get("inserted_code") or "")
+    assert "typedef struct _xmlParserNsData xmlParserNsData;" in inserted, inserted
+    assert "The parser context" not in inserted, inserted
+
+print("OK")
+PY
+
+# search_definition tool: accept only v1/v2, but coerce common model mistakes (commit hashes) to v2.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from agent_tools import AgentTools, KbIndex, SourceManager  # noqa: E402
+from tools.runner import ToolRunner  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    node = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "FooType",
+        "location": {"file": "foo.h", "line": 1, "column": 1},
+        "extent": {"start": {"file": "foo.h", "line": 1, "column": 1}, "end": {"file": "foo.h", "line": 1, "column": 20}},
+    }
+    (kb_v2 / "foo.h_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+    (src_v2 / "foo.h").write_text("typedef int FooType;\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+    runner = ToolRunner(tools, mode="real")
+
+    obs = runner.call("search_definition", {"symbol_name": "FooType", "version": "f0fd1b"})
+    assert obs.ok is True, obs
+    assert obs.args.get("version") == "v2", obs.args
+    assert obs.args.get("version_raw") == "f0fd1b", obs.args
+    assert "=== Version 2 ===" in str(obs.output or ""), obs.output
+
+print("OK")
+PY
+
 # Extra patch override tool: do not treat macro *usage* as a definition. If a macro token appears
 # inside other macro bodies (e.g. HASH_FINISH uses HASH_ROR) but isn't defined, we should still
 # insert the real definition via KB.
@@ -706,6 +1185,61 @@ forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
 assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+print("OK")
+PY
+
+# Incomplete-type guardrail: for errors like "incomplete definition of type ..." / "sizeof to an incomplete type ...",
+# force make_extra_patch_override before allowing make_error_patch_override to rewrite the function into a semantic no-op.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _incomplete_type_extra_patch_guardrail_for_override  # noqa: E402
+
+err = "/src/libxml2/parser.c:16920:9: error: incomplete definition of type 'struct _xmlParserNsData'"
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err,
+    snippet="",
+)
+state.grouped_errors = [{"raw": err, "file": "/src/libxml2/parser.c", "line": 16920, "col": 9}]
+state.steps = [
+    {
+        "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
+        "observation": {"ok": True, "tool": "get_error_patch_context", "args": {}, "output": {"patch_key": "p"}, "error": None},
+    },
+]
+state.step_history = list(state.steps)
+
+# Simulate one prior attempt (common sequence: typedef first, then tag body definition).
+state.step_history.append(
+    {"decision": {"type": "tool", "tool": "make_extra_patch_override", "args": {"symbol_name": "xmlParserNsData"}}, "observation": {}}
+)
+
+decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "remove field access", "args": {}}
+forced = _incomplete_type_extra_patch_guardrail_for_override(state, decision)
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
+assert forced.get("args", {}).get("symbol_name") == "xmlParserNsData", forced
+assert forced.get("args", {}).get("file_path") == "/src/libxml2/parser.c", forced
+
+# Once we've already tried twice for both the alias and the struct tag, stop forcing to avoid loops.
+state.step_history.append(
+    {"decision": {"type": "tool", "tool": "make_extra_patch_override", "args": {"symbol_name": "xmlParserNsData"}}, "observation": {}}
+)
+state.step_history.append(
+    {"decision": {"type": "tool", "tool": "make_extra_patch_override", "args": {"symbol_name": "_xmlParserNsData"}}, "observation": {}}
+)
+state.step_history.append(
+    {"decision": {"type": "tool", "tool": "make_extra_patch_override", "args": {"symbol_name": "_xmlParserNsData"}}, "observation": {}}
+)
+forced2 = _incomplete_type_extra_patch_guardrail_for_override(state, decision)
+assert forced2 is None, forced2
+
 print("OK")
 PY
 
@@ -1657,9 +2191,22 @@ override_text = (
 )
 override_path.write_text(override_text, encoding="utf-8", errors="replace")
 
+extra_dir = (artifact_root / "_extra_error.c").resolve()
+extra_dir.mkdir(parents=True, exist_ok=True)
+extra_override_path = extra_dir / "override_extra.diff"
+extra_override_text = (
+    "diff --git a/error.c b/error.c\n"
+    "--- a/error.c\n"
+    "+++ b/error.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-/* extra decls */\n"
+    "-#define EXTRA_DECL 1\n"
+)
+extra_override_path.write_text(extra_override_text, encoding="utf-8", errors="replace")
+
 out = merge_patch_bundle_with_overrides(
     patch_path=str(bundle_path),
-    patch_override_paths=[str(override_path)],
+    patch_override_paths=[str(override_path), str(extra_override_path)],
     output_name="merged_test.diff",
 )
 merged_path = Path(out.get("merged_patch_file_path", "")).resolve()
@@ -1667,10 +2214,12 @@ assert merged_path.is_file(), out
 merged_text = merged_path.read_text(encoding="utf-8", errors="replace")
 assert "OVERRIDE_LINE" in merged_text, merged_path
 assert "p2" in (out.get("overridden_patch_keys") or []), out
+assert "_extra_error.c" in (out.get("overridden_patch_keys") or []), out
+assert "EXTRA_DECL" in merged_text, merged_path
 
 bundle_out = write_patch_bundle_with_overrides(
     patch_path=str(bundle_path),
-    patch_override_paths=[str(override_path)],
+    patch_override_paths=[str(override_path), str(extra_override_path)],
     output_name="merged_test.patch2",
 )
 merged_bundle_path = Path(bundle_out.get("merged_patch_bundle_path", "")).resolve()
@@ -1678,6 +2227,8 @@ assert merged_bundle_path.is_file(), bundle_out
 merged_bundle = load_patch_bundle(str(merged_bundle_path), allowed_roots=[str(bundle_path.parent)])
 assert "p2" in merged_bundle.patches, merged_bundle_path
 assert "OVERRIDE_LINE" in (merged_bundle.patches["p2"].patch_text or ""), merged_bundle_path
+assert "_extra_error.c" in merged_bundle.patches, merged_bundle_path
+assert "EXTRA_DECL" in (merged_bundle.patches["_extra_error.c"].patch_text or ""), merged_bundle_path
 PY
 
 # Target-error verdict helper (non-Docker): verify we can detect whether the original error remains in OSS-Fuzz logs.
