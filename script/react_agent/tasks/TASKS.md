@@ -28,11 +28,11 @@
   - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
   - [x] Post reminder to `#report`.
 
-[ ] Stabilize missing-struct-member handling: focus one member at a time
+[x] Stabilize missing-struct-member handling: focus one member at a time
   - Context: patch-scope runs can include multiple missing-member diagnostics for the same struct within a single function group; unioning them in the prompt encourages broad edits and increases guardrail trips.
-  - [ ] Summarize only the active missing member (no union across grouped errors).
-  - [ ] Wire into patch-scope state init + auto-loop state refresh.
-  - [ ] Update `system_patch_scope` prompt guidance for missing-member errors.
-  - [ ] Add regression test.
-  - [ ] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
-  - [ ] Post reminder to `#report`.
+  - [x] Summarize only the active missing member (no union across grouped errors).
+  - [x] Wire into patch-scope state init + auto-loop state refresh.
+  - [x] Update `system_patch_scope` prompt guidance for missing-member errors.
+  - [x] Add regression test.
+  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
+  - [x] Post reminder to `#report`.
