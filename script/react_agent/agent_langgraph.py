@@ -2122,6 +2122,78 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
     return None
 
 
+_REVERT_NAME_RE = re.compile(r"__revert_[0-9a-fA-F]+_[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _extract_revert_symbol_names(text: str) -> set[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return set()
+    return set(m.group(0) for m in _REVERT_NAME_RE.finditer(raw))
+
+
+def _override_preserve_revert_symbols_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if new_func_code drops multiple __revert_* identifiers from the mapped baseline.
+
+    Models sometimes "normalize" `__revert_<hash>_foo(...)` into `foo(...)` while fixing an unrelated error.
+    That broad rename is high-risk (can introduce new missing-prototype/ABI/behavior issues) and makes patch-scope
+    loops unstable. Allow a single __revert_* drop (e.g., renaming the active function), but reject bulk drops.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
+    if not base_text.strip():
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    base_syms = _extract_revert_symbol_names(base_text)
+    if len(base_syms) < 2:
+        return None
+    new_syms = _extract_revert_symbol_names(new_text)
+    dropped = sorted(base_syms - new_syms)
+    if len(dropped) <= 1:
+        return None
+
+    preview = ", ".join(dropped[:6])
+    if len(dropped) > 6:
+        preview += ", ..."
+    return (
+        f"new_func_code appears to drop {len(dropped)} __revert_* identifiers from the mapped baseline ({base_source}): "
+        f"{preview}. Keep existing __revert_* symbols unless the active diagnostic requires changing them."
+    )
+
+
 def _override_single_function_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
     """Return an error message if new_func_code looks like it rewrites more than the active slice.
 
@@ -4341,6 +4413,55 @@ def _run_langgraph(
                                 "next_step": (
                                     f"{complete_err2}\n\n"
                                     "Increase the model output token budget and try again, or manually edit the BASE slice (read_artifact output) to produce a complete function body."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
+        # Guardrail: avoid broad renames of generated __revert_* helpers while fixing an unrelated error.
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
+            if revert_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
+                            f"{revert_err}\n\n"
+                            "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
+                            "- Keep existing `__revert_*` symbol names as-is (do not mass-replace them with unprefixed names).\n"
+                            "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_revert_symbols_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    revert_err2 = _override_preserve_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not revert_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly removed/renamed multiple __revert_* helper symbols in the override.",
+                                "summary": "Stopped before patch generation due to an overly broad override rewrite.",
+                                "next_step": (
+                                    f"{revert_err2}\n\n"
+                                    "Manually edit the BASE slice (read_artifact output) to keep `__revert_*` calls intact and change only what the current diagnostic requires, then rerun."
                                 ).strip(),
                                 "steps": _steps_for_output(st),
                                 "error": _error_payload(st),

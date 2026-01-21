@@ -803,6 +803,105 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override tool: don't treat a type name mentioned only in prototypes as "already present",
+# and prepend inserted typedefs before existing prototype blocks in `_extra_*`.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import _symbol_defined_in_extra_hunk, make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    node = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlHashedString",
+        "location": {"file": "include/private/dict.h", "line": 1, "column": 1},
+        "extent": {"start": {"file": "include/private/dict.h", "line": 1, "column": 1}, "end": {"file": "include/private/dict.h", "line": 1, "column": 28}},
+    }
+    (kb_v1 / "dict.h_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    inc = src_v1 / "include" / "private"
+    inc.mkdir(parents=True)
+    (inc / "dict.h").write_text("typedef int xmlHashedString;\n", encoding="utf-8")
+    (src_v2 / "parser.c").write_text("#include \"x.h\"\nint marker = 0;\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    extra_key = "_extra_parser.c"
+    extra_patch_text = (
+        "diff --git a/parser.c b/parser.c\n"
+        "--- a/parser.c\n"
+        "+++ b/parser.c\n"
+        "@@ -1,2 +1,0 @@\n"
+        "-/* extra decls */\n"
+        "-static int xmlParserNsPush(xmlParserCtxtPtr ctxt, const xmlHashedString *prefix);\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=3,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({extra_key: extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    assert _symbol_defined_in_extra_hunk(extra_patch_text, symbol_name="xmlHashedString") is False
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlHashedString",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    assert "typedef int xmlHashedString;" in text_out, text_out
+
+    typedef_pos = text_out.find("typedef int xmlHashedString;")
+    proto_pos = text_out.find("xmlParserNsPush(")
+    assert typedef_pos != -1 and proto_pos != -1 and typedef_pos < proto_pos, text_out
+
+print("OK")
+PY
+
 # Extra patch override tool: if the KB points at a file that doesn't exist in the current v1-src working tree,
 # SourceManager should still be able to extract it deterministically from git objects using REACT_AGENT_V1_SRC_COMMIT.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -1676,6 +1775,17 @@ with tempfile.TemporaryDirectory() as td:
     }
     assert _override_preserve_base_guardrail_error(state, ok_decision) is None, "expected guardrail to allow full base"
 
+    # If the override includes the tail but drops most of the body, still reject it.
+    short_with_tail = "\n".join(base_lines[:20] + base_lines[-10:]) + "\n"
+    decision2 = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "oops, kept tail but dropped middle",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": short_with_tail},
+    }
+    err2 = _override_preserve_base_guardrail_error(state, decision2)
+    assert err2 and "much shorter" in err2, err2
+
     # Merged/tail hunk scenario: patch/hunk is large, but the mapped function slice is smaller.
     small_lines = [f"FUNC{i:04d}" for i in range(30)]
     small_text = "\n".join(small_lines) + "\n"
@@ -1687,6 +1797,73 @@ with tempfile.TemporaryDirectory() as td:
         "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": small_text},
     }
     assert _override_preserve_base_guardrail_error(state, ok_small) is None, "expected guardrail to use mapped slice baseline"
+
+print("OK")
+PY
+
+# Override guardrail: avoid broad renames/drops of __revert_* helper symbols while fixing an unrelated error.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_preserve_revert_symbols_guardrail_error  # noqa: E402
+
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="x:1:1: error: y",
+    snippet="",
+)
+
+base_text = (
+    "int __revert_deadbeef_a(void);\\n"
+    "int __revert_deadbeef_b(int x);\\n"
+    "int __revert_deadbeef_c(void);\\n"
+    "int foo(void) {\\n"
+    "  if (__revert_deadbeef_a()) return __revert_deadbeef_b(1);\\n"
+    "  return __revert_deadbeef_c();\\n"
+    "}\\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    baseline_path = Path(td) / "error_func_code.c"
+    baseline_path.write_text(base_text, encoding="utf-8")
+    state.active_error_func_code_artifact_path = str(baseline_path)
+
+    renamed = (
+        "int foo(void) {\\n"
+        "  if (a()) return b(1);\\n"
+        "  return c();\\n"
+        "}\\n"
+    )
+    decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "oops, normalized helpers",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": renamed},
+    }
+    err = _override_preserve_revert_symbols_guardrail_error(state, decision)
+    assert err and "__revert_*" in err, err
+
+    # Allow at most one dropped __revert_* symbol (e.g. a single intentional rename).
+    ok = (
+        "int foo(void) {\\n"
+        "  if (a()) return __revert_deadbeef_b(1);\\n"
+        "  return __revert_deadbeef_c();\\n"
+        "}\\n"
+    )
+    ok_decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "single rename only",
+        "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": ok},
+    }
+    assert _override_preserve_revert_symbols_guardrail_error(state, ok_decision) is None
 
 print("OK")
 PY
