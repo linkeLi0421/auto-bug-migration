@@ -1686,6 +1686,29 @@ assert lines[1] == "- /src/b.c:2:2: error: kaboom", lines
 print("OK")
 PY
 
+# Missing-member summary: only include the ACTIVE missing member (do not union members across grouped errors).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _missing_struct_member_summary_for_error_line  # noqa: E402
+
+line1 = "/src/p.c:1:1: error: no member named 'nsdb' in 'struct _xmlParserCtxt'"
+assert _missing_struct_member_summary_for_error_line(line1) == [
+    {"struct": "struct _xmlParserCtxt", "members": ["nsdb"]}
+]
+
+line2 = "/src/p.c:2:1: error: no member named 'foo' in 'struct _xmlParserCtxt'"
+assert _missing_struct_member_summary_for_error_line(line2) == [
+    {"struct": "struct _xmlParserCtxt", "members": ["foo"]}
+]
+
+print("OK")
+PY
+
 # search_definition guardrail: don't try to "look up" struct fields via search_definition;
 # rewrite to search_definition(struct) so the model can inspect the field list.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

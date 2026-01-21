@@ -1481,29 +1481,7 @@ def _refresh_patch_scope_error_snapshot_from_latest_ossfuzz(state: AgentState) -
         state.build_log_path = str(sources[0] or "").strip() or state.build_log_path
 
     # Refresh missing-member summary only if the refreshed active error is a missing-member diagnostic.
-    state.missing_struct_members = []
-    try:
-        m_active = _MISSING_MEMBER_FIELD_RE.search(str(state.error_line or ""))
-        active_struct = str(m_active.group(2) or "").strip() if m_active else ""
-        if active_struct:
-            members: set[str] = set()
-            for e in state.grouped_errors or []:
-                if not isinstance(e, dict):
-                    continue
-                raw = str(e.get("raw", "") or "").strip()
-                m = _MISSING_MEMBER_FIELD_RE.search(raw)
-                if not m:
-                    continue
-                if str(m.group(2) or "").strip() != active_struct:
-                    continue
-                member = str(m.group(1) or "").strip()
-                if member:
-                    members.add(member)
-            if members:
-                max_members = 12
-                state.missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
-    except Exception:
-        state.missing_struct_members = []
+    state.missing_struct_members = _missing_struct_member_summary_for_error_line(state.error_line)
 
 
 def _extract_minus_slice_from_patch_text(*, patch_text: str, func_start_index: int, func_end_index: int) -> str:
@@ -1618,29 +1596,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     _record_current_error_group(state)
 
     # Refresh missing-member summary for this iteration (bounded output).
-    state.missing_struct_members = []
-    try:
-        m_active = _MISSING_MEMBER_FIELD_RE.search(str(state.error_line or ""))
-        active_struct = str(m_active.group(2) or "").strip() if m_active else ""
-        if active_struct:
-            members: set[str] = set()
-            for e in state.grouped_errors or []:
-                if not isinstance(e, dict):
-                    continue
-                raw = str(e.get("raw", "") or "").strip()
-                m = _MISSING_MEMBER_FIELD_RE.search(raw)
-                if not m:
-                    continue
-                if str(m.group(2) or "").strip() != active_struct:
-                    continue
-                member = str(m.group(1) or "").strip()
-                if member:
-                    members.add(member)
-            if members:
-                max_members = 12
-                state.missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
-    except Exception:
-        state.missing_struct_members = []
+    state.missing_struct_members = _missing_struct_member_summary_for_error_line(state.error_line)
 
     # Clear macro guardrail state across iterations to avoid drift.
     state.macro_tokens_not_defined_in_slice = []
@@ -2117,6 +2073,16 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
             return (
                 f"new_func_code does not appear to include the tail of the mapped '-' slice baseline ({base_source}). "
                 "If you intend a minimal edit, start from the baseline slice and apply minimal edits."
+            )
+
+    base_nonempty = sum(1 for ln in base_lines if ln.strip())
+    new_nonempty = sum(1 for ln in new_lines if ln.strip())
+    if base_nonempty >= 40:
+        ratio = new_nonempty / max(base_nonempty, 1)
+        if ratio < 0.70:
+            return (
+                f"new_func_code is much shorter than the mapped '-' slice baseline ({base_source}). "
+                "Do not omit large chunks or use placeholders; start from the baseline slice and apply minimal edits."
             )
 
     return None
@@ -2914,6 +2880,23 @@ def _extract_undeclared_symbol_name(state: AgentState) -> str:
                 if sym:
                     return sym
     return ""
+
+
+def _missing_struct_member_summary_for_error_line(error_line: str) -> List[Dict[str, Any]]:
+    """Return the missing-member summary for the ACTIVE error line only.
+
+    Patch-scope runs may surface multiple missing-member diagnostics for the same struct in a
+    single function group. To keep prompts stable and incremental, summarize only the specific
+    member named in the active error instead of unioning members across grouped errors.
+    """
+    m = _MISSING_MEMBER_FIELD_RE.search(str(error_line or ""))
+    if not m:
+        return []
+    member = str(m.group(1) or "").strip()
+    struct_name = str(m.group(2) or "").strip()
+    if not (member and struct_name):
+        return []
+    return [{"struct": struct_name, "members": [member]}]
 
 
 def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
@@ -4950,26 +4933,7 @@ def main(argv: List[str]) -> int:
                 # Patch-scope runs can have many unrelated errors in the same patch_key; carrying forward
                 # missing-member info from other errors confuses the model and can trigger irrelevant
                 # prereq tool forcing (search_definition struct diffs).
-                missing_struct_members = []
-                m_active = _MISSING_MEMBER_FIELD_RE.search(str(error_line or ""))
-                active_struct = str(m_active.group(2) or "").strip() if m_active else ""
-                if active_struct:
-                    members: set[str] = set()
-                    for e in grouped_errors or []:
-                        if not isinstance(e, dict):
-                            continue
-                        raw = str(e.get("raw", "") or "").strip()
-                        m = _MISSING_MEMBER_FIELD_RE.search(raw)
-                        if not m:
-                            continue
-                        if str(m.group(2) or "").strip() != active_struct:
-                            continue
-                        member = str(m.group(1) or "").strip()
-                        if member:
-                            members.add(member)
-                    if members:
-                        max_members = 12
-                        missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
+                missing_struct_members = _missing_struct_member_summary_for_error_line(error_line)
         except Exception:
             grouped_errors = []
             patch_key = ""
