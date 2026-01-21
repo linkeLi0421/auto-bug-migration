@@ -195,14 +195,32 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
     if not want:
         return False
 
-    for raw in str(patch_text or "").splitlines():
+    want_re = re.escape(want)
+    fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){want_re}\s*\(")
+    declared_name_pat = re.compile(
+        rf"(?<![A-Za-z0-9_]){want_re}(?![A-Za-z0-9_])\s*(?:\[\s*|=|,|;|:|__attribute__\b|__declspec\b)"
+    )
+    typedef_fn_ptr_pat = re.compile(rf"^typedef\b.*\(\s*\*\s*{want_re}\s*\)")
+    tag_head_pat = re.compile(rf"^(?:typedef\s+)?(?:struct|union|enum)\s+{want_re}\b")
+
+    in_block_comment = False
+    raw_lines = str(patch_text or "").splitlines()
+    for idx, raw in enumerate(raw_lines):
         if not raw.startswith("-") or raw.startswith("---"):
             continue
         code = _strip_diff_prefix(raw).rstrip()
         stripped = code.lstrip()
         if not stripped:
             continue
-        if stripped.startswith(("/*", "//")):
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
+            continue
+        if stripped.startswith("//"):
             continue
 
         # Macros: only treat as defined if we see a matching '#define NAME ...' line.
@@ -217,21 +235,48 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
         if stripped.rstrip().endswith("\\"):
             continue
 
+        # Tag bodies: treat `struct|union|enum NAME {` (or `{` on the next inserted line) as a definition.
+        # Avoid treating `struct NAME;` or `struct NAME *p;` as "already defined".
+        if tag_head_pat.match(stripped):
+            if "{" in stripped:
+                return True
+            # Some style puts `{` on the next line: `typedef struct TAG` then `{`.
+            for j in range(idx + 1, min(len(raw_lines), idx + 8)):
+                nxt = raw_lines[j]
+                if not nxt.startswith("-") or nxt.startswith("---"):
+                    break
+                nxt_code = _strip_diff_prefix(nxt).strip()
+                if not nxt_code or nxt_code.startswith(("/*", "//")):
+                    continue
+                if nxt_code.startswith("{"):
+                    return True
+                break
+
         # Function prototypes/defs at file scope.
         if not stripped.startswith("#"):
-            fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
             if fn_pat.search(stripped) and not _looks_like_statement(stripped):
                 if stripped.rstrip().endswith(";") or "{" in stripped:
                     return True
 
-        # Variable/type declarations at file scope.
-        ident_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}(?![A-Za-z0-9_])")
-        if not stripped.startswith("#") and stripped.rstrip().endswith(";") and ident_pat.search(stripped):
-            return True
-        if stripped.startswith("typedef") and ident_pat.search(stripped):
-            return True
-        if re.match(rf"^(?:struct|enum|union)\s+{re.escape(want)}\b", stripped):
-            return True
+        # Typedefs for function pointers (common C style): `typedef <ret> (*NAME)(...);`
+        if stripped.startswith("typedef") and stripped.rstrip().endswith(";"):
+            if typedef_fn_ptr_pat.match(stripped):
+                return True
+
+        # Other file-scope declarations: treat as defined only if NAME appears in a declarator position,
+        # not merely as a referenced type inside a prototype/param list.
+        if not stripped.startswith("#") and stripped.rstrip().endswith(";"):
+            # Avoid treating forward tag decls (`struct NAME;`) as a definition; tag bodies require `{`.
+            if re.match(rf"^(?:struct|union|enum)\s+{want_re}\b", stripped):
+                continue
+            m_decl = declared_name_pat.search(stripped)
+            if m_decl:
+                # If the only match is inside a function prototype parameter list (unnamed-parameter style),
+                # it will appear after the first '(' on the line; ignore those.
+                first_paren = stripped.find("(")
+                if first_paren >= 0 and m_decl.start() > first_paren:
+                    continue
+                return True
 
     return False
 
@@ -708,8 +753,13 @@ def _recompute_hunk_headers(lines: List[str]) -> List[str]:
     return out
 
 
-def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[str]) -> str:
-    """Insert `insert_lines` (raw code, no diff prefix) as '-' lines into a unified diff hunk."""
+def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[str], prefer_prepend: bool = False) -> str:
+    """Insert `insert_lines` (raw code, no diff prefix) as '-' lines into a unified diff hunk.
+
+    By default, this appends after any existing '-' lines in the first hunk body. When prefer_prepend is True,
+    insert at the top of the hunk body so type declarations (typedef/tag bodies) can appear before previously
+    inserted prototypes/macros.
+    """
     raw = str(patch_text or "")
     if not raw.strip():
         return ""
@@ -718,16 +768,14 @@ def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[s
     if first_hunk < 0:
         return raw.rstrip("\n") + "\n"
 
-    # Insert after the last '-' line in the first hunk body (before trailing context).
-    insert_at = None
-    for i in range(first_hunk + 1, len(lines)):
-        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
-            break
-        if lines[i].startswith("-") and not lines[i].startswith("---"):
-            insert_at = i + 1
-
-    if insert_at is None:
-        insert_at = first_hunk + 1
+    insert_at = first_hunk + 1
+    if not prefer_prepend:
+        # Insert after the last '-' line in the first hunk body (before trailing context).
+        for i in range(first_hunk + 1, len(lines)):
+            if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+                break
+            if lines[i].startswith("-") and not lines[i].startswith("---"):
+                insert_at = i + 1
 
     # Convert raw code lines to diff '-' lines.
     block: List[str] = []
@@ -741,6 +789,39 @@ def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[s
     updated[insert_at:insert_at] = block
     updated = _recompute_hunk_headers(updated)
     return "\n".join(updated).rstrip("\n") + "\n"
+
+
+def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: List[str]) -> bool:
+    """Return True when inserted_lines should be prepended in the `_extra_*` hunk.
+
+    C requires types to be declared before use in prototypes; if a type insertion happens after prototypes
+    were already inserted, we must prepend the type block so those prototypes remain valid.
+    """
+    kind = str(insert_kind or "")
+    if any(k in kind for k in ("TYPEDEF_DECL", "STRUCT_DECL", "UNION_DECL", "ENUM_DECL", "tag_definition_from_kb")):
+        return True
+
+    first = next((str(l) for l in (inserted_lines or []) if str(l).strip()), "")
+    if not first:
+        return False
+    head = first.lstrip()
+    if head.startswith("typedef"):
+        return True
+    if re.match(r"^(?:struct|union|enum)\b", head):
+        if "{" in head:
+            return True
+        # Brace-on-next-line style: `struct TAG` then `{`.
+        for l in (inserted_lines or [])[1:]:
+            s = str(l).strip()
+            if not s:
+                continue
+            if s.startswith("{"):
+                return True
+            break
+        # Forward tag declaration (`struct TAG;`) still needs to precede prototypes using TAG.
+        if re.match(r"^(?:struct|union|enum)\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$", head):
+            return True
+    return False
 
 
 def _symbol_underlying_name(symbol: str) -> Tuple[str, str]:
@@ -1013,7 +1094,7 @@ def _upgrade_existing_forward_typedef_in_extra_hunk(
     if not inserted_lines:
         return "", "", ""
 
-    updated = _insert_minus_block_into_patch_text(patch_text, insert_lines=[""] + inserted_lines)
+    updated = _insert_minus_block_into_patch_text(patch_text, insert_lines=[""] + inserted_lines, prefer_prepend=True)
     insert_kind = f"tag_definition_from_kb:{used_ver}:{chosen_kind or want_kind}"
     return updated, "\n".join(inserted_lines).rstrip("\n") + "\n", insert_kind
 
@@ -1221,7 +1302,11 @@ def make_extra_patch_override(
     # Ensure a blank line separator before the inserted block for readability.
     block_lines = [""] + [l.rstrip() for l in inserted_lines if l is not None]
 
-    updated_text = _insert_minus_block_into_patch_text(existing, insert_lines=block_lines)
+    updated_text = _insert_minus_block_into_patch_text(
+        existing,
+        insert_lines=block_lines,
+        prefer_prepend=_should_prepend_extra_hunk_insertion(insert_kind=insert_kind, inserted_lines=inserted_lines),
+    )
 
     # Persist the override diff under the *extra patch_key* directory so patch_key inference works later.
     store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
