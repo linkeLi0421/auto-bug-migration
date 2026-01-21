@@ -110,6 +110,71 @@ assert "Merged/tail hunks" in p_tail, p_tail
 print("OK")
 PY
 
+# Prompt hygiene: in patch-scope mode, show only one active error line (hide the rest).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _build_messages  # noqa: E402
+
+st = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/a.c:1:1: error: e1",
+    snippet="",
+)
+st.patch_key = "p2"
+st.grouped_errors = [
+    {"raw": "/src/a.c:1:1: error: e1", "file": "/src/a.c", "line": 1, "col": 1, "msg": "e1"},
+    {"raw": "/src/a.c:2:1: error: e2", "file": "/src/a.c", "line": 2, "col": 1, "msg": "e2"},
+]
+
+msgs = _build_messages(st)
+user = next(m["content"] for m in msgs if m.get("role") == "user")
+
+assert "Patch-scope active error:" in user, user
+assert "/src/a.c:1:1: error: e1" in user, user
+assert "/src/a.c:2:1: error: e2" not in user, user
+
+print("OK")
+PY
+
+# Prompt hygiene: do not include missing-struct-member summaries unless the active error is a missing-member diagnostic.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _build_messages  # noqa: E402
+
+st = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/a.c:1:1: warning: call to undeclared function 'foo' [-Wimplicit-function-declaration]",
+    snippet="",
+)
+st.patch_key = "p2"
+st.grouped_errors = [
+    {"raw": st.error_line, "file": "/src/a.c", "line": 1, "col": 1, "level": "warning", "msg": "call to undeclared function 'foo'"},
+]
+
+# Simulate stale/extra missing-member info from other errors in the same patch_key.
+st.missing_struct_members = [{"struct": "struct _X", "members": ["y"]}]
+
+msgs = _build_messages(st)
+user = next(m["content"] for m in msgs if m.get("role") == "user")
+
+assert "Missing struct members" not in user, user
+print("OK")
+PY
+
 # Build-log parsing: include a small subset of warning diagnostics (undeclared function) so
 # patch-scope workflows can deterministically fix them.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -2780,6 +2845,209 @@ with tempfile.TemporaryDirectory() as td:
     assert len(set(build_output_artifacts)) >= 2, build_output_artifacts
     assert all(p.is_file() for p in build_output_artifacts), build_output_artifacts
 
+print("OK")
+PY
+
+# Patch-key status grouping: when mapping provides old_signature, do not collapse groups into "<unknown>".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, ToolObservation, _summarize_active_patch_key_status  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+
+def fake_gepb(bundle, *, patch_path, file_path, line_number, **_kw):
+    if int(line_number) == 10:
+        return {"patch_key": "p", "old_signature": "int f(void)"}
+    if int(line_number) == 20:
+        return {"patch_key": "p", "old_signature": "int g(void)"}
+    return {"patch_key": "p", "old_signature": "int f(void)"}
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    import migration_tools.tools as mt  # noqa: E402
+
+    mt._get_error_patch_from_bundle = fake_gepb
+
+    bundle_path = root / "bundle.pkl"
+    bundle_path.write_bytes(
+        pickle.dumps(
+            {
+                "p": PatchInfo(
+                    file_path_old="a.c",
+                    file_path_new="a.c",
+                    patch_text="diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+                    file_type="source",
+                    old_start_line=1,
+                    old_end_line=1,
+                    new_start_line=1,
+                    new_end_line=1,
+                )
+            }
+        )
+    )
+
+    build_log = root / "build.log"
+    build_log.write_text("/src/a.c:10:1: error: e1\n/src/a.c:20:1: error: e2\n", encoding="utf-8")
+
+    st = AgentState(build_log_path="-", patch_path=str(bundle_path), error_scope="patch", error_line="old", snippet="")
+    st.patch_key = "p"
+    st.active_patch_key = "p"
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_log)}},
+        error=None,
+    )
+
+    pkv = _summarize_active_patch_key_status(st)
+    assert pkv.get("status") == "ok", pkv
+    groups = pkv.get("function_groups") or []
+    sigs = {g.get("old_signature") for g in groups if isinstance(g, dict)}
+    assert "int f(void)" in sigs, sigs
+    assert "int g(void)" in sigs, sigs
+
+print("OK")
+PY
+
+# After stopping post-OSS-Fuzz (auto-loop disabled or loop-max hit), refresh the final error snapshot from
+# the latest OSS-Fuzz logs so "Build error" matches "Current function groups".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentConfig, AgentState, ToolObservation, _run_langgraph  # noqa: E402
+from models import ChatModel  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+
+class NoModel(ChatModel):
+    def complete(self, messages):
+        raise AssertionError("Model should not be called in this scenario.")
+
+
+class NoRunner:
+    def call(self, tool, args):  # pragma: no cover
+        raise AssertionError("No tool calls expected.")
+
+
+def fake_gepb(bundle, *, patch_path, file_path, line_number, **_kw):
+    return {"patch_key": "p", "old_signature": "int f(void)"}
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    import migration_tools.tools as mt  # noqa: E402
+
+    mt._get_error_patch_from_bundle = fake_gepb
+
+    bundle_path = root / "bundle.pkl"
+    bundle_path.write_bytes(
+        pickle.dumps(
+            {
+                "p": PatchInfo(
+                    file_path_old="a.c",
+                    file_path_new="a.c",
+                    patch_text="diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+                    file_type="source",
+                    old_start_line=1,
+                    old_end_line=1,
+                    new_start_line=1,
+                    new_end_line=1,
+                )
+            }
+        )
+    )
+
+    build_log = root / "build.log"
+    build_log.write_text("/src/a.c:10:1: error: e_new\n", encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="old.log",
+        patch_path=str(bundle_path),
+        error_scope="patch",
+        error_line="/src/a.c:1:1: error: e_old",
+        snippet="",
+        artifacts_dir=str(root),
+        patch_key="p",
+        active_patch_key="p",
+        active_old_signature="int f(void)",
+        grouped_errors=[{"raw": "/src/a.c:1:1: error: e_old", "file": "/src/a.c", "line": 1, "col": 1, "msg": "e_old"}],
+        target_errors=[{"patch_key": "p", "msg": "e_old"}],
+    )
+    st.patch_generated = True
+    st.ossfuzz_test_attempted = True
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_log)}},
+        error=None,
+    )
+
+    cfg = AgentConfig(max_steps=1, tools_mode="fake", error_scope="patch", auto_ossfuzz_loop=False)
+    final = _run_langgraph(NoModel(), NoRunner(), st, cfg, artifact_store=None)
+    assert final.get("type") == "final", final
+    err_line = str((final.get("error") or {}).get("line") or "")
+    assert "/src/a.c:10:1: error: e_new" in err_line, err_line
+
+print("OK")
+PY
+
+# Text output: include a round header before each set of tool calls (shows which error is being handled).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _render_final_text  # noqa: E402
+
+final = {
+    "type": "final",
+    "thought": "",
+    "summary": "",
+    "next_step": "",
+    "error": {"line": "/src/a.c:1:1: error: e", "snippet": "", "scope": "patch", "patch_key": "p"},
+    "steps": [
+        {
+            "context": {"error_line": "/src/a.c:1:1: error: e1", "active_patch_key": "p", "active_old_signature": "int f(void)"},
+            "decision": {"tool": "get_error_patch_context", "args": {"x": 1}, "thought": "t"},
+            "observation": {"ok": True, "tool": "get_error_patch_context", "args": {"x": 1}, "output": {}, "error": None},
+        },
+        {
+            "context": {"error_line": "/src/a.c:2:1: error: e2", "active_patch_key": "p", "active_old_signature": "int g(void)"},
+            "decision": {"tool": "make_error_patch_override", "args": {"x": 2}, "thought": "t2"},
+            "observation": {"ok": True, "tool": "make_error_patch_override", "args": {"x": 2}, "output": {}, "error": None},
+        },
+    ],
+}
+
+text = _render_final_text(final)
+assert "Round 1" in text, text
+assert "error: e1" in text, text
+assert "Round 2" in text, text
+assert "error: e2" in text, text
 print("OK")
 PY
 
