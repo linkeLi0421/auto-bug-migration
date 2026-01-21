@@ -1352,10 +1352,12 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
         ln = int(e.get("line", 0) or 0)
         if not fp or ln <= 0:
             continue
+        mapping: Dict[str, Any] = {}
         patch_key = ""
         try:
-            mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
-            patch_key = str((mapping or {}).get("patch_key") or "").strip()
+            raw_mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
+            patch_key = str(mapping.get("patch_key") or "").strip()
         except Exception as exc:  # noqa: BLE001
             if mapping_error is None:
                 mapping_error = f"{type(exc).__name__}: {exc}"
@@ -1367,6 +1369,10 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             "msg": str(e.get("msg", "") or "").strip(),
             "patch_key": patch_key,
         }
+        if mapping:
+            for k in ("old_signature", "func_start_index", "func_end_index"):
+                if k in mapping:
+                    item[k] = mapping.get(k)
         if item["raw"]:
             enriched.append(item)
 
@@ -1384,6 +1390,120 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
         "mapping_error": mapping_error,
         "ossfuzz_runs_attempted": int(state.ossfuzz_runs_attempted or 0),
     }
+
+
+def _refresh_patch_scope_error_snapshot_from_latest_ossfuzz(state: AgentState) -> None:
+    """Refresh patch-scope error snapshot from the latest OSS-Fuzz logs (for output/debugging).
+
+    When auto-loop is disabled (or hits its loop limit), the agent may stop immediately after an
+    `ossfuzz_apply_patch_and_test` tool call. In that case, `state.error_line`/`state.grouped_errors`
+    can still refer to the *pre-test* error even though `Current function groups` are computed from
+    the latest logs. This helper updates the state so the final output is self-consistent.
+
+    Notes:
+    - Only refreshes within the pinned/active patch_key (does not drift across hunks).
+    - Does NOT mutate `state.error_history` (handled-error history). It may update "current" grouping.
+    """
+    if state.error_scope != "patch" or not state.patch_path:
+        return
+    if not (isinstance(state.last_observation, ToolObservation) and state.last_observation.tool == "ossfuzz_apply_patch_and_test"):
+        return
+
+    active_key = str(state.active_patch_key or state.patch_key or "").strip()
+    if not active_key:
+        return
+
+    errors, sources, err_msg = _iter_ossfuzz_compiler_errors(state)
+    if err_msg or not errors:
+        return
+
+    bundle, bundle_err = _load_effective_patch_bundle_for_mapping(state)
+    if bundle_err or bundle is None:
+        return
+
+    try:
+        from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+    except Exception:
+        return
+
+    enriched: List[Dict[str, Any]] = []
+    for e in errors:
+        fp = str(e.get("file", "") or "").strip()
+        ln = int(e.get("line", 0) or 0)
+        if not fp or ln <= 0:
+            continue
+        try:
+            mapping_raw = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            mapping = mapping_raw if isinstance(mapping_raw, dict) else {}
+        except Exception:
+            mapping = {}
+        item = dict(e)
+        if isinstance(mapping, dict):
+            pk = str(mapping.get("patch_key") or "").strip()
+            if pk:
+                item["patch_key"] = pk
+            for k in ("old_signature", "func_start_index", "func_end_index"):
+                if k in mapping:
+                    item[k] = mapping.get(k)
+        enriched.append(item)
+
+    in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
+    if not in_active:
+        return
+
+    in_active = _prioritize_warnings_within_hunk(in_active)
+    func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
+    state.function_groups = func_groups
+    state.function_groups_total = func_total
+    state.function_groups_truncated = func_trunc
+
+    preferred_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if not preferred_sig and state.grouped_errors:
+        preferred_sig = str(state.grouped_errors[0].get("old_signature", "") or "").strip()
+    selected, chosen_sig = _select_function_group_errors(in_active, preferred_old_signature=preferred_sig)
+    if chosen_sig:
+        state.active_old_signature = chosen_sig
+    if not selected:
+        return
+
+    next_err = selected[0]
+    state.grouped_errors = selected[:10]
+    state.error_line = str(next_err.get("raw", "") or "").strip() or state.error_line
+    state.snippet = str(next_err.get("snippet", "") or "").rstrip("\n") or state.snippet
+
+    fp = str(next_err.get("file", "") or "").strip()
+    ln = int(next_err.get("line", 0) or 0)
+    if fp and ln > 0:
+        state.active_file_path = fp
+        state.active_line_number = ln
+
+    if sources:
+        state.build_log_path = str(sources[0] or "").strip() or state.build_log_path
+
+    # Refresh missing-member summary only if the refreshed active error is a missing-member diagnostic.
+    state.missing_struct_members = []
+    try:
+        m_active = _MISSING_MEMBER_FIELD_RE.search(str(state.error_line or ""))
+        active_struct = str(m_active.group(2) or "").strip() if m_active else ""
+        if active_struct:
+            members: set[str] = set()
+            for e in state.grouped_errors or []:
+                if not isinstance(e, dict):
+                    continue
+                raw = str(e.get("raw", "") or "").strip()
+                m = _MISSING_MEMBER_FIELD_RE.search(raw)
+                if not m:
+                    continue
+                if str(m.group(2) or "").strip() != active_struct:
+                    continue
+                member = str(m.group(1) or "").strip()
+                if member:
+                    members.add(member)
+            if members:
+                max_members = 12
+                state.missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
+    except Exception:
+        state.missing_struct_members = []
 
 
 def _extract_minus_slice_from_patch_text(*, patch_text: str, func_start_index: int, func_end_index: int) -> str:
@@ -1500,28 +1620,25 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     # Refresh missing-member summary for this iteration (bounded output).
     state.missing_struct_members = []
     try:
-        from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
-
-        raw_block = "\n".join(str(e.get("raw", "")).strip() for e in state.grouped_errors if e.get("raw"))
-        if raw_block:
-            parsed = parse_build_errors_tool(build_log_text=raw_block)
-            msm = parsed.get("missing_struct_members") if isinstance(parsed, dict) else None
-            if isinstance(msm, list) and msm:
-                by_struct: Dict[str, set[str]] = {}
-                for item in msm:
-                    if not isinstance(item, dict):
-                        continue
-                    struct_raw = str(item.get("struct", "")).strip()
-                    member = str(item.get("member", "")).strip()
-                    if struct_raw and member:
-                        by_struct.setdefault(struct_raw, set()).add(member)
-                max_structs = 8
+        m_active = _MISSING_MEMBER_FIELD_RE.search(str(state.error_line or ""))
+        active_struct = str(m_active.group(2) or "").strip() if m_active else ""
+        if active_struct:
+            members: set[str] = set()
+            for e in state.grouped_errors or []:
+                if not isinstance(e, dict):
+                    continue
+                raw = str(e.get("raw", "") or "").strip()
+                m = _MISSING_MEMBER_FIELD_RE.search(raw)
+                if not m:
+                    continue
+                if str(m.group(2) or "").strip() != active_struct:
+                    continue
+                member = str(m.group(1) or "").strip()
+                if member:
+                    members.add(member)
+            if members:
                 max_members = 12
-                out: List[Dict[str, Any]] = []
-                for struct_name in sorted(by_struct.keys())[:max_structs]:
-                    members = sorted(by_struct[struct_name])[:max_members]
-                    out.append({"struct": struct_name, "members": members})
-                state.missing_struct_members = out
+                state.missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
     except Exception:
         state.missing_struct_members = []
 
@@ -1690,16 +1807,21 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
         for tok in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", snippet_sanitized):
             if keep(tok):
                 terms.append(tok)
-    for item in state.missing_struct_members or []:
-        if not isinstance(item, dict):
-            continue
-        for member in item.get("members") or []:
-            m = str(member or "").strip()
-            if keep(m):
-                terms.append(m)
-        struct_name = str(item.get("struct", "") or "").strip()
-        if keep(struct_name):
-            terms.append(struct_name)
+    # Only include missing-struct-member tokens when the active error is actually
+    # a missing-member diagnostic. Patch-scope runs can include many other errors
+    # in the same patch_key; including unrelated struct tokens can skew truncation
+    # windows and confuse the model.
+    if _MISSING_MEMBER_RE.search(str(state.error_line or "")) and state.missing_struct_members:
+        for item in state.missing_struct_members or []:
+            if not isinstance(item, dict):
+                continue
+            for member in item.get("members") or []:
+                m = str(member or "").strip()
+                if keep(m):
+                    terms.append(m)
+            struct_name = str(item.get("struct", "") or "").strip()
+            if keep(struct_name):
+                terms.append(struct_name)
     # Also include a few tokens from the error line itself.
     err = str(state.error_line or "")
     for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", err):
@@ -2842,7 +2964,7 @@ def _should_force_struct_diff_tools(state: AgentState) -> Optional[str]:
         return None
 
     struct_name = ""
-    if state.missing_struct_members:
+    if _MISSING_MEMBER_RE.search(str(state.error_line or "")) and state.missing_struct_members:
         struct_name = str(state.missing_struct_members[0].get("struct", "") or "").strip()
     if not struct_name:
         m = _MISSING_MEMBER_RE.search(str(state.error_line or ""))
@@ -2922,12 +3044,13 @@ def _last_tool_call_name(state: AgentState) -> str:
 
 def _structs_to_compare(state: AgentState) -> List[str]:
     structs: List[str] = []
-    for item in state.missing_struct_members or []:
-        if not isinstance(item, dict):
-            continue
-        s = str(item.get("struct", "") or "").strip()
-        if s:
-            structs.append(s)
+    if _MISSING_MEMBER_RE.search(str(state.error_line or "")):
+        for item in state.missing_struct_members or []:
+            if not isinstance(item, dict):
+                continue
+            s = str(item.get("struct", "") or "").strip()
+            if s:
+                structs.append(s)
     if not structs:
         m = _MISSING_MEMBER_RE.search(str(state.error_line or ""))
         if m:
@@ -3250,9 +3373,31 @@ def _render_final_text(final: Dict[str, Any]) -> str:
     if isinstance(steps, list) and steps:
         lines.append("")
         lines.append(f"Steps (full run, {len(steps)}):")
+        round_no = 0
+        last_round_key: tuple[str, str, str] | None = None
         for idx, step in enumerate(steps, start=1):
             decision = step.get("decision") if isinstance(step, dict) else {}
             observation = step.get("observation") if isinstance(step, dict) else {}
+            context = step.get("context") if isinstance(step, dict) else {}
+            if isinstance(context, dict):
+                ctx_err = str(context.get("error_line", "") or "").strip()
+                ctx_key = str(context.get("active_patch_key", "") or "").strip() or str(
+                    context.get("pinned_patch_key", "") or ""
+                ).strip()
+                ctx_sig = str(context.get("active_old_signature", "") or "").strip()
+                rk = (ctx_key, ctx_sig, ctx_err) if ctx_err else None
+                if rk and rk != last_round_key:
+                    round_no += 1
+                    meta: List[str] = []
+                    if ctx_key:
+                        meta.append(f"patch_key={ctx_key}")
+                    if ctx_sig:
+                        meta.append(f"func={ctx_sig}")
+                    meta_s = f" ({', '.join(meta)})" if meta else ""
+                    lines.append("")
+                    lines.append(f"Round {round_no}{meta_s}:")
+                    lines.append(textwrap.indent(ctx_err, "  "))
+                    last_round_key = rk
             if not isinstance(decision, dict) or not isinstance(observation, dict):
                 lines.append(f"{idx}. (malformed step)")
                 continue
@@ -3321,6 +3466,50 @@ def _system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState) -> List[Dict[str, str]]:
+    def _active_error_summary() -> str:
+        """Render a single active error for patch-scope runs.
+
+        Patch-scope runs can involve many errors mapped to the same patch_key. For prompt hygiene,
+        show only the active error (the one the agent is addressing this round) and summarize the rest.
+        """
+        if not (state.error_scope == "patch" and state.grouped_errors):
+            return ""
+        active = state.grouped_errors[0] if isinstance(state.grouped_errors[0], dict) else {}
+        raw = str(active.get("raw") or state.error_line or "").strip()
+        # Ensure the model sees a single error line, not a multi-line blob.
+        raw_line = raw.splitlines()[0].strip() if raw else ""
+
+        patch_key = str(state.patch_key or state.active_patch_key or "").strip()
+        other_count = max(int(len(state.grouped_errors)) - 1, 0)
+
+        active_json: Dict[str, Any] = {}
+        if isinstance(active, dict):
+            for k in ("raw", "file", "line", "col", "level", "msg", "patch_key", "old_signature", "func_start_index", "func_end_index"):
+                if k == "raw":
+                    active_json[k] = raw_line
+                    continue
+                v = active.get(k)
+                if v is not None:
+                    active_json[k] = v
+
+        lines: List[str] = ["Patch-scope active error:"]
+        if patch_key:
+            lines.append(f"patch_key: {patch_key}")
+        if raw_line:
+            lines.append(raw_line)
+        if other_count:
+            lines.append(f"(other errors in this patch_key: {other_count} hidden)")
+        lines.append("")
+        lines.append("Details (JSON):")
+        lines.append(
+            json.dumps(
+                {"patch_key": patch_key, "active_error": active_json, "other_errors_in_patch_key": other_count},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return "\n".join(lines).strip()
+
     header_lines: List[str] = []
     if state.build_log_path:
         header_lines.append(f"Build log path: {state.build_log_path}")
@@ -3349,8 +3538,12 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
             header_lines.append(f"  fuzz_target: {state.ossfuzz_fuzz_target}")
         header_lines.append(f"  use_sudo: {state.ossfuzz_use_sudo}")
     if state.missing_struct_members:
-        header_lines.append("Missing struct members (JSON):")
-        header_lines.append(json.dumps(state.missing_struct_members, ensure_ascii=False))
+        # Only show struct-member summaries when the active error is a missing-member diagnostic.
+        # Patch-scope runs can include many errors in the same patch_key; emitting unrelated struct
+        # summaries in every round confuses the model.
+        if _MISSING_MEMBER_RE.search(str(state.error_line or "")):
+            header_lines.append("Missing struct members (JSON):")
+            header_lines.append(json.dumps(state.missing_struct_members, ensure_ascii=False))
     header = "\n".join(header_lines).strip()
 
     messages: List[Dict[str, str]] = [
@@ -3359,10 +3552,7 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
             "role": "user",
             "content": (header + "\n\n" if header else "")
             + (
-                "Patch-scope errors (all map to the same patch key):\n"
-                + (("\n".join(str(e.get("raw", "")).strip() for e in state.grouped_errors if e.get("raw"))) + "\n\n")
-                + "Details (JSON):\n"
-                + json.dumps({"patch_key": state.patch_key, "errors": state.grouped_errors}, ensure_ascii=False, indent=2)
+                _active_error_summary()
                 if state.error_scope == "patch" and state.grouped_errors
                 else "Build error:\n" + state.error_line + "\n\nContext:\n" + state.snippet
             )
@@ -3556,6 +3746,10 @@ def _run_langgraph(
             if patch_text_path:
                 next_step_lines.append(f"Override diff: {patch_text_path}")
             next_step = "\n".join(next_step_lines).strip()
+
+            # If we're stopping after an OSS-Fuzz test (e.g. auto-loop disabled or loop-max hit),
+            # refresh the visible error snapshot so `Build error`/`Grouped errors` match the latest logs.
+            _refresh_patch_scope_error_snapshot_from_latest_ossfuzz(st)
             return {
                 "state": st,
                 "final": {
@@ -4237,6 +4431,15 @@ def _run_langgraph(
         st = gs["state"]
         decision = gs["pending"]
         tool = str(decision["tool"])
+        # Record which error the agent was targeting when making this tool call.
+        step_context = {
+            "scope": str(st.error_scope),
+            "pinned_patch_key": str(getattr(st, "patch_key", "") or "").strip(),
+            "active_patch_key": str(getattr(st, "active_patch_key", "") or "").strip(),
+            "active_old_signature": str(getattr(st, "active_old_signature", "") or "").strip(),
+            "error_line": str(getattr(st, "error_line", "") or "").strip(),
+            "build_log_path": str(getattr(st, "build_log_path", "") or "").strip(),
+        }
         # Patch-scope: always run patch tools against the current effective patch bundle.
         if st.error_scope == "patch" and st.patch_path and tool in _PATCH_TOOLS_WITH_PATCH_PATH:
             args_obj = decision.get("args")
@@ -4254,7 +4457,7 @@ def _run_langgraph(
             )
             if offloaded is not obs.output:
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
-        step_rec = {"decision": decision, "observation": obs.__dict__}
+        step_rec = {"decision": decision, "observation": obs.__dict__, "context": step_context}
         st.steps.append(step_rec)
         st.step_history.append(step_rec)
         st.last_observation = obs
@@ -4587,7 +4790,6 @@ def main(argv: List[str]) -> int:
     if cfg.error_scope == "patch" and patch_path:
         try:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
-            from tools.migration_tools import parse_build_errors as parse_build_errors_tool  # noqa: PLC0415
 
             errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -4622,26 +4824,31 @@ def main(argv: List[str]) -> int:
                     snippet = str(grouped_errors[0].get("snippet", snippet))
                     if not active_old_signature:
                         active_old_signature = str(grouped_errors[0].get("old_signature", "") or "").strip()
-                raw_block = "\n".join(str(e.get("raw", "")).strip() for e in grouped_errors if e.get("raw"))
-                if raw_block:
-                    parsed = parse_build_errors_tool(build_log_text=raw_block)
-                    msm = parsed.get("missing_struct_members") if isinstance(parsed, dict) else None
-                    if isinstance(msm, list) and msm:
-                        by_struct: Dict[str, set[str]] = {}
-                        for item in msm:
-                            if not isinstance(item, dict):
-                                continue
-                            struct_raw = str(item.get("struct", "")).strip()
-                            member = str(item.get("member", "")).strip()
-                            if struct_raw and member:
-                                by_struct.setdefault(struct_raw, set()).add(member)
-                        # Bound output size for prompt readability.
-                        max_structs = 8
+
+                # Only compute a missing-member summary when the ACTIVE error is a missing-member diagnostic.
+                # Patch-scope runs can have many unrelated errors in the same patch_key; carrying forward
+                # missing-member info from other errors confuses the model and can trigger irrelevant
+                # prereq tool forcing (search_definition struct diffs).
+                missing_struct_members = []
+                m_active = _MISSING_MEMBER_FIELD_RE.search(str(error_line or ""))
+                active_struct = str(m_active.group(2) or "").strip() if m_active else ""
+                if active_struct:
+                    members: set[str] = set()
+                    for e in grouped_errors or []:
+                        if not isinstance(e, dict):
+                            continue
+                        raw = str(e.get("raw", "") or "").strip()
+                        m = _MISSING_MEMBER_FIELD_RE.search(raw)
+                        if not m:
+                            continue
+                        if str(m.group(2) or "").strip() != active_struct:
+                            continue
+                        member = str(m.group(1) or "").strip()
+                        if member:
+                            members.add(member)
+                    if members:
                         max_members = 12
-                        missing_struct_members = []
-                        for struct_name in sorted(by_struct.keys())[:max_structs]:
-                            members = sorted(by_struct[struct_name])[:max_members]
-                            missing_struct_members.append({"struct": struct_name, "members": members})
+                        missing_struct_members = [{"struct": active_struct, "members": sorted(members)[:max_members]}]
         except Exception:
             grouped_errors = []
             patch_key = ""
