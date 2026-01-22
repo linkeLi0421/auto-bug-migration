@@ -1,0 +1,428 @@
+{
+  "type": "multi_agent",
+  "build_log": "tmp1",
+  "patch_path": "/home/user/oss-fuzz-build/data/tmp_patch/libxml2.patch2",
+  "patch_keys_total": 2,
+  "jobs": 1,
+  "artifacts_root": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6",
+  "summary_json_path": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/summary.json",
+  "hunks_fixed": 1,
+  "hunks_not_fixed": 1,
+  "hunks_unknown": 0,
+  "agents_failed": 0,
+  "results": [
+    {
+      "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+      "patch_key_dirname": "tail-parser.c-xmlParse3986DecOctet_",
+      "errors": 37,
+      "primary_error": "/src/libxml2/parser.c:17188:26: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+      "agent_exit_code": 0,
+      "agent_summary": "Generated an override patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
+      "agent_next_step": "Target error fixed: no.\nRemaining target errors:\n- /src/libxml2/parser.c:17169:1: error: redefinition of '__revert_e11519_xmlParserNsCreate'\n- /src/libxml2/parser.c:17184:1: error: redefinition of '__revert_e11519_xmlParserNsReset'\n- /src/libxml2/parser.c:17196:1: error: redefinition of '__revert_e11519_xmlParserNsStartElement'\n- /src/libxml2/parser.c:17206:1: error: redefinition of '__revert_e11519_xmlSaturatedAddSizeT'\n- /src/libxml2/parser.c:17213:1: error: redefinition of '__revert_e11519_xmlSaturatedAdd'\nReview OSS-Fuzz logs in artifacts and apply the merged patch file.\nMerged patch: /home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_merged_libxml2_f0fd1b.diff\nOverride diff: /home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/make_error_patch_override_patch_text_parser.c.diff",
+      "agent_error_line": "/src/libxml2/parser.c:17169:1: error: redefinition of '__revert_e11519_xmlParserNsCreate'",
+      "agent_output_parse_error": null,
+      "artifacts_dir": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_",
+      "agent_stdout_path": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/agent_stdout.json",
+      "started_at": 1768184708.7413595,
+      "finished_at": 1768185181.111446,
+      "duration_sec": 472.37008358864114,
+      "hunk_fixed": false,
+      "target_fixed": false,
+      "task_status": "remaining_errors",
+      "task_success": false,
+      "remaining_in_active_patch_key": 39,
+      "active_patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+      "log_artifacts": [
+        "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_build_output.log",
+        "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_check_build_output.log"
+      ],
+      "ossfuzz_verdict": {
+        "status": "ok",
+        "fixed": false,
+        "targets": [
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsCreate'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsReset'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsStartElement'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAddSizeT'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAdd'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlParseURISafe'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsLookup'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "no member named 'nsdb' in 'struct _xmlParserCtxt'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          }
+        ],
+        "matched_target_errors": [
+          {
+            "raw": "/src/libxml2/parser.c:17169:1: error: redefinition of '__revert_e11519_xmlParserNsCreate'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17169,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsCreate'"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17184:1: error: redefinition of '__revert_e11519_xmlParserNsReset'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17184,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsReset'"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17196:1: error: redefinition of '__revert_e11519_xmlParserNsStartElement'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17196,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlParserNsStartElement'"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17206:1: error: redefinition of '__revert_e11519_xmlSaturatedAddSizeT'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17206,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAddSizeT'"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17213:1: error: redefinition of '__revert_e11519_xmlSaturatedAdd'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17213,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAdd'"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17220:1: error: redefinition of '__revert_e11519_xmlParseURISafe'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17220,
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+            "msg": "redefinition of '__revert_e11519_xmlParseURISafe'"
+          }
+        ],
+        "other_errors": [
+          {
+            "raw": "/src/libxml2/encoding.c:104:5: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 104,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:106:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 106,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:107:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 107,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:108:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 108,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:109:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 109,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:110:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 110,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:111:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 111,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:113:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 113,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/error.c:675:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 675,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbWarnings' in 'struct _xmlParserCtxt'"
+          },
+          {
+            "raw": "/src/libxml2/error.c:677:23: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 677,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbWarnings' in 'struct _xmlParserCtxt'"
+          }
+        ],
+        "log_artifacts": [
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_build_output.log",
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_check_build_output.log"
+        ],
+        "mapping_error": null
+      },
+      "patch_key_verdict": {
+        "status": "ok",
+        "active_patch_key": "tail-parser.c-xmlParse3986DecOctet_",
+        "remaining_in_active_patch_key": 39,
+        "errors": [
+          {
+            "raw": "/src/libxml2/parser.c:17169:1: error: redefinition of '__revert_e11519_xmlParserNsCreate'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17169,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlParserNsCreate'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17184:1: error: redefinition of '__revert_e11519_xmlParserNsReset'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17184,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlParserNsReset'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17196:1: error: redefinition of '__revert_e11519_xmlParserNsStartElement'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17196,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlParserNsStartElement'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17206:1: error: redefinition of '__revert_e11519_xmlSaturatedAddSizeT'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17206,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAddSizeT'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17213:1: error: redefinition of '__revert_e11519_xmlSaturatedAdd'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17213,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlSaturatedAdd'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17220:1: error: redefinition of '__revert_e11519_xmlParseURISafe'",
+            "file": "/src/libxml2/parser.c",
+            "line": 17220,
+            "col": 1,
+            "msg": "redefinition of '__revert_e11519_xmlParseURISafe'",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17316:50: error: function definition is not allowed here",
+            "file": "/src/libxml2/parser.c",
+            "line": 17316,
+            "col": 50,
+            "msg": "function definition is not allowed here",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17354:62: error: function definition is not allowed here",
+            "file": "/src/libxml2/parser.c",
+            "line": 17354,
+            "col": 62,
+            "msg": "function definition is not allowed here",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17366:71: error: function definition is not allowed here",
+            "file": "/src/libxml2/parser.c",
+            "line": 17366,
+            "col": 71,
+            "msg": "function definition is not allowed here",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          },
+          {
+            "raw": "/src/libxml2/parser.c:17399:92: error: function definition is not allowed here",
+            "file": "/src/libxml2/parser.c",
+            "line": 17399,
+            "col": 92,
+            "msg": "function definition is not allowed here",
+            "patch_key": "tail-parser.c-xmlParse3986DecOctet_"
+          }
+        ],
+        "log_artifacts": [
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_build_output.log",
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/tail-parser.c-xmlParse3986DecOctet_/ossfuzz_apply_patch_and_test_check_build_output.log"
+        ],
+        "mapping_error": null,
+        "ossfuzz_runs_attempted": 10
+      }
+    },
+    {
+      "patch_key": "92116236229",
+      "patch_key_dirname": "92116236229",
+      "errors": 12,
+      "primary_error": "/src/libxml2/parser.c:10105:55: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+      "agent_exit_code": 0,
+      "agent_summary": "Generated an override patch, tested it in OSS-Fuzz, and checked whether the target error is fixed.",
+      "agent_next_step": "Target error fixed: yes.\nNext top errors:\n- /src/libxml2/error.c:675:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'\n- /src/libxml2/error.c:677:23: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'\n- /src/libxml2/error.c:679:27: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'\n- /src/libxml2/error.c:681:23: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'\n- /src/libxml2/encoding.c:104:5: error: expected '}'\nReview OSS-Fuzz logs in artifacts and apply the merged patch file.\nMerged patch: /home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_merged_libxml2_f0fd1b.diff\nOverride diff: /home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/make_error_patch_override_patch_text_parser.c.diff",
+      "agent_error_line": "/src/libxml2/parser.c:10166:43: error: cannot take the address of an rvalue of type 'xmlHashedString *'",
+      "agent_output_parse_error": null,
+      "artifacts_dir": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229",
+      "agent_stdout_path": "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/agent_stdout.json",
+      "started_at": 1768185181.112849,
+      "finished_at": 1768185494.4585116,
+      "duration_sec": 313.3456598529592,
+      "hunk_fixed": true,
+      "target_fixed": true,
+      "task_status": "fixed",
+      "task_success": true,
+      "remaining_in_active_patch_key": 0,
+      "active_patch_key": "92116236229",
+      "log_artifacts": [
+        "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_build_output.log",
+        "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_check_build_output.log"
+      ],
+      "ossfuzz_verdict": {
+        "status": "ok",
+        "fixed": true,
+        "targets": [
+          {
+            "file": "/src/libxml2/parser.c",
+            "msg": "cannot take the address of an rvalue of type 'xmlHashedString *'",
+            "patch_key": "92116236229"
+          }
+        ],
+        "matched_target_errors": [],
+        "other_errors": [
+          {
+            "raw": "/src/libxml2/error.c:675:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 675,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbWarnings' in 'struct _xmlParserCtxt'"
+          },
+          {
+            "raw": "/src/libxml2/error.c:677:23: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 677,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbWarnings' in 'struct _xmlParserCtxt'"
+          },
+          {
+            "raw": "/src/libxml2/error.c:679:27: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 679,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbErrors' in 'struct _xmlParserCtxt'"
+          },
+          {
+            "raw": "/src/libxml2/error.c:681:23: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'",
+            "file": "/src/libxml2/error.c",
+            "line": 681,
+            "patch_key": "208640714364",
+            "msg": "no member named 'nbErrors' in 'struct _xmlParserCtxt'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:104:5: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 104,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:106:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 106,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:107:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 107,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:108:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 108,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:109:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 109,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          },
+          {
+            "raw": "/src/libxml2/encoding.c:110:6: error: expected '}'",
+            "file": "/src/libxml2/encoding.c",
+            "line": 110,
+            "patch_key": "_extra_encoding.c",
+            "msg": "expected '}'"
+          }
+        ],
+        "log_artifacts": [
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_build_output.log",
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_check_build_output.log"
+        ],
+        "mapping_error": null
+      },
+      "patch_key_verdict": {
+        "status": "ok",
+        "active_patch_key": "92116236229",
+        "remaining_in_active_patch_key": 0,
+        "errors": [],
+        "log_artifacts": [
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_build_output.log",
+          "/home/user/oss-fuzz-build/data/react_agent_artifacts/multi_20260112_022508_3723316_581c25b6/92116236229/ossfuzz_apply_patch_and_test_check_build_output.log"
+        ],
+        "mapping_error": null,
+        "ossfuzz_runs_attempted": 3
+      }
+    }
+  ]
+}

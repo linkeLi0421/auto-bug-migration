@@ -1,0 +1,12 @@
+/src/libxml2/error.c:675:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'
+  675 |                 if (ctxt->nbWarnings >= __rervert_var_e11519_XML_MAX_ERRORS)
+      |                     ~~~~  ^
+/src/libxml2/error.c:677:23: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'
+  677 |                 ctxt->nbWarnings += 1;
+      |                 ~~~~  ^
+/src/libxml2/error.c:679:27: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'
+  679 |                 if (ctxt->nbErrors >= __rervert_var_e11519_XML_MAX_ERRORS)
+      |                     ~~~~  ^
+/src/libxml2/error.c:681:23: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'
+  681 |                 ctxt->nbErrors += 1;
+      |                 ~~~~  ^

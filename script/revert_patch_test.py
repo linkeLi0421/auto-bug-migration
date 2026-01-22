@@ -3560,18 +3560,26 @@ def apply_and_test_patches(
     # build and test if it works, oss-fuzz version has been set in collect_trace_cmd
     error_log = 'undeclared identifier'
     count = 0
+    # Store previous handle_build_error results to detect when results stop changing
+    prev_build_error_results = None
     while ('undeclared identifier' in error_log or 'undeclared function' in error_log or 
            'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
            in error_log):
         count += 1
-        if count == 30:
-            break
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
         with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
             f.write(error_log)
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
+        
+        # Check if build error results are the same as last iteration
+        current_build_error_results = (undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types)
+        if prev_build_error_results is not None and current_build_error_results == prev_build_error_results:
+            logger.info('Build error results unchanged from last iteration, breaking loop')
+            break
+        prev_build_error_results = current_build_error_results
+        
         with open(patch_file_path, 'r') as f:
             patch_text = f.read()
         if error_last_round != stable_hash(patch_text):
