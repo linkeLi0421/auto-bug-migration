@@ -46,3 +46,16 @@
   - [x] Tighten `maybe_add` parsing:
     - [x] When `patch_text` is a string, only treat it as an override artifact path if it “looks like a path” (single-line, reasonable length); otherwise skip it.
   - [x] Add regression coverage to `script/react_agent/test_multi_agent.sh` ensuring the unified-diff-string case does not throw and does not produce an override path.
+
+[x] Multi-agent resume support: restart without redoing fixed hunks
+  - Context: long multi-agent runs can fail transiently (e.g. `read operation timed out`) and it’s expensive to restart from the beginning.
+  - [x] Add `--resume-from` to `script/react_agent/multi_agent.py` to reuse an existing `multi_<run_id>` artifacts root (or its `progress.json`/`summary.json`).
+  - [x] Skip patch_keys whose prior `task_status` is `fixed`; rerun the rest.
+  - [x] Write `progress.json` checkpoints after each completed hunk so partial runs can be resumed.
+  - [x] Add regression coverage in `script/react_agent/test_multi_agent.sh`.
+
+[x] Single-agent restart on transient timeouts (agent_langgraph)
+  - Context: single-agent runs can fail with transient network/LLM errors like `Result: next_step: The read operation timed out` and currently exit with `thought: Agent error.`
+  - [x] Add `--max-agent-retries` and `--agent-retry-backoff-sec` to `script/react_agent/agent_langgraph.py`.
+  - [x] Retry LangGraph execution in-process when the exception chain indicates a timeout (`urllib.error.URLError` / `socket.timeout` / “timed out” text).
+  - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh` with a flaky model that times out once, then succeeds.

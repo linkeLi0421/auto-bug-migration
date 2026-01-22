@@ -8,6 +8,9 @@ import re
 import sys
 import textwrap
 import inspect
+import time
+import socket
+import urllib.error
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, TypedDict
@@ -164,6 +167,66 @@ def _error_payload(state: AgentState) -> Dict[str, Any]:
     if state.missing_struct_members:
         payload["missing_struct_members"] = state.missing_struct_members
     return payload
+
+
+def _exc_chain(exc: BaseException) -> List[BaseException]:
+    chain: List[BaseException] = []
+    cur: Optional[BaseException] = exc
+    while cur is not None and cur not in chain:
+        chain.append(cur)
+        next_exc = cur.__cause__ or cur.__context__
+        cur = next_exc if isinstance(next_exc, BaseException) else None
+    return chain
+
+
+def _is_transient_agent_error(exc: BaseException) -> bool:
+    for e in _exc_chain(exc):
+        if isinstance(e, (TimeoutError, socket.timeout)):
+            return True
+        if isinstance(e, urllib.error.URLError):
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                return True
+            if "timed out" in str(e).lower():
+                return True
+        msg = str(e).lower()
+        if "timed out" in msg or "timeout" in msg:
+            return True
+        if "temporarily unavailable" in msg or "connection reset" in msg:
+            return True
+    return False
+
+
+def _run_langgraph_with_retries(
+    model: ChatModel,
+    runner: Any,
+    state: AgentState,
+    cfg: AgentConfig,
+    *,
+    artifact_store: Any,
+    max_retries: int,
+    backoff_sec: float,
+) -> Dict[str, Any]:
+    attempts = 0
+    retries = max(0, int(max_retries))
+    delay = max(0.0, float(backoff_sec))
+    while True:
+        attempts += 1
+        try:
+            return _run_langgraph(model, runner, state, cfg, artifact_store=artifact_store)
+        except Exception as exc:  # noqa: BLE001
+            should_retry = attempts <= (retries + 1) and _is_transient_agent_error(exc)
+            if not should_retry:
+                raise
+            sleep_s = delay * (2 ** max(0, attempts - 1))
+            sleep_s = min(max(sleep_s, 0.0), 60.0)
+            print(
+                f"[agent_langgraph] transient error ({type(exc).__name__}: {exc}); retrying in {sleep_s:.1f}s "
+                f"(attempt {attempts}/{retries + 1})",
+                file=sys.stderr,
+            )
+            if sleep_s:
+                time.sleep(sleep_s)
 
 
 def _steps_for_output(state: AgentState) -> List[Dict[str, Any]]:
@@ -4835,6 +4898,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REACT_AGENT_DEBUG_LLM_DIR", ""),
         help="If set, also write each LLM request/response as JSON under this directory.",
     )
+    parser.add_argument(
+        "--max-agent-retries",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_AGENT_RETRIES", "2") or 2),
+        help="Retry transient model/network timeouts (e.g. 'read operation timed out') up to N times (0=disable).",
+    )
+    parser.add_argument(
+        "--agent-retry-backoff-sec",
+        type=float,
+        default=float(os.environ.get("REACT_AGENT_AGENT_RETRY_BACKOFF_SEC", "5") or 5),
+        help="Initial retry backoff in seconds (doubles per attempt; capped at 60s).",
+    )
 
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
     parser.add_argument("--ossfuzz-project", default=os.environ.get("REACT_AGENT_OSSFUZZ_PROJECT", ""))
@@ -5097,12 +5172,14 @@ def main(argv: List[str]) -> int:
             _update_function_error_history(state, full_grouped_for_history)
         _record_current_error_group(state)
 
-        final = _run_langgraph(
+        final = _run_langgraph_with_retries(
             model,
             runner,
             state,
             cfg,
             artifact_store=artifact_store,
+            max_retries=int(getattr(args, "max_agent_retries", 0) or 0),
+            backoff_sec=float(getattr(args, "agent_retry_backoff_sec", 0.0) or 0.0),
         )
     except Exception as exc:  # noqa: BLE001
         _emit({"type": "final", "thought": "Agent error.", "summary": "", "next_step": str(exc)}, args.output_format)

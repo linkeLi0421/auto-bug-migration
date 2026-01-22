@@ -77,6 +77,43 @@ assert runner.calls == ["search_definition"], runner.calls
 print("OK")
 PY
 
+# Retry transient model/network timeouts instead of exiting with "Agent error."
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentConfig, AgentState, _run_langgraph_with_retries  # noqa: E402
+from models import ChatModel, ModelError  # noqa: E402
+
+
+class FlakyTimeoutModel(ChatModel):
+    def __init__(self) -> None:
+        self.turn = 0
+
+    def complete(self, messages):
+        self.turn += 1
+        if self.turn == 1:
+            raise ModelError("OpenAI URLError: <urlopen error timed out>")
+        return json.dumps({"type": "final", "thought": "ok", "summary": "ok", "next_step": ""})
+
+
+class Runner:
+    def call(self, tool, args):  # pragma: no cover
+        raise AssertionError(f"unexpected tool call: {tool}")
+
+
+st = AgentState(build_log_path="-", patch_path="", error_scope="first", error_line="/src/x.c:1:1: error: x", snippet="")
+cfg = AgentConfig(max_steps=1, tools_mode="fake", error_scope="first")
+final = _run_langgraph_with_retries(FlakyTimeoutModel(), Runner(), st, cfg, artifact_store=None, max_retries=2, backoff_sec=0)
+assert final.get("type") == "final", final
+assert final.get("summary") == "ok", final
+print("OK")
+PY
+
 # System prompt composition: keep the default prompt small by only including relevant sections.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
