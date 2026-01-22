@@ -2014,6 +2014,41 @@ def _last_read_artifact_text(state: AgentState) -> str:
     return ""
 
 
+def _last_read_artifact_path(state: AgentState) -> str:
+    for step in reversed(state.steps):
+        if not isinstance(step, dict):
+            continue
+        obs = step.get("observation")
+        if not isinstance(obs, dict) or obs.get("ok") is not True:
+            continue
+        if str(obs.get("tool", "")).strip() != "read_artifact":
+            continue
+        args = obs.get("args")
+        if not isinstance(args, dict):
+            continue
+        path = str(args.get("artifact_path", "") or "").strip()
+        if path:
+            return path
+    return ""
+
+
+def _force_read_base_slice_for_shrunk_override(state: AgentState) -> Optional[Decision]:
+    """If possible, force re-reading the BASE slice artifact before retrying an override."""
+    base_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+    if not base_path:
+        base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if not base_path:
+        return None
+    if _last_read_artifact_path(state) == base_path:
+        return None
+    return {
+        "type": "tool",
+        "tool": "read_artifact",
+        "thought": "Re-read the mapped BASE slice (error_func_code) before retrying make_error_patch_override.",
+        "args": {"artifact_path": base_path, "start_line": 1, "max_lines": 1200},
+    }
+
+
 def _override_preserve_base_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
     """Return an error message if new_func_code drops too much of the mapped '-' slice baseline.
 
@@ -4258,50 +4293,55 @@ def _run_langgraph(
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             shrink_err = _override_preserve_base_guardrail_error(st, decision)
             if shrink_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
-                            f"{shrink_err}\n\n"
-                            "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
-                            "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
-                            "Return exactly one JSON object of type tool calling make_error_patch_override."
-                        ),
-                    }
-                )
-                raw2 = _complete(model, repair_messages, label="override_shrink_repair")
-                try:
-                    repaired = _parse_decision(raw2)
-                except Exception:
-                    repaired = {}
-                if (
-                    isinstance(repaired, dict)
-                    and repaired.get("type") == "tool"
-                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
-                ):
-                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
-                    shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
-                    if not shrink_err2:
-                        decision = repaired  # type: ignore[assignment]
-                    else:
-                        return {
-                            "state": st,
-                            "final": {
-                                "type": "final",
-                                "thought": "Model repeatedly produced a truncated override body.",
-                                "summary": "Stopped before patch generation due to an incomplete override body.",
-                                "next_step": (
-                                    f"{shrink_err2}\n\n"
-                                    "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
-                                    "or manually construct new_func_code by editing the read_artifact BASE slice."
-                                ).strip(),
-                                "steps": _steps_for_output(st),
-                                "error": _error_payload(st),
-                            },
+                forced_read = _force_read_base_slice_for_shrunk_override(st)
+                if forced_read:
+                    _validate_tool_decision(forced_read)
+                    decision = forced_read  # type: ignore[assignment]
+                else:
+                    repair_messages = list(messages)
+                    repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                    repair_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
+                                f"{shrink_err}\n\n"
+                                "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
+                                "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
+                                "Return exactly one JSON object of type tool calling make_error_patch_override."
+                            ),
                         }
+                    )
+                    raw2 = _complete(model, repair_messages, label="override_shrink_repair")
+                    try:
+                        repaired = _parse_decision(raw2)
+                    except Exception:
+                        repaired = {}
+                    if (
+                        isinstance(repaired, dict)
+                        and repaired.get("type") == "tool"
+                        and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                    ):
+                        _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                        shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                        if not shrink_err2:
+                            decision = repaired  # type: ignore[assignment]
+                        else:
+                            return {
+                                "state": st,
+                                "final": {
+                                    "type": "final",
+                                    "thought": "Model repeatedly produced a truncated override body.",
+                                    "summary": "Stopped before patch generation due to an incomplete override body.",
+                                    "next_step": (
+                                        f"{shrink_err2}\n\n"
+                                        "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
+                                        "or manually construct new_func_code by editing the read_artifact BASE slice."
+                                    ).strip(),
+                                    "steps": _steps_for_output(st),
+                                    "error": _error_payload(st),
+                                },
+                            }
 
         # Guardrail (function-by-function): in merged/tail mode, the override should only rewrite the active function,
         # not the entire patch hunk.

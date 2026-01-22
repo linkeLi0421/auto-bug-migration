@@ -13,10 +13,12 @@ class PromptContext:
     error_line: str
     active_old_signature: str
     missing_struct_members: bool
+    undeclared_symbol: bool
     macro_tokens_not_defined_in_slice: bool
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
+_UNDECLARED_SYMBOL_SNIPPET = "use of undeclared identifier"
 
 
 def _prompt_dir() -> Path:
@@ -61,6 +63,7 @@ def _context_from_state(state: Any) -> PromptContext:
     error_line = str(getattr(state, "error_line", "") or "")
     active_old_signature = str(getattr(state, "active_old_signature", "") or "").strip()
     missing_struct_members = bool(getattr(state, "missing_struct_members", None) or []) or ("no member named" in error_line)
+    undeclared_symbol = _UNDECLARED_SYMBOL_SNIPPET in error_line
     macro_tokens_not_defined_in_slice = bool(getattr(state, "macro_tokens_not_defined_in_slice", None) or [])
     return PromptContext(
         error_scope=error_scope,
@@ -68,6 +71,7 @@ def _context_from_state(state: Any) -> PromptContext:
         error_line=error_line,
         active_old_signature=active_old_signature,
         missing_struct_members=missing_struct_members,
+        undeclared_symbol=undeclared_symbol,
         macro_tokens_not_defined_in_slice=macro_tokens_not_defined_in_slice,
     )
 
@@ -118,6 +122,11 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if struct_members:
             parts.append(struct_members)
 
+    if ctx.undeclared_symbol:
+        undeclared = _load_fragment("system_undeclared_symbol.txt")
+        if undeclared:
+            parts.append(undeclared)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -131,7 +140,8 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_macro.txt")
         if ctx.missing_struct_members:
             names.append("system_struct_members.txt")
+        if ctx.undeclared_symbol:
+            names.append("system_undeclared_symbol.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"
-

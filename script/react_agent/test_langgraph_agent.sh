@@ -102,6 +102,16 @@ st_macro = AgentState(build_log_path="-", patch_path="", error_scope="first", er
 p_macro = build_system_prompt(st_macro, tool_specs=TOOL_SPECS)
 assert "Macro-related syntax errors:" in p_macro, p_macro
 
+st_undeclared = AgentState(
+    build_log_path="-",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/x.c:1:1: error: use of undeclared identifier 'xmlHashedString'",
+    snippet="",
+)
+p_undeclared = build_system_prompt(st_undeclared, tool_specs=TOOL_SPECS)
+assert "Undeclared symbol/type errors:" in p_undeclared, p_undeclared
+
 st_tail = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
 st_tail.active_old_signature = "int f(int x)"
 p_tail = build_system_prompt(st_tail, tool_specs=TOOL_SPECS)
@@ -2010,6 +2020,54 @@ with tempfile.TemporaryDirectory() as td:
         "args": {"patch_path": "x", "file_path": "y", "line_number": 1, "new_func_code": base_text},
     }
     assert _override_complete_function_guardrail_error(state, ok) is None, "expected complete-body guardrail to pass"
+
+print("OK")
+PY
+
+# Override shrink recovery: when the base-preservation guardrail triggers, force a read_artifact
+# of this round's get_error_patch_context.error_func_code before retrying an override.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _force_read_base_slice_for_shrunk_override, _override_preserve_base_guardrail_error  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = str(Path(td) / "error_func_code.txt")
+    Path(base_path).write_text("".join([f"LINE{i:03d}\\n" for i in range(80)]), encoding="utf-8")
+    state = AgentState(
+        build_log_path="build.log",
+        patch_path="bundle.patch2",
+        error_scope="patch",
+        error_line="/src/p.c:1:1: error: x",
+        snippet="",
+    )
+    state.active_error_func_code_artifact_path = base_path
+
+    decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "thought": "too short",
+        "args": {"patch_path": "x", "file_path": "/src/p.c", "line_number": 1, "new_func_code": "int x;\\n"},
+    }
+    assert _override_preserve_base_guardrail_error(state, decision), "expected shrink guardrail to trigger"
+
+    forced = _force_read_base_slice_for_shrunk_override(state)
+    assert forced and forced.get("tool") == "read_artifact", forced
+    assert (forced.get("args") or {}).get("artifact_path") == base_path, forced
+
+    state.steps = [
+        {
+            "decision": {"type": "tool", "tool": "read_artifact", "args": {"artifact_path": base_path}},
+            "observation": {"ok": True, "tool": "read_artifact", "args": {"artifact_path": base_path}, "output": {"text": "ok"}, "error": None},
+            "context": {},
+        }
+    ]
+    assert _force_read_base_slice_for_shrunk_override(state) is None, "expected no force when base already read"
 
 print("OK")
 PY
