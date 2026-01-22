@@ -258,6 +258,43 @@ ordered = [x.get("patch_key") for x in (out.get("per_hunk") or [])]
 assert ordered[:2] == ["p_main", "_extra_a.c"], ordered
 PY
 
+# agent_stdout steps: tolerate "patch_text" being a unified diff string (not a path/artifact).
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY'
+import json
+import tempfile
+from pathlib import Path
+
+import sys
+
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+import multi_agent  # noqa: E402
+
+payload = {
+    "type": "final",
+    "summary": "x",
+    "steps": [
+        {
+            "decision": {"type": "tool", "tool": "make_error_patch_override", "args": {}},
+            "observation": {
+                "ok": True,
+                "tool": "make_error_patch_override",
+                "args": {},
+                "output": {
+                    "patch_key": "p1",
+                    "patch_text": "diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1 +1 @@\n-old\n+new\n",
+                },
+            },
+        }
+    ],
+}
+
+with tempfile.TemporaryDirectory() as td:
+    p = Path(td) / "agent_stdout.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    out = multi_agent._extract_override_diffs_from_agent_stdout_steps(p)
+    assert out == [], out
+PY
+
 # Merged patch output should not overwrite prior iterations (unique paths).
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
 import os
