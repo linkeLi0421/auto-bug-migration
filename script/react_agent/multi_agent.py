@@ -130,16 +130,30 @@ def _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path: Path) -> 
     out: List[Dict[str, Any]] = []
 
     def normalize_path(value: Any) -> str:
-        p = str(value or "").strip()
-        if not p:
+        raw = str(value or "").strip()
+        if not raw:
             return ""
-        path = Path(p).expanduser()
-        if not path.is_absolute():
-            # Most runs emit absolute artifact paths; best-effort resolve relative ones from the cwd.
-            path = (Path.cwd() / path).resolve()
-        else:
-            path = path.resolve()
-        return str(path) if path.is_file() else ""
+        if "\n" in raw or "\r" in raw:
+            return ""
+        if raw.lstrip().startswith("diff --git "):
+            return ""
+        # Avoid Path/stat on obviously-not-path payloads (e.g. unified diffs).
+        if len(raw) > 4096:
+            return ""
+
+        path = Path(raw).expanduser()
+        try:
+            if not path.is_absolute():
+                # Most runs emit absolute artifact paths; best-effort resolve relative ones from the cwd.
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+        except OSError:
+            return ""
+        try:
+            return str(path) if path.is_file() else ""
+        except OSError:
+            return ""
 
     def maybe_add(output: Any, *, method: str) -> None:
         if not isinstance(output, dict):
@@ -151,7 +165,9 @@ def _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path: Path) -> 
             override_path = normalize_path(patch_text.get("artifact_path"))
         elif isinstance(patch_text, str):
             # Some "no change" cases return the current patch text as a string. That's not an override diff.
-            override_path = normalize_path(patch_text)
+            candidate = patch_text.strip()
+            if "\n" not in candidate and "\r" not in candidate and len(candidate) <= 1024:
+                override_path = normalize_path(candidate)
         if not override_path:
             return
         if not patch_key:
@@ -389,6 +405,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Run one patch-scope ReAct agent per patch hunk (patch_key).")
     p.add_argument("build_log", nargs="?", default="-", help="Build log path, or '-' for stdin.")
     p.add_argument("--patch-path", required=True, help="Path to a tmp_patch bundle (*.patch2).")
+    p.add_argument(
+        "--resume-from",
+        default="",
+        help="Resume a prior multi-agent run from an artifacts dir (multi_<run_id>) or a summary/progress JSON file.",
+    )
     p.add_argument("--max-groups", type=int, default=20, help="Max patch_key groups to run (default: 20).")
     p.add_argument(
         "--max-restarts-per-hunk",
@@ -469,6 +490,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Forwarded to agent_langgraph.py (max ossfuzz_apply_patch_and_test calls when --auto-ossfuzz-loop is enabled).",
     )
     return p
+
+
+def _resolve_resume_root(value: str) -> Optional[Path]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    p = Path(raw).expanduser().resolve()
+    if p.is_dir():
+        return p
+    if p.is_file() and p.suffix.lower() == ".json":
+        return p.parent
+    return None
+
+
+def _load_resume_report(artifacts_root: Path) -> Dict[str, Any]:
+    for name in ("progress.json", "summary.json"):
+        p = (artifacts_root / name).resolve()
+        if not p.is_file():
+            continue
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("_resume_source", str(p))
+            return payload
+    return {}
+
+
+def _write_progress_json(artifacts_root: Path, report: Dict[str, Any]) -> None:
+    try:
+        p = (artifacts_root / "progress.json").resolve()
+        p.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def _agent_cmd(
@@ -580,8 +636,24 @@ def main(argv: List[str]) -> int:
     if not agent_script.is_file():
         raise FileNotFoundError(str(agent_script))
 
+    resume_root = _resolve_resume_root(str(getattr(args, "resume_from", "") or ""))
+    resumed_report: Dict[str, Any] = {}
+    resumed_by_key: Dict[str, Dict[str, Any]] = {}
+
     run_id = default_run_id()
     artifacts_root = repo_root / "data" / "react_agent_artifacts" / f"multi_{run_id}"
+    if resume_root is not None:
+        artifacts_root = resume_root
+        resumed_report = _load_resume_report(artifacts_root)
+        prev = resumed_report.get("results")
+        if isinstance(prev, list):
+            for item in prev:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("patch_key", "") or "").strip()
+                if key:
+                    resumed_by_key[key] = item
+
     artifacts_root.mkdir(parents=True, exist_ok=True)
     agent_build_log_path = str(args.build_log)
     if str(args.build_log).strip() == "-":
@@ -589,10 +661,70 @@ def main(argv: List[str]) -> int:
         out_path.write_text(build_log_text + ("\n" if build_log_text and not build_log_text.endswith("\n") else ""), encoding="utf-8", errors="replace")
         agent_build_log_path = str(out_path)
 
-    results: List[Dict[str, Any]] = []
     env = dict(os.environ)
     env["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
+    def _report_snapshot(*, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
+        hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
+        hunks_unknown = sum(1 for r in results if r.get("hunk_fixed") is None)
+        agents_failed = sum(1 for r in results if int(r.get("agent_exit_code") or 0) != 0)
+        restarts_attempted_total = sum(int(r.get("restarts_attempted") or 0) for r in results)
+        hunks_restarted = sum(1 for r in results if int(r.get("restarts_attempted") or 0) > 0)
+        task_status_counts: Dict[str, int] = {}
+        not_fixed: List[Dict[str, Any]] = []
+        for r in results:
+            status = str(r.get("task_status", "") or "").strip() or "unknown"
+            task_status_counts[status] = task_status_counts.get(status, 0) + 1
+            if status != "fixed":
+                not_fixed.append(
+                    {
+                        "patch_key": r.get("patch_key"),
+                        "task_status": status,
+                        "hunk_fixed": r.get("hunk_fixed"),
+                        "remaining_in_active_patch_key": r.get("remaining_in_active_patch_key"),
+                        "agent_exit_code": r.get("agent_exit_code"),
+                        "agent_output_parse_error": r.get("agent_output_parse_error"),
+                    }
+                )
+        summary_path = artifacts_root / "summary.json"
+        return {
+            "type": "multi_agent",
+            "build_log": str(args.build_log),
+            "patch_path": patch_path,
+            "max_groups_requested": max_groups_requested,
+            "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
+            "patch_key_groups_found": patch_key_groups_found,
+            "patch_key_groups_after_allowlist": patch_key_groups_after_allowlist,
+            "patch_key_groups_selected": patch_key_groups_selected,
+            "patch_keys_total": len(ranked),
+            "jobs": max(1, int(args.jobs or 1)),
+            "artifacts_root": str(artifacts_root),
+            "summary_json_path": str(summary_path),
+            "hunks_fixed": hunks_fixed,
+            "hunks_not_fixed": hunks_not_fixed,
+            "hunks_unknown": hunks_unknown,
+            "agents_failed": agents_failed,
+            "hunks_restarted": hunks_restarted,
+            "restarts_attempted_total": restarts_attempted_total,
+            "task_status_counts": task_status_counts,
+            "not_fixed": not_fixed[:50],
+            "results": results,
+            "resumed_from": str(resumed_report.get("_resume_source", "") or "").strip(),
+        }
+
+    items: Dict[int, Dict[str, Any]] = {}
+    to_run: List[tuple[int, str]] = []
+    for idx, key in enumerate(ranked):
+        prev = resumed_by_key.get(key)
+        if isinstance(prev, dict) and str(prev.get("task_status", "") or "").strip() == "fixed":
+            items[idx] = prev
+        else:
+            to_run.append((idx, key))
+    if resumed_by_key:
+        snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+        _write_progress_json(artifacts_root, snap)
 
     def reset_out_dir(out_dir: Path) -> None:
         resolved = out_dir.resolve()
@@ -751,17 +883,20 @@ def main(argv: List[str]) -> int:
 
     jobs = max(1, int(args.jobs or 1))
     if jobs == 1:
-        for idx, key in enumerate(ranked):
+        for idx, key in to_run:
             _, item = run_one(key, idx)
-            results.append(item)
+            items[idx] = item
+            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+            _write_progress_json(artifacts_root, snap)
     else:
-        items: Dict[int, Dict[str, Any]] = {}
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            futs = [ex.submit(run_one, key, idx) for idx, key in enumerate(ranked)]
+            futs = [ex.submit(run_one, key, idx) for idx, key in to_run]
             for fut in as_completed(futs):
                 idx, item = fut.result()
                 items[idx] = item
-        results = [items[i] for i in sorted(items.keys())]
+                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+                _write_progress_json(artifacts_root, snap)
+    results = [items[i] for i in sorted(items.keys())]
 
     hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
     hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
@@ -922,8 +1057,10 @@ def main(argv: List[str]) -> int:
         "task_status_counts": task_status_counts,
         "not_fixed": not_fixed[:50],
         "results": results,
+        "resumed_from": str(resumed_report.get("_resume_source", "") or "").strip(),
     }
     summary_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _write_progress_json(artifacts_root, report)
     _emit(report, str(args.output_format))
     return 0
 
