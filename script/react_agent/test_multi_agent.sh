@@ -511,4 +511,54 @@ for r in obj.get("results") or []:
     assert isinstance(hist, list) and len(hist) == 2, hist
 PY
 
+# Resume mode: skip already-fixed patch_keys from a prior artifacts root.
+resume_root="$tmp_dir/resume_artifacts"
+mkdir -p "$resume_root/p1" "$resume_root/p2"
+cat >"$resume_root/p1/agent_stdout.json" <<'JSON'
+{"type":"final","summary":"ok","next_step":"","steps":[]}
+JSON
+cat >"$resume_root/p2/agent_stdout.json" <<'JSON'
+{"type":"final","summary":"fail","next_step":"","steps":[]}
+JSON
+
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$resume_root" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+progress = {
+    "type": "multi_agent",
+    "results": [
+        {"patch_key": "p1", "task_status": "fixed", "hunk_fixed": True, "attempts": 7, "restarts_attempted": 0, "artifacts_dir": str(root / "p1"), "agent_stdout_path": str(root / "p1" / "agent_stdout.json"), "patch_key_dirname": "p1", "agent_exit_code": 0},
+        {"patch_key": "p2", "task_status": "agent_failed", "hunk_fixed": None, "attempts": 1, "restarts_attempted": 0, "artifacts_dir": str(root / "p2"), "agent_stdout_path": str(root / "p2" / "agent_stdout.json"), "patch_key_dirname": "p2", "agent_exit_code": 1},
+    ],
+}
+(root / "progress.json").write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
+PY
+
+out_path3="$tmp_dir/out_resume.json"
+"$PYTHON" "$SCRIPT_DIR/multi_agent.py" "$build_log" \
+  --patch-path "$bundle_path" \
+  --resume-from "$resume_root" \
+  --jobs 1 \
+  --max-restarts-per-hunk 0 \
+  --model stub --tools fake --max-steps 1 \
+  --ossfuzz-project libxml2 --ossfuzz-commit f0fd1b \
+  --output-format json-pretty >"$out_path3"
+
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$out_path3" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+obj = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace"))
+assert obj["type"] == "multi_agent", obj
+assert "progress.json" in (obj.get("resumed_from") or ""), obj.get("resumed_from")
+rmap = {r["patch_key"]: r for r in (obj.get("results") or [])}
+assert rmap["p1"].get("task_status") == "fixed", rmap["p1"]
+assert rmap["p1"].get("attempts") == 7, rmap["p1"]  # skipped (not rerun)
+assert rmap["p2"].get("attempts") == 1, rmap["p2"]  # rerun once in this resumed invocation
+PY
+
 echo "OK"
