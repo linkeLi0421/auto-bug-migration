@@ -37,17 +37,25 @@
   - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
   - [x] Post reminder to `#report`.
 
-[ ] Undeclared identifier guidance: define first, don’t delete usage
-  - Context: for diagnostics like `error: use of undeclared identifier 'xmlHashedString'`, the agent sometimes “fixes” by deleting the identifier use inside the function, instead of first trying to add the missing definition at file scope.
-  - [ ] Add a system-prompt fragment for undeclared identifier/function/type errors: try adding the definition via `make_extra_patch_override` before rewriting/removing code.
-  - [ ] Wire the fragment into prompt assembly (only when the active error is an undeclared symbol diagnostic).
-  - [ ] Add a regression test that the undeclared-identifier prompt section is included when `error_line` matches.
-  - [ ] Run `bash script/react_agent/test_langgraph_agent.sh`.
-  - [ ] Post reminder to `#report`.
+[ ] Fix `multi_agent.py` crash when `patch_text` is a unified diff string (Errno 36: file name too long)
+  - Context: `_extract_override_diffs_from_agent_stdout_steps()` currently calls `normalize_path(patch_text)` when `patch_text` is a string. In some “no change” tool outputs, `patch_text` is the *full diff text* (starts with `diff --git ...`), so `Path(...).is_file()` attempts to `stat()` a huge “filename” and crashes.
+  - [x] Reproduce with a minimal `agent_stdout.json` payload where `steps[*].observation.output.patch_text` is a unified diff string (no `artifact_path`).
+  - [x] Harden `normalize_path`:
+    - [x] Reject obviously-not-a-path strings (contains `\n`, starts with `diff --git`, overly long).
+    - [x] Wrap `path.resolve()` / `path.is_file()` in `try/except OSError` and return `""` on failure.
+  - [x] Tighten `maybe_add` parsing:
+    - [x] When `patch_text` is a string, only treat it as an override artifact path if it “looks like a path” (single-line, reasonable length); otherwise skip it.
+  - [x] Add regression coverage to `script/react_agent/test_multi_agent.sh` ensuring the unified-diff-string case does not throw and does not produce an override path.
 
-[ ] Override shrink guardrail: force BASE slice reread
-  - Context: when the override base-preservation guardrail triggers (“new_func_code drops too much of the mapped '-' slice baseline”), the agent should re-read the mapped BASE slice for this round (get_error_patch_context.error_func_code) before attempting another override.
-  - [ ] When shrink guardrail triggers, force a `read_artifact(artifact_path=<error_func_code artifact>)` tool call (prefer this round’s error_func_code; fall back to loop BASE slice).
-  - [ ] Add regression test for the forced read_artifact decision.
-  - [ ] Run `bash script/react_agent/test_langgraph_agent.sh`.
-  - [ ] Post reminder to `#report`.
+[x] Multi-agent resume support: restart without redoing fixed hunks
+  - Context: long multi-agent runs can fail transiently (e.g. `read operation timed out`) and it’s expensive to restart from the beginning.
+  - [x] Add `--resume-from` to `script/react_agent/multi_agent.py` to reuse an existing `multi_<run_id>` artifacts root (or its `progress.json`/`summary.json`).
+  - [x] Skip patch_keys whose prior `task_status` is `fixed`; rerun the rest.
+  - [x] Write `progress.json` checkpoints after each completed hunk so partial runs can be resumed.
+  - [x] Add regression coverage in `script/react_agent/test_multi_agent.sh`.
+
+[x] Single-agent restart on transient timeouts (agent_langgraph)
+  - Context: single-agent runs can fail with transient network/LLM errors like `Result: next_step: The read operation timed out` and currently exit with `thought: Agent error.`
+  - [x] Add `--max-agent-retries` and `--agent-retry-backoff-sec` to `script/react_agent/agent_langgraph.py`.
+  - [x] Retry LangGraph execution in-process when the exception chain indicates a timeout (`urllib.error.URLError` / `socket.timeout` / “timed out” text).
+  - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh` with a flaky model that times out once, then succeeds.
