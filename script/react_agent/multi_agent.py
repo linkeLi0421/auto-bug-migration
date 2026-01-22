@@ -130,16 +130,30 @@ def _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path: Path) -> 
     out: List[Dict[str, Any]] = []
 
     def normalize_path(value: Any) -> str:
-        p = str(value or "").strip()
-        if not p:
+        raw = str(value or "").strip()
+        if not raw:
             return ""
-        path = Path(p).expanduser()
-        if not path.is_absolute():
-            # Most runs emit absolute artifact paths; best-effort resolve relative ones from the cwd.
-            path = (Path.cwd() / path).resolve()
-        else:
-            path = path.resolve()
-        return str(path) if path.is_file() else ""
+        if "\n" in raw or "\r" in raw:
+            return ""
+        if raw.lstrip().startswith("diff --git "):
+            return ""
+        # Avoid Path/stat on obviously-not-path payloads (e.g. unified diffs).
+        if len(raw) > 4096:
+            return ""
+
+        path = Path(raw).expanduser()
+        try:
+            if not path.is_absolute():
+                # Most runs emit absolute artifact paths; best-effort resolve relative ones from the cwd.
+                path = (Path.cwd() / path).resolve()
+            else:
+                path = path.resolve()
+        except OSError:
+            return ""
+        try:
+            return str(path) if path.is_file() else ""
+        except OSError:
+            return ""
 
     def maybe_add(output: Any, *, method: str) -> None:
         if not isinstance(output, dict):
@@ -151,7 +165,9 @@ def _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path: Path) -> 
             override_path = normalize_path(patch_text.get("artifact_path"))
         elif isinstance(patch_text, str):
             # Some "no change" cases return the current patch text as a string. That's not an override diff.
-            override_path = normalize_path(patch_text)
+            candidate = patch_text.strip()
+            if "\n" not in candidate and "\r" not in candidate and len(candidate) <= 1024:
+                override_path = normalize_path(candidate)
         if not override_path:
             return
         if not patch_key:
