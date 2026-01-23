@@ -10,6 +10,7 @@ import textwrap
 import inspect
 import time
 import socket
+import random
 import urllib.error
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -190,6 +191,14 @@ def _exc_chain(exc: BaseException) -> List[BaseException]:
 
 def _is_transient_agent_error(exc: BaseException) -> bool:
     for e in _exc_chain(exc):
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                code = int(getattr(e, "code", 0) or 0)
+            except (TypeError, ValueError):
+                code = 0
+            # Retry common transient upstream failures (Cloudflare / OpenAI edge).
+            if code == 429 or (500 <= code < 600):
+                return True
         if isinstance(e, (TimeoutError, socket.timeout)):
             return True
         if isinstance(e, urllib.error.URLError):
@@ -203,6 +212,18 @@ def _is_transient_agent_error(exc: BaseException) -> bool:
             return True
         if "temporarily unavailable" in msg or "connection reset" in msg:
             return True
+        # Fallback: ModelError may only include the HTTP code in the message.
+        # Example: "OpenAI HTTPError: 502 Bad Gateway <html>...cloudflare...</html>"
+        m = re.search(r"\bopenai\s+httperror:\s*(\d{3})\b", msg)
+        if not m:
+            m = re.search(r"\bstatus\s*=\s*(\d{3})\b", msg)
+        if m:
+            try:
+                code = int(m.group(1))
+            except (TypeError, ValueError):
+                code = 0
+            if code == 429 or (500 <= code < 600):
+                return True
     return False
 
 
@@ -219,6 +240,7 @@ def _run_langgraph_with_retries(
     attempts = 0
     retries = max(0, int(max_retries))
     delay = max(0.0, float(backoff_sec))
+    max_sleep_s = 60.0
     while True:
         attempts += 1
         try:
@@ -227,8 +249,13 @@ def _run_langgraph_with_retries(
             should_retry = attempts <= (retries + 1) and _is_transient_agent_error(exc)
             if not should_retry:
                 raise
-            sleep_s = delay * (2 ** max(0, attempts - 1))
-            sleep_s = min(max(sleep_s, 0.0), 60.0)
+            # Exponential backoff with jitter:
+            #   base: delay * 2^(attempt-1) (capped)
+            #   sleep = base * (0.5 + rand())  where rand() in [0, 1)
+            base_s = delay * (2 ** max(0, attempts - 1))
+            base_s = min(max(base_s, 0.0), max_sleep_s)
+            sleep_s = base_s * (0.5 + random.random())
+            sleep_s = min(max(sleep_s, 0.0), max_sleep_s)
             print(
                 f"[agent_langgraph] transient error ({type(exc).__name__}: {exc}); retrying in {sleep_s:.1f}s "
                 f"(attempt {attempts}/{retries + 1})",
@@ -5584,14 +5611,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-agent-retries",
         type=int,
-        default=int(os.environ.get("REACT_AGENT_MAX_AGENT_RETRIES", "2") or 2),
-        help="Retry transient model/network timeouts (e.g. 'read operation timed out') up to N times (0=disable).",
+        default=int(os.environ.get("REACT_AGENT_MAX_AGENT_RETRIES", "6") or 6),
+        help="Retry transient model/network failures (timeouts + HTTP 5xx/429) up to N times (0=disable).",
     )
     parser.add_argument(
         "--agent-retry-backoff-sec",
         type=float,
-        default=float(os.environ.get("REACT_AGENT_AGENT_RETRY_BACKOFF_SEC", "5") or 5),
-        help="Initial retry backoff in seconds (doubles per attempt; capped at 60s).",
+        default=float(os.environ.get("REACT_AGENT_AGENT_RETRY_BACKOFF_SEC", "1") or 1),
+        help="Initial retry backoff in seconds (doubles per attempt; jitter; capped at 60s).",
     )
 
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)

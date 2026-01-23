@@ -277,6 +277,43 @@ assert ranked2[0]["level"] == "warning", ranked2
 print("OK")
 PY
 
+# Retry classifier: treat OpenAI HTTP 5xx/429 as transient, but not auth failures.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import io
+import sys
+import urllib.error
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _is_transient_agent_error  # noqa: E402
+from models import ModelError  # noqa: E402
+
+
+def http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        url="https://api.openai.com/v1/chat/completions",
+        code=code,
+        msg="x",
+        hdrs=None,
+        fp=io.BytesIO(b"body"),
+    )
+
+
+try:
+    raise ModelError("OpenAI HTTPError: 502 Bad Gateway <html>cloudflare</html>") from http_error(502)
+except Exception as exc:  # noqa: BLE001
+    assert _is_transient_agent_error(exc) is True, exc
+
+try:
+    raise ModelError("OpenAI HTTPError: 401 Unauthorized") from http_error(401)
+except Exception as exc:  # noqa: BLE001
+    assert _is_transient_agent_error(exc) is False, exc
+
+print("OK")
+PY
+
 # Guardrail: do not force make_extra_patch_override due to unrelated grouped errors when the active error is not undeclared.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
