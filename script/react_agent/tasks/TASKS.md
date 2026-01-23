@@ -37,7 +37,7 @@
   - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
   - [x] Post reminder to `#report`.
 
-[ ] Fix `multi_agent.py` crash when `patch_text` is a unified diff string (Errno 36: file name too long)
+[x] Fix `multi_agent.py` crash when `patch_text` is a unified diff string (Errno 36: file name too long)
   - Context: `_extract_override_diffs_from_agent_stdout_steps()` currently calls `normalize_path(patch_text)` when `patch_text` is a string. In some “no change” tool outputs, `patch_text` is the *full diff text* (starts with `diff --git ...`), so `Path(...).is_file()` attempts to `stat()` a huge “filename” and crashes.
   - [x] Reproduce with a minimal `agent_stdout.json` payload where `steps[*].observation.output.patch_text` is a unified diff string (no `artifact_path`).
   - [x] Harden `normalize_path`:
@@ -46,6 +46,13 @@
   - [x] Tighten `maybe_add` parsing:
     - [x] When `patch_text` is a string, only treat it as an override artifact path if it “looks like a path” (single-line, reasonable length); otherwise skip it.
   - [x] Add regression coverage to `script/react_agent/test_multi_agent.sh` ensuring the unified-diff-string case does not throw and does not produce an override path.
+  - [ ] Post reminder to `#report`.
+
+[ ] Preserve leading underscores in artifact dir names
+  - Context: patch keys like `_extra_parser.c` are currently written under `extra_parser.c/` because `_safe_bundle_name` strips leading `_`, which is confusing and can collide with a real `extra_parser.c` key.
+  - [x] Update `_safe_bundle_name` to keep leading `_` and only strip leading/trailing `.`.
+  - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
+  - [ ] Post reminder to `#report`.
 
 [x] Multi-agent resume support: restart without redoing fixed hunks
   - Context: long multi-agent runs can fail transiently (e.g. `read operation timed out`) and it’s expensive to restart from the beginning.
@@ -59,3 +66,8 @@
   - [x] Add `--max-agent-retries` and `--agent-retry-backoff-sec` to `script/react_agent/agent_langgraph.py`.
   - [x] Retry LangGraph execution in-process when the exception chain indicates a timeout (`urllib.error.URLError` / `socket.timeout` / “timed out” text).
   - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh` with a flaky model that times out once, then succeeds.
+
+[x] Missing-struct-member guidance: patch-scope workflow + direct override
+  - Context: errors like `error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'` need a deterministic workflow to avoid the agent stalling or making broad edits.
+  - [x] Update `script/react_agent/prompts/system_struct_members.txt` to include a step-by-step patch-scope flow: get_error_patch_context → search_definition(struct in v1/v2) → make_error_patch_override → ossfuzz_apply_patch_and_test.
+  - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh`.

@@ -114,6 +114,113 @@ assert final.get("summary") == "ok", final
 print("OK")
 PY
 
+# Guardrail: do not introduce new __revert_* call targets in overrides (keep function names stable).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_no_new_revert_symbols_guardrail_error  # noqa: E402
+
+base = (
+    "static const xmlChar *\\n"
+    "__revert_e11519_xmlParseStartTag(xmlParserCtxtPtr ctxt) {\\n"
+    "  const xmlChar *x = xmlParseAttribute2(ctxt, NULL, NULL, NULL, NULL, NULL, NULL);\\n"
+    "  return x;\\n"
+    "}\\n"
+)
+new = (
+    "static const xmlChar *\\n"
+    "__revert_e11519_xmlParseStartTag(xmlParserCtxtPtr ctxt) {\\n"
+    "  const xmlChar *x = __revert_e11519_xmlParseAttribute2(ctxt, NULL, NULL, NULL, NULL, NULL, NULL);\\n"
+    "  return x;\\n"
+    "}\\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text(base, encoding="utf-8")
+    st = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+    st.loop_base_func_code_artifact_path = str(base_path)
+    decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "args": {"new_func_code": new, "patch_path": "bundle.patch2", "file_path": "/src/x.c", "line_number": 1},
+    }
+    err = _override_no_new_revert_symbols_guardrail_error(st, decision)
+    assert err and "introduces" in err, err
+print("OK")
+PY
+
+# Guardrail: do not falsely flag __revert_* prefixed BASE function names as "renamed".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_preserve_function_name_guardrail_error  # noqa: E402
+
+base = (
+    "static const xmlChar *\\n"
+    "__revert_e11519_xmlParseStartTag2(xmlParserCtxtPtr ctxt) {\\n"
+    "  return NULL;\\n"
+    "}\\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text(base, encoding="utf-8")
+    st = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+    st.active_old_signature = "const xmlChar * xmlParseStartTag2(xmlParserCtxtPtr ctxt)"
+    st.loop_base_func_code_artifact_path = str(base_path)
+    decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "args": {"new_func_code": base, "patch_path": "bundle.patch2", "file_path": "/src/x.c", "line_number": 1},
+    }
+    err = _override_preserve_function_name_guardrail_error(st, decision)
+    assert err is None, err
+print("OK")
+PY
+
+# Patch-scope prompt: include log context + additional errors when configured.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _build_messages  # noqa: E402
+
+st = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/a.c:1:1: error: e1",
+    snippet="",
+)
+st.patch_key = "p1"
+st.grouped_errors = [
+    {"raw": "/src/a.c:1:1: error: e1", "file": "/src/a.c", "line": 1, "col": 1, "msg": "e1", "snippet": "line1\\n  1 | bad\\n    | ^"},
+    {"raw": "/src/b.c:2:3: error: e2", "file": "/src/b.c", "line": 2, "col": 3, "msg": "e2", "snippet": "line2\\n  2 | also bad\\n    |   ^"},
+]
+
+msgs = _build_messages(st)
+user = next(m["content"] for m in msgs if m.get("role") == "user")
+assert "Log context:" in user, user
+assert "/src/b.c:2:3: error: e2" in user, user
+assert "Other errors in this patch_key" in user, user
+print("OK")
+PY
+
 # System prompt composition: keep the default prompt small by only including relevant sections.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
@@ -154,10 +261,25 @@ st_tail.active_old_signature = "int f(int x)"
 p_tail = build_system_prompt(st_tail, tool_specs=TOOL_SPECS)
 assert "Merged/tail hunks" in p_tail, p_tail
 
+st_member = AgentState(
+    build_log_path="-",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/x.c:1:1: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'",
+    snippet="",
+)
+p_member = build_system_prompt(st_member, tool_specs=TOOL_SPECS)
+assert "Struct-member errors:" in p_member, p_member
+assert "Workflow (patch-scope):" in p_member, p_member
+assert "get_error_patch_context" in p_member, p_member
+assert "search_definition(symbol_name=\"struct <Name>\"" in p_member, p_member
+assert "make_error_patch_override" in p_member, p_member
+assert "ossfuzz_apply_patch_and_test" in p_member, p_member
+
 print("OK")
 PY
 
-# Prompt hygiene: in patch-scope mode, show only one active error line (hide the rest).
+# Patch-scope prompt: show the active error and include additional errors for context.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -185,7 +307,8 @@ user = next(m["content"] for m in msgs if m.get("role") == "user")
 
 assert "Patch-scope active error:" in user, user
 assert "/src/a.c:1:1: error: e1" in user, user
-assert "/src/a.c:2:1: error: e2" not in user, user
+assert "Other errors in this patch_key" in user, user
+assert "/src/a.c:2:1: error: e2" in user, user
 
 print("OK")
 PY
@@ -2874,6 +2997,7 @@ sys.path.insert(0, str(repo_root))
 
 from agent_langgraph import AgentConfig, AgentState, _run_langgraph  # noqa: E402
 from artifacts import ArtifactStore  # noqa: E402
+from datetime import datetime  # noqa: E402
 from tools.artifact_tools import read_artifact as read_artifact_tool  # noqa: E402
 from tools.migration_tools import get_error_patch_context as get_error_patch_context_tool  # noqa: E402
 from tools.migration_tools import make_error_patch_override as make_error_patch_override_tool  # noqa: E402
@@ -2897,6 +3021,29 @@ class FakeRunner:
             return ToolObservation(True, tool, args, output=out, error=None)
         if tool == "make_error_patch_override":
             out = make_error_patch_override_tool(**args)
+            return ToolObservation(True, tool, args, output=out, error=None)
+        if tool == "make_extra_patch_override":
+            # Minimal stub diff: reverse-applied `-` lines become additions in patch-scope.
+            # This just needs to be non-empty so agent_langgraph treats it as a generated patch.
+            file_path = str(args.get("file_path") or "")
+            symbol = str(args.get("symbol_name") or "")
+            base = Path(file_path).name or "file.c"
+            extra_key = f"_extra_{base}"
+            stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+            patch_text = (
+                f"diff --git a/{base} b/{base}\n"
+                f"--- a/{base}\n"
+                f"+++ b/{base}\n"
+                f"@@ -1,0 +1,1 @@\n"
+                f"-/* extra stub {stamp}: {symbol} */\n"
+            )
+            out = {
+                "patch_path": str(args.get("patch_path") or ""),
+                "file_path": file_path,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "patch_text": patch_text,
+            }
             return ToolObservation(True, tool, args, output=out, error=None)
         if tool == "ossfuzz_apply_patch_and_test":
             if not self._ossfuzz_outputs:
@@ -3070,8 +3217,7 @@ with tempfile.TemporaryDirectory() as td:
     # After the transition from the first OSS-Fuzz run, we must restart patch mapping via get_error_patch_context.
     # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
     assert "get_error_patch_context" in runner.calls, runner.calls
-    assert "read_artifact" in runner.calls, runner.calls
-    assert runner.calls.count("make_error_patch_override") >= 2, runner.calls
+    assert runner.calls.count("make_extra_patch_override") >= 2, runner.calls
     assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 2, runner.calls
     assert "get_error_v1_code_slice" not in runner.calls, runner.calls
 
@@ -3108,7 +3254,7 @@ with tempfile.TemporaryDirectory() as td:
     assert forced_args.get("line_number") == 52, forced_args
 
     # Artifact preservation: repeated patch/log artifacts must not overwrite prior iterations.
-    patch_text_versions = sorted(root.glob("make_error_patch_override_patch_text_error.c*.diff"))
+    patch_text_versions = sorted(root.glob("make_extra_patch_override_patch_text*.diff"))
     assert len(patch_text_versions) >= 2, patch_text_versions
     build_log_versions = sorted(root.glob("ossfuzz_apply_patch_and_test_build_output*.log"))
     assert len(build_log_versions) >= 2, build_log_versions
@@ -3124,7 +3270,7 @@ with tempfile.TemporaryDirectory() as td:
     build_output_artifacts = []
     for s in steps:
         obs = s.get("observation") if isinstance(s.get("observation"), dict) else {}
-        if str(obs.get("tool") or "") == "make_error_patch_override":
+        if str(obs.get("tool") or "") in {"make_error_patch_override", "make_extra_patch_override"}:
             out = obs.get("output") if isinstance(obs.get("output"), dict) else {}
             ap = artifact_path(out.get("patch_text"))
             if ap:
