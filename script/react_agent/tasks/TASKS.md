@@ -34,5 +34,20 @@ Context: `log/agent_log/tmp1.log` ends with `next_step: OpenAI HTTPError: 502 Ba
 - [x] Add a regression test for retry classification:
   - `ModelError(...)` chained from `urllib.error.HTTPError(502, ...)` returns `True`.
   - `ModelError(...)` chained from `urllib.error.HTTPError(401, ...)` returns `False`.
-- [x] Update CLI/help text for `--max-agent-retries` to reflect that it covers transient HTTP failures (5xx/429) in addition to timeouts.
+- [x] Implement standard retries + backoff:
+  - Exponential backoff with jitter: `sleep = base * (0.5 + rand())`, base doubles each attempt, capped at 60s.
+  - Default `--max-agent-retries=6` (7 total attempts) and default `--agent-retry-backoff-sec=1`.
+- [x] Update CLI/help text for retry behavior (`--max-agent-retries` and `--agent-retry-backoff-sec`).
 - [ ] (Optional) In `--debug-llm` mode, emit a one-line reason when an exception is *not* considered transient (to make retry gating more obvious).
+
+## Plan: Store `ossfuzz_merged_*` artifacts under the primary patch_key directory
+Context: In multi-agent runs (and some patch-scope runs), `ossfuzz_apply_patch_and_test` writes merged patch artifacts like `ossfuzz_merged_<project>_<commit>.diff` at the artifact root even when the run is focused on a single patch_key plus one or more `_extra_*` hunks. This makes it harder to correlate merged patches to a specific patch_key directory like `data/react_agent_artifacts/multi_<run_id>/<patch_key>/...`.
+
+- [x] Update `merge_patch_bundle_with_overrides()` to infer a “primary” (non-`_extra_*`) patch_key when override paths include both a main patch_key and `_extra_*` keys, and write merged output under `<artifact_root>/<primary_patch_key>/...`.
+- [x] Add a regression test that merges overrides for `p2` + `_extra_error.c` and asserts `merged_patch_file_path` is written under `<artifact_root>/p2/`.
+
+## Plan: Always run final OSS-Fuzz build/check_build in multi-agent runs
+Context: Users want `multi_agent.py` to always emit a combined build log for the merged-overrides bundle, even when not all hunks are fixed.
+
+- [x] Change the default `--final-ossfuzz-test` mode from `auto` → `always` in `script/react_agent/multi_agent.py`.
+- [x] Update `script/react_agent/README.md` to reflect the new default behavior.

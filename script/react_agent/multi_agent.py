@@ -437,10 +437,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--final-ossfuzz-test",
         choices=["auto", "always", "never"],
-        default=str(os.environ.get("REACT_AGENT_FINAL_OSSFUZZ_TEST", "auto") or "auto"),
+        default=str(os.environ.get("REACT_AGENT_FINAL_OSSFUZZ_TEST", "always") or "always"),
         help=(
             "After all hunks complete, run a single OSS-Fuzz build/check_build using the combined override diffs. "
-            "auto=only when all hunks are fixed and --tools real; always=run regardless of per-hunk status; never=skip."
+            "always=run regardless of per-hunk status; auto=only when all hunks are fixed and --tools real; never=skip."
         ),
     )
 

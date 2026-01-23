@@ -177,6 +177,17 @@ def _infer_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
     )
 
 
+def _infer_primary_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
+    """Infer a non-_extra_ patch_key from a path's parent directories (best-effort)."""
+    for parent in [path.parent, *path.parents]:
+        name = str(parent.name or "").strip()
+        if not name:
+            continue
+        if name in patch_keys and not name.startswith("_extra_"):
+            return name
+    return ""
+
+
 def merge_patch_bundle_with_overrides(
     *,
     patch_path: str,
@@ -287,16 +298,40 @@ def merge_patch_bundle_with_overrides(
     out_dir = allow_root
     unique_keys = {str(o.get("patch_key", "")).strip() for o in override_files if str(o.get("patch_key", "")).strip()}
     inferred_key = ""
-    if len(unique_keys) == 1:
-        inferred_key = next(iter(unique_keys))
-    elif not unique_keys:
+    if not unique_keys:
         # Common case: patch_override_paths may be empty when the caller uses an "effective" *.patch2 that already
         # contains the updated patch_text for the active patch_key. In that scenario, infer the patch_key from the
         # bundle path on disk so merged patch output stays under the per-hunk artifacts dir.
         try:
-            inferred_key = _infer_patch_key_from_path(Path(patch_path).expanduser().resolve(), patch_keys)
+            bundle_path = Path(patch_path).expanduser().resolve()
+            inferred_key = _infer_primary_patch_key_from_path(bundle_path, patch_keys) or _infer_patch_key_from_path(
+                bundle_path, patch_keys
+            )
         except Exception:
             inferred_key = ""
+    elif len(unique_keys) == 1:
+        inferred_key = next(iter(unique_keys))
+    else:
+        # Common case: a run may override both the primary patch_key and one or more `_extra_*` hunks.
+        # Prefer writing merged output under the primary (non-_extra_) patch_key directory.
+        primary = {k for k in unique_keys if k and not k.startswith("_extra_")}
+        if len(primary) == 1:
+            inferred_key = next(iter(primary))
+        else:
+            # Even if the override patch_key is `_extra_*`, the override diff is often nested under
+            # `<patch_key>/_extra_*/...`; use that as a hint.
+            primary_from_paths = set()
+            for o in override_files:
+                p = Path(str(o.get("path", "") or "")).expanduser()
+                try:
+                    p = p.resolve()
+                except Exception:
+                    continue
+                k = _infer_primary_patch_key_from_path(p, patch_keys)
+                if k:
+                    primary_from_paths.add(k)
+            if len(primary_from_paths) == 1:
+                inferred_key = next(iter(primary_from_paths))
     if inferred_key and str(allow_root.name) != str(inferred_key):
         out_dir = (allow_root / inferred_key).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
