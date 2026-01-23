@@ -2,4 +2,5 @@ Undeclared symbol/type errors:
 - For diagnostics like “use of undeclared identifier 'X'”, “call to undeclared function 'X'”, or “unknown type name 'X'”:
   - Do NOT “fix” by deleting or bypassing the usage of X inside the function.
   - First, try to provide X via a file-scope declaration/definition using make_extra_patch_override(symbol_name="X", version="v1") or (when appropriate) version="v2".
+  - Do NOT replace missing globals with local variables (that changes semantics); add the real declaration/definition via make_extra_patch_override.
   - Only rewrite the function if there is clearly no reasonable way to provide X at file scope, and then minimize behavioral changes.

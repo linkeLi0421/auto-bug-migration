@@ -48,6 +48,8 @@ class AgentConfig:
     debug_llm_dir: str = ""
     auto_ossfuzz_loop: bool = False
     ossfuzz_loop_max: int = 1
+    # (debug) In patch-scope runs, prefer handling an error whose message/snippet matches this substring first.
+    focus_error: str = ""
 
 
 @dataclass
@@ -57,6 +59,9 @@ class AgentState:
     error_scope: Literal["first", "patch"]
     error_line: str
     snippet: str
+    # Original patch bundle path provided by the user/CLI. Never mutated.
+    # OSS-Fuzz testing should use this base bundle plus patch_override_paths.
+    base_patch_path: str = ""
     artifacts_dir: str = ""
     patch_key: str = ""
 
@@ -67,6 +72,8 @@ class AgentState:
     active_func_start_index: Optional[int] = None
     active_func_end_index: Optional[int] = None
     active_old_signature: str = ""
+    # Patch metadata for the pinned active_patch_key (from the patch bundle).
+    active_patch_types: List[str] = field(default_factory=list)
     active_excerpt_artifact_path: str = ""
     active_patch_minus_code_artifact_path: str = ""
     active_error_func_code_artifact_path: str = ""
@@ -105,6 +112,8 @@ class AgentState:
 
     # Tracks the latest generated override diff artifact paths (for OSS-Fuzz tool)
     patch_override_paths: List[str] = field(default_factory=list)
+    # Override diffs keyed by patch_key (avoid duplicates/stale overrides).
+    patch_override_by_key: Dict[str, str] = field(default_factory=dict)
 
     # Indicates we already attempted OSS-Fuzz test after generating a patch.
     ossfuzz_test_attempted: bool = False
@@ -377,6 +386,34 @@ def _prioritize_warnings_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[
         ranked.append((0 if is_warning else 1, 0 if is_missing_proto else 1, idx, err))
     ranked.sort(key=lambda t: (t[0], t[1], t[2]))
     return [e for _, _, _, e in ranked]
+
+
+def _error_matches_focus(err: Dict[str, Any], focus: str) -> bool:
+    needle = str(focus or "").strip()
+    if not needle:
+        return False
+    for k in ("msg", "raw", "snippet"):
+        v = err.get(k)
+        if isinstance(v, str) and needle in v:
+            return True
+    return False
+
+
+def _prioritize_focus_within_hunk(errors: List[Dict[str, Any]], focus_error: str) -> List[Dict[str, Any]]:
+    """Stable ordering helper: prefer a specific error substring first (debug).
+
+    This runs after normal warning/error ranking and can move a matching *error* ahead of warnings.
+    """
+    needle = str(focus_error or "").strip()
+    if not needle:
+        return list(errors or [])
+    ranked: List[tuple[int, int, Dict[str, Any]]] = []
+    for idx, err in enumerate(errors or []):
+        if not isinstance(err, dict):
+            continue
+        ranked.append((0 if _error_matches_focus(err, needle) else 1, idx, err))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [e for _, _, e in ranked]
 
 
 def _summarize_function_groups(
@@ -1248,6 +1285,46 @@ def _write_effective_patch_bundle(
     return str(out_path), None
 
 
+def _persist_override_diff(
+    state: AgentState,
+    *,
+    patch_key: str,
+    patch_text: str,
+    label: str,
+) -> tuple[str, Optional[str]]:
+    """Persist a unified-diff override file under artifacts_dir so OSS-Fuzz merge can infer patch_key."""
+    key = str(patch_key or "").strip()
+    text = str(patch_text or "").rstrip("\n") + "\n"
+    if not key:
+        return "", "missing patch_key"
+    if "diff --git " not in text:
+        return "", "override patch_text missing 'diff --git' header"
+
+    artifacts_dir_raw = str(getattr(state, "artifacts_dir", "") or "").strip()
+    if artifacts_dir_raw:
+        out_dir = Path(artifacts_dir_raw).expanduser().resolve()
+    else:
+        repo_root = Path(__file__).resolve().parents[2]
+        out_dir = (repo_root / "data" / "react_agent_artifacts").resolve()
+
+    safe_key = _safe_bundle_name(key, max_len=160)
+    if safe_key not in out_dir.parts and out_dir.name != safe_key:
+        out_dir = (out_dir / safe_key).resolve()
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to create override dir: {type(exc).__name__}: {exc}"
+
+    stem = _safe_bundle_name(str(label or "override").strip() or "override", max_len=120)
+    out_path = _unique_path((out_dir / f"{stem}.diff").resolve())
+    try:
+        out_path.write_text(text, encoding="utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to write override diff: {type(exc).__name__}: {exc}"
+    return str(out_path), None
+
+
 def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | None, Optional[str]]:
     """Load the patch bundle, optionally overlaying the latest override patch_text for active_patch_key."""
     if not state.patch_path:
@@ -1268,7 +1345,47 @@ def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | N
         return None, f"failed to load patch bundle: {type(exc).__name__}: {exc}"
 
     active_key = str(state.active_patch_key or state.patch_key or "").strip()
-    override_path = str((state.patch_override_paths[-1] if state.patch_override_paths else "") or "").strip()
+
+    # If we have multiple override diffs (e.g. one for the active patch_key and others for `_extra_*` hunks),
+    # only overlay the override that matches the active patch_key. Falling back to "last override wins"
+    # can corrupt mapping by applying an `_extra_*` diff to the main patch_key.
+    patch_keys: set[str] = set()
+    if isinstance(getattr(bundle, "patches", None), dict):
+        try:
+            patch_keys = {str(k) for k in bundle.patches.keys() if isinstance(k, str) and str(k).strip()}
+        except Exception:
+            patch_keys = set()
+
+    def infer_override_patch_key(path: str) -> str:
+        rp = str(path or "").strip()
+        if not rp:
+            return ""
+        try:
+            p = Path(rp).expanduser().resolve()
+        except Exception:
+            return ""
+        for parent in [p.parent, *p.parents]:
+            name = str(parent.name or "").strip()
+            if not name:
+                continue
+            if name in patch_keys:
+                return name
+            if name.startswith("_extra_"):
+                return name
+        return ""
+
+    override_path = ""
+    if active_key and isinstance(getattr(state, "patch_override_by_key", None), dict):
+        override_path = str(state.patch_override_by_key.get(active_key, "") or "").strip()
+    if not override_path and active_key and isinstance(state.patch_override_paths, list) and state.patch_override_paths:
+        for raw in reversed(state.patch_override_paths):
+            rp = str(raw or "").strip()
+            if not rp:
+                continue
+            if infer_override_patch_key(rp) == active_key:
+                override_path = rp
+                break
+
     if active_key and override_path and isinstance(getattr(bundle, "patches", None), dict) and active_key in bundle.patches:
         try:
             override_text = _read_text(override_path)
@@ -1630,6 +1747,9 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     in_active = _prioritize_warnings_within_hunk(
         [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
     )
+    focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
+    if focus_error:
+        in_active = _prioritize_focus_within_hunk(in_active, focus_error)
     if not in_active:
         return None
 
@@ -1642,6 +1762,14 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     _record_current_error_group(state)
 
     preferred_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if focus_error:
+        # If the caller asked to focus a specific error substring, prefer the signature containing it.
+        for e in in_active:
+            if isinstance(e, dict) and _error_matches_focus(e, focus_error):
+                sig = str(e.get("old_signature", "") or "").strip()
+                if sig:
+                    preferred_sig = sig
+                break
     if not preferred_sig and state.grouped_errors:
         preferred_sig = str(state.grouped_errors[0].get("old_signature", "") or "").strip()
 
@@ -1705,7 +1833,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     # Reset patch/test state for the next iteration.
     state.patch_generated = False
     state.patch_result = None
-    state.patch_override_paths = []
+    # Keep accumulated override diffs across iterations; OSS-Fuzz testing uses the base bundle + overrides.
     state.ossfuzz_test_attempted = False
     state.last_observation = None
 
@@ -2211,6 +2339,60 @@ def _last_read_artifact_path(state: AgentState) -> str:
         if path:
             return path
     return ""
+
+
+def _guardrail_repair_model(model: ChatModel) -> ChatModel:
+    """Return the model to use for guardrail-triggered repair calls."""
+    if isinstance(model, OpenAIChatCompletionsModel):
+        # Use a stronger default model for repair rounds; keep the user-selected model for normal turns.
+        try:
+            return replace(model, model="gpt-5.2")
+        except Exception:
+            return model
+    return model
+
+
+def _build_guardrail_repair_messages(
+    state: AgentState,
+    messages: List[Dict[str, str]],
+    rejected: Decision,
+    guidance: str,
+) -> List[Dict[str, str]]:
+    """Build a minimal repair prompt for guardrail-triggered override fixes.
+
+    Keep only the prior tool-call dialogue context (system + tool observations), then append the rejected
+    tool JSON and the guardrail guidance. Drop the initial build-error user blob for prompt hygiene.
+    """
+
+    def _is_initial_build_error_blob(msg: Dict[str, str]) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = str(msg.get("content", "") or "")
+        if content.lstrip().startswith("Observation:\n"):
+            return False
+        if "Choose the next best tool call or return a final decision." not in content:
+            return False
+        return (
+            "Build log path:" in content
+            or "\nBuild error:\n" in content
+            or content.startswith("Build error:\n")
+            or "Patch-scope active error:" in content
+            or "Log context:" in content
+        )
+
+    out: List[Dict[str, str]] = []
+    for msg in messages:
+        if _is_initial_build_error_blob(msg):
+            continue
+        out.append(msg)
+
+    # Ensure we didn't accidentally drop the system prompt.
+    if not out or out[0].get("role") != "system":
+        sys_msg = next((m for m in messages if m.get("role") == "system"), None)
+        if isinstance(sys_msg, dict):
+            out.insert(0, {"role": "system", "content": str(sys_msg.get("content", "") or "")})
+    out.append({"role": "assistant", "content": json.dumps(rejected, ensure_ascii=False)})
+    return out
 
 
 def _force_read_base_slice_for_shrunk_override(state: AgentState) -> Optional[Decision]:
@@ -3871,33 +4053,19 @@ def _system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState) -> List[Dict[str, str]]:
-    other_errors_limit_default = 3
-
-    def _trim_snippet(text: str, *, max_lines: int = 8) -> str:
-        lines = str(text or "").splitlines()
-        max_n = max(0, int(max_lines or 0))
-        if max_n <= 0 or len(lines) <= max_n:
-            return "\n".join(lines).strip()
-        kept = lines[:max_n]
-        kept.append("...[truncated]...")
-        return "\n".join(kept).strip()
-
     def _active_error_summary() -> str:
         """Render a single active error for patch-scope runs.
 
         Patch-scope runs can involve many errors mapped to the same patch_key. For prompt hygiene,
-        show the active error (with log context) and optionally include a few other errors.
+        show only the active error (with its full compiler diagnostic block).
         """
         if not (state.error_scope == "patch" and state.grouped_errors):
             return ""
         active = state.grouped_errors[0] if isinstance(state.grouped_errors[0], dict) else {}
         raw = str(active.get("raw") or state.error_line or "").strip()
-        # Ensure the model sees a single error line, not a multi-line blob.
         raw_line = raw.splitlines()[0].strip() if raw else ""
 
         patch_key = str(state.patch_key or state.active_patch_key or "").strip()
-        other_count = max(int(len(state.grouped_errors)) - 1, 0)
-        other_limit = max(0, int(other_errors_limit_default))
 
         active_json: Dict[str, Any] = {}
         if isinstance(active, dict):
@@ -3912,48 +4080,26 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         lines: List[str] = ["Patch-scope active error:"]
         if patch_key:
             lines.append(f"patch_key: {patch_key}")
-        if raw_line:
-            lines.append(raw_line)
         active_snippet = ""
         if isinstance(active, dict):
             sn = active.get("snippet")
             if isinstance(sn, str) and sn.strip():
                 active_snippet = sn
-        if active_snippet.strip():
-            lines.append("")
-            lines.append("Log context:")
-            lines.append(_trim_snippet(active_snippet, max_lines=8))
-        elif state.snippet and state.snippet.strip():
+        block = active_snippet.strip()
+        if not block and str(state.snippet or "").strip():
             # Fallback for cases where grouped_errors lack snippet context but state.snippet is available.
+            block = str(state.snippet or "").strip()
+        if not block and raw_line:
+            block = raw_line
+        if block:
             lines.append("")
             lines.append("Log context:")
-            lines.append(_trim_snippet(state.snippet, max_lines=8))
-
-        if other_count and other_limit > 0:
-            shown = min(other_count, other_limit)
-            lines.append("")
-            lines.append(f"Other errors in this patch_key (showing {shown} of {other_count}):")
-            for e in (state.grouped_errors[1 : 1 + shown] or []):
-                if not isinstance(e, dict):
-                    continue
-                r = str(e.get("raw") or "").strip()
-                rline = r.splitlines()[0].strip() if r else ""
-                if not rline:
-                    continue
-                lines.append(rline)
-                sn = e.get("snippet")
-                if isinstance(sn, str) and sn.strip():
-                    lines.append(_trim_snippet(sn, max_lines=8))
-                lines.append("")
-            if lines and not lines[-1].strip():
-                lines.pop()
-        elif other_count:
-            lines.append(f"(other errors in this patch_key: {other_count} hidden)")
+            lines.append(block)
         lines.append("")
         lines.append("Details (JSON):")
         lines.append(
             json.dumps(
-                {"patch_key": patch_key, "active_error": active_json, "other_errors_in_patch_key": other_count},
+                {"patch_key": patch_key, "active_error": active_json},
                 ensure_ascii=False,
                 indent=2,
             )
@@ -4117,7 +4263,7 @@ def _run_langgraph(
                 "args": {
                     "project": st.ossfuzz_project,
                     "commit": st.ossfuzz_commit,
-                    "patch_path": st.patch_path,
+                    "patch_path": str(st.patch_path or "").strip(),
                     "patch_override_paths": list(st.patch_override_paths or []),
                     "build_csv": st.ossfuzz_build_csv,
                     "sanitizer": st.ossfuzz_sanitizer,
@@ -4164,7 +4310,28 @@ def _run_langgraph(
             if verdict.get("status") == "ok":
                 fixed_str = "yes" if verdict.get("fixed") else "no"
 
-            next_step_lines = [f"Target error fixed: {fixed_str}."]
+            fixed_label = "Target error fixed"
+            if st.error_scope == "patch" and str(getattr(st, "active_old_signature", "") or "").strip():
+                fixed_label = "Active function fixed"
+            next_step_lines = [f"{fixed_label}: {fixed_str}."]
+            if (
+                st.error_scope == "patch"
+                and isinstance(patch_key_verdict, dict)
+                and patch_key_verdict.get("status") == "ok"
+                and str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+            ):
+                pk = str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+                remaining = int(patch_key_verdict.get("remaining_in_active_patch_key", 0) or 0)
+                next_step_lines.append(f"Remaining errors in active patch_key {pk}: {remaining}.")
+                if remaining > 0:
+                    if not cfg.auto_ossfuzz_loop:
+                        next_step_lines.append(
+                            "Auto-loop is disabled; rerun with --auto-ossfuzz-loop to keep iterating within this patch_key."
+                        )
+                    elif st.ossfuzz_runs_attempted >= int(cfg.ossfuzz_loop_max or 0):
+                        next_step_lines.append(
+                            f"Auto-loop stopped: reached --ossfuzz-loop-max ({st.ossfuzz_runs_attempted}/{int(cfg.ossfuzz_loop_max or 0)})."
+                        )
             if verdict.get("status") == "failed":
                 reason = str(verdict.get("reason", "") or "").strip()
                 if reason:
@@ -4650,73 +4817,76 @@ def _run_langgraph(
         if fixed_loc:
             decision = fixed_loc  # type: ignore[assignment]
 
-        # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
-        # drops large portions of it (common failure mode: model emits only a short snippet).
-        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
-            shrink_err = _override_preserve_base_guardrail_error(st, decision)
-            if shrink_err:
-                forced_read = _force_read_base_slice_for_shrunk_override(st)
-                if forced_read:
-                    _validate_tool_decision(forced_read)
-                    decision = forced_read  # type: ignore[assignment]
-                else:
-                    repair_messages = list(messages)
-                    repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                    repair_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
-                                f"{shrink_err}\n\n"
-                                "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
-                                "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
-                                "Return exactly one JSON object of type tool calling make_error_patch_override."
-                            ),
-                        }
-                    )
-                    raw2 = _complete(model, repair_messages, label="override_shrink_repair")
-                    try:
-                        repaired = _parse_decision(raw2)
-                    except Exception:
-                        repaired = {}
-                    if (
-                        isinstance(repaired, dict)
-                        and repaired.get("type") == "tool"
-                        and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
-                    ):
-                        _validate_tool_decision(repaired)  # type: ignore[arg-type]
-                        shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
-                        if not shrink_err2:
-                            decision = repaired  # type: ignore[assignment]
-                        else:
-                            return {
-                                "state": st,
-                                "final": {
-                                    "type": "final",
-                                    "thought": "Model repeatedly produced a truncated override body.",
-                                    "summary": "Stopped before patch generation due to an incomplete override body.",
-                                    "next_step": (
-                                        f"{shrink_err2}\n\n"
-                                        "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
-                                        "or manually construct new_func_code by editing the read_artifact BASE slice."
-                                    ).strip(),
-                                    "steps": _steps_for_output(st),
-                                    "error": _error_payload(st),
-                                },
-                            }
+        # # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
+        # # drops large portions of it (common failure mode: model emits only a short snippet).
+        # if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+        #     shrink_err = _override_preserve_base_guardrail_error(st, decision)
+        #     if shrink_err:
+        #         forced_read = _force_read_base_slice_for_shrunk_override(st)
+        #         if forced_read:
+        #             _validate_tool_decision(forced_read)
+        #             decision = forced_read  # type: ignore[assignment]
+        #         else:
+        #             repair_messages = list(messages)
+        #             repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+        #             repair_messages.append(
+        #                 {
+        #                     "role": "user",
+        #                     "content": (
+        #                         "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
+        #                         f"{shrink_err}\n\n"
+        #                         "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
+        #                         "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
+        #                         "Return exactly one JSON object of type tool calling make_error_patch_override."
+        #                     ),
+        #                 }
+        #             )
+        #             raw2 = _complete(model, repair_messages, label="override_shrink_repair")
+        #             try:
+        #                 repaired = _parse_decision(raw2)
+        #             except Exception:
+        #                 repaired = {}
+        #             if (
+        #                 isinstance(repaired, dict)
+        #                 and repaired.get("type") == "tool"
+        #                 and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+        #             ):
+        #                 _validate_tool_decision(repaired)  # type: ignore[arg-type]
+        #                 shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
+        #                 if not shrink_err2:
+        #                     decision = repaired  # type: ignore[assignment]
+        #                 else:
+        #                     return {
+        #                         "state": st,
+        #                         "final": {
+        #                             "type": "final",
+        #                             "thought": "Model repeatedly produced a truncated override body.",
+        #                             "summary": "Stopped before patch generation due to an incomplete override body.",
+        #                             "next_step": (
+        #                                 f"{shrink_err2}\n\n"
+        #                                 "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
+        #                                 "or manually construct new_func_code by editing the read_artifact BASE slice."
+        #                             ).strip(),
+        #                             "steps": _steps_for_output(st),
+        #                             "error": _error_payload(st),
+        #                         },
+        #                     }
 
         # Guardrail (function-by-function): in merged/tail mode, the override should only rewrite the active function,
         # not the entire patch hunk.
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             func_scope_err = _override_single_function_guardrail_error(st, decision)
             if func_scope_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "In function-by-function mode (Active function (old_signature) is set), make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
+                            "In function-by-function mode (Active function (old_signature) is set), "
+                            "make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
                             "for the active function from this round.\n"
                             f"active_old_signature: {str(getattr(st, 'active_old_signature', '') or '').strip()}\n"
                             f"{func_scope_err}\n\n"
@@ -4724,9 +4894,9 @@ def _run_langgraph(
                             "Do NOT include other functions or unified-diff headers.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_function_scope_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_function_scope_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4760,21 +4930,23 @@ def _run_langgraph(
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             name_err = _override_preserve_function_name_guardrail_error(st, decision)
             if name_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "make_error_patch_override.new_func_code must not rename the function being overridden.\n"
                             f"{name_err}\n\n"
                             "Fix: start from the BASE slice (read_artifact output) and keep the same function name/signature; "
                             "apply minimal edits inside the body only.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_function_name_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_function_name_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4806,21 +4978,23 @@ def _run_langgraph(
 
             complete_err = _override_complete_function_guardrail_error(st, decision)
             if complete_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "Your make_error_patch_override.new_func_code appears to be an incomplete/truncated function body.\n"
                             f"{complete_err}\n\n"
                             "Fix: output the FULL function body as raw C code (balanced braces; include the final return/closing `}`), "
                             "still scoped to the mapped '-' slice for this round. Do NOT include unified-diff headers.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_complete_body_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_complete_body_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4850,74 +5024,78 @@ def _run_langgraph(
                             },
                         }
 
-        # Guardrail: avoid broad renames of generated __revert_* helpers while fixing an unrelated error.
-        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
-            revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
-            if revert_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
-                            f"{revert_err}\n\n"
-                            "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
-                            "- Keep existing `__revert_*` symbol names as-is (do not mass-replace them with unprefixed names).\n"
-                            "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
-                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+            # Guardrail: avoid broad renames of generated __revert_* helpers while fixing an unrelated error.
+            if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+                revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
+                if revert_err:
+                    repair_model = _guardrail_repair_model(model)
+                    raw2 = _complete(
+                        repair_model,
+                        _build_guardrail_repair_messages(
+                            st,
+                            messages,
+                            decision,
+                            (
+                                "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
+                                f"{revert_err}\n\n"
+                                "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
+                                "- Keep existing `__revert_*` symbol names as-is (do not mass-replace them with unprefixed names).\n"
+                                "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
+                                "Return exactly one JSON object of type tool calling make_error_patch_override."
+                            ),
                         ),
-                    }
-                )
-                raw2 = _complete(model, repair_messages, label="override_revert_symbols_repair")
-                try:
-                    repaired = _parse_decision(raw2)
-                except Exception:
-                    repaired = {}
-                if (
-                    isinstance(repaired, dict)
-                    and repaired.get("type") == "tool"
-                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
-                ):
-                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
-                    revert_err2 = _override_preserve_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
-                    if not revert_err2:
-                        decision = repaired  # type: ignore[assignment]
-                    else:
-                        return {
-                            "state": st,
-                            "final": {
-                                "type": "final",
-                                "thought": "Model repeatedly removed/renamed multiple __revert_* helper symbols in the override.",
-                                "summary": "Stopped before patch generation due to an overly broad override rewrite.",
-                                "next_step": (
-                                    f"{revert_err2}\n\n"
-                                    "Manually edit the BASE slice (read_artifact output) to keep `__revert_*` calls intact and change only what the current diagnostic requires, then rerun."
-                                ).strip(),
-                                "steps": _steps_for_output(st),
-                                "error": _error_payload(st),
-                            },
+                        label="override_revert_symbols_repair",
+                    )
+                    try:
+                        repaired = _parse_decision(raw2)
+                    except Exception:
+                        repaired = {}
+                    if (
+                        isinstance(repaired, dict)
+                        and repaired.get("type") == "tool"
+                        and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                    ):
+                        _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                        revert_err2 = _override_preserve_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                        if not revert_err2:
+                            decision = repaired  # type: ignore[assignment]
+                        else:
+                            return {
+                                "state": st,
+                                "final": {
+                                    "type": "final",
+                                    "thought": "Model repeatedly removed/renamed multiple __revert_* helper symbols in the override.",
+                                    "summary": "Stopped before patch generation due to an overly broad override rewrite.",
+                                    "next_step": (
+                                        f"{revert_err2}\n\n"
+                                        "Manually edit the BASE slice (read_artifact output) to keep `__revert_*` calls intact and change only what the current diagnostic requires, then rerun."
+                                    ).strip(),
+                                    "steps": _steps_for_output(st),
+                                    "error": _error_payload(st),
+                                },
                         }
 
         # Guardrail: do not introduce new __revert_* call targets/helpers in the override.
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             new_revert_err = _override_no_new_revert_symbols_guardrail_error(st, decision)
             if new_revert_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "Your make_error_patch_override.new_func_code introduces new `__revert_*` function symbols/call targets.\n"
                             f"{new_revert_err}\n\n"
                             "Fix: keep function names and call targets stable. Start from the BASE slice and make the smallest edits needed "
                             "without introducing new `__revert_*` helper names.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_new_revert_symbols_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_new_revert_symbols_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -5032,6 +5210,7 @@ def _run_langgraph(
         st = gs["state"]
         decision = gs["pending"]
         tool = str(decision["tool"])
+
         # Record which error the agent was targeting when making this tool call.
         step_context = {
             "scope": str(st.error_scope),
@@ -5041,6 +5220,7 @@ def _run_langgraph(
             "error_line": str(getattr(st, "error_line", "") or "").strip(),
             "build_log_path": str(getattr(st, "build_log_path", "") or "").strip(),
         }
+
         # Patch-scope: always run patch tools against the current effective patch bundle.
         if st.error_scope == "patch" and st.patch_path and tool in _PATCH_TOOLS_WITH_PATCH_PATH:
             args_obj = decision.get("args")
@@ -5052,16 +5232,29 @@ def _run_langgraph(
         args = dict(decision.get("args", {}))
         obs = runner.call(tool, args)
         obs = _enforce_patch_key_scope(st, obs)
+
         if artifact_store and obs.ok and obs.tool != "read_artifact":
             offloaded = offload_patch_output(
-                store=artifact_store, tool=obs.tool, args=obs.args, output=obs.output, focus_terms=_collect_focus_terms(st)
+                store=artifact_store,
+                tool=obs.tool,
+                args=obs.args,
+                output=obs.output,
+                focus_terms=_collect_focus_terms(st),
             )
             if offloaded is not obs.output:
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
+
         step_rec = {"decision": decision, "observation": obs.__dict__, "context": step_context}
         st.steps.append(step_rec)
         st.step_history.append(step_rec)
         st.last_observation = obs
+
+        if obs.tool in {"make_error_patch_override", "make_extra_patch_override"} and not obs.ok:
+            # Do not let a failed patch-generation tool call leave stale patch state behind;
+            # otherwise we may run OSS-Fuzz against an older patch bundle/override set.
+            st.patch_generated = False
+            st.patch_result = None
+            st.pending_patch = None
 
         if obs.ok and obs.tool == "get_error_patch_context" and isinstance(obs.output, dict):
             st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
@@ -5088,10 +5281,13 @@ def _run_langgraph(
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
                 st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
+
         if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            st.ossfuzz_test_attempted = False
+
             if isinstance(obs.output, dict):
                 st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
                 st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
@@ -5121,23 +5317,40 @@ def _run_langgraph(
                     patch_text = pt
 
             if patch_text.strip():
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                override_path, override_err = _persist_override_diff(
+                    st,
+                    patch_key=override_key,
+                    patch_text=patch_text,
+                    label=f"override_{override_key}",
+                )
+                if override_path and not override_err:
+                    st.patch_override_by_key[override_key] = override_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+
                 effective_path, effective_err = _write_effective_patch_bundle(
                     st,
-                    patch_key=str(st.active_patch_key or st.patch_key or "").strip(),
+                    patch_key=override_key,
                     patch_text=patch_text,
                     hiden_func_dict_updated=hiden_func_dict_updated,
                 )
                 if effective_path and not effective_err:
                     st.patch_path = effective_path
-                    # The bundle now contains the rewritten patch_text; no separate override diff is required.
-                    st.patch_override_paths = []
                 elif patch_text_path:
-                    st.patch_override_paths = [patch_text_path]
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
             elif patch_text_path:
-                st.patch_override_paths = [patch_text_path]
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                st.patch_override_by_key[override_key] = patch_text_path
+                st.patch_override_paths = list(st.patch_override_by_key.values())
+
         if obs.ok and obs.tool == "make_extra_patch_override":
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            st.ossfuzz_test_attempted = False
 
             patch_text = ""
             patch_text_path = ""
@@ -5156,13 +5369,22 @@ def _run_langgraph(
                     patch_text = pt
 
             has_patch = bool(patch_text.strip()) or bool(patch_text_path)
-            if not has_patch:
-                # Tool ran but did not emit an override diff (e.g. symbol not found); do not trigger OSS-Fuzz test.
-                st.patch_generated = False
-            else:
-                st.patch_generated = True
+            st.patch_generated = bool(has_patch)
 
             if patch_text.strip() and extra_patch_key:
+                override_path, override_err = _persist_override_diff(
+                    st,
+                    patch_key=extra_patch_key,
+                    patch_text=patch_text,
+                    label=f"override_{extra_patch_key}",
+                )
+                if override_path and not override_err:
+                    st.patch_override_by_key[extra_patch_key] = override_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(extra_patch_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+
                 effective_path, effective_err = _write_effective_patch_bundle(
                     st,
                     patch_key=extra_patch_key,
@@ -5170,15 +5392,18 @@ def _run_langgraph(
                 )
                 if effective_path and not effective_err:
                     st.patch_path = effective_path
-                    st.patch_override_paths = []
-                elif patch_text_path and patch_text_path not in st.patch_override_paths:
-                    st.patch_override_paths.append(patch_text_path)
-            elif patch_text_path and patch_text_path not in st.patch_override_paths:
-                st.patch_override_paths.append(patch_text_path)
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(extra_patch_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+            elif patch_text_path and extra_patch_key:
+                st.patch_override_by_key[extra_patch_key] = patch_text_path
+                st.patch_override_paths = list(st.patch_override_by_key.values())
+
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
             if obs.ok:
                 st.ossfuzz_runs_attempted += 1
+
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -5266,6 +5491,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REACT_AGENT_FOCUS_PATCH_KEY", ""),
         help="In --error-scope patch mode, select this patch_key group (hunk) instead of the default heuristic.",
     )
+    parser.add_argument(
+        "--focus-error",
+        default=os.environ.get("REACT_AGENT_FOCUS_ERROR", ""),
+        help="(debug) In --error-scope patch mode, prefer handling an error whose message/snippet contains this substring first.",
+    )
     parser.add_argument("--no-artifacts", action="store_true", help="Disable artifact-backed tool outputs.")
 
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
@@ -5346,6 +5576,7 @@ def main(argv: List[str]) -> int:
         debug_llm_dir=str(getattr(args, "debug_llm_dir", "") or "").strip(),
         auto_ossfuzz_loop=bool(getattr(args, "auto_ossfuzz_loop", False)),
         ossfuzz_loop_max=max(int(getattr(args, "ossfuzz_loop_max", 0) or 0), 1),
+        focus_error=str(getattr(args, "focus_error", "") or "").strip(),
     )
 
     # Fail fast: in patch-scope runs we will generate a patch and must be able to test it.
@@ -5407,6 +5638,8 @@ def main(argv: List[str]) -> int:
             errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
             first_mapped_key = ""
+            first_focus_key = ""
+            focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
             for err in errs:
                 mapping = map_error_patch(patch_path=patch_path, file_path=err["file"], line_number=err["line"])
                 key = str(mapping.get("patch_key") or "").strip()
@@ -5418,14 +5651,20 @@ def main(argv: List[str]) -> int:
                 if key:
                     if not first_mapped_key:
                         first_mapped_key = key
+                    if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
+                        first_focus_key = key
                     groups.setdefault(key, []).append(enriched)
             if groups:
                 focus = str(getattr(args, "focus_patch_key", "") or "").strip()
                 if focus and focus in groups:
                     patch_key = focus
+                elif first_focus_key and first_focus_key in groups:
+                    patch_key = first_focus_key
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                full_grouped = _prioritize_warnings_within_hunk(groups[patch_key])
+                full_grouped = _prioritize_focus_within_hunk(
+                    _prioritize_warnings_within_hunk(groups[patch_key]), focus_error
+                )
                 full_grouped_for_history = list(full_grouped)
                 function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
                 grouped_errors = full_grouped
@@ -5480,6 +5719,20 @@ def main(argv: List[str]) -> int:
                     active_func_end_index = fe
         except Exception:
             pass
+
+    active_patch_types: List[str] = []
+    if cfg.error_scope == "patch" and patch_path and active_patch_key:
+        try:
+            from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
+
+            bundle = _lpb(patch_path)
+            patches = getattr(bundle, "patches", None)
+            if isinstance(patches, dict):
+                patch = patches.get(active_patch_key)
+                if patch is not None:
+                    active_patch_types = sorted(str(pt) for pt in (getattr(patch, "patch_type", None) or set()))
+        except Exception:
+            active_patch_types = []
 
     artifact_store, artifacts_dir = resolve_artifact_dir(
         disabled=bool(args.no_artifacts),
@@ -5536,6 +5789,7 @@ def main(argv: List[str]) -> int:
         state = AgentState(
             build_log_path=str(args.build_log),
             patch_path=patch_path,
+            base_patch_path=patch_path,
             error_scope=cfg.error_scope,
             error_line=error_line,
             snippet=snippet,
@@ -5547,6 +5801,7 @@ def main(argv: List[str]) -> int:
             active_func_start_index=active_func_start_index,
             active_func_end_index=active_func_end_index,
             active_old_signature=active_old_signature,
+            active_patch_types=active_patch_types,
             grouped_errors=grouped_errors,
             function_groups=function_groups,
             function_groups_total=function_groups_total,
