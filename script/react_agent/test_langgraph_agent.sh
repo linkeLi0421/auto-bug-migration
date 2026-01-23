@@ -258,8 +258,16 @@ assert "Undeclared symbol/type errors:" in p_undeclared, p_undeclared
 
 st_tail = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
 st_tail.active_old_signature = "int f(int x)"
+st_tail.active_patch_types = ["Merged functions"]
 p_tail = build_system_prompt(st_tail, tool_specs=TOOL_SPECS)
 assert "Merged/tail hunks" in p_tail, p_tail
+
+st_not_merged = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+st_not_merged.active_old_signature = "int f(int x)"
+st_not_merged.active_patch_types = ["Recreated function"]
+p_not_merged = build_system_prompt(st_not_merged, tool_specs=TOOL_SPECS)
+assert "Mapped-slice rewrites" in p_not_merged, p_not_merged
+assert "Merged/tail hunks" not in p_not_merged, p_not_merged
 
 st_member = AgentState(
     build_log_path="-",
@@ -309,6 +317,98 @@ assert "Patch-scope active error:" in user, user
 assert "/src/a.c:1:1: error: e1" in user, user
 assert "Other errors in this patch_key" in user, user
 assert "/src/a.c:2:1: error: e2" in user, user
+
+print("OK")
+PY
+
+# Mapping regression: do not treat an `_extra_*` override diff as the active patch_key's override just because
+# the override file happens to be nested under `.../<active_patch_key>/_extra_*/...`.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _load_effective_patch_bundle_for_mapping  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+main_key = "p_main"
+extra_key = "_extra_parser.c"
+
+main_patch_text = (
+    "diff --git a/parser.c b/parser.c\n"
+    "--- a/parser.c\n"
+    "+++ b/parser.c\n"
+    "@@ -10,25 +10,25 @@\n"
+    + "".join(f"-MAIN{i:02d}\n" for i in range(1, 51))
+)
+extra_patch_text = (
+    "diff --git a/parser.c b/parser.c\n"
+    "--- a/parser.c\n"
+    "+++ b/parser.c\n"
+    "@@ -90,6 +90,3 @@\n"
+    "-EXTRA\n"
+    "+EXTRA\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    bundle_path = root / "bundle.patch2"
+    patches = {
+        main_key: PatchInfo(
+            file_path_old="parser.c",
+            file_path_new="parser.c",
+            patch_text=main_patch_text,
+            file_type="source",
+            old_start_line=10,
+            old_end_line=50,
+            new_start_line=10,
+            new_end_line=50,
+            patch_type={"Recreated function"},
+            old_signature="int main(void)",
+            dependent_func=set(),
+            hiden_func_dict={},
+        ),
+        extra_key: PatchInfo(
+            file_path_old="parser.c",
+            file_path_new="parser.c",
+            patch_text=extra_patch_text,
+            file_type="source",
+            old_start_line=90,
+            old_end_line=95,
+            new_start_line=90,
+            new_end_line=95,
+            patch_type={"Extra"},
+            old_signature="",
+            dependent_func=set(),
+            hiden_func_dict={},
+        ),
+    }
+    bundle_path.write_bytes(pickle.dumps(patches))
+
+    # The override diff applies to `_extra_parser.c`, but the file is nested under `<main_key>/_extra_parser.c/`.
+    override_dir = root / main_key / extra_key
+    override_dir.mkdir(parents=True, exist_ok=True)
+    override_path = override_dir / "override__extra_parser.c.diff"
+    override_path.write_text(extra_patch_text, encoding="utf-8")
+
+    st = AgentState(build_log_path="-", patch_path=str(bundle_path), error_scope="patch", error_line="x", snippet="")
+    st.patch_key = main_key
+    st.active_patch_key = main_key
+    st.patch_override_paths = [str(override_path)]
+    st.patch_override_by_key = {}
+
+    bundle, err = _load_effective_patch_bundle_for_mapping(st)
+    assert err is None, err
+    out_patches = getattr(bundle, "patches", None)
+    assert isinstance(out_patches, dict), type(out_patches)
+    assert str(out_patches[main_key].patch_text) == main_patch_text, "main patch_text was incorrectly overridden"
 
 print("OK")
 PY

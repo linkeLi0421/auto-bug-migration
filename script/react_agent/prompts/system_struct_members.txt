@@ -1,15 +1,14 @@
 Struct-member errors:
 - Workflow (patch-scope):
   1) Call get_error_patch_context(patch_path=..., file_path=..., line_number=...) to obtain the mapped BASE slice for the active error location.
-  2) Inspect the owning struct definition in both versions:
+  2) Identify the owning struct and inspect its definition in both versions:
      - search_definition(symbol_name="struct <Name>", version="v1")
      - search_definition(symbol_name="struct <Name>", version="v2")
-  3) Edit ONLY the mapped BASE slice to use the correct V2 fields/semantics and apply it via make_error_patch_override.
-  4) Run ossfuzz_apply_patch_and_test before returning final.
+  3) Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards).
+     - search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
+  4) Edit ONLY the mapped BASE slice to use the correct V2 fields/semantics and apply it via make_error_patch_override.
 
-- For "no member named 'X' in 'struct Y'": compare struct Y in V1 vs V2 using search_definition(version="v1") and search_definition(version="v2") before patching.
-- search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
-- Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards) and then adapt the migrated code accordingly.
+- Focus on fixing the single missing member named in the active error first; do NOT try to preemptively fix other struct members in the same round.
 
 Your job:
 
@@ -17,10 +16,8 @@ Your job:
   * If there is ANY reasonable candidate field in version B that appears to represent the same concept
     (same or compatible type, similar comment, or similar role), treat it as a rename / semantic replacement
     and update the code to use that field.
-  * ONLY remove or greatly simplify logic when there is clearly no suitable replacement field.
-
-- Prefer updating code to use renamed / replacement fields over deleting code. Err on the side of mapping
-  to a new field rather than removing functionality, unless the types clearly do not match.
+  * ONLY remove or greatly simplify logic when there is clearly no suitable replacement field or the types
+    clearly do not match.
 
 - If version B introduces new ownership / flag fields (for example booleans that say whether a buffer
   can be freed or whether a frame is sparse), set them consistently with the function's behavior:
