@@ -57,6 +57,9 @@ class AgentState:
     error_scope: Literal["first", "patch"]
     error_line: str
     snippet: str
+    # Original patch bundle path provided by the user/CLI. Never mutated.
+    # OSS-Fuzz testing should use this base bundle plus patch_override_paths.
+    base_patch_path: str = ""
     artifacts_dir: str = ""
     patch_key: str = ""
 
@@ -105,6 +108,8 @@ class AgentState:
 
     # Tracks the latest generated override diff artifact paths (for OSS-Fuzz tool)
     patch_override_paths: List[str] = field(default_factory=list)
+    # Override diffs keyed by patch_key (avoid duplicates/stale overrides).
+    patch_override_by_key: Dict[str, str] = field(default_factory=dict)
 
     # Indicates we already attempted OSS-Fuzz test after generating a patch.
     ossfuzz_test_attempted: bool = False
@@ -1248,6 +1253,46 @@ def _write_effective_patch_bundle(
     return str(out_path), None
 
 
+def _persist_override_diff(
+    state: AgentState,
+    *,
+    patch_key: str,
+    patch_text: str,
+    label: str,
+) -> tuple[str, Optional[str]]:
+    """Persist a unified-diff override file under artifacts_dir so OSS-Fuzz merge can infer patch_key."""
+    key = str(patch_key or "").strip()
+    text = str(patch_text or "").rstrip("\n") + "\n"
+    if not key:
+        return "", "missing patch_key"
+    if "diff --git " not in text:
+        return "", "override patch_text missing 'diff --git' header"
+
+    artifacts_dir_raw = str(getattr(state, "artifacts_dir", "") or "").strip()
+    if artifacts_dir_raw:
+        out_dir = Path(artifacts_dir_raw).expanduser().resolve()
+    else:
+        repo_root = Path(__file__).resolve().parents[2]
+        out_dir = (repo_root / "data" / "react_agent_artifacts").resolve()
+
+    safe_key = _safe_bundle_name(key, max_len=160)
+    if safe_key not in out_dir.parts and out_dir.name != safe_key:
+        out_dir = (out_dir / safe_key).resolve()
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to create override dir: {type(exc).__name__}: {exc}"
+
+    stem = _safe_bundle_name(str(label or "override").strip() or "override", max_len=120)
+    out_path = _unique_path((out_dir / f"{stem}.diff").resolve())
+    try:
+        out_path.write_text(text, encoding="utf-8", errors="replace")
+    except Exception as exc:  # noqa: BLE001
+        return "", f"failed to write override diff: {type(exc).__name__}: {exc}"
+    return str(out_path), None
+
+
 def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | None, Optional[str]]:
     """Load the patch bundle, optionally overlaying the latest override patch_text for active_patch_key."""
     if not state.patch_path:
@@ -1268,7 +1313,30 @@ def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | N
         return None, f"failed to load patch bundle: {type(exc).__name__}: {exc}"
 
     active_key = str(state.active_patch_key or state.patch_key or "").strip()
-    override_path = str((state.patch_override_paths[-1] if state.patch_override_paths else "") or "").strip()
+
+    # If we have multiple override diffs (e.g. one for the active patch_key and others for `_extra_*` hunks),
+    # only overlay the override that matches the active patch_key. Falling back to "last override wins"
+    # can corrupt mapping by applying an `_extra_*` diff to the main patch_key.
+    override_path = ""
+    if active_key and isinstance(getattr(state, "patch_override_by_key", None), dict):
+        override_path = str(state.patch_override_by_key.get(active_key, "") or "").strip()
+    if not override_path and active_key and isinstance(state.patch_override_paths, list) and state.patch_override_paths:
+        for raw in reversed(state.patch_override_paths):
+            rp = str(raw or "").strip()
+            if not rp:
+                continue
+            try:
+                p = Path(rp).expanduser().resolve()
+            except Exception:
+                continue
+            for parent in [p.parent, *p.parents]:
+                name = str(parent.name or "").strip()
+                if name == active_key:
+                    override_path = rp
+                    break
+            if override_path:
+                break
+
     if active_key and override_path and isinstance(getattr(bundle, "patches", None), dict) and active_key in bundle.patches:
         try:
             override_text = _read_text(override_path)
@@ -1705,7 +1773,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     # Reset patch/test state for the next iteration.
     state.patch_generated = False
     state.patch_result = None
-    state.patch_override_paths = []
+    # Keep accumulated override diffs across iterations; OSS-Fuzz testing uses the base bundle + overrides.
     state.ossfuzz_test_attempted = False
     state.last_observation = None
 
@@ -4117,7 +4185,7 @@ def _run_langgraph(
                 "args": {
                     "project": st.ossfuzz_project,
                     "commit": st.ossfuzz_commit,
-                    "patch_path": st.patch_path,
+                    "patch_path": str(st.base_patch_path or st.patch_path or "").strip(),
                     "patch_override_paths": list(st.patch_override_paths or []),
                     "build_csv": st.ossfuzz_build_csv,
                     "sanitizer": st.ossfuzz_sanitizer,
@@ -5032,6 +5100,7 @@ def _run_langgraph(
         st = gs["state"]
         decision = gs["pending"]
         tool = str(decision["tool"])
+
         # Record which error the agent was targeting when making this tool call.
         step_context = {
             "scope": str(st.error_scope),
@@ -5041,6 +5110,7 @@ def _run_langgraph(
             "error_line": str(getattr(st, "error_line", "") or "").strip(),
             "build_log_path": str(getattr(st, "build_log_path", "") or "").strip(),
         }
+
         # Patch-scope: always run patch tools against the current effective patch bundle.
         if st.error_scope == "patch" and st.patch_path and tool in _PATCH_TOOLS_WITH_PATCH_PATH:
             args_obj = decision.get("args")
@@ -5052,16 +5122,29 @@ def _run_langgraph(
         args = dict(decision.get("args", {}))
         obs = runner.call(tool, args)
         obs = _enforce_patch_key_scope(st, obs)
+
         if artifact_store and obs.ok and obs.tool != "read_artifact":
             offloaded = offload_patch_output(
-                store=artifact_store, tool=obs.tool, args=obs.args, output=obs.output, focus_terms=_collect_focus_terms(st)
+                store=artifact_store,
+                tool=obs.tool,
+                args=obs.args,
+                output=obs.output,
+                focus_terms=_collect_focus_terms(st),
             )
             if offloaded is not obs.output:
                 obs = ToolObservation(ok=obs.ok, tool=obs.tool, args=obs.args, output=offloaded, error=obs.error)
+
         step_rec = {"decision": decision, "observation": obs.__dict__, "context": step_context}
         st.steps.append(step_rec)
         st.step_history.append(step_rec)
         st.last_observation = obs
+
+        if obs.tool in {"make_error_patch_override", "make_extra_patch_override"} and not obs.ok:
+            # Do not let a failed patch-generation tool call leave stale patch state behind;
+            # otherwise we may run OSS-Fuzz against an older patch bundle/override set.
+            st.patch_generated = False
+            st.patch_result = None
+            st.pending_patch = None
 
         if obs.ok and obs.tool == "get_error_patch_context" and isinstance(obs.output, dict):
             st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
@@ -5088,10 +5171,13 @@ def _run_langgraph(
             missing = obs.output.get("macro_tokens_not_defined_in_slice")
             if isinstance(missing, list):
                 st.macro_tokens_not_defined_in_slice = [str(x) for x in missing if str(x).strip()][:200]
+
         if obs.ok and obs.tool == "make_error_patch_override":
             st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            st.ossfuzz_test_attempted = False
+
             if isinstance(obs.output, dict):
                 st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
                 st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
@@ -5121,23 +5207,40 @@ def _run_langgraph(
                     patch_text = pt
 
             if patch_text.strip():
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                override_path, override_err = _persist_override_diff(
+                    st,
+                    patch_key=override_key,
+                    patch_text=patch_text,
+                    label=f"override_{override_key}",
+                )
+                if override_path and not override_err:
+                    st.patch_override_by_key[override_key] = override_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+
                 effective_path, effective_err = _write_effective_patch_bundle(
                     st,
-                    patch_key=str(st.active_patch_key or st.patch_key or "").strip(),
+                    patch_key=override_key,
                     patch_text=patch_text,
                     hiden_func_dict_updated=hiden_func_dict_updated,
                 )
                 if effective_path and not effective_err:
                     st.patch_path = effective_path
-                    # The bundle now contains the rewritten patch_text; no separate override diff is required.
-                    st.patch_override_paths = []
                 elif patch_text_path:
-                    st.patch_override_paths = [patch_text_path]
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
             elif patch_text_path:
-                st.patch_override_paths = [patch_text_path]
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                st.patch_override_by_key[override_key] = patch_text_path
+                st.patch_override_paths = list(st.patch_override_by_key.values())
+
         if obs.ok and obs.tool == "make_extra_patch_override":
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
+            st.ossfuzz_test_attempted = False
 
             patch_text = ""
             patch_text_path = ""
@@ -5156,13 +5259,22 @@ def _run_langgraph(
                     patch_text = pt
 
             has_patch = bool(patch_text.strip()) or bool(patch_text_path)
-            if not has_patch:
-                # Tool ran but did not emit an override diff (e.g. symbol not found); do not trigger OSS-Fuzz test.
-                st.patch_generated = False
-            else:
-                st.patch_generated = True
+            st.patch_generated = bool(has_patch)
 
             if patch_text.strip() and extra_patch_key:
+                override_path, override_err = _persist_override_diff(
+                    st,
+                    patch_key=extra_patch_key,
+                    patch_text=patch_text,
+                    label=f"override_{extra_patch_key}",
+                )
+                if override_path and not override_err:
+                    st.patch_override_by_key[extra_patch_key] = override_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(extra_patch_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+
                 effective_path, effective_err = _write_effective_patch_bundle(
                     st,
                     patch_key=extra_patch_key,
@@ -5170,15 +5282,18 @@ def _run_langgraph(
                 )
                 if effective_path and not effective_err:
                     st.patch_path = effective_path
-                    st.patch_override_paths = []
-                elif patch_text_path and patch_text_path not in st.patch_override_paths:
-                    st.patch_override_paths.append(patch_text_path)
-            elif patch_text_path and patch_text_path not in st.patch_override_paths:
-                st.patch_override_paths.append(patch_text_path)
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(extra_patch_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+            elif patch_text_path and extra_patch_key:
+                st.patch_override_by_key[extra_patch_key] = patch_text_path
+                st.patch_override_paths = list(st.patch_override_by_key.values())
+
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
             if obs.ok:
                 st.ossfuzz_runs_attempted += 1
+
         return {"state": st}
 
     def route(gs: GraphState) -> str:
@@ -5536,6 +5651,7 @@ def main(argv: List[str]) -> int:
         state = AgentState(
             build_log_path=str(args.build_log),
             patch_path=patch_path,
+            base_patch_path=patch_path,
             error_scope=cfg.error_scope,
             error_line=error_line,
             snippet=snippet,
