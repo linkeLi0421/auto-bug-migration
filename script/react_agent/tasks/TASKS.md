@@ -13,3 +13,10 @@ Context: When a `make_error_patch_override` tool call is rejected by our guardra
 - [x] Add a regression test that inspects logged repair prompts and asserts they do NOT contain strings like `Build log path:` / `Patch-scope active error:` / `Log context:`.
 - [ ] Validate the repair still succeeds without the dropped context (ensure we still pass enough BASE-slice references for the model to rewrite `new_func_code` correctly).
 - [x] Model selection: when a guardrail triggers a repair round, run the repair `_complete(...)` with a stronger default model (`gpt-5.2`) regardless of the user-selected `--openai-model`; keep the user-selected model for all non-repair turns.
+
+## Plan: Don’t override `make_error_patch_override` due to non-active grouped errors
+Context: In patch-scope mode we often have many grouped errors for a single patch_key (including warnings). Our “undeclared symbol / missing prototype / incomplete type” guardrails were extracting symbols from `state.grouped_errors`, which can cause the agent to override a model’s `make_error_patch_override` request even when the *active* error is something else (e.g. missing struct member `ctxt->nsdb`). This manifests as: the log shows an LLM tool call for `make_error_patch_override`, but the run executes `make_extra_patch_override` instead, and the override function rewrite never happens in that round.
+
+- [x] Restrict symbol extraction for these guardrails to the active error only (`state.error_line` + `state.snippet`) instead of scanning `state.grouped_errors`.
+- [x] Keep the broader grouped-error scan available for other contexts via an `active_only` flag (default `False`).
+- [x] Add a regression test: active error is missing-member, grouped_errors contains an unrelated undeclared-function warning; ensure `_undeclared_symbol_extra_patch_guardrail_for_override(...)` returns `None` (does not override the tool call).

@@ -2352,6 +2352,20 @@ def _guardrail_repair_model(model: ChatModel) -> ChatModel:
     return model
 
 
+def _debug_guardrail_forced_tool(cfg: AgentConfig, *, original: Decision, forced: Decision) -> None:
+    """When guardrails replace a model tool call, emit a one-line debug hint."""
+    if not bool(getattr(cfg, "debug_llm", False)):
+        return
+    orig_tool = str(original.get("tool", "")).strip()
+    forced_tool = str(forced.get("tool", "")).strip()
+    if not orig_tool or not forced_tool or orig_tool == forced_tool:
+        return
+    reason = str(forced.get("thought", "") or "").strip()
+    suffix = f" reason={reason!r}" if reason else ""
+    sys.stderr.write(f"[guardrail] overriding tool call: {orig_tool} -> {forced_tool}.{suffix}\n")
+    sys.stderr.flush()
+
+
 def _build_guardrail_repair_messages(
     state: AgentState,
     messages: List[Dict[str, str]],
@@ -3121,7 +3135,7 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    undeclared = _extract_undeclared_symbol_name(state)
+    undeclared = _extract_undeclared_symbol_name(state, active_only=True)
     if not undeclared:
         return None
     if _has_make_extra_patch_override_for_symbol(state, undeclared):
@@ -3166,7 +3180,7 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    candidates = _extract_incomplete_type_symbol_candidates(state)
+    candidates = _extract_incomplete_type_symbol_candidates(state, active_only=True)
     if not candidates:
         return None
 
@@ -3207,7 +3221,7 @@ def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decisi
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    sym = _extract_missing_prototype_symbol_name(state)
+    sym = _extract_missing_prototype_symbol_name(state, active_only=True)
     if not sym:
         return None
     if _has_make_extra_patch_override_for_symbol(state, sym):
@@ -3390,15 +3404,21 @@ _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<s
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _extract_undeclared_symbol_name(state: AgentState) -> str:
-    """Best-effort extraction of an undeclared symbol/type/macro name from current error context."""
+def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
+    """Best-effort extraction of an undeclared symbol/type/macro name from error context.
+
+    In patch-scope mode, state.grouped_errors may contain many other diagnostics from the same patch_key
+    (often including warnings). For guardrails that should apply only to the active diagnostic, pass
+    active_only=True to avoid matching unrelated errors.
+    """
     candidates: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            candidates.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                candidates.append(raw)
     if str(state.error_line or "").strip():
         candidates.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -3431,18 +3451,19 @@ def _missing_struct_member_summary_for_error_line(error_line: str) -> List[Dict[
     return [{"struct": struct_name, "members": [member]}]
 
 
-def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
+def _extract_incomplete_type_symbol_candidates(state: AgentState, *, active_only: bool = False) -> List[str]:
     """Best-effort extraction of incomplete type names from current error context.
 
     Returns a prioritized list of candidate symbol names to try with make_extra_patch_override.
     """
     texts: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            texts.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                texts.append(raw)
     if str(state.error_line or "").strip():
         texts.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -3483,15 +3504,16 @@ def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
     return out
 
 
-def _extract_missing_prototype_symbol_name(state: AgentState) -> str:
+def _extract_missing_prototype_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
     """Best-effort extraction of a function name from -Wmissing-prototypes warnings."""
     candidates: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            candidates.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                candidates.append(raw)
     if str(state.error_line or "").strip():
         candidates.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -4624,7 +4646,7 @@ def _run_langgraph(
                         },
                     }
 
-                undeclared_symbol = _extract_undeclared_symbol_name(st)
+                undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
                 if (
                     undeclared_symbol
                     and _C_IDENT_RE.match(undeclared_symbol)
@@ -5127,21 +5149,25 @@ def _run_langgraph(
 
         forced_missing_proto = _missing_prototype_extra_patch_guardrail(st, decision)
         if forced_missing_proto:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_missing_proto)
             _validate_tool_decision(forced_missing_proto)
             return {"state": st, "pending": forced_missing_proto}
 
         forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
         if forced_undeclared:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_undeclared)
             _validate_tool_decision(forced_undeclared)
             return {"state": st, "pending": forced_undeclared}
 
         forced_incomplete = _incomplete_type_extra_patch_guardrail_for_override(st, decision)
         if forced_incomplete:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_incomplete)
             _validate_tool_decision(forced_incomplete)
             return {"state": st, "pending": forced_incomplete}
 
         forced_macro = _macro_define_guardrail_for_override(st, decision)
         if forced_macro:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_macro)
             _validate_tool_decision(forced_macro)
             return {"state": st, "pending": forced_macro}
 
@@ -5302,6 +5328,8 @@ def _run_langgraph(
 
             patch_text = ""
             patch_text_path = ""
+            override_key = ""
+            override_path = ""
             hiden_func_dict_updated = None
             if isinstance(st.patch_result, dict):
                 hiden_func_dict_updated = st.patch_result.get("hiden_func_dict_updated")
@@ -5347,6 +5375,21 @@ def _run_langgraph(
                 st.patch_override_by_key[override_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
 
+            sys.stderr.write("[make_error_patch_override] artifacts:\n")
+            if patch_text_path:
+                sys.stderr.write(f"  patch_text: {patch_text_path}\n")
+            if override_key:
+                sys.stderr.write(f"  patch_key: {override_key}\n")
+            if override_path:
+                sys.stderr.write(f"  override_diff: {override_path}\n")
+            if str(st.patch_path or "").strip():
+                sys.stderr.write(f"  effective_patch_bundle: {str(st.patch_path).strip()}\n")
+            if st.patch_override_paths:
+                sys.stderr.write("  patch_override_paths:\n")
+                for p in st.patch_override_paths:
+                    sys.stderr.write(f"    - {p}\n")
+            sys.stderr.flush()
+
         if obs.ok and obs.tool == "make_extra_patch_override":
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
@@ -5354,6 +5397,7 @@ def _run_langgraph(
 
             patch_text = ""
             patch_text_path = ""
+            override_path = ""
             extra_patch_key = ""
             if isinstance(st.patch_result, dict):
                 extra_patch_key = str(st.patch_result.get("patch_key", "") or "").strip()
@@ -5398,6 +5442,21 @@ def _run_langgraph(
             elif patch_text_path and extra_patch_key:
                 st.patch_override_by_key[extra_patch_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
+
+            sys.stderr.write("[make_extra_patch_override] artifacts:\n")
+            if patch_text_path:
+                sys.stderr.write(f"  patch_text: {patch_text_path}\n")
+            if extra_patch_key:
+                sys.stderr.write(f"  patch_key: {extra_patch_key}\n")
+            if override_path:
+                sys.stderr.write(f"  override_diff: {override_path}\n")
+            if str(st.patch_path or "").strip():
+                sys.stderr.write(f"  effective_patch_bundle: {str(st.patch_path).strip()}\n")
+            if st.patch_override_paths:
+                sys.stderr.write("  patch_override_paths:\n")
+                for p in st.patch_override_paths:
+                    sys.stderr.write(f"    - {p}\n")
+            sys.stderr.flush()
 
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
