@@ -190,7 +190,7 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
-# Patch-scope prompt: include log context + additional errors when configured.
+# Patch-scope prompt: include full log context for the active error only.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -216,8 +216,9 @@ st.grouped_errors = [
 msgs = _build_messages(st)
 user = next(m["content"] for m in msgs if m.get("role") == "user")
 assert "Log context:" in user, user
-assert "/src/b.c:2:3: error: e2" in user, user
-assert "Other errors in this patch_key" in user, user
+assert "line1" in user, user
+assert "/src/b.c:2:3: error: e2" not in user, user
+assert "Other errors in this patch_key" not in user, user
 print("OK")
 PY
 
@@ -287,7 +288,7 @@ assert "ossfuzz_apply_patch_and_test" in p_member, p_member
 print("OK")
 PY
 
-# Patch-scope prompt: show the active error and include additional errors for context.
+# Patch-scope prompt: show only the active error (no other errors).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -315,8 +316,8 @@ user = next(m["content"] for m in msgs if m.get("role") == "user")
 
 assert "Patch-scope active error:" in user, user
 assert "/src/a.c:1:1: error: e1" in user, user
-assert "Other errors in this patch_key" in user, user
-assert "/src/a.c:2:1: error: e2" in user, user
+assert "Other errors in this patch_key" not in user, user
+assert "/src/a.c:2:1: error: e2" not in user, user
 
 print("OK")
 PY

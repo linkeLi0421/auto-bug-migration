@@ -19,22 +19,34 @@ def load_build_log(path_or_stdin: Optional[str]) -> str:
 
 
 def find_first_fatal(build_log: str) -> Tuple[str, str]:
-    """Return the first compiler error line and a small surrounding snippet."""
+    """Return the first compiler error line and its full diagnostic block.
+
+    A diagnostic block starts at the first `file:line:col: error:` (or warning) line
+    and includes all subsequent lines until the next `error:`/`warning:` diagnostic.
+    """
     lines = build_log.splitlines()
     for idx, line in enumerate(lines):
         stripped = line.strip()
         if _COMPILER_ERROR_RE.match(stripped):
-            start = max(idx - 5, 0)
-            end = min(idx + 6, len(lines))
-            return stripped, "\n".join(lines[start:end])
+            end = len(lines)
+            for j in range(idx + 1, len(lines)):
+                nxt = lines[j].strip()
+                if _COMPILER_ERROR_RE.match(nxt) or _COMPILER_WARNING_RE.match(nxt):
+                    end = j
+                    break
+            return stripped, "\n".join(lines[idx:end]).strip()
 
     # Best-effort fallback if the log doesn't match file:line:col format.
     for idx, line in enumerate(lines):
         if "error:" in line:
             stripped = line.strip()
-            start = max(idx - 5, 0)
-            end = min(idx + 6, len(lines))
-            return stripped, "\n".join(lines[start:end])
+            end = len(lines)
+            for j in range(idx + 1, len(lines)):
+                nxt = lines[j]
+                if "error:" in nxt or "warning:" in nxt:
+                    end = j
+                    break
+            return stripped, "\n".join(lines[idx:end]).strip()
 
     return "", ""
 
@@ -44,53 +56,58 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
 
     Output items:
       - file, line, col, msg, raw
-      - snippet: small surrounding context block
+      - snippet: full diagnostic block (from this error/warning line until the next one)
     """
     lines = build_log.splitlines()
     errors: List[Dict[str, Any]] = []
     seen: set[Tuple[str, int, int, str]] = set()
-    ctx = max(0, min(int(snippet_lines or 0), 10))
 
+    # Identify all compiler diagnostic start lines first so we can compute exact blocks.
+    starts: List[Tuple[int, str, re.Match[str]]] = []
     for idx, line in enumerate(lines):
         stripped = line.strip()
         level = "error"
-        m = _COMPILER_ERROR_RE.match(stripped)
-        if not m:
+        m_err = _COMPILER_ERROR_RE.match(stripped)
+        if m_err:
+            starts.append((idx, level, m_err))
+            continue
+        m_warn = _COMPILER_WARNING_RE.match(stripped)
+        if m_warn:
+            starts.append((idx, "warning", m_warn))
+            continue
+
+    for i, (idx, level, m) in enumerate(starts):
+        file_path = str(m.group("file"))
+        line_no = int(m.group("line"))
+        col_no = int(m.group("col"))
+        msg = str(m.group("msg"))
+
+        if level == "warning":
             # Include only a small subset of warnings that frequently represent hard build
             # failures in OSS-Fuzz (e.g. -Werror=implicit-function-declaration).
-            mw = _COMPILER_WARNING_RE.match(stripped)
-            if not mw:
-                continue
-            msg = str(mw.group("msg") or "")
             if (
                 "undeclared function" not in msg
                 and "implicit declaration of function" not in msg
                 and "no previous prototype for function" not in msg
             ):
                 continue
-            level = "warning"
-            m = mw
-        file_path = str(m.group("file"))
-        line_no = int(m.group("line"))
-        col_no = int(m.group("col"))
-        msg = str(m.group("msg"))
 
         key = (file_path, line_no, col_no, msg)
         if key in seen:
             continue
         seen.add(key)
 
-        start = max(idx - ctx, 0)
-        end = min(idx + ctx + 1, len(lines))
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
+        block = "\n".join(lines[idx:end]).strip()
         errors.append(
             {
                 "file": file_path,
                 "line": line_no,
                 "col": col_no,
                 "msg": msg,
-                "raw": stripped,
+                "raw": lines[idx].strip(),
                 "level": level,
-                "snippet": "\n".join(lines[start:end]),
+                "snippet": block,
             }
         )
     return errors
