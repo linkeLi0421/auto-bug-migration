@@ -70,6 +70,8 @@ class AgentState:
     active_func_start_index: Optional[int] = None
     active_func_end_index: Optional[int] = None
     active_old_signature: str = ""
+    # Patch metadata for the pinned active_patch_key (from the patch bundle).
+    active_patch_types: List[str] = field(default_factory=list)
     active_excerpt_artifact_path: str = ""
     active_patch_minus_code_artifact_path: str = ""
     active_error_func_code_artifact_path: str = ""
@@ -1317,6 +1319,31 @@ def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | N
     # If we have multiple override diffs (e.g. one for the active patch_key and others for `_extra_*` hunks),
     # only overlay the override that matches the active patch_key. Falling back to "last override wins"
     # can corrupt mapping by applying an `_extra_*` diff to the main patch_key.
+    patch_keys: set[str] = set()
+    if isinstance(getattr(bundle, "patches", None), dict):
+        try:
+            patch_keys = {str(k) for k in bundle.patches.keys() if isinstance(k, str) and str(k).strip()}
+        except Exception:
+            patch_keys = set()
+
+    def infer_override_patch_key(path: str) -> str:
+        rp = str(path or "").strip()
+        if not rp:
+            return ""
+        try:
+            p = Path(rp).expanduser().resolve()
+        except Exception:
+            return ""
+        for parent in [p.parent, *p.parents]:
+            name = str(parent.name or "").strip()
+            if not name:
+                continue
+            if name in patch_keys:
+                return name
+            if name.startswith("_extra_"):
+                return name
+        return ""
+
     override_path = ""
     if active_key and isinstance(getattr(state, "patch_override_by_key", None), dict):
         override_path = str(state.patch_override_by_key.get(active_key, "") or "").strip()
@@ -1325,16 +1352,8 @@ def _load_effective_patch_bundle_for_mapping(state: AgentState) -> tuple[Any | N
             rp = str(raw or "").strip()
             if not rp:
                 continue
-            try:
-                p = Path(rp).expanduser().resolve()
-            except Exception:
-                continue
-            for parent in [p.parent, *p.parents]:
-                name = str(parent.name or "").strip()
-                if name == active_key:
-                    override_path = rp
-                    break
-            if override_path:
+            if infer_override_patch_key(rp) == active_key:
+                override_path = rp
                 break
 
     if active_key and override_path and isinstance(getattr(bundle, "patches", None), dict) and active_key in bundle.patches:
@@ -5617,6 +5636,20 @@ def main(argv: List[str]) -> int:
         except Exception:
             pass
 
+    active_patch_types: List[str] = []
+    if cfg.error_scope == "patch" and patch_path and active_patch_key:
+        try:
+            from migration_tools.patch_bundle import load_patch_bundle as _lpb  # type: ignore
+
+            bundle = _lpb(patch_path)
+            patches = getattr(bundle, "patches", None)
+            if isinstance(patches, dict):
+                patch = patches.get(active_patch_key)
+                if patch is not None:
+                    active_patch_types = sorted(str(pt) for pt in (getattr(patch, "patch_type", None) or set()))
+        except Exception:
+            active_patch_types = []
+
     artifact_store, artifacts_dir = resolve_artifact_dir(
         disabled=bool(args.no_artifacts),
         patch_key=patch_key,
@@ -5684,6 +5717,7 @@ def main(argv: List[str]) -> int:
             active_func_start_index=active_func_start_index,
             active_func_end_index=active_func_end_index,
             active_old_signature=active_old_signature,
+            active_patch_types=active_patch_types,
             grouped_errors=grouped_errors,
             function_groups=function_groups,
             function_groups_total=function_groups_total,

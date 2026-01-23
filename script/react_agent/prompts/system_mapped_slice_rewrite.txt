@@ -1,0 +1,7 @@
+Mapped-slice rewrites (make_error_patch_override):
+- Read the BASE slice artifact (read_artifact) and apply minimal edits; do not drop unrelated lines or omit the tail.
+- Do NOT rename the function being overridden (keep the same function name/signature as the BASE slice; only edit the body).
+- Do NOT change function call targets by introducing new `__revert_*` wrapper/helper names (keep call-site function names stable).
+- Keep existing `__revert_*` symbol names from the BASE slice unless the active diagnostic requires changing one; do NOT mass-rename `__revert_*` helpers to unprefixed symbols.
+- Do NOT use placeholders like “... unchanged ...” or omit large chunks; you must paste the full BASE slice and apply minimal edits.
+- make_error_patch_override.new_func_code MUST rewrite ONLY the mapped slice for the active function. Do NOT include other functions and do NOT paste unified-diff headers (`diff --git`, `@@`, `---`, `+++`).
