@@ -1,73 +1,15 @@
-[x] Fix `make_extra_patch_override` false “already present” for type names used only in prototypes
-  - Context: `_symbol_defined_in_extra_hunk` currently treats whole-identifier matches on `;`-terminated prototype lines as “defined”, so a type name like `xmlHashedString` mentioned only in prototypes can block inserting its `typedef` (real repro: libxml2 `parser.c` / `_extra_parser.c`).
-  - [x] Reproduce from real artifact: `_extra_parser.c` contains `xmlHashedString` only in a prototype (no typedef), but tool returns “already present”.
-  - [x] Tighten `_symbol_defined_in_extra_hunk` so “defined” means an actual declaration/definition:
-    - [x] Don’t treat type names appearing inside function prototypes/param lists as “defined”.
-    - [x] Don’t treat `struct TAG *p;` / `struct TAG;` as a tag definition (require `{` or `{` on next inserted line).
-  - [x] Ensure type insertions are ordered correctly:
-    - [x] When inserting `typedef`/tag bodies, prepend them before existing prototypes/macros in the `_extra_*` hunk so later prototypes can use the type.
-  - [x] Add regression tests:
-    - [x] `_symbol_defined_in_extra_hunk` returns false for `xmlHashedString` mentioned only in prototypes.
-    - [x] Type insertions are prepended before existing `-` blocks in the extra hunk.
-  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
-  - [x] Post reminder to `#report`.
+# Tasks
 
-[x] Stabilize `make_error_patch_override`: avoid bulk renaming `__revert_*` helpers to unprefixed symbols
-  - Context: models sometimes “normalize” calls like `__revert_<hash>_foo(...)` to `foo(...)` while fixing an unrelated error, which can introduce new missing-prototype/ABI/behavior issues and makes the patch-scope loop unstable.
-  - [x] Add an agent-side guardrail: when rewriting from a BASE slice, reject overrides that drop multiple `__revert_*` identifiers from the baseline (retry with minimal edits).
-  - [x] Update `system_patch_scope` prompt to explicitly: keep existing `__revert_*` symbols unless directly required by the active diagnostic (prefer `make_extra_patch_override` for prototypes).
-  - [x] Add regression test: dropping 2+ `__revert_*` names triggers the guardrail.
-  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
-  - [x] Post reminder to `#report`.
+## Plan: When guardrails reject `make_error_patch_override`, keep repair prompts minimal
+Context: When a `make_error_patch_override` tool call is rejected by our guardrails (e.g. multi-function body, function rename, incomplete body), the next-round repair call (e.g. `override_function_scope_repair`) currently reuses `repair_messages = list(messages)`. This drags the original patch-scope “Build log path … Patch-scope active error … Log context …” blob into the repair prompt, even though the repair is only about fixing the tool call format/scope.
 
-[x] Stabilize `make_error_patch_override`: reject placeholder/short `new_func_code` that omits large parts of the BASE slice
-  - Context: LLMs sometimes emit “the rest is unchanged …” placeholders or output only a partial function body, which deletes the omitted lines from the patch slice and causes cascading failures.
-  - [x] Tighten the base-preservation guardrail to catch large shrink even when the tail is present (line-count ratio).
-  - [x] Update `system_patch_scope` prompt: no placeholders/ellipsis; always paste the full BASE slice and apply minimal edits.
-  - [x] Add regression test for “short but includes tail” scenario.
-  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
-  - [x] Post reminder to `#report`.
-
-[x] Stabilize missing-struct-member handling: focus one member at a time
-  - Context: patch-scope runs can include multiple missing-member diagnostics for the same struct within a single function group; unioning them in the prompt encourages broad edits and increases guardrail trips.
-  - [x] Summarize only the active missing member (no union across grouped errors).
-  - [x] Wire into patch-scope state init + auto-loop state refresh.
-  - [x] Update `system_patch_scope` prompt guidance for missing-member errors.
-  - [x] Add regression test.
-  - [x] Run `bash script/react_agent/test_langgraph_agent.sh` and `bash script/react_agent/test_multi_agent.sh`.
-  - [x] Post reminder to `#report`.
-
-[x] Fix `multi_agent.py` crash when `patch_text` is a unified diff string (Errno 36: file name too long)
-  - Context: `_extract_override_diffs_from_agent_stdout_steps()` currently calls `normalize_path(patch_text)` when `patch_text` is a string. In some “no change” tool outputs, `patch_text` is the *full diff text* (starts with `diff --git ...`), so `Path(...).is_file()` attempts to `stat()` a huge “filename” and crashes.
-  - [x] Reproduce with a minimal `agent_stdout.json` payload where `steps[*].observation.output.patch_text` is a unified diff string (no `artifact_path`).
-  - [x] Harden `normalize_path`:
-    - [x] Reject obviously-not-a-path strings (contains `\n`, starts with `diff --git`, overly long).
-    - [x] Wrap `path.resolve()` / `path.is_file()` in `try/except OSError` and return `""` on failure.
-  - [x] Tighten `maybe_add` parsing:
-    - [x] When `patch_text` is a string, only treat it as an override artifact path if it “looks like a path” (single-line, reasonable length); otherwise skip it.
-  - [x] Add regression coverage to `script/react_agent/test_multi_agent.sh` ensuring the unified-diff-string case does not throw and does not produce an override path.
-  - [ ] Post reminder to `#report`.
-
-[ ] Preserve leading underscores in artifact dir names
-  - Context: patch keys like `_extra_parser.c` are currently written under `extra_parser.c/` because `_safe_bundle_name` strips leading `_`, which is confusing and can collide with a real `extra_parser.c` key.
-  - [x] Update `_safe_bundle_name` to keep leading `_` and only strip leading/trailing `.`.
-  - [x] Run `bash script/react_agent/test_langgraph_agent.sh`.
-  - [ ] Post reminder to `#report`.
-
-[x] Multi-agent resume support: restart without redoing fixed hunks
-  - Context: long multi-agent runs can fail transiently (e.g. `read operation timed out`) and it’s expensive to restart from the beginning.
-  - [x] Add `--resume-from` to `script/react_agent/multi_agent.py` to reuse an existing `multi_<run_id>` artifacts root (or its `progress.json`/`summary.json`).
-  - [x] Skip patch_keys whose prior `task_status` is `fixed`; rerun the rest.
-  - [x] Write `progress.json` checkpoints after each completed hunk so partial runs can be resumed.
-  - [x] Add regression coverage in `script/react_agent/test_multi_agent.sh`.
-
-[x] Single-agent restart on transient timeouts (agent_langgraph)
-  - Context: single-agent runs can fail with transient network/LLM errors like `Result: next_step: The read operation timed out` and currently exit with `thought: Agent error.`
-  - [x] Add `--max-agent-retries` and `--agent-retry-backoff-sec` to `script/react_agent/agent_langgraph.py`.
-  - [x] Retry LangGraph execution in-process when the exception chain indicates a timeout (`urllib.error.URLError` / `socket.timeout` / “timed out” text).
-  - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh` with a flaky model that times out once, then succeeds.
-
-[x] Missing-struct-member guidance: patch-scope workflow + direct override
-  - Context: errors like `error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'` need a deterministic workflow to avoid the agent stalling or making broad edits.
-  - [x] Update `script/react_agent/prompts/system_struct_members.txt` to include a step-by-step patch-scope flow: get_error_patch_context → search_definition(struct in v1/v2) → make_error_patch_override → ossfuzz_apply_patch_and_test.
-  - [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh`.
+- [x] Identify all guardrail-driven repair paths that call `_complete(..., label="override_*_repair")` and currently reuse the full `messages` history.
+- [x] Change repair prompt construction to exclude the initial patch-scope build-error message(s):
+  - Build `repair_messages` from scratch (or filter `messages`) so the repair LLM sees only:
+    - the system prompt,
+    - minimal state (patch_path, patch_key, file_path, line_number, active_old_signature, patch_type),
+    - the most relevant tool observation(s) needed to craft the corrected tool call (e.g. `get_error_patch_context` artifact paths),
+    - the rejected tool JSON and the guardrail feedback text.
+- [x] Add a regression test that inspects logged repair prompts and asserts they do NOT contain strings like `Build log path:` / `Patch-scope active error:` / `Log context:`.
+- [ ] Validate the repair still succeeds without the dropped context (ensure we still pass enough BASE-slice references for the model to rewrite `new_func_code` correctly).
+- [x] Model selection: when a guardrail triggers a repair round, run the repair `_complete(...)` with a stronger default model (`gpt-5.2`) regardless of the user-selected `--openai-model`; keep the user-selected model for all non-repair turns.

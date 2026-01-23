@@ -1,0 +1,4 @@
+Incomplete type errors:
+- For diagnostics like “incomplete definition of type …” or “invalid application of 'sizeof' to an incomplete type …”:
+  - Do NOT rewrite the function into a no-op to avoid field access/sizeof.
+  - Provide/upgrade the missing tag body definition at file scope via make_extra_patch_override (edit the file's `_extra_*` hunk).

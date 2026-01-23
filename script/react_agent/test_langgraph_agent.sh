@@ -190,7 +190,94 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
-# Patch-scope prompt: include log context + additional errors when configured.
+# Guardrail repair prompts: do not include the initial patch-scope build-error blob (Build log path / Log context).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _build_guardrail_repair_messages, _build_messages  # noqa: E402
+
+base = "int f(int x) { return x + 1; }\n"
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text(base, encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="build.log",
+        patch_path="bundle.patch2",
+        error_scope="patch",
+        error_line="/src/a.c:1:1: error: e1",
+        snippet="",
+    )
+    st.patch_key = "p1"
+    st.active_patch_key = "p1"
+    st.active_file_path = "/src/a.c"
+    st.active_line_number = 1
+    st.active_old_signature = "int f(int x)"
+    st.loop_base_func_code_artifact_path = str(base_path)
+    st.grouped_errors = [{"raw": "/src/a.c:1:1: error: e1", "file": "/src/a.c", "line": 1, "col": 1, "msg": "e1"}]
+
+    msgs = _build_messages(st)
+    assert any("Build log path:" in m.get("content", "") for m in msgs if m.get("role") == "user"), msgs
+
+    rejected = {
+        "type": "tool",
+        "thought": "bad override",
+        "tool": "make_error_patch_override",
+        "args": {"patch_path": "bundle.patch2", "file_path": "/src/a.c", "line_number": 1, "new_func_code": base},
+    }
+    repair = _build_guardrail_repair_messages(st, msgs, rejected, "GUARDRAIL")
+
+    joined = "\n".join(m.get("content", "") for m in repair if m.get("role") in {"user", "assistant", "system"})
+    assert "Build log path:" not in joined, joined
+    assert "Patch-scope active error:" not in joined, joined
+    assert "Log context:" not in joined, joined
+    assert "Guardrail repair context" not in joined, joined
+
+print("OK")
+PY
+
+# Focus-error ordering (debug): allow prioritizing a specific error substring ahead of warnings.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _prioritize_focus_within_hunk, _prioritize_warnings_within_hunk  # noqa: E402
+
+errors = [
+    {
+        "level": "warning",
+        "msg": "no previous prototype for function 'foo'",
+        "raw": "/src/x.c:1:1: warning: no previous prototype for function 'foo'",
+        "snippet": "warning block",
+    },
+    {
+        "level": "error",
+        "msg": "no member named 'nsdb' in 'struct _xmlParserCtxt'",
+        "raw": "/src/y.c:2:2: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+        "snippet": "error block",
+    },
+]
+
+ranked = _prioritize_focus_within_hunk(_prioritize_warnings_within_hunk(errors), "nsdb")
+assert ranked[0]["level"] == "error", ranked
+assert "nsdb" in ranked[0]["msg"], ranked
+
+ranked2 = _prioritize_focus_within_hunk(_prioritize_warnings_within_hunk(errors), "")
+assert ranked2[0]["level"] == "warning", ranked2
+
+print("OK")
+PY
+
+# Patch-scope prompt: include full log context for the active error only.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -216,8 +303,9 @@ st.grouped_errors = [
 msgs = _build_messages(st)
 user = next(m["content"] for m in msgs if m.get("role") == "user")
 assert "Log context:" in user, user
-assert "/src/b.c:2:3: error: e2" in user, user
-assert "Other errors in this patch_key" in user, user
+assert "line1" in user, user
+assert "/src/b.c:2:3: error: e2" not in user, user
+assert "Other errors in this patch_key" not in user, user
 print("OK")
 PY
 
@@ -258,8 +346,16 @@ assert "Undeclared symbol/type errors:" in p_undeclared, p_undeclared
 
 st_tail = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
 st_tail.active_old_signature = "int f(int x)"
+st_tail.active_patch_types = ["Merged functions"]
 p_tail = build_system_prompt(st_tail, tool_specs=TOOL_SPECS)
 assert "Merged/tail hunks" in p_tail, p_tail
+
+st_not_merged = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+st_not_merged.active_old_signature = "int f(int x)"
+st_not_merged.active_patch_types = ["Recreated function"]
+p_not_merged = build_system_prompt(st_not_merged, tool_specs=TOOL_SPECS)
+assert "Mapped-slice rewrites" in p_not_merged, p_not_merged
+assert "Merged/tail hunks" not in p_not_merged, p_not_merged
 
 st_member = AgentState(
     build_log_path="-",
@@ -279,7 +375,7 @@ assert "ossfuzz_apply_patch_and_test" in p_member, p_member
 print("OK")
 PY
 
-# Patch-scope prompt: show the active error and include additional errors for context.
+# Patch-scope prompt: show only the active error (no other errors).
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
 from pathlib import Path
@@ -307,8 +403,100 @@ user = next(m["content"] for m in msgs if m.get("role") == "user")
 
 assert "Patch-scope active error:" in user, user
 assert "/src/a.c:1:1: error: e1" in user, user
-assert "Other errors in this patch_key" in user, user
-assert "/src/a.c:2:1: error: e2" in user, user
+assert "Other errors in this patch_key" not in user, user
+assert "/src/a.c:2:1: error: e2" not in user, user
+
+print("OK")
+PY
+
+# Mapping regression: do not treat an `_extra_*` override diff as the active patch_key's override just because
+# the override file happens to be nested under `.../<active_patch_key>/_extra_*/...`.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _load_effective_patch_bundle_for_mapping  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+main_key = "p_main"
+extra_key = "_extra_parser.c"
+
+main_patch_text = (
+    "diff --git a/parser.c b/parser.c\n"
+    "--- a/parser.c\n"
+    "+++ b/parser.c\n"
+    "@@ -10,25 +10,25 @@\n"
+    + "".join(f"-MAIN{i:02d}\n" for i in range(1, 51))
+)
+extra_patch_text = (
+    "diff --git a/parser.c b/parser.c\n"
+    "--- a/parser.c\n"
+    "+++ b/parser.c\n"
+    "@@ -90,6 +90,3 @@\n"
+    "-EXTRA\n"
+    "+EXTRA\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    bundle_path = root / "bundle.patch2"
+    patches = {
+        main_key: PatchInfo(
+            file_path_old="parser.c",
+            file_path_new="parser.c",
+            patch_text=main_patch_text,
+            file_type="source",
+            old_start_line=10,
+            old_end_line=50,
+            new_start_line=10,
+            new_end_line=50,
+            patch_type={"Recreated function"},
+            old_signature="int main(void)",
+            dependent_func=set(),
+            hiden_func_dict={},
+        ),
+        extra_key: PatchInfo(
+            file_path_old="parser.c",
+            file_path_new="parser.c",
+            patch_text=extra_patch_text,
+            file_type="source",
+            old_start_line=90,
+            old_end_line=95,
+            new_start_line=90,
+            new_end_line=95,
+            patch_type={"Extra"},
+            old_signature="",
+            dependent_func=set(),
+            hiden_func_dict={},
+        ),
+    }
+    bundle_path.write_bytes(pickle.dumps(patches))
+
+    # The override diff applies to `_extra_parser.c`, but the file is nested under `<main_key>/_extra_parser.c/`.
+    override_dir = root / main_key / extra_key
+    override_dir.mkdir(parents=True, exist_ok=True)
+    override_path = override_dir / "override__extra_parser.c.diff"
+    override_path.write_text(extra_patch_text, encoding="utf-8")
+
+    st = AgentState(build_log_path="-", patch_path=str(bundle_path), error_scope="patch", error_line="x", snippet="")
+    st.patch_key = main_key
+    st.active_patch_key = main_key
+    st.patch_override_paths = [str(override_path)]
+    st.patch_override_by_key = {}
+
+    bundle, err = _load_effective_patch_bundle_for_mapping(st)
+    assert err is None, err
+    out_patches = getattr(bundle, "patches", None)
+    assert isinstance(out_patches, dict), type(out_patches)
+    assert str(out_patches[main_key].patch_text) == main_patch_text, "main patch_text was incorrectly overridden"
 
 print("OK")
 PY

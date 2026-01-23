@@ -12,13 +12,22 @@ class PromptContext:
     snippet: str
     error_line: str
     active_old_signature: str
+    active_patch_types: List[str]
+    active_patch_is_merged: bool
     missing_struct_members: bool
     undeclared_symbol: bool
     macro_tokens_not_defined_in_slice: bool
+    incomplete_type: bool
+    missing_prototypes: bool
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
-_UNDECLARED_SYMBOL_SNIPPET = "use of undeclared identifier"
+_UNDECLARED_SYMBOL_SNIPPETS = (
+    "use of undeclared identifier",
+    "call to undeclared function",
+    "unknown type name",
+    "implicit declaration of function",
+)
 
 
 def _prompt_dir() -> Path:
@@ -62,17 +71,29 @@ def _context_from_state(state: Any) -> PromptContext:
     snippet = str(getattr(state, "snippet", "") or "")
     error_line = str(getattr(state, "error_line", "") or "")
     active_old_signature = str(getattr(state, "active_old_signature", "") or "").strip()
+    active_patch_types = getattr(state, "active_patch_types", None)
+    if not isinstance(active_patch_types, list):
+        active_patch_types = []
+    patch_is_merged = any("merged" in str(pt).lower() for pt in active_patch_types)
+    err_lower = error_line.lower()
+    snip_lower = snippet.lower()
     missing_struct_members = bool(getattr(state, "missing_struct_members", None) or []) or ("no member named" in error_line)
-    undeclared_symbol = _UNDECLARED_SYMBOL_SNIPPET in error_line
+    undeclared_symbol = any(s in err_lower for s in _UNDECLARED_SYMBOL_SNIPPETS)
     macro_tokens_not_defined_in_slice = bool(getattr(state, "macro_tokens_not_defined_in_slice", None) or [])
+    incomplete_type = ("incomplete" in err_lower and "type" in err_lower) or ("incomplete" in snip_lower and "type" in snip_lower)
+    missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
         error_line=error_line,
         active_old_signature=active_old_signature,
+        active_patch_types=active_patch_types,
+        active_patch_is_merged=patch_is_merged,
         missing_struct_members=missing_struct_members,
         undeclared_symbol=undeclared_symbol,
         macro_tokens_not_defined_in_slice=macro_tokens_not_defined_in_slice,
+        incomplete_type=incomplete_type,
+        missing_prototypes=missing_prototypes,
     )
 
 
@@ -107,10 +128,14 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if patch_scope:
             parts.append(patch_scope)
 
-    if ctx.active_old_signature:
-        merged_tail = _load_fragment("system_merged_tail.txt")
-        if merged_tail:
-            parts.append(merged_tail)
+    if ctx.error_scope == "patch" and ctx.active_old_signature:
+        mapped_slice = _load_fragment("system_mapped_slice_rewrite.txt")
+        if mapped_slice:
+            parts.append(mapped_slice)
+        if ctx.active_patch_is_merged:
+            merged_tail = _load_fragment("system_merged_tail.txt")
+            if merged_tail:
+                parts.append(merged_tail)
 
     if _needs_macro_guidance(ctx):
         macro = _load_fragment("system_macro.txt")
@@ -127,6 +152,16 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if undeclared:
             parts.append(undeclared)
 
+    if ctx.incomplete_type:
+        incomplete_type = _load_fragment("system_incomplete_type.txt")
+        if incomplete_type:
+            parts.append(incomplete_type)
+
+    if ctx.missing_prototypes:
+        missing_prototypes = _load_fragment("system_missing_prototypes.txt")
+        if missing_prototypes:
+            parts.append(missing_prototypes)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -134,14 +169,20 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         names = ["system_base.txt", "system_tools.txt"]
         if ctx.error_scope == "patch":
             names.append("system_patch_scope.txt")
-        if ctx.active_old_signature:
-            names.append("system_merged_tail.txt")
+        if ctx.error_scope == "patch" and ctx.active_old_signature:
+            names.append("system_mapped_slice_rewrite.txt")
+            if ctx.active_patch_is_merged:
+                names.append("system_merged_tail.txt")
         if _needs_macro_guidance(ctx):
             names.append("system_macro.txt")
         if ctx.missing_struct_members:
             names.append("system_struct_members.txt")
         if ctx.undeclared_symbol:
             names.append("system_undeclared_symbol.txt")
+        if ctx.incomplete_type:
+            names.append("system_incomplete_type.txt")
+        if ctx.missing_prototypes:
+            names.append("system_missing_prototypes.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"
