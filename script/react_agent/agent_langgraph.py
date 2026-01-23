@@ -4185,7 +4185,7 @@ def _run_langgraph(
                 "args": {
                     "project": st.ossfuzz_project,
                     "commit": st.ossfuzz_commit,
-                    "patch_path": str(st.base_patch_path or st.patch_path or "").strip(),
+                    "patch_path": str(st.patch_path or "").strip(),
                     "patch_override_paths": list(st.patch_override_paths or []),
                     "build_csv": st.ossfuzz_build_csv,
                     "sanitizer": st.ossfuzz_sanitizer,
