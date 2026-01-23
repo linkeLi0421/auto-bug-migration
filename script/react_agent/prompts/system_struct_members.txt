@@ -1,4 +1,12 @@
 Struct-member errors:
+- Workflow (patch-scope):
+  1) Call get_error_patch_context(patch_path=..., file_path=..., line_number=...) to obtain the mapped BASE slice for the active error location.
+  2) Inspect the owning struct definition in both versions:
+     - search_definition(symbol_name="struct <Name>", version="v1")
+     - search_definition(symbol_name="struct <Name>", version="v2")
+  3) Edit ONLY the mapped BASE slice to use the correct V2 fields/semantics and apply it via make_error_patch_override.
+  4) Run ossfuzz_apply_patch_and_test before returning final.
+
 - For "no member named 'X' in 'struct Y'": compare struct Y in V1 vs V2 using search_definition(version="v1") and search_definition(version="v2") before patching.
 - search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
 - Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards) and then adapt the migrated code accordingly.

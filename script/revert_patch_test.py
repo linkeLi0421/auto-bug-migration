@@ -3562,9 +3562,13 @@ def apply_and_test_patches(
     count = 0
     # Store previous handle_build_error results to detect when results stop changing
     prev_build_error_results = None
-    while ('undeclared identifier' in error_log or 'undeclared function' in error_log or 
-           'too few arguments to function call' in error_log or 'member named' or 'unknown type name'
-           in error_log):
+    while (
+        'undeclared identifier' in error_log
+        or 'undeclared function' in error_log
+        or 'too few arguments to function call' in error_log
+        or 'member named' in error_log
+        or 'unknown type name' in error_log
+    ):
         count += 1
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:

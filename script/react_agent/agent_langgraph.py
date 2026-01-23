@@ -993,7 +993,9 @@ def _infer_commitish_from_path(path: str) -> str:
 
 def _safe_bundle_name(name: str, *, max_len: int = 160) -> str:
     raw = str(name or "").strip().replace(os.sep, "_")
-    cleaned = _SAFE_BUNDLE_NAME_RE.sub("_", raw).strip("._-")
+    # Preserve leading underscores (e.g. `_extra_foo.c`) so artifact dirs align with patch keys.
+    # Only strip leading/trailing dots to avoid hidden paths and `.`/`..` ambiguities.
+    cleaned = _SAFE_BUNDLE_NAME_RE.sub("_", raw).strip().strip(".")
     if not cleaned:
         cleaned = "artifact"
     return cleaned[:max_len]
@@ -1710,7 +1712,10 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     if not fp or ln <= 0:
         return None
 
-    err_text = str(next_err.get("msg", "") or "").strip() or str(state.error_line or "")[:400]
+    # Prefer stable, line-number-based mapping for forced auto-loop restarts. Passing `error_text`
+    # can cause get_error_patch_context to return a very narrow token slice (e.g. just `foo_t`)
+    # instead of the full function body, which then breaks base-preserving overrides.
+    err_text = ""
     forced: Decision = {
         "type": "tool",
         "thought": (
@@ -1926,6 +1931,119 @@ def _extract_function_name_from_signature(signature: str) -> str:
     while j >= 0 and (s[j].isalnum() or s[j] == "_"):
         j -= 1
     return s[j + 1 : end + 1]
+
+
+def _extract_first_top_level_function_name(code: str) -> str:
+    """Best-effort: extract the function name for the first top-level `(...) {` body in code."""
+    text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not text.strip():
+        return ""
+
+    in_sl_comment = False
+    in_ml_comment = False
+    in_str = False
+    in_char = False
+    escape = False
+    brace_depth = 0
+    paren_depth = 0
+    last_open_paren_at_top: Optional[int] = None
+    last_close_paren_at_top: Optional[int] = None
+
+    i = 0
+    while i < len(text):
+        c = text[i]
+        n = text[i + 1] if i + 1 < len(text) else ""
+
+        if in_sl_comment:
+            if c == "\n":
+                in_sl_comment = False
+            i += 1
+            continue
+        if in_ml_comment:
+            if c == "*" and n == "/":
+                in_ml_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_str:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if c == "\\":
+                escape = True
+                i += 1
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if c == "\\":
+                escape = True
+                i += 1
+                continue
+            if c == "'":
+                in_char = False
+            i += 1
+            continue
+
+        if c == "/" and n == "/":
+            in_sl_comment = True
+            i += 2
+            continue
+        if c == "/" and n == "*":
+            in_ml_comment = True
+            i += 2
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        if c == "'":
+            in_char = True
+            i += 1
+            continue
+
+        if c == "{":
+            if brace_depth == 0 and paren_depth == 0 and last_open_paren_at_top is not None and last_close_paren_at_top is not None:
+                if 0 <= (i - last_close_paren_at_top) <= 200:
+                    j = last_open_paren_at_top - 1
+                    while j >= 0 and text[j].isspace():
+                        j -= 1
+                    end = j
+                    while j >= 0 and (text[j].isalnum() or text[j] == "_"):
+                        j -= 1
+                    name = text[j + 1 : end + 1].strip()
+                    return name if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or "") else ""
+            brace_depth += 1
+            i += 1
+            continue
+        if c == "}":
+            brace_depth = max(0, brace_depth - 1)
+            i += 1
+            continue
+        if c == "(":
+            if brace_depth == 0 and paren_depth == 0:
+                last_open_paren_at_top = i
+            paren_depth += 1
+            i += 1
+            continue
+        if c == ")":
+            if paren_depth > 0:
+                paren_depth -= 1
+                if brace_depth == 0 and paren_depth == 0:
+                    last_close_paren_at_top = i
+            i += 1
+            continue
+
+        i += 1
+    return ""
 
 
 def _count_top_level_bodies(code: str) -> tuple[int, bool]:
@@ -2258,6 +2376,66 @@ def _override_preserve_revert_symbols_guardrail_error(state: AgentState, decisio
     )
 
 
+def _override_no_new_revert_symbols_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if new_func_code introduces new __revert_* symbols not present in the BASE slice.
+
+    We rely on __revert_* names to remain stable across patch-scope iterations; introducing new helpers/call targets
+    (e.g. rewriting `xmlParseAttribute2(...)` to `__revert_<hash>_xmlParseAttribute2(...)`) makes the patch less
+    deterministic and can cascade into missing prototypes/ABI mismatches.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
+    if not base_text.strip():
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    base_syms = _extract_revert_symbol_names(base_text)
+    new_syms = _extract_revert_symbol_names(new_text)
+    added = sorted(new_syms - base_syms)
+    if not added:
+        return None
+
+    preview = ", ".join(added[:6])
+    if len(added) > 6:
+        preview += ", ..."
+    return (
+        f"new_func_code introduces {len(added)} new __revert_* identifiers not present in the BASE slice ({base_source}): "
+        f"{preview}. Do not change function names/call targets by introducing new __revert_* helpers; keep existing names."
+    )
+
+
 def _override_single_function_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
     """Return an error message if new_func_code looks like it rewrites more than the active slice.
 
@@ -2354,6 +2532,80 @@ def _override_single_function_guardrail_error(state: AgentState, decision: Decis
             " In function-scoped mode, avoid adding extra top-level decls/macros; keep the rewrite inside the mapped body."
         )
 
+    return None
+
+
+def _override_preserve_function_name_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if make_error_patch_override renames the function being overridden."""
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    expected_sig = ""
+    active_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if active_sig:
+        expected_sig = _extract_function_name_from_signature(active_sig)
+
+    base_text = ""
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+
+    expected_base = _extract_first_top_level_function_name(base_text) if base_text.strip() else ""
+    expected = expected_base or expected_sig
+    if not expected:
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    actual = _extract_first_top_level_function_name(new_text)
+    if not actual:
+        return (
+            f"new_func_code does not appear to define a top-level function body for {expected}(...). "
+            "Do not rename the function; output the full function definition with the same name as the BASE slice."
+        )
+
+    def equiv(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        if not a or not b:
+            return False
+        # Treat `__revert_<hash>_<name>` as equivalent to `<name>` for name-matching purposes,
+        # because active_old_signature is often unprefixed while the migrated slice uses __revert_*.
+        m = re.match(r"^__revert_[0-9a-fA-F]+_(.+)$", a)
+        if m and m.group(1) == b:
+            return True
+        m = re.match(r"^__revert_[0-9a-fA-F]+_(.+)$", b)
+        if m and m.group(1) == a:
+            return True
+        return False
+
+    # Prefer comparing against the BASE slice name when available (that's what we must not change).
+    compare_name = expected_base or expected_sig
+    if compare_name and not equiv(actual, compare_name):
+        return (
+            f"new_func_code appears to rename the function from {compare_name}(...) to {actual}(...). "
+            "Do NOT change/rename the function name; keep the original name and only edit the body as needed."
+        )
     return None
 
 
@@ -3619,11 +3871,22 @@ def _system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState) -> List[Dict[str, str]]:
+    other_errors_limit_default = 3
+
+    def _trim_snippet(text: str, *, max_lines: int = 8) -> str:
+        lines = str(text or "").splitlines()
+        max_n = max(0, int(max_lines or 0))
+        if max_n <= 0 or len(lines) <= max_n:
+            return "\n".join(lines).strip()
+        kept = lines[:max_n]
+        kept.append("...[truncated]...")
+        return "\n".join(kept).strip()
+
     def _active_error_summary() -> str:
         """Render a single active error for patch-scope runs.
 
         Patch-scope runs can involve many errors mapped to the same patch_key. For prompt hygiene,
-        show only the active error (the one the agent is addressing this round) and summarize the rest.
+        show the active error (with log context) and optionally include a few other errors.
         """
         if not (state.error_scope == "patch" and state.grouped_errors):
             return ""
@@ -3634,6 +3897,7 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
 
         patch_key = str(state.patch_key or state.active_patch_key or "").strip()
         other_count = max(int(len(state.grouped_errors)) - 1, 0)
+        other_limit = max(0, int(other_errors_limit_default))
 
         active_json: Dict[str, Any] = {}
         if isinstance(active, dict):
@@ -3650,7 +3914,40 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
             lines.append(f"patch_key: {patch_key}")
         if raw_line:
             lines.append(raw_line)
-        if other_count:
+        active_snippet = ""
+        if isinstance(active, dict):
+            sn = active.get("snippet")
+            if isinstance(sn, str) and sn.strip():
+                active_snippet = sn
+        if active_snippet.strip():
+            lines.append("")
+            lines.append("Log context:")
+            lines.append(_trim_snippet(active_snippet, max_lines=8))
+        elif state.snippet and state.snippet.strip():
+            # Fallback for cases where grouped_errors lack snippet context but state.snippet is available.
+            lines.append("")
+            lines.append("Log context:")
+            lines.append(_trim_snippet(state.snippet, max_lines=8))
+
+        if other_count and other_limit > 0:
+            shown = min(other_count, other_limit)
+            lines.append("")
+            lines.append(f"Other errors in this patch_key (showing {shown} of {other_count}):")
+            for e in (state.grouped_errors[1 : 1 + shown] or []):
+                if not isinstance(e, dict):
+                    continue
+                r = str(e.get("raw") or "").strip()
+                rline = r.splitlines()[0].strip() if r else ""
+                if not rline:
+                    continue
+                lines.append(rline)
+                sn = e.get("snippet")
+                if isinstance(sn, str) and sn.strip():
+                    lines.append(_trim_snippet(sn, max_lines=8))
+                lines.append("")
+            if lines and not lines[-1].strip():
+                lines.pop()
+        elif other_count:
             lines.append(f"(other errors in this patch_key: {other_count} hidden)")
         lines.append("")
         lines.append("Details (JSON):")
@@ -4163,9 +4460,11 @@ def _run_langgraph(
                 undeclared_symbol = _extract_undeclared_symbol_name(st)
                 if (
                     undeclared_symbol
-                    and undeclared_symbol.startswith("__revert_")
-                    and not _has_tool_call(st, "make_extra_patch_override")
+                    and _C_IDENT_RE.match(undeclared_symbol)
+                    and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
                 ):
+                    # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
+                    # deterministically before trying to rewrite the active function body.
                     if remaining < 2:
                         return {
                             "state": st,
@@ -4182,7 +4481,7 @@ def _run_langgraph(
                         }
                     forced_extra: Decision = {
                         "type": "tool",
-                        "thought": "Undeclared symbol/type detected: add a forward declaration/define in the file's _extra_* hunk (deterministic extra patch strategy).",
+                        "thought": "Undeclared symbol/type detected: add a forward declaration/define/typedef in the file's _extra_* hunk (deterministic extra patch strategy).",
                         "tool": "make_extra_patch_override",
                         "args": {
                             "patch_path": st.patch_path,
@@ -4459,6 +4758,52 @@ def _run_langgraph(
 
         # Guardrail: when the BASE slice is function-scoped, new_func_code must be a complete function body.
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            name_err = _override_preserve_function_name_guardrail_error(st, decision)
+            if name_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "make_error_patch_override.new_func_code must not rename the function being overridden.\n"
+                            f"{name_err}\n\n"
+                            "Fix: start from the BASE slice (read_artifact output) and keep the same function name/signature; "
+                            "apply minimal edits inside the body only.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_function_name_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    name_err2 = _override_preserve_function_name_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not name_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly renamed the function in the override.",
+                                "summary": "Stopped before patch generation due to a function name change in the override.",
+                                "next_step": (
+                                    f"{name_err2}\n\n"
+                                    "Manually edit the BASE slice (read_artifact output) to preserve the original function name, then rerun."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
             complete_err = _override_complete_function_guardrail_error(st, decision)
             if complete_err:
                 repair_messages = list(messages)
@@ -4554,6 +4899,54 @@ def _run_langgraph(
                             },
                         }
 
+        # Guardrail: do not introduce new __revert_* call targets/helpers in the override.
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            new_revert_err = _override_no_new_revert_symbols_guardrail_error(st, decision)
+            if new_revert_err:
+                repair_messages = list(messages)
+                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                repair_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your make_error_patch_override.new_func_code introduces new `__revert_*` function symbols/call targets.\n"
+                            f"{new_revert_err}\n\n"
+                            "Fix: keep function names and call targets stable. Start from the BASE slice and make the smallest edits needed "
+                            "without introducing new `__revert_*` helper names.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    }
+                )
+                raw2 = _complete(model, repair_messages, label="override_new_revert_symbols_repair")
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    new_revert_err2 = _override_no_new_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not new_revert_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly introduced new __revert_* helper symbols in the override.",
+                                "summary": "Stopped before patch generation due to new __revert_* call targets.",
+                                "next_step": (
+                                    f"{new_revert_err2}\n\n"
+                                    "Manually edit the BASE slice (read_artifact output) to avoid introducing new `__revert_*` helper names, then rerun."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
         forced_missing_proto = _missing_prototype_extra_patch_guardrail(st, decision)
         if forced_missing_proto:
             _validate_tool_decision(forced_missing_proto)
@@ -4614,8 +5007,9 @@ def _run_langgraph(
                         "start_line": 1,
                         "query": "",
                         "context_lines": 0,
-                        "max_lines": 0,
-                        "max_chars": 0,
+                        # `read_artifact` interprets max_lines/max_chars as hard limits; 0 yields empty output.
+                        "max_lines": 8000,
+                        "max_chars": 200000,
                     },
                 }
                 _validate_tool_decision(forced)
