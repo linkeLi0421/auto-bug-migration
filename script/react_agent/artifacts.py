@@ -20,6 +20,7 @@ _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
     },
     "get_patch": {"patch_text": ".diff"},
     "make_error_patch_override": {"old_func_code": ".c", "patch_text": ".diff"},
+    "make_extra_patch_override": {"patch_text": ".diff"},
     "ossfuzz_apply_patch_and_test": {
         "build_output": ".log",
         "check_build_output": ".log",
