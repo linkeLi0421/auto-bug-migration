@@ -277,6 +277,50 @@ assert ranked2[0]["level"] == "warning", ranked2
 print("OK")
 PY
 
+# Guardrail: do not force make_extra_patch_override due to unrelated grouped errors when the active error is not undeclared.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _undeclared_symbol_extra_patch_guardrail_for_override  # noqa: E402
+
+st = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line="/src/x.c:1:1: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+    snippet="if (ctxt->nsdb) {}",
+)
+st.patch_key = "p1"
+st.grouped_errors = [
+    {"raw": st.error_line, "file": "/src/x.c", "line": 1, "col": 1, "level": "error", "msg": "missing member"},
+    {
+        "raw": "/src/x.c:2:1: warning: call to undeclared function 'foo' [-Wimplicit-function-declaration]",
+        "file": "/src/x.c",
+        "line": 2,
+        "col": 1,
+        "level": "warning",
+        "msg": "call to undeclared function 'foo'",
+    },
+]
+# Simulate auto-loop state where mapping prereqs are already satisfied.
+st.loop_base_func_code_artifact_path = "/tmp/base.c"
+
+decision = {
+    "type": "tool",
+    "thought": "rewrite function",
+    "tool": "make_error_patch_override",
+    "args": {"patch_path": "bundle.patch2", "file_path": "/src/x.c", "line_number": 1, "new_func_code": "int f(void){return 0;}"},
+}
+
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
+assert forced is None, forced
+print("OK")
+PY
+
 # Patch-scope prompt: include full log context for the active error only.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
