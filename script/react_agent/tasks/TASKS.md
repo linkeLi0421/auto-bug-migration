@@ -20,3 +20,19 @@ Context: In patch-scope mode we often have many grouped errors for a single patc
 - [x] Restrict symbol extraction for these guardrails to the active error only (`state.error_line` + `state.snippet`) instead of scanning `state.grouped_errors`.
 - [x] Keep the broader grouped-error scan available for other contexts via an `active_only` flag (default `False`).
 - [x] Add a regression test: active error is missing-member, grouped_errors contains an unrelated undeclared-function warning; ensure `_undeclared_symbol_extra_patch_guardrail_for_override(...)` returns `None` (does not override the tool call).
+
+## Plan: Restart on OpenAI HTTP 5xx/429 (not just timeouts)
+Context: `log/agent_log/tmp1.log` ends with `next_step: OpenAI HTTPError: 502 Bad Gateway ... cloudflare` and then `thought: Agent error.` without any `[agent_langgraph] transient error ... retrying ...` message.
+
+- [x] Confirm the retry gate is the classifier:
+  - `_run_langgraph_with_retries` is enabled (default `--max-agent-retries` is non-zero).
+  - `_is_transient_agent_error` returned false for `ModelError("OpenAI HTTPError: 502 ...")` (and/or its `urllib.error.HTTPError` cause), so the exception was re-raised and the agent stopped.
+- [x] Expand transient error detection in `script/react_agent/agent_langgraph.py:_is_transient_agent_error`:
+  - Treat `urllib.error.HTTPError` with `code >= 500` as transient, and `429` as transient.
+  - Preserve non-retriable errors (e.g., 401/403 auth, 400 invalid request) as fatal.
+  - If the HTTP status is only present in a `ModelError` string, parse it as a fallback.
+- [x] Add a regression test for retry classification:
+  - `ModelError(...)` chained from `urllib.error.HTTPError(502, ...)` returns `True`.
+  - `ModelError(...)` chained from `urllib.error.HTTPError(401, ...)` returns `False`.
+- [x] Update CLI/help text for `--max-agent-retries` to reflect that it covers transient HTTP failures (5xx/429) in addition to timeouts.
+- [ ] (Optional) In `--debug-llm` mode, emit a one-line reason when an exception is *not* considered transient (to make retry gating more obvious).
