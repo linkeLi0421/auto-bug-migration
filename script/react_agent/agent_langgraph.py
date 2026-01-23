@@ -4232,7 +4232,28 @@ def _run_langgraph(
             if verdict.get("status") == "ok":
                 fixed_str = "yes" if verdict.get("fixed") else "no"
 
-            next_step_lines = [f"Target error fixed: {fixed_str}."]
+            fixed_label = "Target error fixed"
+            if st.error_scope == "patch" and str(getattr(st, "active_old_signature", "") or "").strip():
+                fixed_label = "Active function fixed"
+            next_step_lines = [f"{fixed_label}: {fixed_str}."]
+            if (
+                st.error_scope == "patch"
+                and isinstance(patch_key_verdict, dict)
+                and patch_key_verdict.get("status") == "ok"
+                and str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+            ):
+                pk = str(patch_key_verdict.get("active_patch_key", "") or "").strip()
+                remaining = int(patch_key_verdict.get("remaining_in_active_patch_key", 0) or 0)
+                next_step_lines.append(f"Remaining errors in active patch_key {pk}: {remaining}.")
+                if remaining > 0:
+                    if not cfg.auto_ossfuzz_loop:
+                        next_step_lines.append(
+                            "Auto-loop is disabled; rerun with --auto-ossfuzz-loop to keep iterating within this patch_key."
+                        )
+                    elif st.ossfuzz_runs_attempted >= int(cfg.ossfuzz_loop_max or 0):
+                        next_step_lines.append(
+                            f"Auto-loop stopped: reached --ossfuzz-loop-max ({st.ossfuzz_runs_attempted}/{int(cfg.ossfuzz_loop_max or 0)})."
+                        )
             if verdict.get("status") == "failed":
                 reason = str(verdict.get("reason", "") or "").strip()
                 if reason:
