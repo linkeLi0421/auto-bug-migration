@@ -1,32 +1,19 @@
 Struct-member errors:
-- Workflow (patch-scope):
-  1) Call get_error_patch_context(patch_path=..., file_path=..., line_number=...) to obtain the mapped BASE slice for the active error location.
-  2) Identify the owning struct and inspect its definition in both versions:
-     - search_definition(symbol_name="struct <Name>", version="v1")
-     - search_definition(symbol_name="struct <Name>", version="v2")
-  3) Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards).
-     - search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
-  4) Edit ONLY the mapped BASE slice to use the correct V2 fields/semantics and apply it via make_error_patch_override.
-
-- Focus on fixing the single missing member named in the active error first; do NOT try to preemptively fix other struct members in the same round.
-
-Your job:
-
-- For every struct field used in the function that does not exist in version B:
-  * If there is ANY reasonable candidate field in version B that appears to represent the same concept
+- For every struct field used in the function that does not exist in v2:
+  * If there is ANY reasonable candidate field in v2 that appears to represent the same concept
     (same or compatible type, similar comment, or similar role), treat it as a rename / semantic replacement
     and update the code to use that field.
   * ONLY remove or greatly simplify logic when there is clearly no suitable replacement field or the types
     clearly do not match.
 
-- If version B introduces new ownership / flag fields (for example booleans that say whether a buffer
+- If v2 introduces new ownership / flag fields (for example booleans that say whether a buffer
   can be freed or whether a frame is sparse), set them consistently with the function's behavior:
   * If the function allocates a new buffer, mark the frame as owning that buffer (so it can be freed).
   * If the function just aliases a caller-provided buffer, mark the frame as NOT owning it.
   * If there is a flag indicating the frame is “sparse” or similar, set it to true/false as implied by the
     function's name and logic.
 
-- If a struct field from version A is genuinely deleted (not renamed or replaced), refactor or remove only
+- If a struct field from v1 is genuinely deleted (not renamed or replaced), refactor or remove only
   the minimal amount of code that depends on it. Do NOT invent arbitrary new fields.
 
 - When you must set a missing pointer field, assign or compare it directly to NULL; never call NULL as if
@@ -39,3 +26,4 @@ Constraints:
 - Do NOT change line numbers outside the function.
 - Do NOT add new functions, global variables, or struct definitions.
 - Do NOT add comments or explanations.
+- Search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".

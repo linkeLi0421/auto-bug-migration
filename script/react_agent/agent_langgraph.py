@@ -48,6 +48,8 @@ class AgentConfig:
     debug_llm_dir: str = ""
     auto_ossfuzz_loop: bool = False
     ossfuzz_loop_max: int = 1
+    # (debug) In patch-scope runs, prefer handling an error whose message/snippet matches this substring first.
+    focus_error: str = ""
 
 
 @dataclass
@@ -384,6 +386,34 @@ def _prioritize_warnings_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[
         ranked.append((0 if is_warning else 1, 0 if is_missing_proto else 1, idx, err))
     ranked.sort(key=lambda t: (t[0], t[1], t[2]))
     return [e for _, _, _, e in ranked]
+
+
+def _error_matches_focus(err: Dict[str, Any], focus: str) -> bool:
+    needle = str(focus or "").strip()
+    if not needle:
+        return False
+    for k in ("msg", "raw", "snippet"):
+        v = err.get(k)
+        if isinstance(v, str) and needle in v:
+            return True
+    return False
+
+
+def _prioritize_focus_within_hunk(errors: List[Dict[str, Any]], focus_error: str) -> List[Dict[str, Any]]:
+    """Stable ordering helper: prefer a specific error substring first (debug).
+
+    This runs after normal warning/error ranking and can move a matching *error* ahead of warnings.
+    """
+    needle = str(focus_error or "").strip()
+    if not needle:
+        return list(errors or [])
+    ranked: List[tuple[int, int, Dict[str, Any]]] = []
+    for idx, err in enumerate(errors or []):
+        if not isinstance(err, dict):
+            continue
+        ranked.append((0 if _error_matches_focus(err, needle) else 1, idx, err))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [e for _, _, e in ranked]
 
 
 def _summarize_function_groups(
@@ -1717,6 +1747,9 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     in_active = _prioritize_warnings_within_hunk(
         [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
     )
+    focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
+    if focus_error:
+        in_active = _prioritize_focus_within_hunk(in_active, focus_error)
     if not in_active:
         return None
 
@@ -1729,6 +1762,14 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     _record_current_error_group(state)
 
     preferred_sig = str(getattr(state, "active_old_signature", "") or "").strip()
+    if focus_error:
+        # If the caller asked to focus a specific error substring, prefer the signature containing it.
+        for e in in_active:
+            if isinstance(e, dict) and _error_matches_focus(e, focus_error):
+                sig = str(e.get("old_signature", "") or "").strip()
+                if sig:
+                    preferred_sig = sig
+                break
     if not preferred_sig and state.grouped_errors:
         preferred_sig = str(state.grouped_errors[0].get("old_signature", "") or "").strip()
 
@@ -2298,6 +2339,60 @@ def _last_read_artifact_path(state: AgentState) -> str:
         if path:
             return path
     return ""
+
+
+def _guardrail_repair_model(model: ChatModel) -> ChatModel:
+    """Return the model to use for guardrail-triggered repair calls."""
+    if isinstance(model, OpenAIChatCompletionsModel):
+        # Use a stronger default model for repair rounds; keep the user-selected model for normal turns.
+        try:
+            return replace(model, model="gpt-5.2")
+        except Exception:
+            return model
+    return model
+
+
+def _build_guardrail_repair_messages(
+    state: AgentState,
+    messages: List[Dict[str, str]],
+    rejected: Decision,
+    guidance: str,
+) -> List[Dict[str, str]]:
+    """Build a minimal repair prompt for guardrail-triggered override fixes.
+
+    Keep only the prior tool-call dialogue context (system + tool observations), then append the rejected
+    tool JSON and the guardrail guidance. Drop the initial build-error user blob for prompt hygiene.
+    """
+
+    def _is_initial_build_error_blob(msg: Dict[str, str]) -> bool:
+        if msg.get("role") != "user":
+            return False
+        content = str(msg.get("content", "") or "")
+        if content.lstrip().startswith("Observation:\n"):
+            return False
+        if "Choose the next best tool call or return a final decision." not in content:
+            return False
+        return (
+            "Build log path:" in content
+            or "\nBuild error:\n" in content
+            or content.startswith("Build error:\n")
+            or "Patch-scope active error:" in content
+            or "Log context:" in content
+        )
+
+    out: List[Dict[str, str]] = []
+    for msg in messages:
+        if _is_initial_build_error_blob(msg):
+            continue
+        out.append(msg)
+
+    # Ensure we didn't accidentally drop the system prompt.
+    if not out or out[0].get("role") != "system":
+        sys_msg = next((m for m in messages if m.get("role") == "system"), None)
+        if isinstance(sys_msg, dict):
+            out.insert(0, {"role": "system", "content": str(sys_msg.get("content", "") or "")})
+    out.append({"role": "assistant", "content": json.dumps(rejected, ensure_ascii=False)})
+    return out
 
 
 def _force_read_base_slice_for_shrunk_override(state: AgentState) -> Optional[Decision]:
@@ -4782,13 +4877,16 @@ def _run_langgraph(
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             func_scope_err = _override_single_function_guardrail_error(st, decision)
             if func_scope_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "In function-by-function mode (Active function (old_signature) is set), make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
+                            "In function-by-function mode (Active function (old_signature) is set), "
+                            "make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
                             "for the active function from this round.\n"
                             f"active_old_signature: {str(getattr(st, 'active_old_signature', '') or '').strip()}\n"
                             f"{func_scope_err}\n\n"
@@ -4796,9 +4894,9 @@ def _run_langgraph(
                             "Do NOT include other functions or unified-diff headers.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_function_scope_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_function_scope_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4832,21 +4930,23 @@ def _run_langgraph(
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             name_err = _override_preserve_function_name_guardrail_error(st, decision)
             if name_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "make_error_patch_override.new_func_code must not rename the function being overridden.\n"
                             f"{name_err}\n\n"
                             "Fix: start from the BASE slice (read_artifact output) and keep the same function name/signature; "
                             "apply minimal edits inside the body only.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_function_name_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_function_name_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4878,21 +4978,23 @@ def _run_langgraph(
 
             complete_err = _override_complete_function_guardrail_error(st, decision)
             if complete_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "Your make_error_patch_override.new_func_code appears to be an incomplete/truncated function body.\n"
                             f"{complete_err}\n\n"
                             "Fix: output the FULL function body as raw C code (balanced braces; include the final return/closing `}`), "
                             "still scoped to the mapped '-' slice for this round. Do NOT include unified-diff headers.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_complete_body_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_complete_body_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -4926,12 +5028,14 @@ def _run_langgraph(
             if str(decision.get("tool", "")).strip() == "make_error_patch_override":
                 revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
                 if revert_err:
-                    repair_messages = list(messages)
-                    repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                    repair_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
+                    repair_model = _guardrail_repair_model(model)
+                    raw2 = _complete(
+                        repair_model,
+                        _build_guardrail_repair_messages(
+                            st,
+                            messages,
+                            decision,
+                            (
                                 "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
                                 f"{revert_err}\n\n"
                                 "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
@@ -4939,9 +5043,9 @@ def _run_langgraph(
                                 "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
                                 "Return exactly one JSON object of type tool calling make_error_patch_override."
                             ),
-                        }
+                        ),
+                        label="override_revert_symbols_repair",
                     )
-                    raw2 = _complete(model, repair_messages, label="override_revert_symbols_repair")
                     try:
                         repaired = _parse_decision(raw2)
                     except Exception:
@@ -4975,21 +5079,23 @@ def _run_langgraph(
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
             new_revert_err = _override_no_new_revert_symbols_guardrail_error(st, decision)
             if new_revert_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
                             "Your make_error_patch_override.new_func_code introduces new `__revert_*` function symbols/call targets.\n"
                             f"{new_revert_err}\n\n"
                             "Fix: keep function names and call targets stable. Start from the BASE slice and make the smallest edits needed "
                             "without introducing new `__revert_*` helper names.\n"
                             "Return exactly one JSON object of type tool calling make_error_patch_override."
                         ),
-                    }
+                    ),
+                    label="override_new_revert_symbols_repair",
                 )
-                raw2 = _complete(model, repair_messages, label="override_new_revert_symbols_repair")
                 try:
                     repaired = _parse_decision(raw2)
                 except Exception:
@@ -5385,6 +5491,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("REACT_AGENT_FOCUS_PATCH_KEY", ""),
         help="In --error-scope patch mode, select this patch_key group (hunk) instead of the default heuristic.",
     )
+    parser.add_argument(
+        "--focus-error",
+        default=os.environ.get("REACT_AGENT_FOCUS_ERROR", ""),
+        help="(debug) In --error-scope patch mode, prefer handling an error whose message/snippet contains this substring first.",
+    )
     parser.add_argument("--no-artifacts", action="store_true", help="Disable artifact-backed tool outputs.")
 
     parser.add_argument("--openai-api-key", default=os.environ.get("OPENAI_API_KEY", ""))
@@ -5465,6 +5576,7 @@ def main(argv: List[str]) -> int:
         debug_llm_dir=str(getattr(args, "debug_llm_dir", "") or "").strip(),
         auto_ossfuzz_loop=bool(getattr(args, "auto_ossfuzz_loop", False)),
         ossfuzz_loop_max=max(int(getattr(args, "ossfuzz_loop_max", 0) or 0), 1),
+        focus_error=str(getattr(args, "focus_error", "") or "").strip(),
     )
 
     # Fail fast: in patch-scope runs we will generate a patch and must be able to test it.
@@ -5526,6 +5638,8 @@ def main(argv: List[str]) -> int:
             errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
             first_mapped_key = ""
+            first_focus_key = ""
+            focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
             for err in errs:
                 mapping = map_error_patch(patch_path=patch_path, file_path=err["file"], line_number=err["line"])
                 key = str(mapping.get("patch_key") or "").strip()
@@ -5537,14 +5651,20 @@ def main(argv: List[str]) -> int:
                 if key:
                     if not first_mapped_key:
                         first_mapped_key = key
+                    if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
+                        first_focus_key = key
                     groups.setdefault(key, []).append(enriched)
             if groups:
                 focus = str(getattr(args, "focus_patch_key", "") or "").strip()
                 if focus and focus in groups:
                     patch_key = focus
+                elif first_focus_key and first_focus_key in groups:
+                    patch_key = first_focus_key
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                full_grouped = _prioritize_warnings_within_hunk(groups[patch_key])
+                full_grouped = _prioritize_focus_within_hunk(
+                    _prioritize_warnings_within_hunk(groups[patch_key]), focus_error
+                )
                 full_grouped_for_history = list(full_grouped)
                 function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
                 grouped_errors = full_grouped
