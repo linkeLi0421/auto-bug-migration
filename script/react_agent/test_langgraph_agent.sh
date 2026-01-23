@@ -3032,6 +3032,7 @@ assert "OVERRIDE_LINE" in merged_text, merged_path
 assert "p2" in (out.get("overridden_patch_keys") or []), out
 assert "_extra_error.c" in (out.get("overridden_patch_keys") or []), out
 assert "EXTRA_DECL" in merged_text, merged_path
+assert merged_path.parent == artifact_dir.resolve(), (merged_path, artifact_dir)
 
 bundle_out = write_patch_bundle_with_overrides(
     patch_path=str(bundle_path),

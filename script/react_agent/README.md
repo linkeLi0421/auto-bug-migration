@@ -116,8 +116,8 @@ Notes:
 - Run only specific hunks: `--only-patch-keys p1,p2,p3`
 - Retry a failing hunk from a clean slate: `--max-restarts-per-hunk 1`
 - Run one final OSS-Fuzz build/check_build with *all* hunks’ overrides:
-  - `--final-ossfuzz-test auto` (default): only when all hunks are `fixed` and `--tools real`
-  - `--final-ossfuzz-test always`: run regardless of per-hunk status (still requires `--tools real`)
+  - `--final-ossfuzz-test always` (default): run regardless of per-hunk status (still requires `--tools real`)
+  - `--final-ossfuzz-test auto`: only when all hunks are `fixed` and `--tools real`
   - `--final-ossfuzz-test never`: skip
 - Multi-run artifacts: `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` plus a top-level `summary.json`
 
