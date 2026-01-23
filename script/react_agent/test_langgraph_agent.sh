@@ -190,6 +190,93 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# Guardrail repair prompts: do not include the initial patch-scope build-error blob (Build log path / Log context).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _build_guardrail_repair_messages, _build_messages  # noqa: E402
+
+base = "int f(int x) { return x + 1; }\n"
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text(base, encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="build.log",
+        patch_path="bundle.patch2",
+        error_scope="patch",
+        error_line="/src/a.c:1:1: error: e1",
+        snippet="",
+    )
+    st.patch_key = "p1"
+    st.active_patch_key = "p1"
+    st.active_file_path = "/src/a.c"
+    st.active_line_number = 1
+    st.active_old_signature = "int f(int x)"
+    st.loop_base_func_code_artifact_path = str(base_path)
+    st.grouped_errors = [{"raw": "/src/a.c:1:1: error: e1", "file": "/src/a.c", "line": 1, "col": 1, "msg": "e1"}]
+
+    msgs = _build_messages(st)
+    assert any("Build log path:" in m.get("content", "") for m in msgs if m.get("role") == "user"), msgs
+
+    rejected = {
+        "type": "tool",
+        "thought": "bad override",
+        "tool": "make_error_patch_override",
+        "args": {"patch_path": "bundle.patch2", "file_path": "/src/a.c", "line_number": 1, "new_func_code": base},
+    }
+    repair = _build_guardrail_repair_messages(st, msgs, rejected, "GUARDRAIL")
+
+    joined = "\n".join(m.get("content", "") for m in repair if m.get("role") in {"user", "assistant", "system"})
+    assert "Build log path:" not in joined, joined
+    assert "Patch-scope active error:" not in joined, joined
+    assert "Log context:" not in joined, joined
+    assert "Guardrail repair context" not in joined, joined
+
+print("OK")
+PY
+
+# Focus-error ordering (debug): allow prioritizing a specific error substring ahead of warnings.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import _prioritize_focus_within_hunk, _prioritize_warnings_within_hunk  # noqa: E402
+
+errors = [
+    {
+        "level": "warning",
+        "msg": "no previous prototype for function 'foo'",
+        "raw": "/src/x.c:1:1: warning: no previous prototype for function 'foo'",
+        "snippet": "warning block",
+    },
+    {
+        "level": "error",
+        "msg": "no member named 'nsdb' in 'struct _xmlParserCtxt'",
+        "raw": "/src/y.c:2:2: error: no member named 'nsdb' in 'struct _xmlParserCtxt'",
+        "snippet": "error block",
+    },
+]
+
+ranked = _prioritize_focus_within_hunk(_prioritize_warnings_within_hunk(errors), "nsdb")
+assert ranked[0]["level"] == "error", ranked
+assert "nsdb" in ranked[0]["msg"], ranked
+
+ranked2 = _prioritize_focus_within_hunk(_prioritize_warnings_within_hunk(errors), "")
+assert ranked2[0]["level"] == "warning", ranked2
+
+print("OK")
+PY
+
 # Patch-scope prompt: include full log context for the active error only.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
