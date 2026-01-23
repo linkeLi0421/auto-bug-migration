@@ -3958,33 +3958,19 @@ def _system_prompt(state: AgentState) -> str:
 
 
 def _build_messages(state: AgentState) -> List[Dict[str, str]]:
-    other_errors_limit_default = 3
-
-    def _trim_snippet(text: str, *, max_lines: int = 8) -> str:
-        lines = str(text or "").splitlines()
-        max_n = max(0, int(max_lines or 0))
-        if max_n <= 0 or len(lines) <= max_n:
-            return "\n".join(lines).strip()
-        kept = lines[:max_n]
-        kept.append("...[truncated]...")
-        return "\n".join(kept).strip()
-
     def _active_error_summary() -> str:
         """Render a single active error for patch-scope runs.
 
         Patch-scope runs can involve many errors mapped to the same patch_key. For prompt hygiene,
-        show the active error (with log context) and optionally include a few other errors.
+        show only the active error (with its full compiler diagnostic block).
         """
         if not (state.error_scope == "patch" and state.grouped_errors):
             return ""
         active = state.grouped_errors[0] if isinstance(state.grouped_errors[0], dict) else {}
         raw = str(active.get("raw") or state.error_line or "").strip()
-        # Ensure the model sees a single error line, not a multi-line blob.
         raw_line = raw.splitlines()[0].strip() if raw else ""
 
         patch_key = str(state.patch_key or state.active_patch_key or "").strip()
-        other_count = max(int(len(state.grouped_errors)) - 1, 0)
-        other_limit = max(0, int(other_errors_limit_default))
 
         active_json: Dict[str, Any] = {}
         if isinstance(active, dict):
@@ -3999,48 +3985,26 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         lines: List[str] = ["Patch-scope active error:"]
         if patch_key:
             lines.append(f"patch_key: {patch_key}")
-        if raw_line:
-            lines.append(raw_line)
         active_snippet = ""
         if isinstance(active, dict):
             sn = active.get("snippet")
             if isinstance(sn, str) and sn.strip():
                 active_snippet = sn
-        if active_snippet.strip():
-            lines.append("")
-            lines.append("Log context:")
-            lines.append(_trim_snippet(active_snippet, max_lines=8))
-        elif state.snippet and state.snippet.strip():
+        block = active_snippet.strip()
+        if not block and str(state.snippet or "").strip():
             # Fallback for cases where grouped_errors lack snippet context but state.snippet is available.
+            block = str(state.snippet or "").strip()
+        if not block and raw_line:
+            block = raw_line
+        if block:
             lines.append("")
             lines.append("Log context:")
-            lines.append(_trim_snippet(state.snippet, max_lines=8))
-
-        if other_count and other_limit > 0:
-            shown = min(other_count, other_limit)
-            lines.append("")
-            lines.append(f"Other errors in this patch_key (showing {shown} of {other_count}):")
-            for e in (state.grouped_errors[1 : 1 + shown] or []):
-                if not isinstance(e, dict):
-                    continue
-                r = str(e.get("raw") or "").strip()
-                rline = r.splitlines()[0].strip() if r else ""
-                if not rline:
-                    continue
-                lines.append(rline)
-                sn = e.get("snippet")
-                if isinstance(sn, str) and sn.strip():
-                    lines.append(_trim_snippet(sn, max_lines=8))
-                lines.append("")
-            if lines and not lines[-1].strip():
-                lines.pop()
-        elif other_count:
-            lines.append(f"(other errors in this patch_key: {other_count} hidden)")
+            lines.append(block)
         lines.append("")
         lines.append("Details (JSON):")
         lines.append(
             json.dumps(
-                {"patch_key": patch_key, "active_error": active_json, "other_errors_in_patch_key": other_count},
+                {"patch_key": patch_key, "active_error": active_json},
                 ensure_ascii=False,
                 indent=2,
             )
@@ -4758,60 +4722,60 @@ def _run_langgraph(
         if fixed_loc:
             decision = fixed_loc  # type: ignore[assignment]
 
-        # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
-        # drops large portions of it (common failure mode: model emits only a short snippet).
-        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
-            shrink_err = _override_preserve_base_guardrail_error(st, decision)
-            if shrink_err:
-                forced_read = _force_read_base_slice_for_shrunk_override(st)
-                if forced_read:
-                    _validate_tool_decision(forced_read)
-                    decision = forced_read  # type: ignore[assignment]
-                else:
-                    repair_messages = list(messages)
-                    repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                    repair_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
-                                f"{shrink_err}\n\n"
-                                "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
-                                "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
-                                "Return exactly one JSON object of type tool calling make_error_patch_override."
-                            ),
-                        }
-                    )
-                    raw2 = _complete(model, repair_messages, label="override_shrink_repair")
-                    try:
-                        repaired = _parse_decision(raw2)
-                    except Exception:
-                        repaired = {}
-                    if (
-                        isinstance(repaired, dict)
-                        and repaired.get("type") == "tool"
-                        and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
-                    ):
-                        _validate_tool_decision(repaired)  # type: ignore[arg-type]
-                        shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
-                        if not shrink_err2:
-                            decision = repaired  # type: ignore[assignment]
-                        else:
-                            return {
-                                "state": st,
-                                "final": {
-                                    "type": "final",
-                                    "thought": "Model repeatedly produced a truncated override body.",
-                                    "summary": "Stopped before patch generation due to an incomplete override body.",
-                                    "next_step": (
-                                        f"{shrink_err2}\n\n"
-                                        "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
-                                        "or manually construct new_func_code by editing the read_artifact BASE slice."
-                                    ).strip(),
-                                    "steps": _steps_for_output(st),
-                                    "error": _error_payload(st),
-                                },
-                            }
+        # # Guardrail: if we have a BASE slice from read_artifact, do not accept an override that
+        # # drops large portions of it (common failure mode: model emits only a short snippet).
+        # if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+        #     shrink_err = _override_preserve_base_guardrail_error(st, decision)
+        #     if shrink_err:
+        #         forced_read = _force_read_base_slice_for_shrunk_override(st)
+        #         if forced_read:
+        #             _validate_tool_decision(forced_read)
+        #             decision = forced_read  # type: ignore[assignment]
+        #         else:
+        #             repair_messages = list(messages)
+        #             repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+        #             repair_messages.append(
+        #                 {
+        #                     "role": "user",
+        #                     "content": (
+        #                         "Your make_error_patch_override.new_func_code appears to drop too much of the mapped '-' slice baseline.\n"
+        #                         f"{shrink_err}\n\n"
+        #                         "Fix: start from the mapped function slice (get_error_patch_context.error_func_code or the auto-loop BASE slice) and apply the smallest possible edits.\n"
+        #                         "If your change is meant to be minimal, do NOT omit the tail; keep unrelated lines.\n"
+        #                         "Return exactly one JSON object of type tool calling make_error_patch_override."
+        #                     ),
+        #                 }
+        #             )
+        #             raw2 = _complete(model, repair_messages, label="override_shrink_repair")
+        #             try:
+        #                 repaired = _parse_decision(raw2)
+        #             except Exception:
+        #                 repaired = {}
+        #             if (
+        #                 isinstance(repaired, dict)
+        #                 and repaired.get("type") == "tool"
+        #                 and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+        #             ):
+        #                 _validate_tool_decision(repaired)  # type: ignore[arg-type]
+        #                 shrink_err2 = _override_preserve_base_guardrail_error(st, repaired)  # type: ignore[arg-type]
+        #                 if not shrink_err2:
+        #                     decision = repaired  # type: ignore[assignment]
+        #                 else:
+        #                     return {
+        #                         "state": st,
+        #                         "final": {
+        #                             "type": "final",
+        #                             "thought": "Model repeatedly produced a truncated override body.",
+        #                             "summary": "Stopped before patch generation due to an incomplete override body.",
+        #                             "next_step": (
+        #                                 f"{shrink_err2}\n\n"
+        #                                 "Increase the model output token budget and try again (e.g. set OPENAI_MAX_TOKENS higher),\n"
+        #                                 "or manually construct new_func_code by editing the read_artifact BASE slice."
+        #                             ).strip(),
+        #                             "steps": _steps_for_output(st),
+        #                             "error": _error_payload(st),
+        #                         },
+        #                     }
 
         # Guardrail (function-by-function): in merged/tail mode, the override should only rewrite the active function,
         # not the entire patch hunk.
@@ -4958,53 +4922,53 @@ def _run_langgraph(
                             },
                         }
 
-        # Guardrail: avoid broad renames of generated __revert_* helpers while fixing an unrelated error.
-        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
-            revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
-            if revert_err:
-                repair_messages = list(messages)
-                repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
-                repair_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
-                            f"{revert_err}\n\n"
-                            "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
-                            "- Keep existing `__revert_*` symbol names as-is (do not mass-replace them with unprefixed names).\n"
-                            "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
-                            "Return exactly one JSON object of type tool calling make_error_patch_override."
-                        ),
-                    }
-                )
-                raw2 = _complete(model, repair_messages, label="override_revert_symbols_repair")
-                try:
-                    repaired = _parse_decision(raw2)
-                except Exception:
-                    repaired = {}
-                if (
-                    isinstance(repaired, dict)
-                    and repaired.get("type") == "tool"
-                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
-                ):
-                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
-                    revert_err2 = _override_preserve_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
-                    if not revert_err2:
-                        decision = repaired  # type: ignore[assignment]
-                    else:
-                        return {
-                            "state": st,
-                            "final": {
-                                "type": "final",
-                                "thought": "Model repeatedly removed/renamed multiple __revert_* helper symbols in the override.",
-                                "summary": "Stopped before patch generation due to an overly broad override rewrite.",
-                                "next_step": (
-                                    f"{revert_err2}\n\n"
-                                    "Manually edit the BASE slice (read_artifact output) to keep `__revert_*` calls intact and change only what the current diagnostic requires, then rerun."
-                                ).strip(),
-                                "steps": _steps_for_output(st),
-                                "error": _error_payload(st),
-                            },
+            # Guardrail: avoid broad renames of generated __revert_* helpers while fixing an unrelated error.
+            if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+                revert_err = _override_preserve_revert_symbols_guardrail_error(st, decision)
+                if revert_err:
+                    repair_messages = list(messages)
+                    repair_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                    repair_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your make_error_patch_override.new_func_code appears to broadly rename/drop multiple `__revert_*` helper symbols from the BASE slice.\n"
+                                f"{revert_err}\n\n"
+                                "Fix: start from the BASE slice and apply the smallest possible edits to address ONLY the active diagnostic.\n"
+                                "- Keep existing `__revert_*` symbol names as-is (do not mass-replace them with unprefixed names).\n"
+                                "- If a `__revert_*` function is missing a prototype, call make_extra_patch_override to add the file-scope prototype instead of renaming.\n"
+                                "Return exactly one JSON object of type tool calling make_error_patch_override."
+                            ),
+                        }
+                    )
+                    raw2 = _complete(model, repair_messages, label="override_revert_symbols_repair")
+                    try:
+                        repaired = _parse_decision(raw2)
+                    except Exception:
+                        repaired = {}
+                    if (
+                        isinstance(repaired, dict)
+                        and repaired.get("type") == "tool"
+                        and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                    ):
+                        _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                        revert_err2 = _override_preserve_revert_symbols_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                        if not revert_err2:
+                            decision = repaired  # type: ignore[assignment]
+                        else:
+                            return {
+                                "state": st,
+                                "final": {
+                                    "type": "final",
+                                    "thought": "Model repeatedly removed/renamed multiple __revert_* helper symbols in the override.",
+                                    "summary": "Stopped before patch generation due to an overly broad override rewrite.",
+                                    "next_step": (
+                                        f"{revert_err2}\n\n"
+                                        "Manually edit the BASE slice (read_artifact output) to keep `__revert_*` calls intact and change only what the current diagnostic requires, then rerun."
+                                    ).strip(),
+                                    "steps": _steps_for_output(st),
+                                    "error": _error_payload(st),
+                                },
                         }
 
         # Guardrail: do not introduce new __revert_* call targets/helpers in the override.
