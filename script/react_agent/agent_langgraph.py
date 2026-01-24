@@ -246,8 +246,17 @@ def _run_langgraph_with_retries(
         try:
             return _run_langgraph(model, runner, state, cfg, artifact_store=artifact_store)
         except Exception as exc:  # noqa: BLE001
-            should_retry = attempts <= (retries + 1) and _is_transient_agent_error(exc)
+            transient = _is_transient_agent_error(exc)
+            max_attempts = retries + 1
+            # retries is the number of retries after the first attempt.
+            should_retry = attempts <= retries and transient
             if not should_retry:
+                if cfg.debug_llm:
+                    print(
+                        f"[agent_langgraph] not retrying (transient={transient}) on {type(exc).__name__}: {exc} "
+                        f"(attempt {attempts}/{max_attempts}, max_retries={retries})",
+                        file=sys.stderr,
+                    )
                 raise
             # Exponential backoff with jitter:
             #   base: delay * 2^(attempt-1) (capped)
@@ -258,7 +267,7 @@ def _run_langgraph_with_retries(
             sleep_s = min(max(sleep_s, 0.0), max_sleep_s)
             print(
                 f"[agent_langgraph] transient error ({type(exc).__name__}: {exc}); retrying in {sleep_s:.1f}s "
-                f"(attempt {attempts}/{retries + 1})",
+                f"(attempt {attempts}/{max_attempts})",
                 file=sys.stderr,
             )
             if sleep_s:

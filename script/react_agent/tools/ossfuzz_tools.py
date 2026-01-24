@@ -311,6 +311,22 @@ def merge_patch_bundle_with_overrides(
             inferred_key = ""
     elif len(unique_keys) == 1:
         inferred_key = next(iter(unique_keys))
+        if inferred_key.startswith("_extra_"):
+            # Common case: only an `_extra_*` hunk is overridden, but the override diff lives under
+            # `<patch_key>/_extra_*/...`. Prefer writing the merged patch under the primary patch_key
+            # directory rather than `_extra_*`.
+            primary_from_paths = set()
+            for o in override_files:
+                p = Path(str(o.get("path", "") or "")).expanduser()
+                try:
+                    p = p.resolve()
+                except Exception:
+                    continue
+                k = _infer_primary_patch_key_from_path(p, patch_keys)
+                if k:
+                    primary_from_paths.add(k)
+            if len(primary_from_paths) == 1:
+                inferred_key = next(iter(primary_from_paths))
     else:
         # Common case: a run may override both the primary patch_key and one or more `_extra_*` hunks.
         # Prefer writing merged output under the primary (non-_extra_) patch_key directory.

@@ -3034,6 +3034,31 @@ assert "_extra_error.c" in (out.get("overridden_patch_keys") or []), out
 assert "EXTRA_DECL" in merged_text, merged_path
 assert merged_path.parent == artifact_dir.resolve(), (merged_path, artifact_dir)
 
+nested_extra_dir = (artifact_dir / "_extra_error.c").resolve()
+nested_extra_dir.mkdir(parents=True, exist_ok=True)
+nested_extra_override_path = nested_extra_dir / "override_extra_only.diff"
+nested_extra_override_text = (
+    "diff --git a/error.c b/error.c\n"
+    "--- a/error.c\n"
+    "+++ b/error.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-/* extra decls */\n"
+    "-#define EXTRA_ONLY_DECL 1\n"
+)
+nested_extra_override_path.write_text(nested_extra_override_text, encoding="utf-8", errors="replace")
+
+out2 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(nested_extra_override_path)],
+    output_name="merged_test_extra_only.diff",
+)
+merged_path2 = Path(out2.get("merged_patch_file_path", "")).resolve()
+assert merged_path2.is_file(), out2
+merged_text2 = merged_path2.read_text(encoding="utf-8", errors="replace")
+assert "_extra_error.c" in (out2.get("overridden_patch_keys") or []), out2
+assert "EXTRA_ONLY_DECL" in merged_text2, merged_path2
+assert merged_path2.parent == artifact_dir.resolve(), (merged_path2, artifact_dir)
+
 bundle_out = write_patch_bundle_with_overrides(
     patch_path=str(bundle_path),
     patch_override_paths=[str(override_path), str(extra_override_path)],

@@ -1,53 +1,20 @@
 # Tasks
 
-## Plan: When guardrails reject `make_error_patch_override`, keep repair prompts minimal
-Context: When a `make_error_patch_override` tool call is rejected by our guardrails (e.g. multi-function body, function rename, incomplete body), the next-round repair call (e.g. `override_function_scope_repair`) currently reuses `repair_messages = list(messages)`. This drags the original patch-scope “Build log path … Patch-scope active error … Log context …” blob into the repair prompt, even though the repair is only about fixing the tool call format/scope.
+Archived plans live in `script/react_agent/tasks/TASKS_*.md`. This file tracks the current active items.
 
-- [x] Identify all guardrail-driven repair paths that call `_complete(..., label="override_*_repair")` and currently reuse the full `messages` history.
-- [x] Change repair prompt construction to exclude the initial patch-scope build-error message(s):
-  - Build `repair_messages` from scratch (or filter `messages`) so the repair LLM sees only:
-    - the system prompt,
-    - minimal state (patch_path, patch_key, file_path, line_number, active_old_signature, patch_type),
-    - the most relevant tool observation(s) needed to craft the corrected tool call (e.g. `get_error_patch_context` artifact paths),
-    - the rejected tool JSON and the guardrail feedback text.
-- [x] Add a regression test that inspects logged repair prompts and asserts they do NOT contain strings like `Build log path:` / `Patch-scope active error:` / `Log context:`.
-- [ ] Validate the repair still succeeds without the dropped context (ensure we still pass enough BASE-slice references for the model to rewrite `new_func_code` correctly).
-- [x] Model selection: when a guardrail triggers a repair round, run the repair `_complete(...)` with a stronger default model (`gpt-5.2`) regardless of the user-selected `--openai-model`; keep the user-selected model for all non-repair turns.
+## Plan: Multi-agent must merge multiple `_extra_*` overrides for the same patch_key (no last-write-wins)
+Context: In multi-agent runs, multiple independent hunks can each generate an override for the same shared `_extra_*` patch_key (e.g. `_extra_hash.c`). Today our merge path treats overrides as `dict[patch_key] -> patch_text`, so later overrides silently overwrite earlier ones. This can drop required extra definitions/macros from the final merged bundle/diff (example: only `.../_extra_hash.c/make_extra_patch_override_patch_text_hash.c_xmlHashFindEntry.*.diff` ends up included, but `.../_extra_hash.c/make_extra_patch_override_patch_text_hash.c_MAX_HASH_SIZE.*.diff` is missing).
 
-## Plan: Don’t override `make_error_patch_override` due to non-active grouped errors
-Context: In patch-scope mode we often have many grouped errors for a single patch_key (including warnings). Our “undeclared symbol / missing prototype / incomplete type” guardrails were extracting symbols from `state.grouped_errors`, which can cause the agent to override a model’s `make_error_patch_override` request even when the *active* error is something else (e.g. missing struct member `ctxt->nsdb`). This manifests as: the log shows an LLM tool call for `make_error_patch_override`, but the run executes `make_extra_patch_override` instead, and the override function rewrite never happens in that round.
-
-- [x] Restrict symbol extraction for these guardrails to the active error only (`state.error_line` + `state.snippet`) instead of scanning `state.grouped_errors`.
-- [x] Keep the broader grouped-error scan available for other contexts via an `active_only` flag (default `False`).
-- [x] Add a regression test: active error is missing-member, grouped_errors contains an unrelated undeclared-function warning; ensure `_undeclared_symbol_extra_patch_guardrail_for_override(...)` returns `None` (does not override the tool call).
-
-## Plan: Restart on OpenAI HTTP 5xx/429 (not just timeouts)
-Context: `log/agent_log/tmp1.log` ends with `next_step: OpenAI HTTPError: 502 Bad Gateway ... cloudflare` and then `thought: Agent error.` without any `[agent_langgraph] transient error ... retrying ...` message.
-
-- [x] Confirm the retry gate is the classifier:
-  - `_run_langgraph_with_retries` is enabled (default `--max-agent-retries` is non-zero).
-  - `_is_transient_agent_error` returned false for `ModelError("OpenAI HTTPError: 502 ...")` (and/or its `urllib.error.HTTPError` cause), so the exception was re-raised and the agent stopped.
-- [x] Expand transient error detection in `script/react_agent/agent_langgraph.py:_is_transient_agent_error`:
-  - Treat `urllib.error.HTTPError` with `code >= 500` as transient, and `429` as transient.
-  - Preserve non-retriable errors (e.g., 401/403 auth, 400 invalid request) as fatal.
-  - If the HTTP status is only present in a `ModelError` string, parse it as a fallback.
-- [x] Add a regression test for retry classification:
-  - `ModelError(...)` chained from `urllib.error.HTTPError(502, ...)` returns `True`.
-  - `ModelError(...)` chained from `urllib.error.HTTPError(401, ...)` returns `False`.
-- [x] Implement standard retries + backoff:
-  - Exponential backoff with jitter: `sleep = base * (0.5 + rand())`, base doubles each attempt, capped at 60s.
-  - Default `--max-agent-retries=6` (7 total attempts) and default `--agent-retry-backoff-sec=1`.
-- [x] Update CLI/help text for retry behavior (`--max-agent-retries` and `--agent-retry-backoff-sec`).
-- [ ] (Optional) In `--debug-llm` mode, emit a one-line reason when an exception is *not* considered transient (to make retry gating more obvious).
-
-## Plan: Store `ossfuzz_merged_*` artifacts under the primary patch_key directory
-Context: In multi-agent runs (and some patch-scope runs), `ossfuzz_apply_patch_and_test` writes merged patch artifacts like `ossfuzz_merged_<project>_<commit>.diff` at the artifact root even when the run is focused on a single patch_key plus one or more `_extra_*` hunks. This makes it harder to correlate merged patches to a specific patch_key directory like `data/react_agent_artifacts/multi_<run_id>/<patch_key>/...`.
-
-- [x] Update `merge_patch_bundle_with_overrides()` to infer a “primary” (non-`_extra_*`) patch_key when override paths include both a main patch_key and `_extra_*` keys, and write merged output under `<artifact_root>/<primary_patch_key>/...`.
-- [x] Add a regression test that merges overrides for `p2` + `_extra_error.c` and asserts `merged_patch_file_path` is written under `<artifact_root>/p2/`.
-
-## Plan: Always run final OSS-Fuzz build/check_build in multi-agent runs
-Context: Users want `multi_agent.py` to always emit a combined build log for the merged-overrides bundle, even when not all hunks are fixed.
-
-- [x] Change the default `--final-ossfuzz-test` mode from `auto` → `always` in `script/react_agent/multi_agent.py`.
-- [x] Update `script/react_agent/README.md` to reflect the new default behavior.
+- [ ] Repro + confirm: pick a multi-run artifacts dir with 2+ override diffs under the same `_extra_*` patch_key and show the merged bundle only contains one of them.
+- [ ] Decide merge semantics for duplicates:
+  - For `_extra_*`: combine all override diffs for the same patch_key (stable order) so the final patch contains the union.
+  - For non-`_extra_*`: duplicates should be unexpected; either keep last with a warning or hard-fail.
+- [ ] Update `script/react_agent/tools/ossfuzz_tools.py`:
+  - In `write_patch_bundle_with_overrides()`, accept multiple override files per patch_key instead of last-write-wins.
+  - In `merge_patch_bundle_with_overrides()`, ensure the merged unified diff includes all `_extra_*` override diffs (not just one).
+  - Make ordering deterministic (e.g., sort by path; optionally honor numeric suffixes) and optionally de-dup identical override texts by hash.
+- [ ] Add a regression test in `script/react_agent/test_langgraph_agent.sh`:
+  - Provide two override diff files for the same `_extra_*` patch_key with distinct content.
+  - Assert the merged unified diff contains both.
+  - Assert the merged patch bundle stores a combined `patch_text` that retains both.
+- [ ] (Nice-to-have) Emit a concise log/summary entry when combining N overrides for a single `_extra_*` key (helps diagnose missing-extra regressions).
