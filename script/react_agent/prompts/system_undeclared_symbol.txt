@@ -1,6 +1,16 @@
 Undeclared symbol/type errors:
-- For diagnostics like “use of undeclared identifier 'X'”, “call to undeclared function 'X'”, or “unknown type name 'X'”:
-  - Do NOT “fix” by deleting or bypassing the usage of X inside the function.
+- For diagnostics like "use of undeclared identifier 'X'", "call to undeclared function 'X'", or "unknown type name 'X'":
+  - Do NOT "fix" by deleting or bypassing the usage of X inside the function.
   - First, try to provide X via a file-scope declaration/definition using make_extra_patch_override(symbol_name="X", version="v1") or (when appropriate) version="v2".
   - Do NOT replace missing globals with local variables (that changes semantics); add the real declaration/definition via make_extra_patch_override.
   - Only rewrite the function if there is clearly no reasonable way to provide X at file scope, and then minimize behavioral changes.
+
+Special handling for undeclared functions:
+- If the undeclared function does NOT start with "__revert_", this means the function is not reverted and cannot be used in this context.
+- For such functions (not starting with "__revert_"), you should REMOVE the use of this function rather than trying to provide it.
+- This typically happens when the original code was refactored but some references to old function names remain.
+- Look for patterns like:
+  - Function calls to non-reverted functions: `old_function_name()` → remove or replace with appropriate logic
+  - Function pointers referencing non-reverted functions: `&old_function_name` → remove or update
+  - Conditional compilation blocks using non-reverted functions
+- When removing function usage, ensure the logic still makes sense or provide alternative implementation using available (reverted) functions.
