@@ -30,6 +30,25 @@ from tools.registry import ALLOWED_TOOLS, TOOL_SPECS
 from tools.runner import ToolObservation, ToolRunner
 
 
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _undeclared_symbol_guardrail_enabled() -> bool:
+    # Disabled by default: sometimes rewriting a function to remove/replace an undeclared symbol is the
+    # correct minimal fix (e.g. replace a removed global with a local).
+    return _env_flag("REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL")
+
+
+def _active_patch_key_is_extra(state: "AgentState") -> bool:
+    key = str(getattr(state, "active_patch_key", "") or getattr(state, "patch_key", "") or "").strip()
+    return bool(key.startswith("_extra_"))
+
+
+def _active_error_is_unknown_type_name(state: "AgentState") -> bool:
+    return "unknown type name" in str(getattr(state, "error_line", "") or "").lower()
+
+
 class Decision(TypedDict, total=False):
     type: Literal["tool", "final"]
     thought: str
@@ -3161,6 +3180,8 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     If the current diagnostic is an undeclared symbol/type/macro, try make_extra_patch_override once per
     symbol before allowing make_error_patch_override to "fix" the compile by removing references.
     """
+    if not _undeclared_symbol_guardrail_enabled():
+        return None
     if str(decision.get("type", "")).strip() != "tool":
         return None
     if str(decision.get("tool", "")).strip() != "make_error_patch_override":
@@ -3192,6 +3213,66 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
             "file_path": file_path,
             "symbol_name": undeclared,
             "version": "v1",
+        },
+    }
+
+
+def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+    state: AgentState, decision: Decision, *, remaining_steps: int
+) -> Optional[Decision]:
+    """When the active error is inside an `_extra_*` hunk, don't keep extending it.
+
+    For "unknown type name" inside `_extra_*`, the right fix is usually to inspect the existing extra hunk
+    and rewrite it (minimal slice rewrite), not to call make_extra_patch_override again.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    if not _active_patch_key_is_extra(state):
+        return None
+    if not _active_error_is_unknown_type_name(state):
+        return None
+
+    # Ensure mapping prerequisites first.
+    prereq = _next_patch_prereq_tool(state)
+    if prereq:
+        return prereq
+
+    # We need enough remaining steps to read -> patch -> ossfuzz.
+    if remaining_steps < 3:
+        return None
+
+    artifact_path = (
+        str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_patch_minus_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        or _last_artifact_path(state, "get_error_patch_context", "patch_minus_code")
+        or _last_artifact_path(state, "get_error_patch_context", "error_func_code")
+        or _last_artifact_path(state, "get_error_patch_context", "excerpt")
+    )
+    if not str(artifact_path or "").strip():
+        return None
+
+    # Reuse the existing "force patch after read" flow: by setting pending_patch, the next LLM round after
+    # read_artifact will require make_error_patch_override from the BASE slice.
+    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}}
+    return {
+        "type": "tool",
+        "thought": (
+            "Unknown type name inside an _extra_* hunk: inspect the current extra hunk slice and rewrite it "
+            "instead of extending it with make_extra_patch_override."
+        ),
+        "tool": "read_artifact",
+        "args": {
+            "artifact_path": artifact_path,
+            "start_line": 1,
+            "query": "",
+            "context_lines": 0,
+            "max_lines": 8000,
+            "max_chars": 200000,
         },
     }
 
@@ -4682,41 +4763,42 @@ def _run_langgraph(
                         },
                     }
 
-                undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
-                if (
-                    undeclared_symbol
-                    and _C_IDENT_RE.match(undeclared_symbol)
-                    and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
-                ):
-                    # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
-                    # deterministically before trying to rewrite the active function body.
-                    if remaining < 2:
-                        return {
-                            "state": st,
-                            "final": {
-                                "type": "final",
-                                "thought": "Not enough remaining tool steps to generate and test an extra patch override.",
-                                "summary": "Stopped before patch generation.",
-                                "next_step": (
-                                    "Increase --max-steps (need at least 2 remaining steps: make_extra_patch_override -> ossfuzz_apply_patch_and_test)."
-                                ),
-                                "steps": _steps_for_output(st),
-                                "error": _error_payload(st),
+                if _undeclared_symbol_guardrail_enabled():
+                    undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
+                    if (
+                        undeclared_symbol
+                        and _C_IDENT_RE.match(undeclared_symbol)
+                        and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
+                    ):
+                        # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
+                        # deterministically before trying to rewrite the active function body.
+                        if remaining < 2:
+                            return {
+                                "state": st,
+                                "final": {
+                                    "type": "final",
+                                    "thought": "Not enough remaining tool steps to generate and test an extra patch override.",
+                                    "summary": "Stopped before patch generation.",
+                                    "next_step": (
+                                        "Increase --max-steps (need at least 2 remaining steps: make_extra_patch_override -> ossfuzz_apply_patch_and_test)."
+                                    ),
+                                    "steps": _steps_for_output(st),
+                                    "error": _error_payload(st),
+                                },
+                            }
+                        forced_extra: Decision = {
+                            "type": "tool",
+                            "thought": "Undeclared symbol/type detected: add a forward declaration/define/typedef in the file's _extra_* hunk (deterministic extra patch strategy).",
+                            "tool": "make_extra_patch_override",
+                            "args": {
+                                "patch_path": st.patch_path,
+                                "file_path": file_path,
+                                "symbol_name": undeclared_symbol,
+                                "version": "v1",
                             },
                         }
-                    forced_extra: Decision = {
-                        "type": "tool",
-                        "thought": "Undeclared symbol/type detected: add a forward declaration/define/typedef in the file's _extra_* hunk (deterministic extra patch strategy).",
-                        "tool": "make_extra_patch_override",
-                        "args": {
-                            "patch_path": st.patch_path,
-                            "file_path": file_path,
-                            "symbol_name": undeclared_symbol,
-                            "version": "v1",
-                        },
-                    }
-                    _validate_tool_decision(forced_extra)
-                    return {"state": st, "pending": forced_extra}
+                        _validate_tool_decision(forced_extra)
+                        return {"state": st, "pending": forced_extra}
 
                 # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
                 if last_tool != "read_artifact":
@@ -5215,6 +5297,14 @@ def _run_langgraph(
             if prereq:
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
+
+        forced_extra_unknown = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+            st, decision, remaining_steps=remaining
+        )
+        if forced_extra_unknown:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_unknown)
+            _validate_tool_decision(forced_extra_unknown)
+            return {"state": st, "pending": forced_extra_unknown}
 
         if tool == "read_artifact" and remaining < 3:
             return {

@@ -1764,6 +1764,7 @@ PY
 # Undeclared-symbol guardrail: try make_extra_patch_override once per symbol before allowing a
 # function rewrite that removes/replaces the missing symbol.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
 import sys
 from pathlib import Path
 
@@ -1791,9 +1792,52 @@ state.step_history = list(state.steps)
 
 decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "remove missing global", "args": {}}
 forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
+assert forced is None, forced
+
+os.environ["REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL"] = "1"
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
 assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+print("OK")
+PY
+
+# Extra-hunk unknown-type guardrail: if the error is "unknown type name" inside an `_extra_*` hunk,
+# do NOT keep extending the extra hunk via make_extra_patch_override.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import (  # noqa: E402
+    AgentState,
+    _block_make_extra_patch_override_for_unknown_type_in_extra_hunk,
+)
+
+err = "/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'"
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text("foo_t x;\n", encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="build.log",
+        patch_path="bundle.patch2",
+        error_scope="patch",
+        error_line=err,
+        snippet="",
+    )
+    st.patch_key = "_extra_error.c"
+    st.active_patch_key = "_extra_error.c"
+    st.loop_base_func_code_artifact_path = str(base_path)
+
+    decision = {"type": "tool", "tool": "make_extra_patch_override", "thought": "insert type", "args": {}}
+    forced = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(st, decision, remaining_steps=10)
+    assert forced and forced.get("tool") == "read_artifact", forced
+    assert st.pending_patch and (st.pending_patch.get("tool") == "make_error_patch_override"), st.pending_patch
+
 print("OK")
 PY
 
@@ -3059,6 +3103,19 @@ assert "_extra_error.c" in (out2.get("overridden_patch_keys") or []), out2
 assert "EXTRA_ONLY_DECL" in merged_text2, merged_path2
 assert merged_path2.parent == artifact_dir.resolve(), (merged_path2, artifact_dir)
 
+# Multiple override diffs for the same `_extra_*` key should be merged (not last-write-wins).
+out3 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(extra_override_path), str(nested_extra_override_path)],
+    output_name="merged_test_extra_multi.diff",
+)
+merged_path3 = Path(out3.get("merged_patch_file_path", "")).resolve()
+assert merged_path3.is_file(), out3
+merged_text3 = merged_path3.read_text(encoding="utf-8", errors="replace")
+assert "_extra_error.c" in (out3.get("overridden_patch_keys") or []), out3
+assert "EXTRA_DECL" in merged_text3, merged_path3
+assert "EXTRA_ONLY_DECL" in merged_text3, merged_path3
+
 bundle_out = write_patch_bundle_with_overrides(
     patch_path=str(bundle_path),
     patch_override_paths=[str(override_path), str(extra_override_path)],
@@ -3071,6 +3128,56 @@ assert "p2" in merged_bundle.patches, merged_bundle_path
 assert "OVERRIDE_LINE" in (merged_bundle.patches["p2"].patch_text or ""), merged_bundle_path
 assert "_extra_error.c" in merged_bundle.patches, merged_bundle_path
 assert "EXTRA_DECL" in (merged_bundle.patches["_extra_error.c"].patch_text or ""), merged_bundle_path
+
+bundle_out2 = write_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(override_path), str(extra_override_path), str(nested_extra_override_path)],
+    output_name="merged_test_extra_multi.patch2",
+)
+merged_bundle_path2 = Path(bundle_out2.get("merged_patch_bundle_path", "")).resolve()
+assert merged_bundle_path2.is_file(), bundle_out2
+merged_bundle2 = load_patch_bundle(str(merged_bundle_path2), allowed_roots=[str(bundle_path.parent)])
+assert "_extra_error.c" in merged_bundle2.patches, merged_bundle_path2
+extra_text = merged_bundle2.patches["_extra_error.c"].patch_text or ""
+assert "EXTRA_DECL" in extra_text, merged_bundle_path2
+assert "EXTRA_ONLY_DECL" in extra_text, merged_bundle_path2
+PY
+
+# Multi-agent override collection: keep multiple `_extra_*` overrides (per origin hunk).
+"$PYTHON" - "$SCRIPT_DIR" "$bundle_path" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+bundle_path = Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from multi_agent import _collect_final_override_diffs  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td).resolve()
+    results = []
+    for origin, marker in [("pA", "EXTRA_A"), ("pB", "EXTRA_B")]:
+        out_dir = root / origin
+        extra_dir = out_dir / "_extra_error.c"
+        extra_dir.mkdir(parents=True, exist_ok=True)
+        # Minimal unified diff; collector only needs it to be a file path.
+        (extra_dir / "override__extra_error.c.diff").write_text(
+            "diff --git a/error.c b/error.c\n"
+            "--- a/error.c\n"
+            "+++ b/error.c\n"
+            "@@ -1,1 +1,0 @@\n"
+            f"-#define {marker} 1\n",
+            encoding="utf-8",
+            errors="replace",
+        )
+        results.append({"patch_key": origin, "artifacts_dir": str(out_dir)})
+
+    out = _collect_final_override_diffs(results, patch_path=str(bundle_path))
+    paths = [str(p) for p in (out.get("override_paths") or [])]
+    got = [p for p in paths if p.endswith("override__extra_error.c.diff")]
+    assert len(got) == 2, got
 PY
 
 # Target-error verdict helper (non-Docker): verify we can detect whether the original error remains in OSS-Fuzz logs.
@@ -3512,7 +3619,9 @@ with tempfile.TemporaryDirectory() as td:
     # After the transition from the first OSS-Fuzz run, we must restart patch mapping via get_error_patch_context.
     # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
     assert "get_error_patch_context" in runner.calls, runner.calls
-    assert runner.calls.count("make_extra_patch_override") >= 2, runner.calls
+    # Undeclared-symbol guardrail is disabled by default; either make_error_patch_override or make_extra_patch_override
+    # can be used to address the follow-up errors in this patch_key during auto-loop.
+    assert (runner.calls.count("make_error_patch_override") + runner.calls.count("make_extra_patch_override")) >= 2, runner.calls
     assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 2, runner.calls
     assert "get_error_v1_code_slice" not in runner.calls, runner.calls
 
@@ -3549,7 +3658,9 @@ with tempfile.TemporaryDirectory() as td:
     assert forced_args.get("line_number") == 52, forced_args
 
     # Artifact preservation: repeated patch/log artifacts must not overwrite prior iterations.
-    patch_text_versions = sorted(root.glob("make_extra_patch_override_patch_text*.diff"))
+    patch_text_versions = sorted(root.glob("make_error_patch_override_patch_text*.diff")) + sorted(
+        root.glob("make_extra_patch_override_patch_text*.diff")
+    )
     assert len(patch_text_versions) >= 2, patch_text_versions
     build_log_versions = sorted(root.glob("ossfuzz_apply_patch_and_test_build_output*.log"))
     assert len(build_log_versions) >= 2, build_log_versions

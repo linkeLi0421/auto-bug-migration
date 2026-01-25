@@ -188,6 +188,66 @@ def _infer_primary_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
     return ""
 
 
+def _extra_hunk_minus_lines(patch_text: str) -> list[str]:
+    """Return raw code lines for all '-' diff lines (excluding '---' headers)."""
+    out: list[str] = []
+    for raw in str(patch_text or "").splitlines():
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        out.append("" if raw == "-" else raw[1:])
+    return out
+
+
+def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str]) -> str:
+    """Merge multiple `_extra_*` override diffs into one by unioning inserted '-' lines.
+
+    In patch-scope runs, `_extra_*` hunks are reverse-applied: '-' lines become additions. Multiple agents can
+    independently extend the same `_extra_*` hunk; we must not drop earlier insertions.
+    """
+    texts = [str(t or "") for t in (override_texts or []) if str(t or "").strip()]
+    base = str(base_text or "")
+    if not texts:
+        return base
+
+    if not base.strip():
+        base = texts[0]
+        texts = texts[1:]
+        if not texts:
+            return base
+
+    # Import late to avoid tool-level import cycles.
+    try:
+        from tools.extra_patch_tools import _insert_minus_block_into_patch_text, _should_prepend_extra_hunk_insertion  # type: ignore
+    except Exception:
+        # Fallback: best-effort concatenate unique '-' lines by appending at end of the first hunk.
+        _insert_minus_block_into_patch_text = None  # type: ignore[assignment]
+        _should_prepend_extra_hunk_insertion = None  # type: ignore[assignment]
+
+    base_minus = set(_extra_hunk_minus_lines(base))
+    for text in texts:
+        other_minus = _extra_hunk_minus_lines(text)
+        if not other_minus:
+            continue
+        # Preserve appearance order; de-dup by exact line text.
+        missing = [l for l in other_minus if l not in base_minus]
+        if not missing:
+            continue
+
+        if _insert_minus_block_into_patch_text is None:
+            # Best-effort: append the missing lines at end of file.
+            base = base.rstrip("\n") + "\n" + "\n".join("-" + l if l else "-" for l in ([""] + missing)) + "\n"
+        else:
+            prefer_prepend = False
+            if _should_prepend_extra_hunk_insertion is not None:
+                try:
+                    prefer_prepend = bool(_should_prepend_extra_hunk_insertion(insert_kind="", inserted_lines=missing))
+                except Exception:
+                    prefer_prepend = False
+            base = _insert_minus_block_into_patch_text(base, insert_lines=[""] + missing, prefer_prepend=prefer_prepend)
+        base_minus.update(missing)
+    return base
+
+
 def merge_patch_bundle_with_overrides(
     *,
     patch_path: str,
@@ -207,7 +267,7 @@ def merge_patch_bundle_with_overrides(
     allow_root = _artifact_allow_root()
     allow_root.mkdir(parents=True, exist_ok=True)
 
-    overrides: dict[str, str] = {}
+    overrides_by_key: dict[str, list[dict[str, str]]] = {}
     override_files: list[Dict[str, Any]] = []
     for raw in patch_override_paths or []:
         rp = str(raw or "").strip()
@@ -221,8 +281,29 @@ def merge_patch_bundle_with_overrides(
         if "diff --git " not in text:
             raise ValueError(f"Override patch file does not look like a unified diff (missing 'diff --git'): {p}")
         patch_key = _infer_patch_key_from_path(p, patch_keys)
-        overrides[patch_key] = text
+        overrides_by_key.setdefault(patch_key, []).append({"path": str(p), "text": text})
         override_files.append({"patch_key": patch_key, "path": str(p)})
+
+    overrides: dict[str, str] = {}
+    for key, items in overrides_by_key.items():
+        if not items:
+            continue
+        # Deterministic ordering: sort by file path.
+        items_sorted = sorted(items, key=lambda it: str(it.get("path", "") or ""))
+        texts = [str(it.get("text", "") or "") for it in items_sorted if str(it.get("text", "") or "").strip()]
+        if not texts:
+            continue
+        if len(texts) == 1:
+            overrides[key] = texts[0]
+            continue
+        if str(key).startswith("_extra_"):
+            base_text = ""
+            if key in bundle.patches:
+                base_text = str(getattr(bundle.patches[key], "patch_text", "") or "")
+            overrides[key] = _merge_extra_hunk_override_texts(base_text=base_text, override_texts=texts)
+        else:
+            # Non-extra hunks should not normally have multiple overrides; keep the last one (sorted) deterministically.
+            overrides[key] = texts[-1]
 
     # If we have override diffs for a patch_key not present in the base bundle (common for brand-new `_extra_*` hunks),
     # create a new PatchInfo entry so the merged unified diff includes it.
@@ -421,7 +502,7 @@ def write_patch_bundle_with_overrides(
     allow_root = _artifact_allow_root()
     allow_root.mkdir(parents=True, exist_ok=True)
 
-    overrides: dict[str, str] = {}
+    overrides_by_key: dict[str, list[dict[str, str]]] = {}
     override_files: list[Dict[str, Any]] = []
     for raw in patch_override_paths or []:
         rp = str(raw or "").strip()
@@ -435,8 +516,27 @@ def write_patch_bundle_with_overrides(
         if "diff --git " not in text:
             raise ValueError(f"Override patch file does not look like a unified diff (missing 'diff --git'): {p}")
         patch_key = _infer_patch_key_from_path(p, patch_keys)
-        overrides[patch_key] = text
+        overrides_by_key.setdefault(patch_key, []).append({"path": str(p), "text": text})
         override_files.append({"patch_key": patch_key, "path": str(p)})
+
+    overrides: dict[str, str] = {}
+    for key, items in overrides_by_key.items():
+        if not items:
+            continue
+        items_sorted = sorted(items, key=lambda it: str(it.get("path", "") or ""))
+        texts = [str(it.get("text", "") or "") for it in items_sorted if str(it.get("text", "") or "").strip()]
+        if not texts:
+            continue
+        if len(texts) == 1:
+            overrides[key] = texts[0]
+            continue
+        if str(key).startswith("_extra_"):
+            base_text = ""
+            if key in bundle.patches:
+                base_text = str(getattr(bundle.patches[key], "patch_text", "") or "")
+            overrides[key] = _merge_extra_hunk_override_texts(base_text=base_text, override_texts=texts)
+        else:
+            overrides[key] = texts[-1]
 
     # Brand-new `_extra_*` keys can appear as override diffs even when the base bundle lacks them; add PatchInfo entries.
     for key, text in list(overrides.items()):
