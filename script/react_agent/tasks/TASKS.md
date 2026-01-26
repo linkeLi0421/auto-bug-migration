@@ -18,7 +18,7 @@ Context: In multi-agent runs, multiple independent hunks can each generate an ov
   - Assert the merged unified diff contains both.
   - Assert the merged patch bundle stores a combined `patch_text` that retains both.
 - [x] Naming/traceability: prefer per-hunk `override_*.diff` artifacts (nested under `<origin_patch_key>/_extra_*/`) when collecting overrides, rather than `make_extra_patch_override_patch_text_*` (named by symbol) from the shared `_extra_*` directory.
-- [ ] (Nice-to-have) Emit a concise log/summary entry when combining N overrides for a single `_extra_*` key (helps diagnose missing-extra regressions).
+- [x] (Nice-to-have) Emit a concise log/summary entry when combining N overrides for a single `_extra_*` key (helps diagnose missing-extra regressions).
 
 ### Status (2026-01-25)
 - Implemented override collection + `_extra_*` merge semantics in `script/react_agent/multi_agent.py` and `script/react_agent/tools/ossfuzz_tools.py`.
@@ -40,16 +40,16 @@ Context: Our current `_extra_*` merge strategy unions individual inserted `-` li
   - `static int` + `__revert_e11519_xmlHashGrow(...);`
 The line-union merge keeps `__revert_e11519_xmlHashGrow(...);` once, but still inserts the missing `int` line, producing a malformed stray `-int` in the merged output (`.../ossfuzz_merged_libxml2_f0fd1b.diff` around line ~5580).
 
-- [ ] Repro in a minimal fixture: two override diffs with overlapping multi-line prototypes (shared name line, different return-type line).
-- [ ] Update `_extra_*` merge semantics (in `script/react_agent/tools/ossfuzz_tools.py`) from “union of lines” to “union of blocks”:
+- [x] Repro in a minimal fixture: two override diffs with overlapping multi-line prototypes (shared name line, different return-type line).
+- [x] Update `_extra_*` merge semantics (in `script/react_agent/tools/ossfuzz_tools.py`) from “union of lines” to “union of blocks”:
   - Parse each override diff’s first hunk body into inserted blocks (split on blank `-` lines) and merge whole blocks (atomic), never partial lines.
   - De-dup blocks by semantic key when possible:
     - function prototype blocks: key by function name (prefer a `static` prototype if any variant is `static` to avoid “static follows non-static” issues)
     - `#define`: key by macro name
     - `typedef`/tag blocks: key by declared type name/tag
     - fallback: key by exact block text
-- [ ] Add a deterministic “sanity check” on merged `_extra_*` hunks to catch merge corruption (e.g., lone `int` / `unsigned` / `static int` lines, incomplete prototypes).
-- [ ] (Optional, gated) If the sanity check fails, call an LLM “merge repair” pass to rewrite just the `_extra_*` hunk insertions into a coherent set of declarations/macros (config/env guarded; default deterministic-only).
-- [ ] Add regression test(s) in `script/react_agent/test_langgraph_agent.sh` ensuring:
+- [x] Add a deterministic “sanity check” on merged `_extra_*` hunks to catch merge corruption (e.g., lone `int` / `unsigned` / `static int` lines, incomplete prototypes).
+- [x] (Optional, gated) If the sanity check fails, call an LLM “merge repair” pass to rewrite just the `_extra_*` hunk insertions into a coherent set of declarations/macros (config/env guarded; default deterministic-only).
+- [x] Add regression test(s) in `script/react_agent/test_langgraph_agent.sh` ensuring:
   - merged `_extra_*` output does not contain stray fragments
   - exactly one coherent prototype exists for the duplicated function name
