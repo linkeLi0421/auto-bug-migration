@@ -101,6 +101,149 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
 _PP_IF_RE = re.compile(r"^#\s*(?:if|ifdef|ifndef)\b")
 _PP_ENDIF_RE = re.compile(r"^#\s*endif\b")
 
+_FUNC_DEF_KINDS = {"FUNCTION_DEFI", "CXX_METHOD", "FUNCTION_TEMPLATE"}
+
+
+def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
+    """Normalize a C-like function signature into (return_type, name, arg_types).
+
+    Best-effort port of `compare_function_signatures` logic from `script/revert_patch_test.py`,
+    avoiding the heavyweight import.
+    """
+    text = str(sig or "").strip()
+    if not text:
+        return "", "", tuple()
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\b(?:__attribute__|__declspec)\b\s*\([^)]*\)", "", text).strip()
+
+    open_paren = text.find("(")
+    close_paren = text.rfind(")")
+    if open_paren < 0 or close_paren < open_paren:
+        return "", "", tuple()
+
+    head = text[:open_paren].strip()
+    args = text[open_paren + 1 : close_paren].strip()
+
+    parts = head.split()
+    if not parts:
+        return "", "", tuple()
+
+    func_name = parts[-1]
+    ret_type = " ".join(parts[:-1]).strip()
+
+    arg_types: List[str] = []
+    if args and args != "void":
+        for arg in args.split(","):
+            a = arg.strip()
+            if not a:
+                continue
+            # Remove default values and extract type; keep all but last token (parameter name).
+            a = a.split("=", 1)[0].strip()
+            tokens = a.split()
+            if not tokens:
+                continue
+            arg_type = " ".join(tokens[:-1]) if len(tokens) > 1 else tokens[0]
+            arg_types.append(arg_type.strip())
+
+    return ret_type, func_name, tuple(arg_types)
+
+
+def _compare_function_signatures(sig1: str, sig2: str, *, ignore_arg_types: bool = False) -> bool:
+    """Return True if two function signatures match (ignoring parameter names)."""
+    s1 = _normalize_signature(sig1)
+    s2 = _normalize_signature(sig2)
+    if ignore_arg_types:
+        ret_type1, func_name1, args_types1 = s1
+        ret_type2, func_name2, args_types2 = s2
+        return ret_type1 == ret_type2 and func_name1 == func_name2 and len(args_types1) == len(args_types2)
+    return s1 == s2
+
+
+def _extra_skeleton_anchor_func_sig() -> str:
+    return str(os.environ.get("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", "") or "").strip()
+
+
+def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2") -> int:
+    """Return a 1-based insertion line based on AST analysis (best-effort).
+
+    Strategy: insert before a selected function definition start line (start.line).
+    - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
+    - Otherwise, insert before the first function definition in the file (smallest start line).
+    """
+    def no_anchor() -> int:
+        return -1
+
+    kb = getattr(agent_tools, "kb_index", None)
+    if kb is None:
+        return no_anchor()
+
+    ver = str(version or "v2").strip().lower()
+    if ver not in {"v1", "v2"}:
+        ver = "v2"
+
+    base = Path(str(file_path or "").strip()).name
+    if not base:
+        return no_anchor()
+
+    file_index = getattr(kb, "file_index", None)
+    if not isinstance(file_index, dict) or ver not in file_index:
+        return -1
+
+    nodes = file_index[ver].get(base) if isinstance(file_index[ver], dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        return no_anchor()
+
+    def in_file(node: dict) -> bool:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+        loc = node.get("location", {}) if isinstance(node.get("location"), dict) else {}
+        start_file = str(start.get("file") or loc.get("file") or "")
+        if not start_file:
+            return False
+        if "#include" in start_file:
+            return False
+        return Path(start_file).name == base
+
+    def start_line(node: dict) -> int:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+        return int(start.get("line", 0) or 0)
+
+    def end_line(node: dict) -> int:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+        return int(end.get("line", 0) or 0)
+
+    candidates: List[dict] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if str(n.get("kind", "") or "").strip() not in _FUNC_DEF_KINDS:
+            continue
+        if not in_file(n):
+            continue
+        sl = start_line(n)
+        el = end_line(n)
+        if sl <= 0 or el <= 0:
+            continue
+        candidates.append(n)
+
+    if not candidates:
+        return no_anchor()
+
+    want_sig = _extra_skeleton_anchor_func_sig()
+    if want_sig:
+        for n in candidates:
+            sig = str(n.get("signature", "") or "")
+            if sig and _compare_function_signatures(sig, want_sig, ignore_arg_types=True):
+                sl = start_line(n)
+                return sl if sl > 0 else -1
+
+    first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
+    sl = start_line(first)
+    return sl if sl > 0 else -1
+
 
 def _find_file_scope_insertion_index(lines: List[str]) -> int:
     """Return a 0-based index where file-scope decls can be inserted safely.
@@ -154,7 +297,16 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     if not lines:
         return ""
 
-    insert_at = _find_file_scope_insertion_index(lines)
+    insert_at = -1
+    insert_line = _ast_insert_line_number_for_extra_skeleton(agent_tools, file_path=str(file_path or "").strip(), version="v2")
+    if insert_line > 0:
+        # We insert before the context line at insert_line; index is 0-based.
+        idx = insert_line - 1
+        if 0 <= idx < len(lines):
+            insert_at = idx
+
+    if insert_at < 0:
+        insert_at = _find_file_scope_insertion_index(lines)
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
     if not ctx:
@@ -822,6 +974,139 @@ def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: Li
         if re.match(r"^(?:struct|union|enum)\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$", head):
             return True
     return False
+
+
+_EXTRA_MERGE_DEFINE_RE = re.compile(r"^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_MERGE_TAG_RE = re.compile(r"^(?:typedef\s+)?(?P<kind>struct|union|enum)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_MERGE_CONTROL_WORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "goto",
+    "break",
+    "continue",
+    "else",
+    "do",
+    "sizeof",
+}
+
+
+def _merge_extra_hunk_blocks(*args: Any, **kwargs: Any) -> List[List[str]]:
+    """Merge `_extra_*` inserted blocks by semantic key (best-effort, deterministic).
+
+    Accepts either:
+      - `_merge_extra_hunk_blocks(blocks)` where `blocks` is `List[List[str]]`, or
+      - `_merge_extra_hunk_blocks(base_blocks, other_blocks, ...)` with multiple block lists, or
+      - `_merge_extra_hunk_blocks(block_lists=[...])`.
+    Returns a merged `List[List[str]]` preserving first-seen order; for duplicate prototypes, prefers `static`.
+    """
+
+    def normalize_block_list(value: Any) -> List[List[str]]:
+        if not isinstance(value, list):
+            return []
+        out: List[List[str]] = []
+        for item in value:
+            if not isinstance(item, list):
+                continue
+            out.append([str(x) for x in item if x is not None])
+        return out
+
+    block_lists: List[List[List[str]]] = []
+    if "block_lists" in kwargs:
+        for item in (kwargs.get("block_lists") or []):
+            block_lists.append(normalize_block_list(item))
+    elif len(args) == 1 and isinstance(args[0], list):
+        block_lists.append(normalize_block_list(args[0]))
+    else:
+        for item in args:
+            block_lists.append(normalize_block_list(item))
+
+    blocks_in: List[List[str]] = []
+    for bl in block_lists:
+        blocks_in.extend(bl)
+
+    def typedef_declared_name(lines: List[str]) -> str:
+        joined = " ".join(str(l).strip() for l in (lines or []) if str(l).strip())
+        if not joined:
+            return ""
+        m = re.search(r"\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", joined)
+        if m:
+            return str(m.group(1) or "")
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?;\s*$", joined)
+        if m:
+            return str(m.group(1) or "")
+        return ""
+
+    def semantic_id(block: List[str]) -> Tuple[str, str]:
+        head = next((str(l).strip() for l in (block or []) if str(l).strip()), "")
+        if not head:
+            return ("text", "")
+
+        m = _EXTRA_MERGE_DEFINE_RE.match(head)
+        if m:
+            return ("define", str(m.group(1) or ""))
+
+        if head.startswith("typedef"):
+            name = typedef_declared_name(block)
+            return ("typedef", name or "\n".join(block).strip())
+
+        m = _EXTRA_MERGE_TAG_RE.match(head)
+        if m:
+            return ("tag", f"{m.group('kind')} {m.group('name')}".strip())
+
+        func_name = ""
+        for raw in block:
+            for m2 in _FUNC_NAME_RE.finditer(str(raw or "")):
+                cand = str(m2.group(1) or "")
+                if cand and cand not in _EXTRA_MERGE_CONTROL_WORDS:
+                    func_name = cand
+                    break
+            if func_name:
+                break
+        if func_name:
+            return ("prototype", func_name)
+
+        return ("text", "\n".join(block).strip())
+
+    def is_static_prototype(block: List[str]) -> bool:
+        joined = " ".join(str(l).strip() for l in (block or []) if str(l).strip())
+        return bool(re.search(r"(?<![A-Za-z0-9_])static(?![A-Za-z0-9_])", joined))
+
+    def choose_better(kind: str, *, current: List[str], candidate: List[str]) -> List[str]:
+        if kind == "prototype":
+            cur_static = is_static_prototype(current)
+            cand_static = is_static_prototype(candidate)
+            if cur_static != cand_static:
+                return candidate if cand_static else current
+
+            cur_tail = next((str(l).strip() for l in reversed(current) if str(l).strip()), "")
+            cand_tail = next((str(l).strip() for l in reversed(candidate) if str(l).strip()), "")
+            cur_semicolon = cur_tail.endswith(";")
+            cand_semicolon = cand_tail.endswith(";")
+            if cur_semicolon != cand_semicolon:
+                return candidate if cand_semicolon else current
+
+        return candidate if len("\n".join(candidate)) > len("\n".join(current)) else current
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    order = 0
+    for block in blocks_in:
+        kind, name = semantic_id(block)
+        key = f"{kind}:{name}"
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = {"kind": kind, "name": name, "lines": list(block), "order": order}
+            order += 1
+            continue
+        cur_lines = list(existing.get("lines") or [])
+        if cur_lines == block:
+            continue
+        existing["lines"] = choose_better(kind, current=cur_lines, candidate=block)
+
+    merged_items = sorted((v for v in merged.values() if isinstance(v, dict)), key=lambda it: int(it.get("order") or 0))
+    return [list(it.get("lines") or []) for it in merged_items if it.get("lines")]
 
 
 def _symbol_underlying_name(symbol: str) -> Tuple[str, str]:

@@ -198,8 +198,272 @@ def _extra_hunk_minus_lines(patch_text: str) -> list[str]:
     return out
 
 
+def _extra_hunk_minus_blocks_first_hunk(patch_text: str) -> list[list[str]]:
+    """Return inserted blocks (raw code, no diff prefix) for the first hunk, split on blank '-' lines."""
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return []
+
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return []
+
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+
+    minus: list[str] = []
+    for l in lines[first_hunk + 1 : end]:
+        if not l.startswith("-") or l.startswith("---"):
+            continue
+        minus.append("" if l == "-" else l[1:])
+
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for line in minus:
+        if line == "":
+            if cur:
+                blocks.append(cur)
+                cur = []
+            continue
+        cur.append(line)
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def _strip_first_hunk_minus_lines(patch_text: str) -> str:
+    """Return patch_text with '-' diff lines removed from the first hunk body (keeps headers and context)."""
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return ""
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return raw.rstrip("\n") + "\n"
+
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+
+    body = [l for l in lines[first_hunk + 1 : end] if not (l.startswith("-") and not l.startswith("---"))]
+    updated = lines[: first_hunk + 1] + body + lines[end:]
+    return "\n".join(updated).rstrip("\n") + "\n"
+
+
+_EXTRA_DEFINE_RE = re.compile(r"^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_TAG_RE = re.compile(r"^(?:typedef\s+)?(?P<kind>struct|union|enum)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_FUNC_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_EXTRA_CONTROL_WORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "goto",
+    "break",
+    "continue",
+    "else",
+    "do",
+    "sizeof",
+}
+_EXTRA_TYPE_FRAGMENT_TOKENS = {
+    "char",
+    "const",
+    "double",
+    "float",
+    "int",
+    "long",
+    "short",
+    "signed",
+    "static",
+    "unsigned",
+    "void",
+    "volatile",
+}
+
+
+def _typedef_declared_name(lines: list[str]) -> str:
+    joined = " ".join(str(l).strip() for l in (lines or []) if str(l).strip())
+    if not joined:
+        return ""
+    m = re.search(r"\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", joined)
+    if m:
+        return str(m.group(1) or "")
+    m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?;\s*$", joined)
+    if m:
+        return str(m.group(1) or "")
+    return ""
+
+
+def _extra_insert_block_semantic_id(block: list[str]) -> tuple[str, str]:
+    """Return (kind, name) for a file-scope insertion block in an `_extra_*` hunk."""
+    head = next((str(l).strip() for l in (block or []) if str(l).strip()), "")
+    if not head:
+        return ("text", "")
+
+    m = _EXTRA_DEFINE_RE.match(head)
+    if m:
+        return ("define", str(m.group(1) or ""))
+
+    if head.startswith("typedef"):
+        name = _typedef_declared_name(block)
+        return ("typedef", name or "\n".join(block).strip())
+
+    m = _EXTRA_TAG_RE.match(head)
+    if m:
+        kind = str(m.group("kind") or "")
+        name = str(m.group("name") or "")
+        return ("tag", f"{kind} {name}".strip())
+
+    func_name = ""
+    for raw in block:
+        for m2 in _EXTRA_FUNC_NAME_RE.finditer(str(raw or "")):
+            cand = str(m2.group(1) or "")
+            if cand and cand not in _EXTRA_CONTROL_WORDS:
+                func_name = cand
+                break
+        if func_name:
+            break
+    if func_name:
+        return ("prototype", func_name)
+
+    return ("text", "\n".join(block).strip())
+
+
+def _extra_merge_block_category(kind: str, *, prefer_prepend: bool) -> int:
+    if prefer_prepend:
+        return 0
+    if kind == "define":
+        return 1
+    if kind == "prototype":
+        return 2
+    return 3
+
+
+def _extra_block_is_static_prototype(block: list[str]) -> bool:
+    joined = " ".join(str(l).strip() for l in (block or []) if str(l).strip())
+    return bool(re.search(r"(?<![A-Za-z0-9_])static(?![A-Za-z0-9_])", joined))
+
+
+def _choose_better_extra_block(kind: str, *, current: list[str], candidate: list[str]) -> list[str]:
+    if kind == "prototype":
+        cur_static = _extra_block_is_static_prototype(current)
+        cand_static = _extra_block_is_static_prototype(candidate)
+        if cur_static != cand_static:
+            return candidate if cand_static else current
+        # Prefer blocks that end in ';' (prototype) and then "more complete" (more text).
+        cur_tail = next((str(l).strip() for l in reversed(current) if str(l).strip()), "")
+        cand_tail = next((str(l).strip() for l in reversed(candidate) if str(l).strip()), "")
+        cur_semicolon = cur_tail.endswith(";")
+        cand_semicolon = cand_tail.endswith(";")
+        if cur_semicolon != cand_semicolon:
+            return candidate if cand_semicolon else current
+        return candidate if len("\n".join(candidate)) > len("\n".join(current)) else current
+
+    if kind in {"typedef", "tag"}:
+        cur_def = any("{" in str(l) for l in current)
+        cand_def = any("{" in str(l) for l in candidate)
+        if cur_def != cand_def:
+            return candidate if cand_def else current
+        return candidate if len("\n".join(candidate)) > len("\n".join(current)) else current
+
+    # For defines (and unknown), keep the first-seen block unless the candidate is strictly longer.
+    return candidate if len("\n".join(candidate)) > len("\n".join(current)) else current
+
+
+def _extra_hunk_merge_sanity_issues(patch_text: str) -> list[str]:
+    issues: list[str] = []
+
+    def is_type_fragment_line(line: str) -> bool:
+        stripped = str(line or "").strip()
+        if not stripped:
+            return False
+        if any(ch in stripped for ch in (";", "(", ")", "{", "}", "[", "]", "=", ",", "#")):
+            return False
+        toks = [t for t in stripped.split() if t]
+        return bool(toks) and all(t in _EXTRA_TYPE_FRAGMENT_TOKENS for t in toks)
+
+    for block in _extra_hunk_minus_blocks_first_hunk(patch_text):
+        if not block:
+            continue
+        if len(block) == 1 and is_type_fragment_line(block[0]):
+            issues.append(f"stray type fragment block: {block[0]!r}")
+            continue
+
+        kind, _name = _extra_insert_block_semantic_id(block)
+        if kind != "prototype":
+            continue
+
+        tail = next((str(l).strip() for l in reversed(block) if str(l).strip()), "")
+        if tail and not tail.endswith(";"):
+            issues.append(f"incomplete prototype (missing ';'): {tail!r}")
+    return issues
+
+
+def _maybe_llm_repair_extra_hunk_insert_lines(*, insert_lines: list[str], issues: list[str]) -> list[str] | None:
+    """Best-effort LLM repair pass for `_extra_*` merge corruption (disabled by default)."""
+    if not issues or not _env_flag("REACT_AGENT_ENABLE_EXTRA_MERGE_REPAIR"):
+        return None
+
+    try:
+        import json  # noqa: PLC0415
+
+        from react_agent.models import ModelError, OpenAIChatCompletionsModel  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        model = OpenAIChatCompletionsModel.from_env()
+        override_model = str(os.environ.get("REACT_AGENT_EXTRA_MERGE_REPAIR_MODEL", "") or "").strip()
+        if override_model:
+            model.model = override_model
+        try:
+            model.max_tokens = int(os.environ.get("REACT_AGENT_EXTRA_MERGE_REPAIR_MAX_TOKENS", "") or "") or model.max_tokens
+        except Exception:
+            pass
+
+        payload = {"issues": issues[:20], "insert_lines": insert_lines}
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You repair file-scope C insertion snippets for an OSS-Fuzz revert patch `_extra_*` hunk.\n"
+                    "Input is a list of code lines (no diff prefixes). Empty-string entries represent blank lines.\n"
+                    "Rewrite into a coherent set of declarations/macros:\n"
+                    "- Never output partial type fragments (e.g. `int`, `unsigned`, `static int`).\n"
+                    "- Keep multi-line prototypes atomic.\n"
+                    "- Deduplicate by semantic key: function name (prefer `static` variants), macro name, typedef/tag name.\n"
+                    "Return ONLY valid JSON: {\"insert_lines\": [..]}.\n"
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+        raw = model.complete(messages)
+        data = json.loads(raw)
+        repaired = data.get("insert_lines") if isinstance(data, dict) else None
+        if not isinstance(repaired, list) or not repaired:
+            return None
+        out: list[str] = []
+        for item in repaired:
+            if item is None:
+                continue
+            out.append(str(item))
+        return out or None
+    except ModelError:
+        return None
+    except Exception:
+        return None
+
+
 def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str]) -> str:
-    """Merge multiple `_extra_*` override diffs into one by unioning inserted '-' lines.
+    """Merge multiple `_extra_*` override diffs into one by unioning inserted blocks (never partial lines).
 
     In patch-scope runs, `_extra_*` hunks are reverse-applied: '-' lines become additions. Multiple agents can
     independently extend the same `_extra_*` hunk; we must not drop earlier insertions.
@@ -223,29 +487,82 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
         _insert_minus_block_into_patch_text = None  # type: ignore[assignment]
         _should_prepend_extra_hunk_insertion = None  # type: ignore[assignment]
 
-    base_minus = set(_extra_hunk_minus_lines(base))
-    for text in texts:
-        other_minus = _extra_hunk_minus_lines(text)
-        if not other_minus:
-            continue
-        # Preserve appearance order; de-dup by exact line text.
-        missing = [l for l in other_minus if l not in base_minus]
-        if not missing:
-            continue
+    blocks: dict[str, dict[str, object]] = {}
+    order = 0
 
-        if _insert_minus_block_into_patch_text is None:
-            # Best-effort: append the missing lines at end of file.
-            base = base.rstrip("\n") + "\n" + "\n".join("-" + l if l else "-" for l in ([""] + missing)) + "\n"
-        else:
+    def ingest(text: str) -> None:
+        nonlocal order
+        for block in _extra_hunk_minus_blocks_first_hunk(text):
+            kind, name = _extra_insert_block_semantic_id(block)
+            key = f"{kind}:{name}"
             prefer_prepend = False
             if _should_prepend_extra_hunk_insertion is not None:
                 try:
-                    prefer_prepend = bool(_should_prepend_extra_hunk_insertion(insert_kind="", inserted_lines=missing))
+                    prefer_prepend = bool(_should_prepend_extra_hunk_insertion(insert_kind="", inserted_lines=block))
                 except Exception:
                     prefer_prepend = False
-            base = _insert_minus_block_into_patch_text(base, insert_lines=[""] + missing, prefer_prepend=prefer_prepend)
-        base_minus.update(missing)
-    return base
+            category = _extra_merge_block_category(kind, prefer_prepend=prefer_prepend)
+
+            existing = blocks.get(key)
+            if existing is None:
+                blocks[key] = {"kind": kind, "name": name, "lines": list(block), "order": order, "category": category}
+                order += 1
+                continue
+
+            cur_lines = list(existing.get("lines") or [])
+            if cur_lines == block:
+                continue
+            chosen = _choose_better_extra_block(kind, current=cur_lines, candidate=block)
+            existing["lines"] = list(chosen)
+            existing["kind"] = kind
+            existing["name"] = name
+            existing["category"] = category
+
+    ingest(base)
+    for text in texts:
+        ingest(text)
+
+    if not blocks:
+        return base
+
+    def sort_key(item: dict[str, object]) -> tuple[int, int]:
+        return (int(item.get("category") or 0), int(item.get("order") or 0))
+
+    merged_blocks = sorted((v for v in blocks.values() if isinstance(v, dict)), key=sort_key)
+    insert_lines: list[str] = []
+    for idx, item in enumerate(merged_blocks):
+        lines = list(item.get("lines") or [])
+        if not lines:
+            continue
+        if idx > 0 and insert_lines:
+            insert_lines.append("")
+        insert_lines.extend([str(l) for l in lines])
+
+    if not insert_lines:
+        return base
+
+    stripped = _strip_first_hunk_minus_lines(base)
+    if _insert_minus_block_into_patch_text is None:
+        merged = stripped.rstrip("\n") + "\n" + "\n".join("-" + l if l else "-" for l in insert_lines) + "\n"
+    else:
+        merged = _insert_minus_block_into_patch_text(stripped, insert_lines=insert_lines, prefer_prepend=True)
+
+    issues = _extra_hunk_merge_sanity_issues(merged)
+    if issues and _insert_minus_block_into_patch_text is not None:
+        repaired_lines = _maybe_llm_repair_extra_hunk_insert_lines(insert_lines=insert_lines, issues=issues)
+        if repaired_lines:
+            repaired = _insert_minus_block_into_patch_text(stripped, insert_lines=repaired_lines, prefer_prepend=True)
+            repaired_issues = _extra_hunk_merge_sanity_issues(repaired)
+            if not repaired_issues:
+                merged = repaired
+                issues = []
+            else:
+                issues = repaired_issues
+
+    if issues:
+        sys.stderr.write("[_extra_* merge] sanity issues: " + "; ".join(issues[:5]) + "\n")
+        sys.stderr.flush()
+    return merged
 
 
 def merge_patch_bundle_with_overrides(
@@ -285,11 +602,13 @@ def merge_patch_bundle_with_overrides(
         override_files.append({"patch_key": patch_key, "path": str(p)})
 
     overrides: dict[str, str] = {}
+    extra_override_merges: list[dict[str, Any]] = []
     for key, items in overrides_by_key.items():
         if not items:
             continue
         # Deterministic ordering: sort by file path.
         items_sorted = sorted(items, key=lambda it: str(it.get("path", "") or ""))
+        sorted_paths = [str(it.get("path", "") or "") for it in items_sorted if str(it.get("path", "") or "").strip()]
         texts = [str(it.get("text", "") or "") for it in items_sorted if str(it.get("text", "") or "").strip()]
         if not texts:
             continue
@@ -301,6 +620,9 @@ def merge_patch_bundle_with_overrides(
             if key in bundle.patches:
                 base_text = str(getattr(bundle.patches[key], "patch_text", "") or "")
             overrides[key] = _merge_extra_hunk_override_texts(base_text=base_text, override_texts=texts)
+            extra_override_merges.append(
+                {"patch_key": str(key), "override_count": len(texts), "override_paths": sorted_paths, "merged": True}
+            )
         else:
             # Non-extra hunks should not normally have multiple overrides; keep the last one (sorted) deterministically.
             overrides[key] = texts[-1]
@@ -371,6 +693,7 @@ def merge_patch_bundle_with_overrides(
             parts.append(patch_text)
 
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
+
 
     out_name = _safe_filename(str(output_name or "ossfuzz_merged.diff"))
     # Avoid collisions across parallel agents by writing the merged patch file under the inferred patch_key
@@ -443,6 +766,7 @@ def merge_patch_bundle_with_overrides(
         "override_count": len(override_files),
         "override_files": override_files,
         "overridden_patch_keys": sorted({o["patch_key"] for o in override_files}),
+        "extra_override_merges": extra_override_merges,
     }
 
 
@@ -520,10 +844,12 @@ def write_patch_bundle_with_overrides(
         override_files.append({"patch_key": patch_key, "path": str(p)})
 
     overrides: dict[str, str] = {}
+    extra_override_merges: list[dict[str, Any]] = []
     for key, items in overrides_by_key.items():
         if not items:
             continue
         items_sorted = sorted(items, key=lambda it: str(it.get("path", "") or ""))
+        sorted_paths = [str(it.get("path", "") or "") for it in items_sorted if str(it.get("path", "") or "").strip()]
         texts = [str(it.get("text", "") or "") for it in items_sorted if str(it.get("text", "") or "").strip()]
         if not texts:
             continue
@@ -535,6 +861,9 @@ def write_patch_bundle_with_overrides(
             if key in bundle.patches:
                 base_text = str(getattr(bundle.patches[key], "patch_text", "") or "")
             overrides[key] = _merge_extra_hunk_override_texts(base_text=base_text, override_texts=texts)
+            extra_override_merges.append(
+                {"patch_key": str(key), "override_count": len(texts), "override_paths": sorted_paths, "merged": True}
+            )
         else:
             overrides[key] = texts[-1]
 
@@ -632,6 +961,7 @@ def write_patch_bundle_with_overrides(
         "override_count": len(override_files),
         "override_files": override_files,
         "overridden_patch_keys": sorted({o["patch_key"] for o in override_files}),
+        "extra_override_merges": extra_override_merges,
     }
 
 
