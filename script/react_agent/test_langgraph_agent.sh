@@ -1242,6 +1242,115 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override tool: when V2 analysis JSON is available, anchor the new `_extra_*` skeleton
+# using an AST-derived insertion line (before the first function), not the include region heuristic.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+    os.environ.pop("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", None)
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # V1 KB provides a typedef for the missing type.
+    node_v1 = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlHashedString",
+        "location": {"file": "parser.c", "line": 10, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 10, "column": 1}, "end": {"file": "parser.c", "line": 10, "column": 40}},
+    }
+    (kb_v1 / "parser.c_analysis.json").write_text(json.dumps([node_v1]), encoding="utf-8")
+
+    # V2 KB provides a function definition extent so the skeleton can anchor before it.
+    node_v2 = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "anchor",
+        "signature": "void anchor(int x)",
+        "location": {"file": "parser.c", "line": 3, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 3, "column": 1}, "end": {"file": "parser.c", "line": 5, "column": 2}},
+    }
+    (kb_v2 / "parser.c_analysis.json").write_text(json.dumps([node_v2]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    v1_lines = ["/* filler */"] * 20
+    v1_lines[9] = "typedef int xmlHashedString;"
+    (src_v1 / "parser.c").write_text("\n".join(v1_lines) + "\n", encoding="utf-8")
+
+    v2_text = (
+        "/* header */\n"
+        "#include \"x.h\"\n"
+        "void anchor(int x) {\n"
+        "  (void)x;\n"
+        "}\n"
+        "int marker = 0;\n"
+        "int other = 1;\n"
+    )
+    (src_v2 / "parser.c").write_text(v2_text, encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    main_key = "p_main"
+    main_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text="diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({main_key: main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlHashedString",
+        version="v1",
+    )
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    # First function begins at line 3, so skeleton context should be anchored at line 3.
+    assert "@@ -3," in text_out, text_out
+    assert " void anchor(int x) {" in text_out, text_out
+    assert "typedef int xmlHashedString;" in text_out, text_out
+
+print("OK")
+PY
+
 # Extra patch override tool: don't treat a type name mentioned only in prototypes as "already present",
 # and prepend inserted typedefs before existing prototype blocks in `_extra_*`.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

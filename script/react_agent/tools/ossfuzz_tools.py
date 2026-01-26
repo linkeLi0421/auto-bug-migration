@@ -694,6 +694,7 @@ def merge_patch_bundle_with_overrides(
 
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
 
+
     out_name = _safe_filename(str(output_name or "ossfuzz_merged.diff"))
     # Avoid collisions across parallel agents by writing the merged patch file under the inferred patch_key
     # directory when possible (single-hunk overrides are the common case). If the allow-root is already the

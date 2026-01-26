@@ -101,6 +101,149 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
 _PP_IF_RE = re.compile(r"^#\s*(?:if|ifdef|ifndef)\b")
 _PP_ENDIF_RE = re.compile(r"^#\s*endif\b")
 
+_FUNC_DEF_KINDS = {"FUNCTION_DEFI", "CXX_METHOD", "FUNCTION_TEMPLATE"}
+
+
+def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
+    """Normalize a C-like function signature into (return_type, name, arg_types).
+
+    Best-effort port of `compare_function_signatures` logic from `script/revert_patch_test.py`,
+    avoiding the heavyweight import.
+    """
+    text = str(sig or "").strip()
+    if not text:
+        return "", "", tuple()
+
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\b(?:__attribute__|__declspec)\b\s*\([^)]*\)", "", text).strip()
+
+    open_paren = text.find("(")
+    close_paren = text.rfind(")")
+    if open_paren < 0 or close_paren < open_paren:
+        return "", "", tuple()
+
+    head = text[:open_paren].strip()
+    args = text[open_paren + 1 : close_paren].strip()
+
+    parts = head.split()
+    if not parts:
+        return "", "", tuple()
+
+    func_name = parts[-1]
+    ret_type = " ".join(parts[:-1]).strip()
+
+    arg_types: List[str] = []
+    if args and args != "void":
+        for arg in args.split(","):
+            a = arg.strip()
+            if not a:
+                continue
+            # Remove default values and extract type; keep all but last token (parameter name).
+            a = a.split("=", 1)[0].strip()
+            tokens = a.split()
+            if not tokens:
+                continue
+            arg_type = " ".join(tokens[:-1]) if len(tokens) > 1 else tokens[0]
+            arg_types.append(arg_type.strip())
+
+    return ret_type, func_name, tuple(arg_types)
+
+
+def _compare_function_signatures(sig1: str, sig2: str, *, ignore_arg_types: bool = False) -> bool:
+    """Return True if two function signatures match (ignoring parameter names)."""
+    s1 = _normalize_signature(sig1)
+    s2 = _normalize_signature(sig2)
+    if ignore_arg_types:
+        ret_type1, func_name1, args_types1 = s1
+        ret_type2, func_name2, args_types2 = s2
+        return ret_type1 == ret_type2 and func_name1 == func_name2 and len(args_types1) == len(args_types2)
+    return s1 == s2
+
+
+def _extra_skeleton_anchor_func_sig() -> str:
+    return str(os.environ.get("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", "") or "").strip()
+
+
+def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2") -> int:
+    """Return a 1-based insertion line based on AST analysis (best-effort).
+
+    Strategy: insert before a selected function definition start line (start.line).
+    - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
+    - Otherwise, insert before the first function definition in the file (smallest start line).
+    """
+    def no_anchor() -> int:
+        return -1
+
+    kb = getattr(agent_tools, "kb_index", None)
+    if kb is None:
+        return no_anchor()
+
+    ver = str(version or "v2").strip().lower()
+    if ver not in {"v1", "v2"}:
+        ver = "v2"
+
+    base = Path(str(file_path or "").strip()).name
+    if not base:
+        return no_anchor()
+
+    file_index = getattr(kb, "file_index", None)
+    if not isinstance(file_index, dict) or ver not in file_index:
+        return -1
+
+    nodes = file_index[ver].get(base) if isinstance(file_index[ver], dict) else None
+    if not isinstance(nodes, list) or not nodes:
+        return no_anchor()
+
+    def in_file(node: dict) -> bool:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+        loc = node.get("location", {}) if isinstance(node.get("location"), dict) else {}
+        start_file = str(start.get("file") or loc.get("file") or "")
+        if not start_file:
+            return False
+        if "#include" in start_file:
+            return False
+        return Path(start_file).name == base
+
+    def start_line(node: dict) -> int:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        start = extent.get("start", {}) if isinstance(extent.get("start"), dict) else {}
+        return int(start.get("line", 0) or 0)
+
+    def end_line(node: dict) -> int:
+        extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
+        end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+        return int(end.get("line", 0) or 0)
+
+    candidates: List[dict] = []
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        if str(n.get("kind", "") or "").strip() not in _FUNC_DEF_KINDS:
+            continue
+        if not in_file(n):
+            continue
+        sl = start_line(n)
+        el = end_line(n)
+        if sl <= 0 or el <= 0:
+            continue
+        candidates.append(n)
+
+    if not candidates:
+        return no_anchor()
+
+    want_sig = _extra_skeleton_anchor_func_sig()
+    if want_sig:
+        for n in candidates:
+            sig = str(n.get("signature", "") or "")
+            if sig and _compare_function_signatures(sig, want_sig, ignore_arg_types=True):
+                sl = start_line(n)
+                return sl if sl > 0 else -1
+
+    first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
+    sl = start_line(first)
+    return sl if sl > 0 else -1
+
 
 def _find_file_scope_insertion_index(lines: List[str]) -> int:
     """Return a 0-based index where file-scope decls can be inserted safely.
@@ -154,7 +297,16 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     if not lines:
         return ""
 
-    insert_at = _find_file_scope_insertion_index(lines)
+    insert_at = -1
+    insert_line = _ast_insert_line_number_for_extra_skeleton(agent_tools, file_path=str(file_path or "").strip(), version="v2")
+    if insert_line > 0:
+        # We insert before the context line at insert_line; index is 0-based.
+        idx = insert_line - 1
+        if 0 <= idx < len(lines):
+            insert_at = idx
+
+    if insert_at < 0:
+        insert_at = _find_file_scope_insertion_index(lines)
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
     if not ctx:
