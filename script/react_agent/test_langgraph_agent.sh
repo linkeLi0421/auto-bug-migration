@@ -1242,6 +1242,115 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override tool: when V2 analysis JSON is available, anchor the new `_extra_*` skeleton
+# using an AST-derived insertion line (before the first function), not the include region heuristic.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+    os.environ.pop("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", None)
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # V1 KB provides a typedef for the missing type.
+    node_v1 = {
+        "kind": "TYPEDEF_DECL",
+        "spelling": "xmlHashedString",
+        "location": {"file": "parser.c", "line": 10, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 10, "column": 1}, "end": {"file": "parser.c", "line": 10, "column": 40}},
+    }
+    (kb_v1 / "parser.c_analysis.json").write_text(json.dumps([node_v1]), encoding="utf-8")
+
+    # V2 KB provides a function definition extent so the skeleton can anchor before it.
+    node_v2 = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "anchor",
+        "signature": "void anchor(int x)",
+        "location": {"file": "parser.c", "line": 3, "column": 1},
+        "extent": {"start": {"file": "parser.c", "line": 3, "column": 1}, "end": {"file": "parser.c", "line": 5, "column": 2}},
+    }
+    (kb_v2 / "parser.c_analysis.json").write_text(json.dumps([node_v2]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "libxml2"
+    src_v2 = td / "src_v2" / "libxml2"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    v1_lines = ["/* filler */"] * 20
+    v1_lines[9] = "typedef int xmlHashedString;"
+    (src_v1 / "parser.c").write_text("\n".join(v1_lines) + "\n", encoding="utf-8")
+
+    v2_text = (
+        "/* header */\n"
+        "#include \"x.h\"\n"
+        "void anchor(int x) {\n"
+        "  (void)x;\n"
+        "}\n"
+        "int marker = 0;\n"
+        "int other = 1;\n"
+    )
+    (src_v2 / "parser.c").write_text(v2_text, encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    bundle_path = td / "bundle.patch2"
+    main_key = "p_main"
+    main_patch = PatchInfo(
+        file_path_old="parser.c",
+        file_path_new="parser.c",
+        patch_text="diff --git a/parser.c b/parser.c\n--- a/parser.c\n+++ b/parser.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({main_key: main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/parser.c",
+        symbol_name="xmlHashedString",
+        version="v1",
+    )
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text_out = p.read_text(encoding="utf-8", errors="replace")
+    # First function begins at line 3, so skeleton context should be anchored at line 3.
+    assert "@@ -3," in text_out, text_out
+    assert " void anchor(int x) {" in text_out, text_out
+    assert "typedef int xmlHashedString;" in text_out, text_out
+
+print("OK")
+PY
+
 # Extra patch override tool: don't treat a type name mentioned only in prototypes as "already present",
 # and prepend inserted typedefs before existing prototype blocks in `_extra_*`.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
@@ -3141,6 +3250,94 @@ assert "_extra_error.c" in merged_bundle2.patches, merged_bundle_path2
 extra_text = merged_bundle2.patches["_extra_error.c"].patch_text or ""
 assert "EXTRA_DECL" in extra_text, merged_bundle_path2
 assert "EXTRA_ONLY_DECL" in extra_text, merged_bundle_path2
+
+# Regression: `_extra_*` merge must treat multi-line prototypes atomically (avoid stray fragments like a lone `-int`).
+proto_dir = (artifact_dir / "_extra_proto.c").resolve()
+proto_dir.mkdir(parents=True, exist_ok=True)
+proto_static_path = proto_dir / "000_proto_static.diff"
+proto_int_path = proto_dir / "999_proto_int.diff"
+
+proto_static_text = (
+    "diff --git a/merge_proto.c b/merge_proto.c\n"
+    "--- a/merge_proto.c\n"
+    "+++ b/merge_proto.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-static int\n"
+    "-__revert_e11519_xmlHashGrow(void);\n"
+)
+proto_int_text = (
+    "diff --git a/merge_proto.c b/merge_proto.c\n"
+    "--- a/merge_proto.c\n"
+    "+++ b/merge_proto.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-int\n"
+    "-__revert_e11519_xmlHashGrow(void);\n"
+)
+proto_static_path.write_text(proto_static_text, encoding="utf-8", errors="replace")
+proto_int_path.write_text(proto_int_text, encoding="utf-8", errors="replace")
+
+out4 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(proto_static_path), str(proto_int_path)],
+    output_name="merged_test_extra_proto.diff",
+)
+merged_path4 = Path(out4.get("merged_patch_file_path", "")).resolve()
+assert merged_path4.is_file(), out4
+merged_text4 = merged_path4.read_text(encoding="utf-8", errors="replace")
+
+hdr = "diff --git a/merge_proto.c b/merge_proto.c"
+start = merged_text4.find(hdr)
+assert start >= 0, (hdr, merged_path4)
+tail = merged_text4[start:]
+end = tail.find("\ndiff --git ")
+section = tail if end < 0 else tail[: end + 1]
+
+section_lines = section.splitlines()
+minus = []
+in_hunk = False
+for line in section_lines:
+    if line.startswith("@@"):
+        in_hunk = True
+        continue
+    if not in_hunk:
+        continue
+    if line.startswith("diff --git ") or line.startswith("@@"):
+        break
+    if line.startswith("---"):
+        continue
+    if line.startswith("-"):
+        minus.append("" if line == "-" else line[1:])
+
+blocks = []
+cur = []
+for l in minus:
+    if l == "":
+        if cur:
+            blocks.append(cur)
+            cur = []
+        continue
+    cur.append(l)
+if cur:
+    blocks.append(cur)
+
+assert any("static int" in b[0] for b in blocks if b), blocks
+assert "__revert_e11519_xmlHashGrow" in section, section
+assert "\n-int\n" not in section, section
+assert section.count("__revert_e11519_xmlHashGrow(") == 1, section
+
+bundle_out3 = write_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(proto_static_path), str(proto_int_path)],
+    output_name="merged_test_extra_proto.patch2",
+)
+merged_bundle_path3 = Path(bundle_out3.get("merged_patch_bundle_path", "")).resolve()
+assert merged_bundle_path3.is_file(), bundle_out3
+merged_bundle3 = load_patch_bundle(str(merged_bundle_path3), allowed_roots=[str(bundle_path.parent)])
+assert "_extra_proto.c" in merged_bundle3.patches, merged_bundle_path3
+proto_patch_text = merged_bundle3.patches["_extra_proto.c"].patch_text or ""
+assert "\n-static int\n" in proto_patch_text, proto_patch_text
+assert "\n-int\n" not in proto_patch_text, proto_patch_text
+assert proto_patch_text.count("__revert_e11519_xmlHashGrow(") == 1, proto_patch_text
 PY
 
 # Multi-agent override collection: keep multiple `_extra_*` overrides (per origin hunk).
