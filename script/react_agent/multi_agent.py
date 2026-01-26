@@ -219,6 +219,27 @@ def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path
     return max(candidates, key=lambda p: (p.stat().st_mtime, version(p), p.name))
 
 
+def _latest_override_diff(artifacts_dir: Path) -> Optional[Path]:
+    """Return the latest `override*.diff` file under artifacts_dir (best-effort)."""
+    candidates = [p for p in artifacts_dir.glob("override*.diff") if p.is_file()]
+    if not candidates:
+        return None
+
+    def version(p: Path) -> int:
+        name = p.name
+        if not name.endswith(".diff"):
+            return 0
+        base = name[: -len(".diff")]
+        last = base.rsplit(".", 1)[-1]
+        if last.isdigit():
+            try:
+                return int(last)
+            except ValueError:
+                return 0
+        return 0
+
+    return max(candidates, key=lambda p: (p.stat().st_mtime, version(p), p.name))
+
 def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: str) -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     missing: List[str] = []
@@ -252,8 +273,11 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
         found_any = False
         agent_stdout_path = artifacts_dir / "agent_stdout.json"
         if agent_stdout_path.is_file():
+            # Prefer override_*.diff files under the per-hunk artifacts dir (named by patch_key, not symbol).
             extracted = _extract_override_diffs_from_agent_stdout_steps(agent_stdout_path)
             if extracted:
+                for item in extracted:
+                    item["origin_patch_key"] = patch_key
                 candidates.extend(extracted)
                 found_any = True
             else:
@@ -266,9 +290,45 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
                             "patch_key": inferred_key or patch_key,
                             "override_diff": str(Path(chosen).resolve()),
                             "method": "agent_stdout.next_step",
+                            "origin_patch_key": patch_key,
                         }
                     )
                     found_any = True
+
+        # Best-effort: prefer the latest override_*.diff in the per-hunk root (this is the main hunk override).
+        latest_override = _latest_override_diff(artifacts_dir)
+        if latest_override is not None:
+            candidates.append(
+                {
+                    "patch_key": patch_key,
+                    "override_diff": str(latest_override.resolve()),
+                    "method": "glob_latest_override",
+                }
+            )
+            found_any = True
+
+        # Also collect the latest nested override for each `_extra_*` directory under this hunk.
+        try:
+            for child in artifacts_dir.iterdir():
+                if not child.is_dir():
+                    continue
+                name = child.name
+                if not str(name).startswith("_extra_"):
+                    continue
+                latest_extra = _latest_override_diff(child)
+                if latest_extra is None:
+                    continue
+                candidates.append(
+                    {
+                        "patch_key": name,
+                        "override_diff": str(latest_extra.resolve()),
+                        "method": "glob_latest_nested_override",
+                        "origin_patch_key": patch_key,
+                    }
+                )
+                found_any = True
+        except Exception:
+            pass
 
         # Always include the latest make_error_patch_override diff in the per-hunk artifact dir if present;
         # many patch-scope runs end with a make_extra_patch_override, so next_step may not mention the
@@ -287,6 +347,7 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
     # Pick the best (latest) override per patch_key.
     per_hunk: List[Dict[str, Any]] = []
     by_key: Dict[str, Dict[str, Any]] = {}
+    by_extra_origin: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     def version_suffix(p: Path) -> int:
         name = p.name
@@ -315,16 +376,37 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
         if not key or not path:
             continue
         rp = str(Path(path).expanduser().resolve())
+        method = str(c.get("method", "") or "").strip()
+        origin = str(c.get("origin_patch_key", "") or "").strip()
+
+        if key.startswith("_extra_") and origin:
+            extra_key = (key, origin)
+            existing = by_extra_origin.get(extra_key)
+            if existing is None or score(rp) > score(str(existing.get("override_diff", "") or "")):
+                by_extra_origin[extra_key] = {"patch_key": key, "override_diff": rp, "method": method, "origin_patch_key": origin}
+            continue
+
         existing = by_key.get(key)
         if existing is None or score(rp) > score(str(existing.get("override_diff", "") or "")):
-            by_key[key] = {"patch_key": key, "override_diff": rp, "method": str(c.get("method", "") or "").strip()}
+            by_key[key] = {"patch_key": key, "override_diff": rp, "method": method}
 
     for key, item in by_key.items():
         item["new_start_line"] = patch_key_new_start_line.get(key, 0)
         per_hunk.append(item)
 
+    for (key, _origin), item in by_extra_origin.items():
+        item["new_start_line"] = patch_key_new_start_line.get(key, 0)
+        per_hunk.append(item)
+
     # Sort like script/revert_patch_test.py: newer hunks first (bottom-up application).
-    per_hunk.sort(key=lambda item: (-int(item.get("new_start_line", 0) or 0), str(item.get("patch_key", "") or "")))
+    per_hunk.sort(
+        key=lambda item: (
+            -int(item.get("new_start_line", 0) or 0),
+            str(item.get("patch_key", "") or ""),
+            str(item.get("origin_patch_key", "") or ""),
+            str(item.get("override_diff", "") or ""),
+        )
+    )
     override_paths = [
         str(item.get("override_diff", "") or "").strip()
         for item in per_hunk
@@ -437,10 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--final-ossfuzz-test",
         choices=["auto", "always", "never"],
-        default=str(os.environ.get("REACT_AGENT_FINAL_OSSFUZZ_TEST", "auto") or "auto"),
+        default=str(os.environ.get("REACT_AGENT_FINAL_OSSFUZZ_TEST", "always") or "always"),
         help=(
             "After all hunks complete, run a single OSS-Fuzz build/check_build using the combined override diffs. "
-            "auto=only when all hunks are fixed and --tools real; always=run regardless of per-hunk status; never=skip."
+            "always=run regardless of per-hunk status; auto=only when all hunks are fixed and --tools real; never=skip."
         ),
     )
 

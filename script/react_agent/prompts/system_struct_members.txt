@@ -1,4 +1,13 @@
 Struct-member errors:
+- Workflow (patch-scope):
+  1) Call get_error_patch_context(patch_path=..., file_path=..., line_number=...) to obtain the mapped BASE slice for the active error location.
+  2) Identify the owning struct and inspect its definition in both versions:
+     - search_definition(symbol_name="struct <Name>", version="v1")
+     - search_definition(symbol_name="struct <Name>", version="v2")
+  3) Determine the correct field mapping by inspecting the struct body returned by search_definition (field list, nesting, #if guards).
+     - search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".
+  4) Edit ONLY the mapped BASE slice to use the correct v2 fields/semantics and apply it via make_error_patch_override.
+
 - For every struct field used in the function that does not exist in v2:
   * If there is ANY reasonable candidate field in v2 that appears to represent the same concept
     (same or compatible type, similar comment, or similar role), treat it as a rename / semantic replacement
@@ -26,4 +35,3 @@ Constraints:
 - Do NOT change line numbers outside the function.
 - Do NOT add new functions, global variables, or struct definitions.
 - Do NOT add comments or explanations.
-- Search_definition is NOT a struct-field lookup. Do not call it on member names like "nsdb" or expressions like "ctxt->nsdb".

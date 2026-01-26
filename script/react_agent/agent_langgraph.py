@@ -10,6 +10,7 @@ import textwrap
 import inspect
 import time
 import socket
+import random
 import urllib.error
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -27,6 +28,25 @@ from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
 from prompting import build_system_prompt
 from tools.registry import ALLOWED_TOOLS, TOOL_SPECS
 from tools.runner import ToolObservation, ToolRunner
+
+
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _undeclared_symbol_guardrail_enabled() -> bool:
+    # Disabled by default: sometimes rewriting a function to remove/replace an undeclared symbol is the
+    # correct minimal fix (e.g. replace a removed global with a local).
+    return _env_flag("REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL")
+
+
+def _active_patch_key_is_extra(state: "AgentState") -> bool:
+    key = str(getattr(state, "active_patch_key", "") or getattr(state, "patch_key", "") or "").strip()
+    return bool(key.startswith("_extra_"))
+
+
+def _active_error_is_unknown_type_name(state: "AgentState") -> bool:
+    return "unknown type name" in str(getattr(state, "error_line", "") or "").lower()
 
 
 class Decision(TypedDict, total=False):
@@ -190,6 +210,14 @@ def _exc_chain(exc: BaseException) -> List[BaseException]:
 
 def _is_transient_agent_error(exc: BaseException) -> bool:
     for e in _exc_chain(exc):
+        if isinstance(e, urllib.error.HTTPError):
+            try:
+                code = int(getattr(e, "code", 0) or 0)
+            except (TypeError, ValueError):
+                code = 0
+            # Retry common transient upstream failures (Cloudflare / OpenAI edge).
+            if code == 429 or (500 <= code < 600):
+                return True
         if isinstance(e, (TimeoutError, socket.timeout)):
             return True
         if isinstance(e, urllib.error.URLError):
@@ -203,6 +231,18 @@ def _is_transient_agent_error(exc: BaseException) -> bool:
             return True
         if "temporarily unavailable" in msg or "connection reset" in msg:
             return True
+        # Fallback: ModelError may only include the HTTP code in the message.
+        # Example: "OpenAI HTTPError: 502 Bad Gateway <html>...cloudflare...</html>"
+        m = re.search(r"\bopenai\s+httperror:\s*(\d{3})\b", msg)
+        if not m:
+            m = re.search(r"\bstatus\s*=\s*(\d{3})\b", msg)
+        if m:
+            try:
+                code = int(m.group(1))
+            except (TypeError, ValueError):
+                code = 0
+            if code == 429 or (500 <= code < 600):
+                return True
     return False
 
 
@@ -219,19 +259,34 @@ def _run_langgraph_with_retries(
     attempts = 0
     retries = max(0, int(max_retries))
     delay = max(0.0, float(backoff_sec))
+    max_sleep_s = 60.0
     while True:
         attempts += 1
         try:
             return _run_langgraph(model, runner, state, cfg, artifact_store=artifact_store)
         except Exception as exc:  # noqa: BLE001
-            should_retry = attempts <= (retries + 1) and _is_transient_agent_error(exc)
+            transient = _is_transient_agent_error(exc)
+            max_attempts = retries + 1
+            # retries is the number of retries after the first attempt.
+            should_retry = attempts <= retries and transient
             if not should_retry:
+                if cfg.debug_llm:
+                    print(
+                        f"[agent_langgraph] not retrying (transient={transient}) on {type(exc).__name__}: {exc} "
+                        f"(attempt {attempts}/{max_attempts}, max_retries={retries})",
+                        file=sys.stderr,
+                    )
                 raise
-            sleep_s = delay * (2 ** max(0, attempts - 1))
-            sleep_s = min(max(sleep_s, 0.0), 60.0)
+            # Exponential backoff with jitter:
+            #   base: delay * 2^(attempt-1) (capped)
+            #   sleep = base * (0.5 + rand())  where rand() in [0, 1)
+            base_s = delay * (2 ** max(0, attempts - 1))
+            base_s = min(max(base_s, 0.0), max_sleep_s)
+            sleep_s = base_s * (0.5 + random.random())
+            sleep_s = min(max(sleep_s, 0.0), max_sleep_s)
             print(
                 f"[agent_langgraph] transient error ({type(exc).__name__}: {exc}); retrying in {sleep_s:.1f}s "
-                f"(attempt {attempts}/{retries + 1})",
+                f"(attempt {attempts}/{max_attempts})",
                 file=sys.stderr,
             )
             if sleep_s:
@@ -2352,6 +2407,20 @@ def _guardrail_repair_model(model: ChatModel) -> ChatModel:
     return model
 
 
+def _debug_guardrail_forced_tool(cfg: AgentConfig, *, original: Decision, forced: Decision) -> None:
+    """When guardrails replace a model tool call, emit a one-line debug hint."""
+    if not bool(getattr(cfg, "debug_llm", False)):
+        return
+    orig_tool = str(original.get("tool", "")).strip()
+    forced_tool = str(forced.get("tool", "")).strip()
+    if not orig_tool or not forced_tool or orig_tool == forced_tool:
+        return
+    reason = str(forced.get("thought", "") or "").strip()
+    suffix = f" reason={reason!r}" if reason else ""
+    sys.stderr.write(f"[guardrail] overriding tool call: {orig_tool} -> {forced_tool}.{suffix}\n")
+    sys.stderr.flush()
+
+
 def _build_guardrail_repair_messages(
     state: AgentState,
     messages: List[Dict[str, str]],
@@ -3111,6 +3180,8 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     If the current diagnostic is an undeclared symbol/type/macro, try make_extra_patch_override once per
     symbol before allowing make_error_patch_override to "fix" the compile by removing references.
     """
+    if not _undeclared_symbol_guardrail_enabled():
+        return None
     if str(decision.get("type", "")).strip() != "tool":
         return None
     if str(decision.get("tool", "")).strip() != "make_error_patch_override":
@@ -3121,7 +3192,7 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    undeclared = _extract_undeclared_symbol_name(state)
+    undeclared = _extract_undeclared_symbol_name(state, active_only=True)
     if not undeclared:
         return None
     if _has_make_extra_patch_override_for_symbol(state, undeclared):
@@ -3146,6 +3217,66 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     }
 
 
+def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+    state: AgentState, decision: Decision, *, remaining_steps: int
+) -> Optional[Decision]:
+    """When the active error is inside an `_extra_*` hunk, don't keep extending it.
+
+    For "unknown type name" inside `_extra_*`, the right fix is usually to inspect the existing extra hunk
+    and rewrite it (minimal slice rewrite), not to call make_extra_patch_override again.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    if not _active_patch_key_is_extra(state):
+        return None
+    if not _active_error_is_unknown_type_name(state):
+        return None
+
+    # Ensure mapping prerequisites first.
+    prereq = _next_patch_prereq_tool(state)
+    if prereq:
+        return prereq
+
+    # We need enough remaining steps to read -> patch -> ossfuzz.
+    if remaining_steps < 3:
+        return None
+
+    artifact_path = (
+        str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_patch_minus_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        or _last_artifact_path(state, "get_error_patch_context", "patch_minus_code")
+        or _last_artifact_path(state, "get_error_patch_context", "error_func_code")
+        or _last_artifact_path(state, "get_error_patch_context", "excerpt")
+    )
+    if not str(artifact_path or "").strip():
+        return None
+
+    # Reuse the existing "force patch after read" flow: by setting pending_patch, the next LLM round after
+    # read_artifact will require make_error_patch_override from the BASE slice.
+    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}}
+    return {
+        "type": "tool",
+        "thought": (
+            "Unknown type name inside an _extra_* hunk: inspect the current extra hunk slice and rewrite it "
+            "instead of extending it with make_extra_patch_override."
+        ),
+        "tool": "read_artifact",
+        "args": {
+            "artifact_path": artifact_path,
+            "start_line": 1,
+            "query": "",
+            "context_lines": 0,
+            "max_lines": 8000,
+            "max_chars": 200000,
+        },
+    }
+
+
 def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Prefer deterministic `_extra_*` type definitions over semantic no-op function rewrites.
 
@@ -3166,7 +3297,7 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    candidates = _extract_incomplete_type_symbol_candidates(state)
+    candidates = _extract_incomplete_type_symbol_candidates(state, active_only=True)
     if not candidates:
         return None
 
@@ -3207,7 +3338,7 @@ def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decisi
     if _next_patch_prereq_tool(state) is not None:
         return None
 
-    sym = _extract_missing_prototype_symbol_name(state)
+    sym = _extract_missing_prototype_symbol_name(state, active_only=True)
     if not sym:
         return None
     if _has_make_extra_patch_override_for_symbol(state, sym):
@@ -3390,15 +3521,21 @@ _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<s
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _extract_undeclared_symbol_name(state: AgentState) -> str:
-    """Best-effort extraction of an undeclared symbol/type/macro name from current error context."""
+def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
+    """Best-effort extraction of an undeclared symbol/type/macro name from error context.
+
+    In patch-scope mode, state.grouped_errors may contain many other diagnostics from the same patch_key
+    (often including warnings). For guardrails that should apply only to the active diagnostic, pass
+    active_only=True to avoid matching unrelated errors.
+    """
     candidates: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            candidates.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                candidates.append(raw)
     if str(state.error_line or "").strip():
         candidates.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -3431,18 +3568,19 @@ def _missing_struct_member_summary_for_error_line(error_line: str) -> List[Dict[
     return [{"struct": struct_name, "members": [member]}]
 
 
-def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
+def _extract_incomplete_type_symbol_candidates(state: AgentState, *, active_only: bool = False) -> List[str]:
     """Best-effort extraction of incomplete type names from current error context.
 
     Returns a prioritized list of candidate symbol names to try with make_extra_patch_override.
     """
     texts: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            texts.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                texts.append(raw)
     if str(state.error_line or "").strip():
         texts.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -3483,15 +3621,16 @@ def _extract_incomplete_type_symbol_candidates(state: AgentState) -> List[str]:
     return out
 
 
-def _extract_missing_prototype_symbol_name(state: AgentState) -> str:
+def _extract_missing_prototype_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
     """Best-effort extraction of a function name from -Wmissing-prototypes warnings."""
     candidates: List[str] = []
-    for e in state.grouped_errors or []:
-        if not isinstance(e, dict):
-            continue
-        raw = str(e.get("raw", "") or "").strip()
-        if raw:
-            candidates.append(raw)
+    if not active_only:
+        for e in state.grouped_errors or []:
+            if not isinstance(e, dict):
+                continue
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                candidates.append(raw)
     if str(state.error_line or "").strip():
         candidates.append(str(state.error_line))
     if str(state.snippet or "").strip():
@@ -4624,41 +4763,42 @@ def _run_langgraph(
                         },
                     }
 
-                undeclared_symbol = _extract_undeclared_symbol_name(st)
-                if (
-                    undeclared_symbol
-                    and _C_IDENT_RE.match(undeclared_symbol)
-                    and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
-                ):
-                    # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
-                    # deterministically before trying to rewrite the active function body.
-                    if remaining < 2:
-                        return {
-                            "state": st,
-                            "final": {
-                                "type": "final",
-                                "thought": "Not enough remaining tool steps to generate and test an extra patch override.",
-                                "summary": "Stopped before patch generation.",
-                                "next_step": (
-                                    "Increase --max-steps (need at least 2 remaining steps: make_extra_patch_override -> ossfuzz_apply_patch_and_test)."
-                                ),
-                                "steps": _steps_for_output(st),
-                                "error": _error_payload(st),
+                if _undeclared_symbol_guardrail_enabled():
+                    undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
+                    if (
+                        undeclared_symbol
+                        and _C_IDENT_RE.match(undeclared_symbol)
+                        and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
+                    ):
+                        # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
+                        # deterministically before trying to rewrite the active function body.
+                        if remaining < 2:
+                            return {
+                                "state": st,
+                                "final": {
+                                    "type": "final",
+                                    "thought": "Not enough remaining tool steps to generate and test an extra patch override.",
+                                    "summary": "Stopped before patch generation.",
+                                    "next_step": (
+                                        "Increase --max-steps (need at least 2 remaining steps: make_extra_patch_override -> ossfuzz_apply_patch_and_test)."
+                                    ),
+                                    "steps": _steps_for_output(st),
+                                    "error": _error_payload(st),
+                                },
+                            }
+                        forced_extra: Decision = {
+                            "type": "tool",
+                            "thought": "Undeclared symbol/type detected: add a forward declaration/define/typedef in the file's _extra_* hunk (deterministic extra patch strategy).",
+                            "tool": "make_extra_patch_override",
+                            "args": {
+                                "patch_path": st.patch_path,
+                                "file_path": file_path,
+                                "symbol_name": undeclared_symbol,
+                                "version": "v1",
                             },
                         }
-                    forced_extra: Decision = {
-                        "type": "tool",
-                        "thought": "Undeclared symbol/type detected: add a forward declaration/define/typedef in the file's _extra_* hunk (deterministic extra patch strategy).",
-                        "tool": "make_extra_patch_override",
-                        "args": {
-                            "patch_path": st.patch_path,
-                            "file_path": file_path,
-                            "symbol_name": undeclared_symbol,
-                            "version": "v1",
-                        },
-                    }
-                    _validate_tool_decision(forced_extra)
-                    return {"state": st, "pending": forced_extra}
+                        _validate_tool_decision(forced_extra)
+                        return {"state": st, "pending": forced_extra}
 
                 # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
                 if last_tool != "read_artifact":
@@ -5127,21 +5267,25 @@ def _run_langgraph(
 
         forced_missing_proto = _missing_prototype_extra_patch_guardrail(st, decision)
         if forced_missing_proto:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_missing_proto)
             _validate_tool_decision(forced_missing_proto)
             return {"state": st, "pending": forced_missing_proto}
 
         forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
         if forced_undeclared:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_undeclared)
             _validate_tool_decision(forced_undeclared)
             return {"state": st, "pending": forced_undeclared}
 
         forced_incomplete = _incomplete_type_extra_patch_guardrail_for_override(st, decision)
         if forced_incomplete:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_incomplete)
             _validate_tool_decision(forced_incomplete)
             return {"state": st, "pending": forced_incomplete}
 
         forced_macro = _macro_define_guardrail_for_override(st, decision)
         if forced_macro:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_macro)
             _validate_tool_decision(forced_macro)
             return {"state": st, "pending": forced_macro}
 
@@ -5153,6 +5297,14 @@ def _run_langgraph(
             if prereq:
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
+
+        forced_extra_unknown = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+            st, decision, remaining_steps=remaining
+        )
+        if forced_extra_unknown:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_unknown)
+            _validate_tool_decision(forced_extra_unknown)
+            return {"state": st, "pending": forced_extra_unknown}
 
         if tool == "read_artifact" and remaining < 3:
             return {
@@ -5302,6 +5454,8 @@ def _run_langgraph(
 
             patch_text = ""
             patch_text_path = ""
+            override_key = ""
+            override_path = ""
             hiden_func_dict_updated = None
             if isinstance(st.patch_result, dict):
                 hiden_func_dict_updated = st.patch_result.get("hiden_func_dict_updated")
@@ -5347,6 +5501,21 @@ def _run_langgraph(
                 st.patch_override_by_key[override_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
 
+            sys.stderr.write("[make_error_patch_override] artifacts:\n")
+            if patch_text_path:
+                sys.stderr.write(f"  patch_text: {patch_text_path}\n")
+            if override_key:
+                sys.stderr.write(f"  patch_key: {override_key}\n")
+            if override_path:
+                sys.stderr.write(f"  override_diff: {override_path}\n")
+            if str(st.patch_path or "").strip():
+                sys.stderr.write(f"  effective_patch_bundle: {str(st.patch_path).strip()}\n")
+            if st.patch_override_paths:
+                sys.stderr.write("  patch_override_paths:\n")
+                for p in st.patch_override_paths:
+                    sys.stderr.write(f"    - {p}\n")
+            sys.stderr.flush()
+
         if obs.ok and obs.tool == "make_extra_patch_override":
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
@@ -5354,6 +5523,7 @@ def _run_langgraph(
 
             patch_text = ""
             patch_text_path = ""
+            override_path = ""
             extra_patch_key = ""
             if isinstance(st.patch_result, dict):
                 extra_patch_key = str(st.patch_result.get("patch_key", "") or "").strip()
@@ -5398,6 +5568,21 @@ def _run_langgraph(
             elif patch_text_path and extra_patch_key:
                 st.patch_override_by_key[extra_patch_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
+
+            sys.stderr.write("[make_extra_patch_override] artifacts:\n")
+            if patch_text_path:
+                sys.stderr.write(f"  patch_text: {patch_text_path}\n")
+            if extra_patch_key:
+                sys.stderr.write(f"  patch_key: {extra_patch_key}\n")
+            if override_path:
+                sys.stderr.write(f"  override_diff: {override_path}\n")
+            if str(st.patch_path or "").strip():
+                sys.stderr.write(f"  effective_patch_bundle: {str(st.patch_path).strip()}\n")
+            if st.patch_override_paths:
+                sys.stderr.write("  patch_override_paths:\n")
+                for p in st.patch_override_paths:
+                    sys.stderr.write(f"    - {p}\n")
+            sys.stderr.flush()
 
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
@@ -5525,14 +5710,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-agent-retries",
         type=int,
-        default=int(os.environ.get("REACT_AGENT_MAX_AGENT_RETRIES", "2") or 2),
-        help="Retry transient model/network timeouts (e.g. 'read operation timed out') up to N times (0=disable).",
+        default=int(os.environ.get("REACT_AGENT_MAX_AGENT_RETRIES", "6") or 6),
+        help="Retry transient model/network failures (timeouts + HTTP 5xx/429) up to N times (0=disable).",
     )
     parser.add_argument(
         "--agent-retry-backoff-sec",
         type=float,
-        default=float(os.environ.get("REACT_AGENT_AGENT_RETRY_BACKOFF_SEC", "5") or 5),
-        help="Initial retry backoff in seconds (doubles per attempt; capped at 60s).",
+        default=float(os.environ.get("REACT_AGENT_AGENT_RETRY_BACKOFF_SEC", "1") or 1),
+        help="Initial retry backoff in seconds (doubles per attempt; jitter; capped at 60s).",
     )
 
     # OSS-Fuzz testing (mandatory after patch generation in patch-scope runs)
