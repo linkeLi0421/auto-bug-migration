@@ -396,9 +396,12 @@ def _extra_hunk_merge_sanity_issues(patch_text: str) -> list[str]:
             issues.append(f"stray type fragment block: {block[0]!r}")
             continue
 
+        kind, _name = _extra_insert_block_semantic_id(block)
+        if kind != "prototype":
+            continue
+
         tail = next((str(l).strip() for l in reversed(block) if str(l).strip()), "")
-        looks_like_proto = any("(" in str(l) for l in block) and any(")" in str(l) for l in block)
-        if looks_like_proto and not tail.endswith(";"):
+        if tail and not tail.endswith(";"):
             issues.append(f"incomplete prototype (missing ';'): {tail!r}")
     return issues
 

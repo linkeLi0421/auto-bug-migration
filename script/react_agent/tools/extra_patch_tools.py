@@ -824,6 +824,139 @@ def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: Li
     return False
 
 
+_EXTRA_MERGE_DEFINE_RE = re.compile(r"^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_MERGE_TAG_RE = re.compile(r"^(?:typedef\s+)?(?P<kind>struct|union|enum)\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\b")
+_EXTRA_MERGE_CONTROL_WORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "return",
+    "goto",
+    "break",
+    "continue",
+    "else",
+    "do",
+    "sizeof",
+}
+
+
+def _merge_extra_hunk_blocks(*args: Any, **kwargs: Any) -> List[List[str]]:
+    """Merge `_extra_*` inserted blocks by semantic key (best-effort, deterministic).
+
+    Accepts either:
+      - `_merge_extra_hunk_blocks(blocks)` where `blocks` is `List[List[str]]`, or
+      - `_merge_extra_hunk_blocks(base_blocks, other_blocks, ...)` with multiple block lists, or
+      - `_merge_extra_hunk_blocks(block_lists=[...])`.
+    Returns a merged `List[List[str]]` preserving first-seen order; for duplicate prototypes, prefers `static`.
+    """
+
+    def normalize_block_list(value: Any) -> List[List[str]]:
+        if not isinstance(value, list):
+            return []
+        out: List[List[str]] = []
+        for item in value:
+            if not isinstance(item, list):
+                continue
+            out.append([str(x) for x in item if x is not None])
+        return out
+
+    block_lists: List[List[List[str]]] = []
+    if "block_lists" in kwargs:
+        for item in (kwargs.get("block_lists") or []):
+            block_lists.append(normalize_block_list(item))
+    elif len(args) == 1 and isinstance(args[0], list):
+        block_lists.append(normalize_block_list(args[0]))
+    else:
+        for item in args:
+            block_lists.append(normalize_block_list(item))
+
+    blocks_in: List[List[str]] = []
+    for bl in block_lists:
+        blocks_in.extend(bl)
+
+    def typedef_declared_name(lines: List[str]) -> str:
+        joined = " ".join(str(l).strip() for l in (lines or []) if str(l).strip())
+        if not joined:
+            return ""
+        m = re.search(r"\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", joined)
+        if m:
+            return str(m.group(1) or "")
+        m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?;\s*$", joined)
+        if m:
+            return str(m.group(1) or "")
+        return ""
+
+    def semantic_id(block: List[str]) -> Tuple[str, str]:
+        head = next((str(l).strip() for l in (block or []) if str(l).strip()), "")
+        if not head:
+            return ("text", "")
+
+        m = _EXTRA_MERGE_DEFINE_RE.match(head)
+        if m:
+            return ("define", str(m.group(1) or ""))
+
+        if head.startswith("typedef"):
+            name = typedef_declared_name(block)
+            return ("typedef", name or "\n".join(block).strip())
+
+        m = _EXTRA_MERGE_TAG_RE.match(head)
+        if m:
+            return ("tag", f"{m.group('kind')} {m.group('name')}".strip())
+
+        func_name = ""
+        for raw in block:
+            for m2 in _FUNC_NAME_RE.finditer(str(raw or "")):
+                cand = str(m2.group(1) or "")
+                if cand and cand not in _EXTRA_MERGE_CONTROL_WORDS:
+                    func_name = cand
+                    break
+            if func_name:
+                break
+        if func_name:
+            return ("prototype", func_name)
+
+        return ("text", "\n".join(block).strip())
+
+    def is_static_prototype(block: List[str]) -> bool:
+        joined = " ".join(str(l).strip() for l in (block or []) if str(l).strip())
+        return bool(re.search(r"(?<![A-Za-z0-9_])static(?![A-Za-z0-9_])", joined))
+
+    def choose_better(kind: str, *, current: List[str], candidate: List[str]) -> List[str]:
+        if kind == "prototype":
+            cur_static = is_static_prototype(current)
+            cand_static = is_static_prototype(candidate)
+            if cur_static != cand_static:
+                return candidate if cand_static else current
+
+            cur_tail = next((str(l).strip() for l in reversed(current) if str(l).strip()), "")
+            cand_tail = next((str(l).strip() for l in reversed(candidate) if str(l).strip()), "")
+            cur_semicolon = cur_tail.endswith(";")
+            cand_semicolon = cand_tail.endswith(";")
+            if cur_semicolon != cand_semicolon:
+                return candidate if cand_semicolon else current
+
+        return candidate if len("\n".join(candidate)) > len("\n".join(current)) else current
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    order = 0
+    for block in blocks_in:
+        kind, name = semantic_id(block)
+        key = f"{kind}:{name}"
+        existing = merged.get(key)
+        if existing is None:
+            merged[key] = {"kind": kind, "name": name, "lines": list(block), "order": order}
+            order += 1
+            continue
+        cur_lines = list(existing.get("lines") or [])
+        if cur_lines == block:
+            continue
+        existing["lines"] = choose_better(kind, current=cur_lines, candidate=block)
+
+    merged_items = sorted((v for v in merged.values() if isinstance(v, dict)), key=lambda it: int(it.get("order") or 0))
+    return [list(it.get("lines") or []) for it in merged_items if it.get("lines")]
+
+
 def _symbol_underlying_name(symbol: str) -> Tuple[str, str]:
     """Return (kind, underlying_name) for common generated-name patterns."""
     s = str(symbol or "").strip()
