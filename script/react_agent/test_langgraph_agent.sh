@@ -3141,6 +3141,94 @@ assert "_extra_error.c" in merged_bundle2.patches, merged_bundle_path2
 extra_text = merged_bundle2.patches["_extra_error.c"].patch_text or ""
 assert "EXTRA_DECL" in extra_text, merged_bundle_path2
 assert "EXTRA_ONLY_DECL" in extra_text, merged_bundle_path2
+
+# Regression: `_extra_*` merge must treat multi-line prototypes atomically (avoid stray fragments like a lone `-int`).
+proto_dir = (artifact_dir / "_extra_proto.c").resolve()
+proto_dir.mkdir(parents=True, exist_ok=True)
+proto_static_path = proto_dir / "000_proto_static.diff"
+proto_int_path = proto_dir / "999_proto_int.diff"
+
+proto_static_text = (
+    "diff --git a/merge_proto.c b/merge_proto.c\n"
+    "--- a/merge_proto.c\n"
+    "+++ b/merge_proto.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-static int\n"
+    "-__revert_e11519_xmlHashGrow(void);\n"
+)
+proto_int_text = (
+    "diff --git a/merge_proto.c b/merge_proto.c\n"
+    "--- a/merge_proto.c\n"
+    "+++ b/merge_proto.c\n"
+    "@@ -1,2 +1,0 @@\n"
+    "-int\n"
+    "-__revert_e11519_xmlHashGrow(void);\n"
+)
+proto_static_path.write_text(proto_static_text, encoding="utf-8", errors="replace")
+proto_int_path.write_text(proto_int_text, encoding="utf-8", errors="replace")
+
+out4 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(proto_static_path), str(proto_int_path)],
+    output_name="merged_test_extra_proto.diff",
+)
+merged_path4 = Path(out4.get("merged_patch_file_path", "")).resolve()
+assert merged_path4.is_file(), out4
+merged_text4 = merged_path4.read_text(encoding="utf-8", errors="replace")
+
+hdr = "diff --git a/merge_proto.c b/merge_proto.c"
+start = merged_text4.find(hdr)
+assert start >= 0, (hdr, merged_path4)
+tail = merged_text4[start:]
+end = tail.find("\ndiff --git ")
+section = tail if end < 0 else tail[: end + 1]
+
+section_lines = section.splitlines()
+minus = []
+in_hunk = False
+for line in section_lines:
+    if line.startswith("@@"):
+        in_hunk = True
+        continue
+    if not in_hunk:
+        continue
+    if line.startswith("diff --git ") or line.startswith("@@"):
+        break
+    if line.startswith("---"):
+        continue
+    if line.startswith("-"):
+        minus.append("" if line == "-" else line[1:])
+
+blocks = []
+cur = []
+for l in minus:
+    if l == "":
+        if cur:
+            blocks.append(cur)
+            cur = []
+        continue
+    cur.append(l)
+if cur:
+    blocks.append(cur)
+
+assert any("static int" in b[0] for b in blocks if b), blocks
+assert "__revert_e11519_xmlHashGrow" in section, section
+assert "\n-int\n" not in section, section
+assert section.count("__revert_e11519_xmlHashGrow(") == 1, section
+
+bundle_out3 = write_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(proto_static_path), str(proto_int_path)],
+    output_name="merged_test_extra_proto.patch2",
+)
+merged_bundle_path3 = Path(bundle_out3.get("merged_patch_bundle_path", "")).resolve()
+assert merged_bundle_path3.is_file(), bundle_out3
+merged_bundle3 = load_patch_bundle(str(merged_bundle_path3), allowed_roots=[str(bundle_path.parent)])
+assert "_extra_proto.c" in merged_bundle3.patches, merged_bundle_path3
+proto_patch_text = merged_bundle3.patches["_extra_proto.c"].patch_text or ""
+assert "\n-static int\n" in proto_patch_text, proto_patch_text
+assert "\n-int\n" not in proto_patch_text, proto_patch_text
+assert proto_patch_text.count("__revert_e11519_xmlHashGrow(") == 1, proto_patch_text
 PY
 
 # Multi-agent override collection: keep multiple `_extra_*` overrides (per origin hunk).
