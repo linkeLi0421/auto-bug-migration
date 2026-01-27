@@ -471,6 +471,23 @@ def _prioritize_focus_within_hunk(errors: List[Dict[str, Any]], focus_error: str
     return [e for _, _, e in ranked]
 
 
+def _error_is_unknown_type_name(err: Dict[str, Any]) -> bool:
+    msg = str(err.get("msg", "") or "").lower()
+    raw = str(err.get("raw", "") or "").lower()
+    return "unknown type name" in msg or "unknown type name" in raw
+
+
+def _prioritize_unknown_type_name_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable ordering helper: prioritize 'unknown type name' errors before everything else."""
+    ranked: List[tuple[int, int, Dict[str, Any]]] = []
+    for idx, err in enumerate(errors or []):
+        if not isinstance(err, dict):
+            continue
+        ranked.append((0 if _error_is_unknown_type_name(err) else 1, idx, err))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [e for _, _, e in ranked]
+
+
 def _summarize_function_groups(
     errors: List[Dict[str, Any]], *, max_groups: int = 12, max_examples_per_group: int = 3
 ) -> tuple[List[Dict[str, Any]], int, bool]:
@@ -1688,7 +1705,7 @@ def _refresh_patch_scope_error_snapshot_from_latest_ossfuzz(state: AgentState) -
     if not in_active:
         return
 
-    in_active = _prioritize_warnings_within_hunk(in_active)
+    in_active = _prioritize_unknown_type_name_within_hunk(_prioritize_warnings_within_hunk(in_active))
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     state.function_groups = func_groups
     state.function_groups_total = func_total
@@ -1803,6 +1820,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
         [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
     )
     focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
+    in_active = _prioritize_unknown_type_name_within_hunk(in_active)
     if focus_error:
         in_active = _prioritize_focus_within_hunk(in_active, focus_error)
     if not in_active:
@@ -3217,13 +3235,15 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     }
 
 
-def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+def _block_make_extra_patch_override_for_extra_hunk(
     state: AgentState, decision: Decision, *, remaining_steps: int
 ) -> Optional[Decision]:
-    """When the active error is inside an `_extra_*` hunk, don't keep extending it.
+    """When the active patch_key is `_extra_*`, don't call make_extra_patch_override.
 
-    For "unknown type name" inside `_extra_*`, the right fix is usually to inspect the existing extra hunk
-    and rewrite it (minimal slice rewrite), not to call make_extra_patch_override again.
+    If the agent is already handling an `_extra_*` hunk and encounters an error, calling
+    make_extra_patch_override again would just extend the same hunk, potentially creating
+    cascading issues or circular insertions. Instead, the agent should use make_error_patch_override
+    to directly fix/rewrite the `_extra_*` hunk content.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -3232,8 +3252,6 @@ def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
     if state.error_scope != "patch" or not state.patch_path:
         return None
     if not _active_patch_key_is_extra(state):
-        return None
-    if not _active_error_is_unknown_type_name(state):
         return None
 
     # Ensure mapping prerequisites first.
@@ -3262,8 +3280,8 @@ def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
     return {
         "type": "tool",
         "thought": (
-            "Unknown type name inside an _extra_* hunk: inspect the current extra hunk slice and rewrite it "
-            "instead of extending it with make_extra_patch_override."
+            "Active patch_key is _extra_*: cannot use make_extra_patch_override to extend the same hunk. "
+            "Instead, inspect the current extra hunk slice and rewrite it with make_error_patch_override."
         ),
         "tool": "read_artifact",
         "args": {
@@ -5298,13 +5316,13 @@ def _run_langgraph(
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
 
-        forced_extra_unknown = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+        forced_extra_block = _block_make_extra_patch_override_for_extra_hunk(
             st, decision, remaining_steps=remaining
         )
-        if forced_extra_unknown:
-            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_unknown)
-            _validate_tool_decision(forced_extra_unknown)
-            return {"state": st, "pending": forced_extra_unknown}
+        if forced_extra_block:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_block)
+            _validate_tool_decision(forced_extra_block)
+            return {"state": st, "pending": forced_extra_block}
 
         if tool == "read_artifact" and remaining < 3:
             return {
@@ -5847,9 +5865,8 @@ def main(argv: List[str]) -> int:
                     patch_key = first_focus_key
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                full_grouped = _prioritize_focus_within_hunk(
-                    _prioritize_warnings_within_hunk(groups[patch_key]), focus_error
-                )
+                ranked = _prioritize_unknown_type_name_within_hunk(_prioritize_warnings_within_hunk(groups[patch_key]))
+                full_grouped = _prioritize_focus_within_hunk(ranked, focus_error)
                 full_grouped_for_history = list(full_grouped)
                 function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
                 grouped_errors = full_grouped

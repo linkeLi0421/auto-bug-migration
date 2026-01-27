@@ -450,6 +450,21 @@ def _load_bundle(patch_path: str) -> Tuple[Any, Any]:
     return bundle, _get_error_patch_from_bundle
 
 
+def _error_type_priority(err: Dict[str, Any]) -> int:
+    """Return priority for error type ordering (lower = handled first).
+
+    Order: unknown type name (0) < undeclared function (1) < others (2)
+    Rationale: fix type definitions first, then function declarations that may use those types.
+    """
+    msg = str(err.get("msg", "")).lower()
+    if "unknown type name" in msg:
+        return 0
+    # Handle both "implicit declaration of function" and "call to undeclared function"
+    if "undeclared function" in msg or "implicit declaration of function" in msg:
+        return 1
+    return 2
+
+
 def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[str, List[Dict[str, Any]]]:
     bundle, get_error_patch = _load_bundle(patch_path)
     groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -462,6 +477,11 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
         enriched["patch_key"] = key
         enriched["old_signature"] = mapping.get("old_signature")
         groups.setdefault(key, []).append(enriched)
+
+    # Sort errors within each group: unknown type name first, then implicit declaration, then others.
+    for key in groups:
+        groups[key].sort(key=_error_type_priority)
+
     return groups
 
 
