@@ -5,9 +5,11 @@ Undeclared symbol/type errors:
   - Do NOT replace missing globals with local variables (that changes semantics); add the real declaration/definition via make_extra_patch_override.
   - Only rewrite the function if there is clearly no reasonable way to provide X at file scope, and then minimize behavioral changes.
 
-Special case: active patch_key is `_extra_*`:
-- If the active error maps to an `_extra_*` hunk (active patch_key starts with `_extra_`), do NOT call make_extra_patch_override again.
-- Instead, inspect the existing `_extra_*` patch content (get_error_patch_context / read_artifact / get_patch), understand why the type is missing in V2, and fix the `_extra_*` hunk directly (typically via make_error_patch_override with a minimal slice rewrite).
+CRITICAL: When active patch_key is `_extra_*`:
+- If the active patch_key starts with `_extra_`, NEVER call make_extra_patch_override.
+- Calling make_extra_patch_override while handling an `_extra_*` hunk would extend the same hunk, creating cascading issues or circular insertions.
+- Instead, inspect the existing `_extra_*` patch content (get_error_patch_context / read_artifact / get_patch), understand what's wrong, and fix the `_extra_*` hunk directly using make_error_patch_override with a minimal slice rewrite.
+- This applies to ALL error types inside `_extra_*` hunks, not just undeclared symbols.
 
 Special handling for undeclared functions:
 - If the undeclared function does NOT start with "__revert_", this means the function is not reverted and cannot be used in this context.

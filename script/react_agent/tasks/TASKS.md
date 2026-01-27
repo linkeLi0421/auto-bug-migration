@@ -2,7 +2,37 @@
 
 Archived plans live in `script/react_agent/tasks/TASKS_*.md`. This file tracks the current active items.
 
-## Plan: Fix `_extra_*` insertion order (use AST insert anchors; avoid “unknown type name”)
+## Plan: Fix `_extra_*` override merge - preserve agent ordering (COMPLETED)
+
+Context: When override diffs exist for an `_extra_*` key, the merge function was reordering blocks by category,
+which could break the agent's carefully arranged ordering (e.g., typedef before prototypes that reference it).
+
+### Solution
+
+Simplified `_merge_extra_hunk_override_texts()` to preserve the agent's ordering:
+- If there's one unique override, just use it directly (no block-level merge)
+- If multiple different overrides exist, union blocks while preserving order from the last override
+- Removed category-based sorting entirely - the agent is responsible for correct ordering
+
+### Tasks
+
+- [x] Simplify `_merge_extra_hunk_override_texts()`:
+  - Deduplicate override texts; if only one unique override, return it directly
+  - For multiple different overrides, use the last one as the primary ordering source
+  - Removed `_extra_merge_block_category()` function (no longer needed)
+- [x] Fix `_extra_insert_block_semantic_id()` to skip comment lines when determining block type:
+  - Added `_is_comment_line()` helper for C/C++ comment detection
+  - Handles multi-line comments where continuation lines don't start with `*`
+- [ ] Re-run the failing multi-agent scenario and confirm the build succeeds.
+
+### Success criteria
+
+- Override diffs are used as-is, preserving the agent's intended ordering.
+- Identical duplicate override diffs don't trigger unnecessary merging.
+
+---
+
+## Plan: Fix `_extra_*` insertion order (use AST insert anchors; avoid "unknown type name")
 Context: Some multi-agent runs hit ordering issues like:
 `/src/libxml2/parserInternals.c:93:1: error: unknown type name 'xmlParserNsData'`
 because declarations inserted into `_extra_*` hunks can end up after prototypes that reference them. The current

@@ -301,9 +301,25 @@ def _typedef_declared_name(lines: list[str]) -> str:
     return ""
 
 
+def _is_comment_line(line: str) -> bool:
+    """Return True if line is a C/C++ comment line (not code)."""
+    s = line.strip()
+    if not s:
+        return False
+    # Single-line comment or block-comment start/continuation
+    if s.startswith("//") or s.startswith("/*") or s.startswith("*"):
+        return True
+    # Multi-line comment continuation/end that doesn't start with /* or *
+    # e.g., "   some text */" is the end of a block comment
+    if s.endswith("*/") and "/*" not in s:
+        return True
+    return False
+
+
 def _extra_insert_block_semantic_id(block: list[str]) -> tuple[str, str]:
     """Return (kind, name) for a file-scope insertion block in an `_extra_*` hunk."""
-    head = next((str(l).strip() for l in (block or []) if str(l).strip()), "")
+    # Skip comment lines to find the first meaningful line for classification
+    head = next((str(l).strip() for l in (block or []) if str(l).strip() and not _is_comment_line(str(l))), "")
     if not head:
         return ("text", "")
 
@@ -334,16 +350,6 @@ def _extra_insert_block_semantic_id(block: list[str]) -> tuple[str, str]:
         return ("prototype", func_name)
 
     return ("text", "\n".join(block).strip())
-
-
-def _extra_merge_block_category(kind: str, *, prefer_prepend: bool) -> int:
-    if prefer_prepend:
-        return 0
-    if kind == "define":
-        return 1
-    if kind == "prototype":
-        return 2
-    return 3
 
 
 def _extra_block_is_static_prototype(block: list[str]) -> bool:
@@ -467,81 +473,106 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
 
     In patch-scope runs, `_extra_*` hunks are reverse-applied: '-' lines become additions. Multiple agents can
     independently extend the same `_extra_*` hunk; we must not drop earlier insertions.
+
+    Strategy: preserve the order from overrides rather than sorting by category. If there's one override,
+    just use it. If multiple different overrides exist, union their blocks while preserving appearance order.
     """
     texts = [str(t or "") for t in (override_texts or []) if str(t or "").strip()]
     base = str(base_text or "")
     if not texts:
         return base
 
+    base_from_override = False
     if not base.strip():
         base = texts[0]
         texts = texts[1:]
+        base_from_override = True
         if not texts:
             return base
 
+    # Deduplicate override texts (keep first occurrence of each unique text).
+    unique_overrides: list[str] = []
+    seen: set[str] = set()
+    if base_from_override and base.strip():
+        texts = [base] + texts
+    for t in texts:
+        key = t.strip()
+        if key not in seen:
+            seen.add(key)
+            unique_overrides.append(t)
+
+    # If there's exactly one unique override, just use it directly - no block-level merge.
+    # This preserves the agent's intended ordering (e.g., typedef before prototypes).
+    if len(unique_overrides) == 1:
+        return unique_overrides[0]
+
+    # Multiple different overrides: union blocks, preserving order from the last (most recent) override.
     # Import late to avoid tool-level import cycles.
     try:
-        from tools.extra_patch_tools import _insert_minus_block_into_patch_text, _should_prepend_extra_hunk_insertion  # type: ignore
+        from tools.extra_patch_tools import _insert_minus_block_into_patch_text  # type: ignore
     except Exception:
-        # Fallback: best-effort concatenate unique '-' lines by appending at end of the first hunk.
         _insert_minus_block_into_patch_text = None  # type: ignore[assignment]
-        _should_prepend_extra_hunk_insertion = None  # type: ignore[assignment]
 
-    blocks: dict[str, dict[str, object]] = {}
-    order = 0
+    # Use the last override as the "primary" ordering source, then add any missing blocks from earlier overrides.
+    primary = unique_overrides[-1]
+    primary_blocks = _extra_hunk_minus_blocks_first_hunk(primary)
 
-    def ingest(text: str) -> None:
-        nonlocal order
-        for block in _extra_hunk_minus_blocks_first_hunk(text):
+    # Collect blocks from all overrides, keyed by semantic ID.
+    all_blocks: dict[str, list[str]] = {}
+    for ovr in unique_overrides:
+        for block in _extra_hunk_minus_blocks_first_hunk(ovr):
             kind, name = _extra_insert_block_semantic_id(block)
             key = f"{kind}:{name}"
-            prefer_prepend = False
-            if _should_prepend_extra_hunk_insertion is not None:
-                try:
-                    prefer_prepend = bool(_should_prepend_extra_hunk_insertion(insert_kind="", inserted_lines=block))
-                except Exception:
-                    prefer_prepend = False
-            category = _extra_merge_block_category(kind, prefer_prepend=prefer_prepend)
+            if key not in all_blocks:
+                all_blocks[key] = list(block)
+            else:
+                # Keep the better version.
+                all_blocks[key] = list(_choose_better_extra_block(kind, current=all_blocks[key], candidate=block))
 
-            existing = blocks.get(key)
-            if existing is None:
-                blocks[key] = {"kind": kind, "name": name, "lines": list(block), "order": order, "category": category}
-                order += 1
-                continue
+    # Build merged block list: start with primary's order, then append any extra blocks from earlier overrides.
+    merged_blocks: list[list[str]] = []
+    used_keys: set[str] = set()
+    for block in primary_blocks:
+        kind, name = _extra_insert_block_semantic_id(block)
+        key = f"{kind}:{name}"
+        if key in all_blocks:
+            merged_blocks.append(all_blocks[key])
+            used_keys.add(key)
 
-            cur_lines = list(existing.get("lines") or [])
-            if cur_lines == block:
-                continue
-            chosen = _choose_better_extra_block(kind, current=cur_lines, candidate=block)
-            existing["lines"] = list(chosen)
-            existing["kind"] = kind
-            existing["name"] = name
-            existing["category"] = category
+    # Add blocks that exist in earlier overrides but not in primary.
+    for ovr in unique_overrides[:-1]:
+        for block in _extra_hunk_minus_blocks_first_hunk(ovr):
+            kind, name = _extra_insert_block_semantic_id(block)
+            key = f"{kind}:{name}"
+            if key not in used_keys and key in all_blocks:
+                merged_blocks.append(all_blocks[key])
+                used_keys.add(key)
 
-    ingest(base)
-    for text in texts:
-        ingest(text)
-
-    if not blocks:
-        return base
-
-    def sort_key(item: dict[str, object]) -> tuple[int, int]:
-        return (int(item.get("category") or 0), int(item.get("order") or 0))
-
-    merged_blocks = sorted((v for v in blocks.values() if isinstance(v, dict)), key=sort_key)
+    # Enforce sane ordering across categories. Even when a newer override introduces a prototype before
+    # a dependent typedef/tag, merged output should keep macros/typedefs/tags before prototypes.
+    kind_pri = {"define": 0, "typedef": 1, "tag": 2, "prototype": 3, "text": 4}
+    merged_blocks = [
+        block
+        for _pri, _idx, block in sorted(
+            (
+                (kind_pri.get(_extra_insert_block_semantic_id(block)[0], 9), idx, block)
+                for idx, block in enumerate(merged_blocks)
+            ),
+            key=lambda t: (t[0], t[1]),
+        )
+    ]
     insert_lines: list[str] = []
-    for idx, item in enumerate(merged_blocks):
-        lines = list(item.get("lines") or [])
-        if not lines:
+    for idx, block in enumerate(merged_blocks):
+        if not block:
             continue
         if idx > 0 and insert_lines:
             insert_lines.append("")
-        insert_lines.extend([str(l) for l in lines])
+        insert_lines.extend([str(l) for l in block])
 
     if not insert_lines:
-        return base
+        return primary
 
-    stripped = _strip_first_hunk_minus_lines(base)
+    stripped = _strip_first_hunk_minus_lines(primary)
     if _insert_minus_block_into_patch_text is None:
         merged = stripped.rstrip("\n") + "\n" + "\n".join("-" + l if l else "-" for l in insert_lines) + "\n"
     else:
