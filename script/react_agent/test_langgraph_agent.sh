@@ -4329,4 +4329,74 @@ assert kind == "text", f"Expected 'text', got {kind!r}"
 print("OK")
 PY
 
+# Test: iter_linker_errors parses linker undefined reference errors.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from build_log import iter_linker_errors  # noqa: E402
+
+log = Path(script_dir / "fixtures" / "linker_undefined_reference.log").read_text(encoding="utf-8")
+errs = iter_linker_errors(log, snippet_lines=2)
+
+assert len(errs) == 2, f"Expected 2 linker errors, got {len(errs)}: {errs}"
+
+# First error: defaultHandlers
+err0 = errs[0]
+assert err0.get("kind") == "linker", err0
+assert "encoding.c" in err0.get("file", ""), err0
+assert err0.get("symbol") == "defaultHandlers", err0
+assert err0.get("function") == "__revert_e11519_xmlLookupCharEncodingHandler", err0
+assert "undefined reference" in err0.get("msg", ""), err0
+
+# Second error: xmlSaturatedAddSizeT
+err1 = errs[1]
+assert err1.get("kind") == "linker", err1
+assert "parser.c" in err1.get("file", ""), err1
+assert err1.get("symbol") == "xmlSaturatedAddSizeT", err1
+assert err1.get("function") == "__revert_e11519_xmlSkipBlankChars", err1
+
+print("OK")
+PY
+
+# Test: _error_type_priority returns correct priority for linker errors.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from multi_agent import _error_type_priority  # noqa: E402
+
+# Priority 0: unknown type name
+err_unknown_type = {"msg": "unknown type name 'xmlChar'"}
+assert _error_type_priority(err_unknown_type) == 0, f"Expected 0, got {_error_type_priority(err_unknown_type)}"
+
+# Priority 1: implicit declaration of function
+err_implicit = {"msg": "implicit declaration of function 'foo'"}
+assert _error_type_priority(err_implicit) == 1, f"Expected 1, got {_error_type_priority(err_implicit)}"
+
+# Priority 1: undeclared function
+err_undeclared = {"msg": "call to undeclared function 'bar'"}
+assert _error_type_priority(err_undeclared) == 1, f"Expected 1, got {_error_type_priority(err_undeclared)}"
+
+# Priority 2: linker error by kind
+err_linker_kind = {"kind": "linker", "msg": "undefined reference to `foo`"}
+assert _error_type_priority(err_linker_kind) == 2, f"Expected 2, got {_error_type_priority(err_linker_kind)}"
+
+# Priority 2: linker error by message content
+err_linker_msg = {"msg": "undefined reference to `bar`"}
+assert _error_type_priority(err_linker_msg) == 2, f"Expected 2, got {_error_type_priority(err_linker_msg)}"
+
+# Priority 3: other errors
+err_other = {"msg": "some other error"}
+assert _error_type_priority(err_other) == 3, f"Expected 3, got {_error_type_priority(err_other)}"
+
+print("OK")
+PY
+
 echo "OK"

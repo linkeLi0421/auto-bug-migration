@@ -3537,6 +3537,9 @@ _INCOMPLETE_TYPE_RE = re.compile(
 )
 _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<symbol>[^']+)'", re.IGNORECASE)
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
+_LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
+_LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
@@ -3678,6 +3681,45 @@ def _first_error_location(state: AgentState) -> tuple[str, int]:
     return "", 0
 
 
+def _first_link_error_location(state: AgentState) -> tuple[str, str]:
+    """Best-effort extraction of (file_path, function_name) from a linker error."""
+    # Check grouped_errors first (populated by multi_agent with linker errors)
+    if state.grouped_errors:
+        err = state.grouped_errors[0]
+        kind = str(err.get("kind", "") or "").strip().lower()
+        if kind == "linker":
+            fp = str(err.get("file", "") or "").strip()
+            fn = str(err.get("function", "") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    # Fall back to parsing error_line/snippet for linker patterns
+    for text in (str(state.error_line or ""), str(state.snippet or "")):
+        # Pattern: "file.c:(.text.func+0x...): undefined reference"
+        m = _LINK_UNDEF_SECTION_LOC_RE.search(text)
+        if m:
+            fp = str(m.group("file") or "").strip()
+            fn = str(m.group("func") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    # Pattern: "in function `func'"
+    for text in (str(state.error_line or ""), str(state.snippet or "")):
+        m = _LINK_IN_FUNCTION_RE.search(text)
+        if m:
+            fn = str(m.group("func") or "").strip()
+            # Try to get file from grouped_errors or active state
+            fp = ""
+            if state.grouped_errors:
+                fp = str(state.grouped_errors[0].get("file", "") or "").strip()
+            if not fp:
+                fp = str(getattr(state, "active_file_path", "") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    return "", ""
+
+
 def _active_override_location(state: AgentState) -> tuple[str, int]:
     fp = str(getattr(state, "active_file_path", "") or "").strip()
     ln = int(getattr(state, "active_line_number", 0) or 0)
@@ -3771,6 +3813,9 @@ def _should_require_make_error_patch_override(state: AgentState) -> bool:
     has_base = bool(str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()) or _has_tool_call(
         state, "get_error_patch_context"
     )
+    if not has_base:
+        # Also check for linker error context
+        has_base = _has_tool_call(state, "get_link_error_patch_context")
     if not has_base:
         return False
     return True
@@ -3920,24 +3965,44 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
     if str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip():
         return None
 
+    # Try compiler error location first
     file_path, line_number = _first_error_location(state)
-    if not file_path or line_number <= 0:
-        return None
-
-    if not _has_tool_call(state, "get_error_patch_context"):
-        return {
-            "type": "tool",
-            "thought": "First map the migrated error location to its patch context.",
-            "tool": "get_error_patch_context",
-            "args": {
-                "patch_path": state.patch_path,
-                "file_path": file_path,
-                "line_number": line_number,
-                "error_text": str(state.error_line or "")[:400],
-                "context_lines": 80,
-                "max_total_lines": 800,
-            },
-        }
+    if file_path and line_number > 0:
+        if not _has_tool_call(state, "get_error_patch_context"):
+            return {
+                "type": "tool",
+                "thought": "First map the migrated error location to its patch context.",
+                "tool": "get_error_patch_context",
+                "args": {
+                    "patch_path": state.patch_path,
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_text": str(state.error_line or "")[:400],
+                    "context_lines": 80,
+                    "max_total_lines": 800,
+                },
+            }
+    else:
+        # Try linker error location (undefined reference errors)
+        link_file, link_func = _first_link_error_location(state)
+        if link_file and link_func:
+            if not _has_tool_call(state, "get_link_error_patch_context"):
+                return {
+                    "type": "tool",
+                    "thought": "Map the linker undefined-reference error to its patch context.",
+                    "tool": "get_link_error_patch_context",
+                    "args": {
+                        "patch_path": state.patch_path,
+                        "file_path": link_file,
+                        "function_name": link_func,
+                        "error_text": str(state.error_line or "")[:400],
+                        "context_lines": 80,
+                        "max_total_lines": 800,
+                    },
+                }
+        else:
+            # No valid error location found
+            return None
 
     structs = _structs_to_compare(state)
     if structs:
@@ -4768,7 +4833,11 @@ def _run_langgraph(
 
                 last_tool = _last_tool_call_name(st)
                 file_path, line_number = _first_error_location(st)
+                # Also check for linker error location
+                link_file, link_func = "", ""
                 if not file_path or line_number <= 0:
+                    link_file, link_func = _first_link_error_location(st)
+                if (not file_path or line_number <= 0) and (not link_file or not link_func):
                     return {
                         "state": st,
                         "final": {
@@ -4780,6 +4849,9 @@ def _run_langgraph(
                             "error": _error_payload(st),
                         },
                     }
+                # For linker errors, use link_file as file_path for downstream logic
+                if link_file and link_func and (not file_path or line_number <= 0):
+                    file_path = link_file
 
                 if _undeclared_symbol_guardrail_enabled():
                     undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
@@ -4838,6 +4910,10 @@ def _run_langgraph(
                         or _last_artifact_path(st, "get_error_patch_context", "error_func_code")
                         or _last_artifact_path(st, "get_error_patch_context", "patch_minus_code")
                         or _last_artifact_path(st, "get_error_patch_context", "excerpt")
+                        # Also check linker error context artifacts
+                        or _last_artifact_path(st, "get_link_error_patch_context", "error_func_code")
+                        or _last_artifact_path(st, "get_link_error_patch_context", "patch_minus_code")
+                        or _last_artifact_path(st, "get_link_error_patch_context", "excerpt")
                     )
                     forced_read: Decision = {
                         "type": "tool",

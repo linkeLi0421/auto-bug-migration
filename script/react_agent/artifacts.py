@@ -18,8 +18,14 @@ _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
         "patch_minus_code": ".c",
         "error_func_code": ".c",
     },
+    "get_link_error_patch_context": {
+        "excerpt": ".diff",
+        "patch_minus_code": ".c",
+        "error_func_code": ".c",
+    },
     "get_patch": {"patch_text": ".diff"},
     "make_error_patch_override": {"old_func_code": ".c", "patch_text": ".diff"},
+    "make_link_error_patch_override": {"old_func_code": ".c", "patch_text": ".diff"},
     "make_extra_patch_override": {"patch_text": ".diff"},
     "ossfuzz_apply_patch_and_test": {
         "build_output": ".log",
@@ -147,7 +153,7 @@ def _focus_snippet(text: str, terms: list[str], *, context_lines: int = 10, max_
 
 def _artifact_name(*, tool: str, field: str, args: Dict[str, Any]) -> str:
     parts = [str(tool or "").strip() or "tool", str(field or "").strip() or "output"]
-    for key in ("symbol_name", "patch_key", "old_signature", "file_path"):
+    for key in ("symbol_name", "patch_key", "old_signature", "function_name", "file_path"):
         v = str(args.get(key, "") or "").strip()
         if not v:
             continue

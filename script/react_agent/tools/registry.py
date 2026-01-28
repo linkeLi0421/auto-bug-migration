@@ -11,8 +11,10 @@ ToolName = Literal[
     "get_patch",
     "search_patches",
     "get_error_patch_context",
+    "get_link_error_patch_context",
     "make_extra_patch_override",
     "make_error_patch_override",
+    "make_link_error_patch_override",
     "parse_build_errors",
 ]
 
@@ -94,6 +96,22 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         ),
     },
     {
+        "name": "get_link_error_patch_context",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "function_name": "string",
+            "error_text": "string?",
+            "context_lines": "int?",
+            "max_total_lines": "int?",
+        },
+        "description": (
+            "Map a linker undefined-reference error to a patch slice using file_path + function_name and return "
+            "the full unified-diff hunk excerpt (applyable) plus patch_minus_code (all '-' lines) and "
+            "error_func_code (the mapped '-' slice for that function)."
+        ),
+    },
+    {
         "name": "make_error_patch_override",
         "args": {
             "patch_path": "string",
@@ -110,6 +128,23 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "In merged/tail hunks (function-by-function mode), new_func_code MUST rewrite only the mapped slice for the active function (do not include other functions; "
             "do not paste unified-diff headers). patch_text is always returned in full (max_lines/max_chars do not truncate the diff) "
             "to avoid corrupt override patches."
+        ),
+    },
+    {
+        "name": "make_link_error_patch_override",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "function_name": "string",
+            "new_func_code": "string",
+            "context_lines": "int?",
+            "max_lines": "int?",
+            "max_chars": "int?",
+        },
+        "description": (
+            "Rewrite a linker-error mapped patch slice by replacing its '-' lines with the provided code (each line stored as '-...') "
+            "and recomputing hunk lengths. Use after get_link_error_patch_context when the build fails at link time "
+            "with 'undefined reference to ...' inside a __revert_* function."
         ),
     },
     {
