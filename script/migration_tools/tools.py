@@ -12,6 +12,27 @@ from .types import PatchInfo
 
 
 _HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
+_REVERT_FUNC_RE = re.compile(r"^__revert_[A-Za-z0-9]+_(?P<base>[A-Za-z_][A-Za-z0-9_]*)$")
+
+
+def _strip_revert_prefix(name: str) -> str:
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    m = _REVERT_FUNC_RE.match(raw)
+    if m:
+        return str(m.group("base") or "").strip()
+    return raw
+
+
+def _func_name_from_sig(signature: Optional[str]) -> str:
+    sig = str(signature or "").strip()
+    if not sig:
+        return ""
+    try:
+        return sig.split("(", 1)[0].split()[-1]
+    except Exception:
+        return ""
 
 
 def _parse_first_hunk(patch_text: str) -> Optional[Tuple[int, int, int, int]]:
@@ -596,12 +617,186 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
     }
 
 
+def _get_link_error_patch_from_bundle(
+    bundle: PatchBundle, *, patch_path: str, file_path: str, function_name: str
+) -> Dict[str, Any]:
+    """Map a linker undefined-reference error to a patch slice using file + function name."""
+    func = str(function_name or "").strip()
+    if not func:
+        raise ValueError("function_name must be non-empty")
+
+    base = _strip_revert_prefix(func)
+
+    def locate_hit_index(body: List[str]) -> int:
+        # Prefer exact `__revert_...` function name hits (most common for removed/recreated functions).
+        for i, line in enumerate(body):
+            if line.startswith("-") and func in line:
+                return i
+        if base and base != func:
+            for i, line in enumerate(body):
+                if not line.startswith("-"):
+                    continue
+                if "__revert_" in line and base in line and "(" in line:
+                    return i
+            for i, line in enumerate(body):
+                if line.startswith("-") and base in line and "(" in line:
+                    return i
+        return -1
+
+    def last_minus_end_index(body: List[str]) -> int:
+        for i in range(len(body) - 1, -1, -1):
+            if body[i].startswith("-"):
+                return i + 1
+        return 0
+
+    best_key: Optional[str] = None
+    best_score = -1
+    best_hit_idx = -1
+
+    for key in bundle.keys_sorted:
+        patch = bundle.patches[key]
+        if not _file_matches(patch.file_path_new, file_path):
+            continue
+
+        score = 0
+        text = str(patch.patch_text or "")
+        if func in text:
+            score = max(score, 100)
+
+        old_fn = _func_name_from_sig(patch.old_signature)
+        new_fn = _func_name_from_sig(patch.new_signature)
+        if base and base == old_fn:
+            score = max(score, 95)
+        if base and base == new_fn:
+            score = max(score, 90)
+
+        if patch.hiden_func_dict:
+            for sig in (patch.hiden_func_dict or {}).keys():
+                if base and _func_name_from_sig(sig) == base:
+                    score = max(score, 98)
+                    break
+
+        if score <= 0:
+            continue
+
+        patch_lines = text.splitlines()
+        first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+        body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+        body = patch_lines[body_start:] if body_start < len(patch_lines) else []
+        hit_idx = locate_hit_index(body)
+        if hit_idx >= 0:
+            score += 5
+
+        if score > best_score:
+            best_score = score
+            best_key = key
+            best_hit_idx = hit_idx
+
+    if not best_key or best_key not in bundle.patches:
+        return {
+            "patch_path": str(Path(patch_path)),
+            "file_path": file_path,
+            "line_number": 0,
+            "function_name": func,
+            "patch_key": None,
+            "old_signature": None,
+            "func_start_index": None,
+            "func_end_index": None,
+            "mapping_note": "No matching patch_key found for the provided file_path/function_name.",
+        }
+
+    patch = bundle.patches[best_key]
+    patch_lines = (patch.patch_text or "").splitlines()
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+    body = patch_lines[body_start:] if body_start < len(patch_lines) else []
+
+    func_start_index: Optional[int] = None
+    func_end_index: Optional[int] = None
+    old_function_signature: Optional[str] = patch.old_signature
+
+    hit_idx = best_hit_idx if best_hit_idx >= 0 else locate_hit_index(body)
+
+    if patch.hiden_func_dict:
+        items: List[Tuple[str, int]] = []
+        for sig, off in (patch.hiden_func_dict or {}).items():
+            try:
+                items.append((str(sig), int(off)))
+            except (TypeError, ValueError):
+                continue
+        items.sort(key=lambda x: x[1])
+
+        chosen_start: Optional[int] = None
+        chosen_sig: Optional[str] = None
+
+        if hit_idx >= 0:
+            for sig, off in items:
+                if off <= hit_idx:
+                    chosen_start = off
+                    chosen_sig = sig
+                else:
+                    break
+            if chosen_start is None and items:
+                chosen_sig, chosen_start = items[0]
+        else:
+            for sig, off in items:
+                if base and _func_name_from_sig(sig) == base:
+                    chosen_start = off
+                    chosen_sig = sig
+                    break
+
+        if chosen_start is not None:
+            idx = next((i for i, (_, off) in enumerate(items) if off == chosen_start), -1)
+            func_start_index = chosen_start
+            if idx >= 0 and idx + 1 < len(items):
+                func_end_index = items[idx + 1][1]
+            else:
+                func_end_index = last_minus_end_index(body)
+            if chosen_sig:
+                old_function_signature = chosen_sig
+    else:
+        if hit_idx >= 0:
+            s = hit_idx
+            while s > 0 and body[s - 1].startswith("-"):
+                s -= 1
+            e = hit_idx + 1
+            while e < len(body) and body[e].startswith("-"):
+                e += 1
+            func_start_index = s
+            func_end_index = e
+        elif "Recreated function" in (patch.patch_type or set()):
+            front = next((i for i, x in enumerate(body) if x.startswith("-")), -1)
+            if front >= 0:
+                func_start_index = front
+                func_end_index = last_minus_end_index(body)
+
+    return {
+        "patch_path": str(Path(patch_path)),
+        "file_path": file_path,
+        "line_number": 0,
+        "function_name": func,
+        "patch_key": best_key,
+        "old_signature": old_function_signature,
+        "func_start_index": func_start_index,
+        "func_end_index": func_end_index,
+        "mapping_note": "Mapped linker undefined-reference location by file_path + function_name.",
+    }
+
+
 def get_error_patch(
     *, patch_path: str, file_path: str, line_number: int, allowed_roots: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """Best-effort mapping from a build error location to a patch key in the bundle."""
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
     return _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
+
+
+def get_link_error_patch(
+    *, patch_path: str, file_path: str, function_name: str, allowed_roots: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Best-effort mapping from a linker error (undefined reference) to a patch key in the bundle."""
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    return _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
 
 
 def get_error_patch_context(
@@ -796,6 +991,163 @@ def get_error_patch_context(
         "pre_patch_file_path": pre_patch_file_path or None,
         "pre_patch_line_number": pre_patch_line_number,
         "mapping_note": mapping_note,
+    }
+
+
+def get_link_error_patch_context(
+    *,
+    patch_path: str,
+    file_path: str,
+    function_name: str,
+    error_text: str = "",
+    context_lines: int = 30,
+    max_total_lines: int = 200,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return patch context for a linker error mapped by file + function name."""
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
+    patch_key = mapping.get("patch_key")
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "patch_text_lines_total": 0,
+            "hunk_line_range": [0, 0],
+            "hunk_lines_total": 0,
+            "excerpt_line_range": [0, 0],
+            "excerpt_truncated": False,
+            "excerpt": "",
+            "patch_minus_code": "",
+            "patch_minus_code_lines_total": 0,
+            "error_func_code": "",
+            "error_func_code_lines_total": 0,
+            "defined_macros": [],
+            "referenced_macro_tokens": [],
+            "macro_tokens_not_defined_in_slice": [],
+            "symbols": [],
+            "pre_patch_file_path": None,
+            "pre_patch_line_number": None,
+            "mapping_note": str(mapping.get("mapping_note") or "No matching patch_key; cannot derive patch context."),
+        }
+
+    patch = bundle.patches[str(patch_key)]
+    patch_lines = (patch.patch_text or "").splitlines()
+    total = len(patch_lines)
+
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+
+    anchor = first_hunk_idx if first_hunk_idx >= 0 else 0
+    func_start = mapping.get("func_start_index")
+    if isinstance(func_start, int) and func_start >= 0:
+        anchor = max(0, min(body_start + func_start, total - 1))
+
+    hunk_start = first_hunk_idx
+    if anchor >= 0:
+        for i in range(anchor, -1, -1):
+            if patch_lines[i].startswith("@@"):
+                hunk_start = i
+                break
+
+    file_header_end = first_hunk_idx if first_hunk_idx >= 0 else 0
+    file_header_lines = patch_lines[:file_header_end] if file_header_end > 0 else []
+
+    if hunk_start is None or hunk_start < 0:
+        excerpt_lines = patch_lines
+        hunk_start = 0
+        hunk_end = total
+    else:
+        hunk_end = total
+        for j in range(hunk_start + 1, total):
+            line = patch_lines[j]
+            if line.startswith("@@") or line.startswith("diff --git "):
+                hunk_end = j
+                break
+        excerpt_lines = file_header_lines + patch_lines[hunk_start:hunk_end]
+
+    excerpt_truncated = False
+    excerpt_text = ("\n".join(excerpt_lines).rstrip("\n") + "\n") if excerpt_lines else ""
+
+    patch_minus_lines = _extract_minus_lines_from_unified_diff(excerpt_text)
+    patch_minus_code = "\n".join(patch_minus_lines).rstrip("\n")
+    patch_minus_total_lines = len(patch_minus_lines)
+
+    error_func_code = ""
+    error_func_total_lines = 0
+    func_end = mapping.get("func_end_index")
+    if isinstance(func_start, int) and isinstance(func_end, int) and func_start >= 0 and func_end > func_start:
+        body_len = max(len(patch_lines) - body_start, 0)
+        fs = max(0, min(int(func_start), body_len))
+        fe = max(0, min(int(func_end), body_len))
+        if fe > fs:
+            slice_lines = patch_lines[body_start + fs : body_start + fe]
+            func_minus_lines = [line[1:] for line in slice_lines if line.startswith("-") and not line.startswith("---")]
+            error_func_code = "\n".join(func_minus_lines).rstrip("\n")
+            error_func_total_lines = len(func_minus_lines)
+
+    defined_macros: set[str] = set()
+    for line in patch_minus_lines:
+        m = re.match(r"^\\s*#\\s*define\\s+([A-Za-z_][A-Za-z0-9_]*)\\b", line)
+        if m:
+            defined_macros.add(str(m.group(1)))
+
+    referenced_macro_tokens: set[str] = set()
+    for line in patch_minus_lines:
+        stripped = re.sub(r'\"([^\"\\\\]|\\\\.)*\"', '\"\"', line)
+        stripped = re.sub(r"//.*$", "", stripped)
+        stripped = re.sub(r"/\\*.*?\\*/", "", stripped)
+        for tok in re.findall(r"\\b[A-Za-z_][A-Za-z0-9_]*\\b", stripped):
+            if tok.isupper() and any(c.isalpha() for c in tok):
+                referenced_macro_tokens.add(tok)
+
+    missing_macro_tokens = referenced_macro_tokens - defined_macros
+    defined_macros_list = sorted(defined_macros)[:200]
+    referenced_macro_tokens_list = sorted(referenced_macro_tokens)[:400]
+    missing_macro_tokens_list = sorted(missing_macro_tokens)[:200]
+
+    symbols: List[str] = []
+    if error_text:
+        text = str(error_text)
+        patterns = [
+            r"unknown type name '([^']+)'",
+            r"use of undeclared identifier '([^']+)'",
+            r"implicit declaration of function\\s+'([^']+)'",
+            r"undeclared function '([^']+)'",
+            r"conflicting types for '([^']+)'",
+            r"undefined reference to\\s*[`']([^`']+)[`']",
+        ]
+        for pat in patterns:
+            symbols.extend(re.findall(pat, text))
+        # Dedup preserve order
+        seen: set[str] = set()
+        symbols = [s for s in symbols if s and not (s in seen or seen.add(s))]
+
+    return {
+        **mapping,
+        "patch_text_lines_total": total,
+        "hunk_line_range": [hunk_start, hunk_end],
+        "hunk_lines_total": max(hunk_end - hunk_start, 0),
+        "excerpt_line_range": [hunk_start, hunk_end],
+        "excerpt_truncated": excerpt_truncated,
+        "excerpt": excerpt_text,
+        "excerpt_note": (
+            "Returned the full unified-diff hunk containing the mapped slice (from @@ header to next @@/diff/EOF). "
+            "The excerpt includes the file-level diff header (diff --git/---/+++) to make it applyable."
+        ),
+        "patch_minus_code": patch_minus_code + ("\n" if patch_minus_code and not patch_minus_code.endswith("\n") else ""),
+        "patch_minus_code_lines_total": patch_minus_total_lines,
+        "error_func_code": error_func_code + ("\n" if error_func_code and not error_func_code.endswith("\n") else ""),
+        "error_func_code_lines_total": error_func_total_lines,
+        "defined_macros": defined_macros_list,
+        "referenced_macro_tokens": referenced_macro_tokens_list,
+        "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
+        "symbols": symbols,
+        "pre_patch_file_path": None,
+        "pre_patch_line_number": None,
+        "mapping_note": (
+            "Linker mapping by file+function does not provide pre_patch_* line mapping. "
+            f"context_lines/max_total_lines are accepted for API parity ({int(context_lines or 0)}, {int(max_total_lines or 0)})."
+        ),
     }
 
 
@@ -1064,6 +1416,221 @@ def make_error_patch_override(
         "patch_text_lines_returned": patch_returned_lines,
         "note": (
             "Rewrote the patch bundle's mapped patch slice by replacing '-' lines with the provided code. "
+            "Use the returned patch_text to update the patch bundle entry. "
+            "Note: patch_text is always returned in full (max_lines/max_chars are ignored for patch_text) to avoid corrupt patches."
+            + patch_hiden_note
+        ),
+    }
+    if hiden_func_dict_updated is not None:
+        out["hiden_func_dict_updated"] = hiden_func_dict_updated
+    return out
+
+
+def make_link_error_patch_override(
+    *,
+    patch_path: str,
+    file_path: str,
+    function_name: str,
+    new_func_code: str,
+    context_lines: int = 0,
+    max_lines: int = 2000,
+    max_chars: int = 200000,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Rewrite a mapped patch slice for linker errors by replacing its `-` lines.
+
+    This is the link-time counterpart to make_error_patch_override for errors like:
+      `encoding.c:(.text.__revert_...): undefined reference to \`defaultHandlers'`
+    """
+    new_code = _extract_first_code_fence(new_func_code)
+    if not new_code.strip():
+        raise ValueError("new_func_code must be non-empty")
+
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
+    patch_key = mapping.get("patch_key")
+
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No matching patch_key; cannot generate a patch-slice replacement diff.",
+        }
+
+    func_start = mapping.get("func_start_index")
+    func_end = mapping.get("func_end_index")
+    if not isinstance(func_start, int) or not isinstance(func_end, int) or func_start < 0 or func_end < 0:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Patch mapping lacks a rewriteable '-' slice; cannot rewrite patch.",
+        }
+
+    patch = bundle.patches[str(patch_key)]
+    rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
+    rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
+    if not rel_file:
+        rel_file = _norm_path(file_path).lstrip("./").lstrip("/")
+
+    patch_lines = (patch.patch_text or "").splitlines()
+    if len(patch_lines) < 4:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Patch text is too short to contain a unified-diff header.",
+        }
+
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+    body_len = len(patch_lines) - body_start
+    func_start_n = max(0, min(int(func_start), body_len))
+    func_end_n = max(0, min(int(func_end), body_len))
+    if func_end_n <= func_start_n:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Invalid patch slice indices (empty slice).",
+        }
+
+    slice_start = body_start + func_start_n
+    slice_end = body_start + func_end_n
+    slice_lines = patch_lines[slice_start:slice_end]
+    old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
+    old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
+
+    def _norm_for_compare(text: str) -> str:
+        return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
+
+    new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
+
+    if _norm_for_compare(old_func_code_full) == _norm_for_compare(new_code_norm):
+        raise ValueError("new_func_code is identical to the existing mapped '-' slice (no-op rewrite)")
+    new_func_lines = new_code_norm.splitlines()
+    if not any(line.strip() for line in new_func_lines):
+        raise ValueError("new_func_code must contain at least one non-empty line")
+    new_minus_lines = [f"-{line}" for line in new_func_lines]
+    new_len = len(new_func_lines)
+
+    rewritten_slice: List[str] = []
+    inserted = False
+    for line in slice_lines:
+        if line.startswith("-"):
+            if not inserted:
+                rewritten_slice.extend(new_minus_lines)
+                inserted = True
+            continue
+        rewritten_slice.append(line)
+    if not inserted:
+        return {
+            **mapping,
+            "old_func_code": "",
+            "old_func_code_truncated": False,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No '-' lines found in the mapped patch slice; cannot rewrite patch.",
+        }
+
+    delta = len(rewritten_slice) - len(slice_lines)
+    patch_lines[slice_start:slice_end] = rewritten_slice
+
+    hiden_func_dict_updated: Optional[Dict[str, int]] = None
+    if delta and getattr(patch, "hiden_func_dict", None):
+        try:
+            new_hiden: Dict[str, int] = {}
+            for sig, off in (patch.hiden_func_dict or {}).items():
+                off_i = int(off)
+                new_hiden[str(sig)] = off_i + delta if off_i >= func_end_n else off_i
+            hiden_func_dict_updated = new_hiden
+            patch_hiden_note = f" Updated hiden_func_dict offsets by {delta} lines."
+        except Exception:
+            patch_hiden_note = ""
+    else:
+        patch_hiden_note = ""
+
+    # Recompute hunk header lengths and recompute +new_start offsets (same logic as make_error_patch_override).
+    new_shift = 0
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if line.startswith("diff --git "):
+            new_shift = 0
+            i += 1
+            continue
+        if not line.startswith("@@"):
+            i += 1
+            continue
+        m = _HUNK_RE.match(line.strip())
+        if not m:
+            i += 1
+            continue
+        old_start = int(m.group("old_start"))
+        old_len_hdr = int(m.group("old_len") or 1)
+        new_start_hdr = int(m.group("new_start"))
+        new_len_hdr = int(m.group("new_len") or 1)
+
+        old_len = 0
+        new_len_hunk = 0
+        j = i + 1
+        while j < len(patch_lines):
+            body_line = patch_lines[j]
+            if body_line.startswith("@@") or body_line.startswith("diff --git "):
+                break
+            if not body_line:
+                j += 1
+                continue
+            prefix = body_line[0]
+            if prefix == " ":
+                old_len += 1
+                new_len_hunk += 1
+            elif prefix == "-":
+                old_len += 1
+            elif prefix == "+":
+                new_len_hunk += 1
+            elif prefix == "\\":
+                pass
+            j += 1
+
+        is_file_add = old_start == 0 and old_len_hdr == 0
+        is_file_del = new_start_hdr == 0 and new_len_hdr == 0
+        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
+        patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
+
+        new_shift += new_len_hunk - old_len
+        i = j
+
+    patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
+    patch_total_lines = len(patch_lines)
+
+    # Never truncate patch_text (always returned in full).
+    old_func_code, old_truncated, _, _ = _truncate_text(text=old_func_code_full, max_lines=200, max_chars=12000)
+    patch_text = patch_text_full
+    patch_truncated = False
+    patch_returned_lines = patch_total_lines
+
+    out: Dict[str, Any] = {
+        **mapping,
+        "file_path_patch": rel_file,
+        "old_func_code": old_func_code,
+        "old_func_code_truncated": old_truncated,
+        "new_func_code_lines": new_len,
+        "patch_text": patch_text,
+        "patch_text_truncated": patch_truncated,
+        "patch_text_lines_total": patch_total_lines,
+        "patch_text_lines_returned": patch_returned_lines,
+        "note": (
+            "Rewrote the patch bundle's mapped patch slice for a linker undefined-reference error by replacing '-' lines with the provided code. "
             "Use the returned patch_text to update the patch bundle entry. "
             "Note: patch_text is always returned in full (max_lines/max_chars are ignored for patch_text) to avoid corrupt patches."
             + patch_hiden_note

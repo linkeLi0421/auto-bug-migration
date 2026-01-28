@@ -13,9 +13,12 @@ if str(_SCRIPT_DIR) not in sys.path:
 from migration_tools.tools import (  # noqa: E402
     get_error_patch as _get_error_patch,
     get_error_patch_context as _get_error_patch_context,
+    get_link_error_patch as _get_link_error_patch,
+    get_link_error_patch_context as _get_link_error_patch_context,
     get_patch as _get_patch,
     list_patch_bundle as _list_patch_bundle,
     make_error_patch_override as _make_error_patch_override,
+    make_link_error_patch_override as _make_link_error_patch_override,
     parse_build_errors_tool as _parse_build_errors_tool,
     search_patches as _search_patches,
 )
@@ -67,6 +70,15 @@ def get_error_patch(*, patch_path: str, file_path: str, line_number: int) -> Dic
     )
 
 
+def get_link_error_patch(*, patch_path: str, file_path: str, function_name: str) -> Dict[str, Any]:
+    return _get_link_error_patch(
+        patch_path=patch_path,
+        file_path=file_path,
+        function_name=function_name,
+        allowed_roots=_allowed_roots_from_env(),
+    )
+
+
 def get_error_patch_context(
     *,
     patch_path: str,
@@ -80,6 +92,26 @@ def get_error_patch_context(
         patch_path=patch_path,
         file_path=file_path,
         line_number=line_number,
+        error_text=error_text,
+        context_lines=context_lines,
+        max_total_lines=max_total_lines,
+        allowed_roots=_allowed_roots_from_env(),
+    )
+
+
+def get_link_error_patch_context(
+    *,
+    patch_path: str,
+    file_path: str,
+    function_name: str,
+    error_text: str = "",
+    context_lines: int = 30,
+    max_total_lines: int = 200,
+) -> Dict[str, Any]:
+    return _get_link_error_patch_context(
+        patch_path=patch_path,
+        file_path=file_path,
+        function_name=function_name,
         error_text=error_text,
         context_lines=context_lines,
         max_total_lines=max_total_lines,
@@ -101,6 +133,28 @@ def make_error_patch_override(
         patch_path=patch_path,
         file_path=file_path,
         line_number=line_number,
+        new_func_code=new_func_code,
+        context_lines=context_lines,
+        max_lines=max_lines,
+        max_chars=max_chars,
+        allowed_roots=_allowed_roots_from_env(),
+    )
+
+
+def make_link_error_patch_override(
+    *,
+    patch_path: str,
+    file_path: str,
+    function_name: str,
+    new_func_code: str,
+    context_lines: int = 0,
+    max_lines: int = 2000,
+    max_chars: int = 200000,
+) -> Dict[str, Any]:
+    return _make_link_error_patch_override(
+        patch_path=patch_path,
+        file_path=file_path,
+        function_name=function_name,
         new_func_code=new_func_code,
         context_lines=context_lines,
         max_lines=max_lines,

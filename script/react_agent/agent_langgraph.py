@@ -21,7 +21,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     from langgraph_shim import END, StateGraph
 
-from build_log import find_first_fatal, iter_compiler_errors, load_build_log
+from build_log import find_first_fatal, iter_compiler_errors, iter_linker_errors, load_build_log
 from agent_tools import AgentTools, KbIndex, SourceManager
 from artifacts import offload_patch_output, resolve_artifact_dir
 from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
@@ -467,6 +467,23 @@ def _prioritize_focus_within_hunk(errors: List[Dict[str, Any]], focus_error: str
         if not isinstance(err, dict):
             continue
         ranked.append((0 if _error_matches_focus(err, needle) else 1, idx, err))
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    return [e for _, _, e in ranked]
+
+
+def _error_is_unknown_type_name(err: Dict[str, Any]) -> bool:
+    msg = str(err.get("msg", "") or "").lower()
+    raw = str(err.get("raw", "") or "").lower()
+    return "unknown type name" in msg or "unknown type name" in raw
+
+
+def _prioritize_unknown_type_name_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stable ordering helper: prioritize 'unknown type name' errors before everything else."""
+    ranked: List[tuple[int, int, Dict[str, Any]]] = []
+    for idx, err in enumerate(errors or []):
+        if not isinstance(err, dict):
+            continue
+        ranked.append((0 if _error_is_unknown_type_name(err) else 1, idx, err))
     ranked.sort(key=lambda t: (t[0], t[1]))
     return [e for _, _, e in ranked]
 
@@ -1492,15 +1509,18 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         return [], sources, msg
 
     combined_errors: List[Dict[str, Any]] = []
+    linker_errors: List[Dict[str, Any]] = []
     try:
         if build_text:
             combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=2))
+            linker_errors.extend(iter_linker_errors(build_text, snippet_lines=2))
         if check_text:
             combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=2))
+            linker_errors.extend(iter_linker_errors(check_text, snippet_lines=2))
     except Exception as exc:  # noqa: BLE001
         return [], sources, f"Failed to parse OSS-Fuzz logs: {type(exc).__name__}: {exc}"
 
-    # De-dup across build/check_build while preserving order.
+    # De-dup compiler errors across build/check_build while preserving order.
     seen: set[tuple[str, int, int, str]] = set()
     deduped: List[Dict[str, Any]] = []
     for err in combined_errors:
@@ -1514,6 +1534,21 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         if key in seen:
             continue
         seen.add(key)
+        deduped.append(err)
+
+    # De-dup linker errors (use file+function+msg as key since line is always 0).
+    linker_seen: set[tuple[str, str, str]] = set()
+    for err in linker_errors:
+        fp = str(err.get("file", "") or "").strip()
+        fn = str(err.get("function", "") or "").strip()
+        msg = str(err.get("msg", "") or "").strip()
+        if not fp or not fn or not msg:
+            continue
+        key = (fp, fn, msg)
+        if key in linker_seen:
+            continue
+        linker_seen.add(key)
+        err["kind"] = "linker"
         deduped.append(err)
 
     # OSS-Fuzz can fail without emitting compiler diagnostics (e.g. build script errors).
@@ -1573,6 +1608,7 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
 
     try:
         from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+        from migration_tools.tools import _get_link_error_patch_from_bundle as _glepb  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return {
             "status": "unknown",
@@ -1587,12 +1623,24 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
     for e in errors:
         fp = str(e.get("file", "") or "").strip()
         ln = int(e.get("line", 0) or 0)
-        if not fp or ln <= 0:
-            continue
+        fn = str(e.get("function", "") or "").strip()
+        is_linker = str(e.get("kind", "") or "").strip() == "linker"
+
+        # Skip invalid errors (compiler errors need line > 0, linker errors need function name)
+        if is_linker:
+            if not fp or not fn:
+                continue
+        else:
+            if not fp or ln <= 0:
+                continue
+
         mapping: Dict[str, Any] = {}
         patch_key = ""
         try:
-            raw_mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            if is_linker:
+                raw_mapping = _glepb(bundle, patch_path=state.patch_path, file_path=fp, function_name=fn)
+            else:
+                raw_mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
             mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
             patch_key = str(mapping.get("patch_key") or "").strip()
         except Exception as exc:  # noqa: BLE001
@@ -1605,7 +1653,10 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             "col": int(e.get("col", 0) or 0),
             "msg": str(e.get("msg", "") or "").strip(),
             "patch_key": patch_key,
+            "kind": "linker" if is_linker else "compiler",
         }
+        if is_linker:
+            item["function"] = fn
         if mapping:
             for k in ("old_signature", "func_start_index", "func_end_index"):
                 if k in mapping:
@@ -1688,7 +1739,7 @@ def _refresh_patch_scope_error_snapshot_from_latest_ossfuzz(state: AgentState) -
     if not in_active:
         return
 
-    in_active = _prioritize_warnings_within_hunk(in_active)
+    in_active = _prioritize_unknown_type_name_within_hunk(_prioritize_warnings_within_hunk(in_active))
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     state.function_groups = func_groups
     state.function_groups_total = func_total
@@ -1803,6 +1854,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
         [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key]
     )
     focus_error = str(getattr(cfg, "focus_error", "") or "").strip()
+    in_active = _prioritize_unknown_type_name_within_hunk(in_active)
     if focus_error:
         in_active = _prioritize_focus_within_hunk(in_active, focus_error)
     if not in_active:
@@ -3217,13 +3269,15 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     }
 
 
-def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+def _block_make_extra_patch_override_for_extra_hunk(
     state: AgentState, decision: Decision, *, remaining_steps: int
 ) -> Optional[Decision]:
-    """When the active error is inside an `_extra_*` hunk, don't keep extending it.
+    """When the active patch_key is `_extra_*`, don't call make_extra_patch_override.
 
-    For "unknown type name" inside `_extra_*`, the right fix is usually to inspect the existing extra hunk
-    and rewrite it (minimal slice rewrite), not to call make_extra_patch_override again.
+    If the agent is already handling an `_extra_*` hunk and encounters an error, calling
+    make_extra_patch_override again would just extend the same hunk, potentially creating
+    cascading issues or circular insertions. Instead, the agent should use make_error_patch_override
+    to directly fix/rewrite the `_extra_*` hunk content.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -3232,8 +3286,6 @@ def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
     if state.error_scope != "patch" or not state.patch_path:
         return None
     if not _active_patch_key_is_extra(state):
-        return None
-    if not _active_error_is_unknown_type_name(state):
         return None
 
     # Ensure mapping prerequisites first.
@@ -3262,8 +3314,8 @@ def _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
     return {
         "type": "tool",
         "thought": (
-            "Unknown type name inside an _extra_* hunk: inspect the current extra hunk slice and rewrite it "
-            "instead of extending it with make_extra_patch_override."
+            "Active patch_key is _extra_*: cannot use make_extra_patch_override to extend the same hunk. "
+            "Instead, inspect the current extra hunk slice and rewrite it with make_error_patch_override."
         ),
         "tool": "read_artifact",
         "args": {
@@ -3519,6 +3571,9 @@ _INCOMPLETE_TYPE_RE = re.compile(
 )
 _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<symbol>[^']+)'", re.IGNORECASE)
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
+_LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
+_LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
 
 
 def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
@@ -3660,6 +3715,45 @@ def _first_error_location(state: AgentState) -> tuple[str, int]:
     return "", 0
 
 
+def _first_link_error_location(state: AgentState) -> tuple[str, str]:
+    """Best-effort extraction of (file_path, function_name) from a linker error."""
+    # Check grouped_errors first (populated by multi_agent with linker errors)
+    if state.grouped_errors:
+        err = state.grouped_errors[0]
+        kind = str(err.get("kind", "") or "").strip().lower()
+        if kind == "linker":
+            fp = str(err.get("file", "") or "").strip()
+            fn = str(err.get("function", "") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    # Fall back to parsing error_line/snippet for linker patterns
+    for text in (str(state.error_line or ""), str(state.snippet or "")):
+        # Pattern: "file.c:(.text.func+0x...): undefined reference"
+        m = _LINK_UNDEF_SECTION_LOC_RE.search(text)
+        if m:
+            fp = str(m.group("file") or "").strip()
+            fn = str(m.group("func") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    # Pattern: "in function `func'"
+    for text in (str(state.error_line or ""), str(state.snippet or "")):
+        m = _LINK_IN_FUNCTION_RE.search(text)
+        if m:
+            fn = str(m.group("func") or "").strip()
+            # Try to get file from grouped_errors or active state
+            fp = ""
+            if state.grouped_errors:
+                fp = str(state.grouped_errors[0].get("file", "") or "").strip()
+            if not fp:
+                fp = str(getattr(state, "active_file_path", "") or "").strip()
+            if fp and fn:
+                return fp, fn
+
+    return "", ""
+
+
 def _active_override_location(state: AgentState) -> tuple[str, int]:
     fp = str(getattr(state, "active_file_path", "") or "").strip()
     ln = int(getattr(state, "active_line_number", 0) or 0)
@@ -3753,6 +3847,9 @@ def _should_require_make_error_patch_override(state: AgentState) -> bool:
     has_base = bool(str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()) or _has_tool_call(
         state, "get_error_patch_context"
     )
+    if not has_base:
+        # Also check for linker error context
+        has_base = _has_tool_call(state, "get_link_error_patch_context")
     if not has_base:
         return False
     return True
@@ -3902,24 +3999,44 @@ def _next_patch_prereq_tool(state: AgentState) -> Optional[Decision]:
     if str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip():
         return None
 
+    # Try compiler error location first
     file_path, line_number = _first_error_location(state)
-    if not file_path or line_number <= 0:
-        return None
-
-    if not _has_tool_call(state, "get_error_patch_context"):
-        return {
-            "type": "tool",
-            "thought": "First map the migrated error location to its patch context.",
-            "tool": "get_error_patch_context",
-            "args": {
-                "patch_path": state.patch_path,
-                "file_path": file_path,
-                "line_number": line_number,
-                "error_text": str(state.error_line or "")[:400],
-                "context_lines": 80,
-                "max_total_lines": 800,
-            },
-        }
+    if file_path and line_number > 0:
+        if not _has_tool_call(state, "get_error_patch_context"):
+            return {
+                "type": "tool",
+                "thought": "First map the migrated error location to its patch context.",
+                "tool": "get_error_patch_context",
+                "args": {
+                    "patch_path": state.patch_path,
+                    "file_path": file_path,
+                    "line_number": line_number,
+                    "error_text": str(state.error_line or "")[:400],
+                    "context_lines": 80,
+                    "max_total_lines": 800,
+                },
+            }
+    else:
+        # Try linker error location (undefined reference errors)
+        link_file, link_func = _first_link_error_location(state)
+        if link_file and link_func:
+            if not _has_tool_call(state, "get_link_error_patch_context"):
+                return {
+                    "type": "tool",
+                    "thought": "Map the linker undefined-reference error to its patch context.",
+                    "tool": "get_link_error_patch_context",
+                    "args": {
+                        "patch_path": state.patch_path,
+                        "file_path": link_file,
+                        "function_name": link_func,
+                        "error_text": str(state.error_line or "")[:400],
+                        "context_lines": 80,
+                        "max_total_lines": 800,
+                    },
+                }
+        else:
+            # No valid error location found
+            return None
 
     structs = _structs_to_compare(state)
     if structs:
@@ -4750,7 +4867,11 @@ def _run_langgraph(
 
                 last_tool = _last_tool_call_name(st)
                 file_path, line_number = _first_error_location(st)
+                # Also check for linker error location
+                link_file, link_func = "", ""
                 if not file_path or line_number <= 0:
+                    link_file, link_func = _first_link_error_location(st)
+                if (not file_path or line_number <= 0) and (not link_file or not link_func):
                     return {
                         "state": st,
                         "final": {
@@ -4762,6 +4883,9 @@ def _run_langgraph(
                             "error": _error_payload(st),
                         },
                     }
+                # For linker errors, use link_file as file_path for downstream logic
+                if link_file and link_func and (not file_path or line_number <= 0):
+                    file_path = link_file
 
                 if _undeclared_symbol_guardrail_enabled():
                     undeclared_symbol = _extract_undeclared_symbol_name(st, active_only=True)
@@ -4820,6 +4944,10 @@ def _run_langgraph(
                         or _last_artifact_path(st, "get_error_patch_context", "error_func_code")
                         or _last_artifact_path(st, "get_error_patch_context", "patch_minus_code")
                         or _last_artifact_path(st, "get_error_patch_context", "excerpt")
+                        # Also check linker error context artifacts
+                        or _last_artifact_path(st, "get_link_error_patch_context", "error_func_code")
+                        or _last_artifact_path(st, "get_link_error_patch_context", "patch_minus_code")
+                        or _last_artifact_path(st, "get_link_error_patch_context", "excerpt")
                     )
                     forced_read: Decision = {
                         "type": "tool",
@@ -5298,13 +5426,13 @@ def _run_langgraph(
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
 
-        forced_extra_unknown = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(
+        forced_extra_block = _block_make_extra_patch_override_for_extra_hunk(
             st, decision, remaining_steps=remaining
         )
-        if forced_extra_unknown:
-            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_unknown)
-            _validate_tool_decision(forced_extra_unknown)
-            return {"state": st, "pending": forced_extra_unknown}
+        if forced_extra_block:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_block)
+            _validate_tool_decision(forced_extra_block)
+            return {"state": st, "pending": forced_extra_block}
 
         if tool == "read_artifact" and remaining < 3:
             return {
@@ -5819,6 +5947,7 @@ def main(argv: List[str]) -> int:
     if cfg.error_scope == "patch" and patch_path:
         try:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
+            from tools.migration_tools import get_link_error_patch  # noqa: PLC0415
 
             errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -5839,6 +5968,29 @@ def main(argv: List[str]) -> int:
                     if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
                         first_focus_key = key
                     groups.setdefault(key, []).append(enriched)
+
+            # Also process linker errors (undefined reference errors from the linker stage).
+            for err in iter_linker_errors(build_log, snippet_lines=10):
+                fp = str(err.get("file", "") or "").strip()
+                fn = str(err.get("function", "") or "").strip()
+                if not fp or not fn:
+                    continue
+                mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=fn)
+                key = str(mapping.get("patch_key") or "").strip()
+                if not key:
+                    continue
+                enriched = dict(err)
+                enriched["patch_key"] = key
+                enriched["old_signature"] = mapping.get("old_signature")
+                enriched["func_start_index"] = mapping.get("func_start_index")
+                enriched["func_end_index"] = mapping.get("func_end_index")
+                enriched["kind"] = "linker"
+                if not first_mapped_key:
+                    first_mapped_key = key
+                if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
+                    first_focus_key = key
+                groups.setdefault(key, []).append(enriched)
+
             if groups:
                 focus = str(getattr(args, "focus_patch_key", "") or "").strip()
                 if focus and focus in groups:
@@ -5847,9 +5999,8 @@ def main(argv: List[str]) -> int:
                     patch_key = first_focus_key
                 else:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
-                full_grouped = _prioritize_focus_within_hunk(
-                    _prioritize_warnings_within_hunk(groups[patch_key]), focus_error
-                )
+                ranked = _prioritize_unknown_type_name_within_hunk(_prioritize_warnings_within_hunk(groups[patch_key]))
+                full_grouped = _prioritize_focus_within_hunk(ranked, focus_error)
                 full_grouped_for_history = list(full_grouped)
                 function_groups, function_groups_total, function_groups_truncated = _summarize_function_groups(full_grouped)
                 grouped_errors = full_grouped
@@ -5904,6 +6055,20 @@ def main(argv: List[str]) -> int:
                     active_func_end_index = fe
         except Exception:
             pass
+
+    # Fallback for linker errors (line_number=0): extract func indices from grouped_errors if available.
+    if cfg.error_scope == "patch" and patch_path and grouped_errors and active_line_number == 0:
+        first_err = grouped_errors[0]
+        if not active_patch_key:
+            active_patch_key = str(first_err.get("patch_key", "") or "").strip()
+        if not active_old_signature:
+            active_old_signature = str(first_err.get("old_signature", "") or "").strip()
+        fs = first_err.get("func_start_index")
+        fe = first_err.get("func_end_index")
+        if isinstance(fs, int) and active_func_start_index is None:
+            active_func_start_index = fs
+        if isinstance(fe, int) and active_func_end_index is None:
+            active_func_end_index = fe
 
     active_patch_types: List[str] = []
     if cfg.error_scope == "patch" and patch_path and active_patch_key:
