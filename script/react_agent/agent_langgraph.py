@@ -5712,6 +5712,83 @@ def _run_langgraph(
                     sys.stderr.write(f"    - {p}\n")
             sys.stderr.flush()
 
+        if obs.ok and obs.tool == "make_link_error_patch_override":
+            st.patch_result = obs.output if isinstance(obs.output, dict) else None
+            st.pending_patch = None
+            st.ossfuzz_test_attempted = False
+
+            if isinstance(obs.output, dict):
+                st.active_patch_key = str(obs.output.get("patch_key") or st.active_patch_key or st.patch_key or "").strip()
+                st.active_file_path = str(obs.output.get("file_path") or st.active_file_path or "").strip()
+                st.active_old_signature = str(obs.output.get("old_signature") or st.active_old_signature or "").strip()
+                fs = obs.output.get("func_start_index")
+                fe = obs.output.get("func_end_index")
+                if isinstance(fs, int):
+                    st.active_func_start_index = fs
+                if isinstance(fe, int):
+                    st.active_func_end_index = fe
+
+            patch_text = ""
+            patch_text_path = ""
+            override_key = ""
+            override_path = ""
+            if isinstance(st.patch_result, dict):
+                pt = st.patch_result.get("patch_text")
+                if isinstance(pt, dict):
+                    patch_text_path = str(pt.get("artifact_path", "") or "").strip()
+                    if patch_text_path:
+                        try:
+                            patch_text = _read_text(patch_text_path)
+                        except Exception:
+                            patch_text = ""
+                elif isinstance(pt, str):
+                    patch_text = pt
+
+            if patch_text.strip():
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                override_path, override_err = _persist_override_diff(
+                    st,
+                    patch_key=override_key,
+                    patch_text=patch_text,
+                    label=f"override_{override_key}",
+                )
+                if override_path and not override_err:
+                    st.patch_override_by_key[override_key] = override_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+
+                effective_path, effective_err = _write_effective_patch_bundle(
+                    st,
+                    patch_key=override_key,
+                    patch_text=patch_text,
+                )
+                if effective_path and not effective_err:
+                    st.patch_path = effective_path
+                elif patch_text_path:
+                    st.patch_override_by_key.setdefault(override_key, patch_text_path)
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+            elif patch_text_path:
+                override_key = str(st.active_patch_key or st.patch_key or "").strip()
+                st.patch_override_by_key[override_key] = patch_text_path
+                st.patch_override_paths = list(st.patch_override_by_key.values())
+
+            sys.stderr.write("[make_link_error_patch_override] artifacts:\n")
+            if patch_text_path:
+                sys.stderr.write(f"  patch_text: {patch_text_path}\n")
+            if override_key:
+                sys.stderr.write(f"  patch_key: {override_key}\n")
+            if override_path:
+                sys.stderr.write(f"  override_diff: {override_path}\n")
+            if str(st.patch_path or "").strip():
+                sys.stderr.write(f"  effective_patch_bundle: {str(st.patch_path).strip()}\n")
+            if st.patch_override_paths:
+                sys.stderr.write("  patch_override_paths:\n")
+                for p in st.patch_override_paths:
+                    sys.stderr.write(f"    - {p}\n")
+            sys.stderr.flush()
+
         if obs.tool == "ossfuzz_apply_patch_and_test":
             st.ossfuzz_test_attempted = True
             if obs.ok:

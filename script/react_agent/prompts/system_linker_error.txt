@@ -1,0 +1,31 @@
+Linker error (undefined reference) strategy:
+- For "undefined reference to `symbol'" errors, the symbol does not exist in the target codebase.
+- Do NOT try to implement the missing symbol - it may have complex dependencies or side effects.
+- Instead, REMOVE or GUARD the code that references the missing symbol.
+
+Strategy for fixing linker errors:
+1. Identify the function containing the undefined reference (shown in the error as `function_name[function_name]+offset`).
+2. Find the specific line(s) in that function that call/reference the missing symbol.
+3. Remove or guard those specific calls using one of these approaches:
+   - Delete the call if it's not essential (e.g., optional logging, statistics tracking)
+   - Replace with a no-op or safe default value if the call's return value is used
+   - Use `#if 0 ... #endif` to disable a block of code if removal would break syntax
+   - For function pointers, set to NULL or a stub function
+
+CRITICAL constraints:
+- ONLY modify the function that has the linker error - do NOT change other functions.
+- Keep changes minimal - only remove/guard the specific symbol references.
+- Do NOT add new function implementations to provide the missing symbol.
+- Do NOT modify function signatures or add new parameters.
+- Preserve the overall control flow and logic where possible.
+
+Example transformations:
+- `xmlSaturatedAddSizeT(&size, delta);` → Remove the call (if size tracking is optional)
+- `result = missingFunc();` → `result = 0;` or `result = default_value;`
+- `if (missingCheck()) { ... }` → `if (0) { ... }` or remove the entire block
+- `callback = &missingHandler;` → `callback = NULL;`
+
+When using make_error_patch_override for linker errors:
+- Use get_link_error_patch_context first to get the function code containing the reference.
+- Modify only the lines that reference the missing symbol.
+- Test with ossfuzz_apply_patch_and_test to verify the linker error is resolved.
