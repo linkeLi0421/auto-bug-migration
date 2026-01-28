@@ -1528,6 +1528,86 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     return True, ''
 
 
+def call_react_agent(
+    build_log_path: str,
+    patch_path: str,
+    project: str,
+    old_commit: str,
+    new_commit: str,
+    build_csv: str,
+    fuzz_target: str,
+    v1_json_dir: str,
+    v2_json_dir: str,
+    v1_src: str,
+    v2_src: str,
+    sanitizer: str = "address",
+    arch: str = "x86_64",
+    max_steps: int = 100,
+    jobs: int = 10,
+    max_groups: int = 100,
+    ossfuzz_loop_max: int = 100,
+    max_restarts_per_hunk: int = 3,
+    openai_model: str = "gpt-5-mini",
+    openai_max_tokens: int = 64000,
+) -> dict:
+    """Call the multi-agent to fix build errors.
+
+    Returns dict with keys: success, output, returncode
+    """
+    agent_script = os.path.join(current_file_path, "react_agent", "multi_agent.py")
+
+    cmd = [
+        sys.executable,
+        agent_script,
+        build_log_path,
+        "--patch-path", patch_path,
+        "--jobs", str(jobs),
+        "--max-groups", str(max_groups),
+        "--model", "openai",
+        "--tools", "real",
+        "--max-steps", str(max_steps),
+        "--recursion-limit", "0",
+        "--ossfuzz-project", project,
+        "--ossfuzz-commit", new_commit,
+        "--ossfuzz-build-csv", build_csv,
+        "--ossfuzz-sanitizer", sanitizer,
+        "--ossfuzz-arch", arch,
+        "--ossfuzz-engine", "libfuzzer",
+        "--ossfuzz-fuzz-target", fuzz_target,
+        "--ossfuzz-use-sudo",
+        "--auto-ossfuzz-loop",
+        "--ossfuzz-loop-max", str(ossfuzz_loop_max),
+        "--v1-json-dir", v1_json_dir,
+        "--v2-json-dir", v2_json_dir,
+        "--v1-src", v1_src,
+        "--v2-src", v2_src,
+        "--openai-model", openai_model,
+        "--openai-base-url", "https://api.openai.com/v1",
+        "--openai-max-tokens", str(openai_max_tokens),
+        "--output-format", "none",
+        "--max-restarts-per-hunk", str(max_restarts_per_hunk),
+        "--auto-continue-on-link-errors",
+        "--refresh-error-queue", "never",
+    ]
+
+    logger.info(f"Calling react multi-agent: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+
+    try:
+        output = json.loads(result.stdout) if result.stdout.strip() else {}
+    except json.JSONDecodeError:
+        output = {"raw_stdout": result.stdout, "raw_stderr": result.stderr}
+
+    # Check if agent succeeded - multi_agent uses returncode 0 for success
+    success = result.returncode == 0
+
+    return {
+        "success": success,
+        "output": output,
+        "returncode": result.returncode,
+    }
+
+
 def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit, next_commit, target_repo_path):
     # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
@@ -3573,8 +3653,41 @@ def apply_and_test_patches(
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
-        with open('/home/user/oss-fuzz-for-select/tmp3', 'w') as f:
+        # Write build log to temp file for agent
+        build_log_temp = os.path.join(data_path, "tmp_patch", f"{target}_build.log")
+        with open(build_log_temp, 'w') as f:
             f.write(error_log)
+
+        # Call react multi-agent to fix build errors
+        v1_json_dir = os.path.join(data_path, f"{target}-{commit['commit_id']}")
+        v2_json_dir = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
+        agent_result = call_react_agent(
+            build_log_path=build_log_temp,
+            patch_path=patch_file_binary,
+            project=target,
+            old_commit=commit['commit_id'],
+            new_commit=next_commit['commit_id'],
+            build_csv=args.build_csv,
+            fuzz_target=fuzzer,
+            v1_json_dir=v1_json_dir,
+            v2_json_dir=v2_json_dir,
+            v1_src=target_repo_path,
+            v2_src=target_repo_path,
+            sanitizer=sanitizer,
+            arch=arch,
+        )
+
+        if agent_result["success"]:
+            logger.info("React multi-agent successfully fixed build errors")
+            # The agent may have updated the patch bundle, rebuild to verify
+            build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+            if build_success:
+                break
+        else:
+            logger.info(f"React multi-agent did not fully fix errors (returncode={agent_result['returncode']})")
+        break
+
+        # Continue with existing manual error handling as fallback
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
         
         # Check if build error results are the same as last iteration
