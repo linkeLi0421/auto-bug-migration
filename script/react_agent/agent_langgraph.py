@@ -650,8 +650,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     try:
         if build_text:
             combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=0))
+            combined_errors.extend(iter_linker_errors(build_text, snippet_lines=0))
         if check_text:
             combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=0))
+            combined_errors.extend(iter_linker_errors(check_text, snippet_lines=0))
     except Exception as exc:  # noqa: BLE001
         return {"status": "unknown", "reason": f"Failed to parse logs: {exc}", "log_artifacts": sources}
 
@@ -686,10 +688,35 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     bundle: Any = None
     bundle_err: Optional[str] = None
     get_error_patch_from_bundle: Any = None
+    get_link_error_patch_from_bundle: Any = None
     mapping_cache: Dict[tuple[str, int], Dict[str, Any]] = {}
+    linker_mapping_cache: Dict[tuple[str, str], Dict[str, Any]] = {}
+
+    def _ensure_bundle_loaded() -> bool:
+        nonlocal bundle, bundle_err, get_error_patch_from_bundle, get_link_error_patch_from_bundle
+        if bundle_err is not None:
+            return False
+        if bundle is not None:
+            return True
+        try:
+            bundle, bundle_err2 = _load_effective_patch_bundle_for_mapping(state)
+            if bundle_err2 or bundle is None:
+                bundle_err = str(bundle_err2 or "Failed to load patch bundle.")
+                return False
+            script_dir = Path(__file__).resolve().parents[1]
+            if str(script_dir) not in sys.path:
+                sys.path.insert(0, str(script_dir))
+            from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+            from migration_tools.tools import _get_link_error_patch_from_bundle as _glepb  # type: ignore
+            get_error_patch_from_bundle = _gepb
+            get_link_error_patch_from_bundle = _glepb
+            return True
+        except Exception as exc:  # noqa: BLE001
+            bundle_err = f"{type(exc).__name__}: {exc}"
+            return False
 
     def mapping_for_error(file_path: str, line_number: int) -> Dict[str, Any]:
-        nonlocal bundle, bundle_err, get_error_patch_from_bundle
+        nonlocal bundle_err
         fp = str(file_path or "").strip()
         ln = int(line_number or 0)
         if not (state.patch_path and fp and ln > 0):
@@ -698,22 +725,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
         cached = mapping_cache.get(cache_key)
         if isinstance(cached, dict):
             return cached
-        if bundle_err is not None:
+        if not _ensure_bundle_loaded():
             mapping_cache[cache_key] = {}
             return {}
         try:
-            if bundle is None:
-                bundle, bundle_err2 = _load_effective_patch_bundle_for_mapping(state)
-                if bundle_err2 or bundle is None:
-                    bundle_err = str(bundle_err2 or "Failed to load patch bundle.")
-                    mapping_cache[cache_key] = {}
-                    return {}
-                script_dir = Path(__file__).resolve().parents[1]
-                if str(script_dir) not in sys.path:
-                    sys.path.insert(0, str(script_dir))
-                from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
-
-                get_error_patch_from_bundle = _gepb
             mapping = get_error_patch_from_bundle(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
             mapping_cache[cache_key] = mapping if isinstance(mapping, dict) else {}
             return mapping_cache[cache_key]
@@ -722,8 +737,33 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             mapping_cache[cache_key] = {}
             return {}
 
-    def patch_key_for_error(file_path: str, line_number: int) -> str:
-        mapping = mapping_for_error(file_path, line_number)
+    def mapping_for_linker_error(file_path: str, function_name: str) -> Dict[str, Any]:
+        nonlocal bundle_err
+        fp = str(file_path or "").strip()
+        fn = str(function_name or "").strip()
+        if not (state.patch_path and fp and fn):
+            return {}
+        cache_key = (fp, fn)
+        cached = linker_mapping_cache.get(cache_key)
+        if isinstance(cached, dict):
+            return cached
+        if not _ensure_bundle_loaded():
+            linker_mapping_cache[cache_key] = {}
+            return {}
+        try:
+            mapping = get_link_error_patch_from_bundle(bundle, patch_path=state.patch_path, file_path=fp, function_name=fn)
+            linker_mapping_cache[cache_key] = mapping if isinstance(mapping, dict) else {}
+            return linker_mapping_cache[cache_key]
+        except Exception as exc:  # noqa: BLE001
+            bundle_err = f"{type(exc).__name__}: {exc}"
+            linker_mapping_cache[cache_key] = {}
+            return {}
+
+    def patch_key_for_error(file_path: str, line_number: int, function_name: str = "", is_linker: bool = False) -> str:
+        if is_linker and function_name:
+            mapping = mapping_for_linker_error(file_path, function_name)
+        else:
+            mapping = mapping_for_error(file_path, line_number)
         if not isinstance(mapping, dict):
             return ""
         return str(mapping.get("patch_key") or "").strip()
@@ -741,10 +781,22 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
         for err in combined_errors:
             fp = str(err.get("file", "") or "").strip()
             ln = int(err.get("line", 0) or 0)
+            fn = str(err.get("function", "") or "").strip()
             msg = str(err.get("msg", "") or "").strip()
-            if not fp or ln <= 0 or not msg:
-                continue
-            mapping = mapping_for_error(fp, ln)
+            is_linker = str(err.get("kind", "") or "").strip() == "linker"
+
+            # Skip invalid errors (compiler errors need line > 0, linker errors need function name)
+            if is_linker:
+                if not fp or not fn or not msg:
+                    continue
+            else:
+                if not fp or ln <= 0 or not msg:
+                    continue
+
+            if is_linker:
+                mapping = mapping_for_linker_error(fp, fn)
+            else:
+                mapping = mapping_for_error(fp, ln)
             if not isinstance(mapping, dict):
                 continue
             err_patch_key = str(mapping.get("patch_key") or "").strip()
@@ -756,6 +808,8 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                     "raw": err.get("raw", ""),
                     "file": fp,
                     "line": ln,
+                    "function": fn,
+                    "kind": "linker" if is_linker else "compiler",
                     "patch_key": err_patch_key,
                     "old_signature": err_sig,
                     "msg": msg,
@@ -768,7 +822,14 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                 "raw": str(e.get("raw", "") or "").strip(),
                 "file": str(e.get("file", "") or "").strip(),
                 "line": int(e.get("line", 0) or 0),
-                "patch_key": patch_key_for_error(str(e.get("file", "") or ""), int(e.get("line", 0) or 0)),
+                "function": str(e.get("function", "") or "").strip(),
+                "kind": str(e.get("kind", "") or "").strip(),
+                "patch_key": patch_key_for_error(
+                    str(e.get("file", "") or ""),
+                    int(e.get("line", 0) or 0),
+                    function_name=str(e.get("function", "") or ""),
+                    is_linker=str(e.get("kind", "") or "").strip() == "linker",
+                ),
                 "msg": str(e.get("msg", "") or "").strip(),
             }
             for e in combined_errors
@@ -792,10 +853,12 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     for err in combined_errors:
         fp = str(err.get("file", "") or "").strip()
         ln = int(err.get("line", 0) or 0)
+        fn = str(err.get("function", "") or "").strip()
         msg = str(err.get("msg", "") or "").strip()
+        is_linker = str(err.get("kind", "") or "").strip() == "linker"
         if not fp or not msg:
             continue
-        err_patch_key = patch_key_for_error(fp, ln)
+        err_patch_key = patch_key_for_error(fp, ln, function_name=fn, is_linker=is_linker)
         for t in targets:
             t_patch_key = str(t.get("patch_key", "") or "").strip()
             if t_patch_key:
@@ -808,7 +871,7 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                     continue
                 matched_keys.add(k)
                 matched.append(
-                    {"raw": err.get("raw", ""), "file": fp, "line": ln, "patch_key": err_patch_key, "msg": msg}
+                    {"raw": err.get("raw", ""), "file": fp, "line": ln, "function": fn, "kind": "linker" if is_linker else "compiler", "patch_key": err_patch_key, "msg": msg}
                 )
                 continue
             if not same_file(fp, t.get("file", "")):
@@ -819,7 +882,7 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             if k in matched_keys:
                 continue
             matched_keys.add(k)
-            matched.append({"raw": err.get("raw", ""), "file": fp, "line": ln, "patch_key": err_patch_key, "msg": msg})
+            matched.append({"raw": err.get("raw", ""), "file": fp, "line": ln, "function": fn, "kind": "linker" if is_linker else "compiler", "patch_key": err_patch_key, "msg": msg})
 
     fixed = len(matched) == 0
     other = [
@@ -827,7 +890,14 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             "raw": str(e.get("raw", "") or "").strip(),
             "file": str(e.get("file", "") or "").strip(),
             "line": int(e.get("line", 0) or 0),
-            "patch_key": patch_key_for_error(str(e.get("file", "") or ""), int(e.get("line", 0) or 0)),
+            "function": str(e.get("function", "") or "").strip(),
+            "kind": str(e.get("kind", "") or "").strip(),
+            "patch_key": patch_key_for_error(
+                str(e.get("file", "") or ""),
+                int(e.get("line", 0) or 0),
+                function_name=str(e.get("function", "") or ""),
+                is_linker=str(e.get("kind", "") or "").strip() == "linker",
+            ),
             "msg": str(e.get("msg", "") or "").strip(),
         }
         for e in combined_errors
@@ -1174,8 +1244,12 @@ _PATCH_TOOLS_WITH_PATCH_PATH: set[str] = {
     "search_patches",
     "get_error_patch",
     "get_error_patch_context",
+    "get_link_error_patch",
+    "get_link_error_patch_context",
     "make_extra_patch_override",
     "make_error_patch_override",
+    "make_link_error_patch_override",
+    "ossfuzz_apply_patch_and_test",
 }
 
 
@@ -1827,6 +1901,7 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
 
     try:
         from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+        from migration_tools.tools import _get_link_error_patch_from_bundle as _glepb  # type: ignore
     except Exception:
         return None
 
@@ -1834,14 +1909,29 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     for e in errors:
         fp = str(e.get("file", "") or "").strip()
         ln = int(e.get("line", 0) or 0)
-        if not fp or ln <= 0:
-            continue
+        fn = str(e.get("function", "") or "").strip()
+        is_linker = str(e.get("kind", "") or "").strip() == "linker"
+
+        # Skip invalid errors (compiler errors need line > 0, linker errors need function name)
+        if is_linker:
+            if not fp or not fn:
+                continue
+        else:
+            if not fp or ln <= 0:
+                continue
+
         try:
-            mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            if is_linker:
+                mapping = _glepb(bundle, patch_path=state.patch_path, file_path=fp, function_name=fn)
+            else:
+                mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
         except Exception:
             mapping = {}
         patch_key = str((mapping or {}).get("patch_key") or "").strip()
         item = dict(e)
+        item["kind"] = "linker" if is_linker else "compiler"
+        if is_linker:
+            item["function"] = fn
         if patch_key:
             item["patch_key"] = patch_key
         if isinstance(mapping, dict):
@@ -5713,6 +5803,7 @@ def _run_langgraph(
             sys.stderr.flush()
 
         if obs.ok and obs.tool == "make_link_error_patch_override":
+            st.patch_generated = True
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
             st.ossfuzz_test_attempted = False
