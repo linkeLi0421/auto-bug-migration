@@ -1437,6 +1437,7 @@ def make_extra_patch_override(
             }
     else:
         existing = str(getattr(patch, "patch_text", "") or "")
+
     if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
         # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.
         updated_existing = ""

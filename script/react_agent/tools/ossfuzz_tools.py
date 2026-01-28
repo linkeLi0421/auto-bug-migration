@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from artifacts import ArtifactStore
+
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PATCH_APPLY_ERROR_PATTERNS = [
@@ -1150,6 +1152,28 @@ def ossfuzz_apply_patch_and_test(
             run_fuzzer_output = run_res["output"]
             run_fuzzer_ok = run_res["returncode"] == 0
 
+    # Write build outputs as artifacts under the same directory as the merged patch
+    artifact_dir = patch_file.parent
+    store = ArtifactStore(artifact_dir, overwrite=False)
+
+    build_output_ref = store.write_text(
+        name="ossfuzz_apply_patch_and_test_build_output",
+        text=build_res["output"],
+        ext=".log",
+    )
+    check_build_output_ref = store.write_text(
+        name="ossfuzz_apply_patch_and_test_check_build_output",
+        text=check_res["output"],
+        ext=".log",
+    )
+    run_fuzzer_output_ref = None
+    if run_fuzzer_output:
+        run_fuzzer_output_ref = store.write_text(
+            name="ossfuzz_apply_patch_and_test_run_fuzzer_output",
+            text=run_fuzzer_output,
+            ext=".log",
+        )
+
     return {
         "project": project_name,
         "commit": commit_id,
@@ -1165,7 +1189,7 @@ def ossfuzz_apply_patch_and_test(
         "build_cmd": build_cmd,
         "check_build_cmd": check_build_cmd,
         "run_fuzzer_cmd": run_fuzzer_cmd,
-        "build_output": build_res["output"],
-        "check_build_output": check_res["output"],
-        "run_fuzzer_output": run_fuzzer_output,
+        "build_output": build_output_ref.to_dict(),
+        "check_build_output": check_build_output_ref.to_dict(),
+        "run_fuzzer_output": run_fuzzer_output_ref.to_dict() if run_fuzzer_output_ref else "",
     }
