@@ -167,10 +167,19 @@ def _allowed_patch_roots_from_env() -> list[str] | None:
 
 
 def _infer_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
+    # Build reverse mapping: safe_name -> original patch_key
+    safe_to_original: Dict[str, str] = {}
+    for pk in patch_keys:
+        safe_name = _safe_filename(pk)
+        safe_to_original[safe_name] = pk
+
     for parent in [path.parent, *path.parents]:
         name = str(parent.name or "").strip()
         if name and name in patch_keys:
             return name
+        # Check if directory name is a safe-ified version of a patch_key
+        if name and name in safe_to_original:
+            return safe_to_original[name]
         if name.startswith("_extra_"):
             return name
     raise ValueError(
@@ -181,12 +190,24 @@ def _infer_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
 
 def _infer_primary_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
     """Infer a non-_extra_ patch_key from a path's parent directories (best-effort)."""
+    # Build reverse mapping: safe_name -> original patch_key
+    safe_to_original: Dict[str, str] = {}
+    for pk in patch_keys:
+        safe_name = _safe_filename(pk)
+        safe_to_original[safe_name] = pk
+
     for parent in [path.parent, *path.parents]:
         name = str(parent.name or "").strip()
         if not name:
             continue
+        # Check direct match
         if name in patch_keys and not name.startswith("_extra_"):
             return name
+        # Check safe-ified match
+        if name in safe_to_original:
+            original = safe_to_original[name]
+            if not original.startswith("_extra_"):
+                return original
     return ""
 
 
@@ -786,7 +807,9 @@ def merge_patch_bundle_with_overrides(
             if len(primary_from_paths) == 1:
                 inferred_key = next(iter(primary_from_paths))
     if inferred_key and str(allow_root.name) != str(inferred_key):
-        out_dir = (allow_root / inferred_key).resolve()
+        # Use safe directory name to avoid nested directories from patch_keys with slashes
+        safe_key_dir = _safe_filename(inferred_key)
+        out_dir = (allow_root / safe_key_dir).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
     out_path = _unique_path((out_dir / out_name).resolve())
     _validate_under_root(out_path, allow_root)
@@ -975,7 +998,9 @@ def write_patch_bundle_with_overrides(
     if len(unique_keys) == 1:
         inferred_key = next(iter(unique_keys))
         if inferred_key and str(allow_root.name) != str(inferred_key):
-            out_dir = (allow_root / inferred_key).resolve()
+            # Use safe directory name to avoid nested directories from patch_keys with slashes
+            safe_key_dir = _safe_filename(inferred_key)
+            out_dir = (allow_root / safe_key_dir).resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
     out_path = _unique_path((out_dir / out_name).resolve())
     _validate_under_root(out_path, allow_root)

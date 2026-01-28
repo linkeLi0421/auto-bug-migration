@@ -1,19 +1,42 @@
 Undeclared symbol/type errors:
 - For diagnostics like "use of undeclared identifier 'X'", "call to undeclared function 'X'", or "unknown type name 'X'":
-  - Do NOT "fix" by deleting or bypassing the usage of X inside the function.
-  - First, try to provide X via a file-scope declaration/definition using make_extra_patch_override(symbol_name="X", version="v1") or (when appropriate) version="v2".
+  - FIRST: Use search_definition(symbol_name="X", version="v1") to understand what X actually is.
+    - If X is a complex data structure (array, static data, etc.) that references other V1-only symbols, adding an extern declaration will just cause linker errors later.
+    - If X is a simple typedef/struct/function that can be migrated, proceed with make_extra_patch_override.
+  - Do NOT blindly add "extern" declarations for symbols without understanding their definition.
+  - Do NOT "fix" by deleting or bypassing the usage of X inside the function (unless the symbol cannot be reasonably provided).
+  - For simple declarations: use make_extra_patch_override(symbol_name="X", version="v1") or (when appropriate) version="v2".
   - Do NOT replace missing globals with local variables (that changes semantics); add the real declaration/definition via make_extra_patch_override.
-  - Only rewrite the function if there is clearly no reasonable way to provide X at file scope, and then minimize behavioral changes.
+  - If the symbol is a complex V1-only data structure that cannot be migrated:
+    - Consider if the code using X can be modified to not need it (e.g., replace with NULL, guard with #if 0).
+    - Use make_error_patch_override to modify the function code directly.
 
 CRITICAL: When active patch_key is `_extra_*`:
 - If the active patch_key starts with `_extra_`, NEVER call make_extra_patch_override.
 - Calling make_extra_patch_override while handling an `_extra_*` hunk would extend the same hunk, creating cascading issues or circular insertions.
-- Instead, inspect the existing `_extra_*` patch content (get_error_patch_context / read_artifact / get_patch), understand what's wrong, and fix the `_extra_*` hunk directly using make_error_patch_override with a minimal slice rewrite.
+- For undeclared identifiers in `_extra_*` hunks:
+  1. FIRST: Use search_definition(symbol_name="X", version="v1") to understand what X is.
+  2. If X is a complex V1 data structure (e.g., `defaultHandlers[]` array referencing other V1 symbols):
+     - Do NOT add an extern declaration - this will just cause linker errors.
+     - Instead, REMOVE the line in the `_extra_*` hunk that references X.
+     - Example: If `_extra_encoding.c` has `static const xmlCharEncodingHandler *xmlLatin1Handler = &defaultHandlers[4];`
+       and `defaultHandlers` is a V1-only array, remove the entire `xmlLatin1Handler` line.
+  3. If X is a simple declaration that can be provided, add it to the `_extra_*` hunk.
+- Use make_error_patch_override with a minimal slice rewrite to fix the `_extra_*` hunk.
 - This applies to ALL error types inside `_extra_*` hunks, not just undeclared symbols.
 
 Special handling for undeclared functions:
-- If the undeclared function does NOT start with "__revert_", this means the function is not reverted and cannot be used in this context.
-- For such functions (not starting with "__revert_"), you should REMOVE the use of this function rather than trying to provide it.
+
+For functions STARTING with "__revert_" (e.g., `__revert_e11519_xmlHashCreate`):
+- These are migration-generated wrapper functions that SHOULD be used.
+- Do NOT remove or replace calls to `__revert_*` functions - they are correct!
+- The function just needs a forward declaration.
+- Use `make_extra_patch_override(symbol_name="__revert_e11519_xmlHashCreate", version="v1")` to add the declaration.
+- The tool will find the original function (e.g., `xmlHashCreate`) and generate the correct `__revert_*` declaration.
+
+For functions NOT starting with "__revert_":
+- This means the function is not reverted and cannot be used in this context.
+- You should REMOVE the use of this function rather than trying to provide it.
 - This typically happens when the original code was refactored but some references to old function names remain.
 - Look for patterns like:
   - Function calls to non-reverted functions: `old_function_name()` → remove or replace with appropriate logic
