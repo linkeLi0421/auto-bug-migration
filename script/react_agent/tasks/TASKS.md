@@ -1,38 +1,47 @@
-# Tasks
+# TASKS
 
-Archived plans live in `script/react_agent/tasks/TASKS_*.md`. This file tracks the current active items.
+## 2026-01-28: Linker Error Detection in OSS-Fuzz Verdict (COMPLETED)
 
-## Plan: Fix `_extra_*` insertion order (use AST insert anchors; avoid “unknown type name”)
-Context: Some multi-agent runs hit ordering issues like:
-`/src/libxml2/parserInternals.c:93:1: error: unknown type name 'xmlParserNsData'`
-because declarations inserted into `_extra_*` hunks can end up after prototypes that reference them. The current
-“insert-after-includes” heuristic is sensitive to the include/preprocessor region. To stabilize, switch the insertion
-anchor selection to an AST-derived line number approach (like `get_patch_insert_line_number(...)` in
-`script/revert_patch_test.py`) when analysis JSON is available.
+**Problem:** After agent generates a patch and runs ossfuzz_apply_patch_and_test, the verdict logic (`_summarize_active_patch_key_status`) only checks for compiler errors, not linker errors. If linker errors remain (like `undefined reference to '__revert_e11519_xmlGlobalInitMutexUnlock'`), the agent reports "Active function fixed: unknown" instead of detecting the remaining error.
 
-- [x] Repro from artifacts: confirm `xmlParserNsData` is referenced before its typedef in `_extra_parserInternals.c`.
-- [x] Implement AST-based anchor selection for new `_extra_*` skeletons:
-  - Reuse V2 `*_analysis.json` function extents to choose an insertion line (start.line of selected function).
-  - Default: if no anchor func_sig is provided, insert before the first function definition (smallest start line).
-  - Optional: override the anchor with `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` (signature match, ignore arg types).
-  - Fallback: keep `_find_file_scope_insertion_index` when analysis JSON is unavailable.
-- [x] Decide anchor policy:
-  - Default is before the first function.
-  - Override with `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` when a specific stable function is preferred.
-- [x] Add regression coverage: ensure skeleton insertion anchor uses the AST-derived line number when V2 analysis JSON exists.
-- [ ] Re-run `script/react_agent/multi_agent.py` on the failing run and confirm ordering-related “unknown type name” errors are gone.
+**Root Cause:** `_iter_ossfuzz_compiler_errors` only called `iter_compiler_errors`, not `iter_linker_errors`. Additionally, the status function skipped errors with `line <= 0` (which linker errors have).
 
-## Plan: Insert new `_extra_*` hunks before the first function
-Context: Some files have multiple nearby hunks that touch the include/attribute region; anchoring the synthesized
-`_extra_*` skeleton at EOF or after a function can create overlapping hunks and context drift (“patch does not apply”).
-Instead, anchor the new `_extra_*` skeleton **before the first function definition** in the file.
+**Changes Made:**
+- [x] Updated `_iter_ossfuzz_compiler_errors` to also call `iter_linker_errors` and collect linker errors with `kind="linker"` (~lines 1511-1548)
+- [x] Updated `_summarize_active_patch_key_status` to handle linker errors using `_get_link_error_patch_from_bundle` for mapping (~lines 1609-1660)
+- [x] Linker errors are now properly mapped to patch_keys and counted in `remaining_in_active_patch_key`
 
-- [x] Define the rule: “before the first function definition” means `insert_line = first_func_extent.start.line` from V2 `*_analysis.json`.
-- [x] Implement anchor selection:
-  - Use V2 `KbIndex.file_index["v2"][basename]` to find the minimum `extent.start.line` among `FUNCTION_DEFI`/`CXX_METHOD`/`FUNCTION_TEMPLATE` nodes in that file.
-  - When found, build the skeleton hunk context starting at that line (so the insertions land above the first function).
-  - Fallback when no function defs or no JSON: keep `_find_file_scope_insertion_index` (after preprocessor/comments).
-- [x] Add regression coverage in `script/react_agent/test_langgraph_agent.sh`:
-  - V2 file with `#include` then a first function at a known line.
-  - Assert the synthesized `_extra_*` hunk header uses that function-start line (not EOF, not after-includes).
-- [ ] Re-run `script/react_agent/multi_agent.py` on a failing multi-run and confirm the merged patch applies cleanly (no context drift between adjacent hunks).
+**Testing:** All tests in `test_langgraph_agent.sh` pass.
+
+---
+
+## 2026-01-28: Linker Error Initialization in agent_langgraph.py (COMPLETED)
+
+**Problem:** When agent_langgraph.py is started with a linker error (undefined reference) as the target, the initialization code only calls `iter_compiler_errors()` and does not process linker errors.
+
+**Solution:** Added `iter_linker_errors()` processing in the `cfg.error_scope == "patch"` initialization block, mirroring `multi_agent.py`'s `_group_errors_by_patch_key()`.
+
+**Changes Made:**
+- [x] Added `iter_linker_errors` to the import from `build_log` (line 24)
+- [x] Added linker error loop after compiler error loop (~lines 5938-5958)
+- [x] Added import of `get_link_error_patch` from `tools.migration_tools` (~line 5916)
+- [x] Added fallback for linker errors (line_number=0) to extract func indices from grouped_errors (~lines 6025-6037)
+
+**Testing:** All tests in `test_langgraph_agent.sh` pass.
+
+---
+
+## 2026-01-27: Dynamic Error Queue Refresh (multi_agent)
+
+- [x] Add `--refresh-error-queue {auto,always,never}` to `script/react_agent/multi_agent.py` (enable when `--tools real` and `--jobs 1`).
+- [x] After each fixed hunk, merge accumulated override diffs into a new `*.patch2`, re-run OSS-Fuzz build, and re-parse compiler errors to discover newly-unblocked patch_keys.
+- [x] Keep writing `progress.json` snapshots during the run (so refreshed queue progress is visible/resumable).
+
+## 2026-01-27: Handle Linker Undefined References (react_agent)
+
+- [x] Parse link-time errors like `undefined reference to \`symbol'` from OSS-Fuzz build output (capture object + function when available, e.g. `encoding.c:(.text.<func>+0x..)`).
+- [x] Add patch-bundle mapping for link errors without `file:line` (best-effort locate the owning patch_key + function slice by `file` + `function` name in the patch bundle).
+- [x] Extend patch tools so the agent can rewrite the mapped slice for link errors (either by adding a new tool or by adding an alternate mapping mode to `get_error_patch_context`/`make_error_patch_override`).
+- [x] Update agent loop to treat link errors as actionable "missing symbol" problems (try v2 replacement symbol via `search_definition`, otherwise minimize by removing/guarding the call).
+- [x] Add regression fixtures/tests for linker errors (at least: `encoding.c:(.text.__revert_...): undefined reference to \`defaultHandlers'`).
+- [x] Update `multi_agent.py` to include linker errors in `_group_errors_by_patch_key()` and `_error_type_priority()`.

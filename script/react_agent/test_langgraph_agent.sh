@@ -250,7 +250,11 @@ from pathlib import Path
 script_dir = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(script_dir))
 
-from agent_langgraph import _prioritize_focus_within_hunk, _prioritize_warnings_within_hunk  # noqa: E402
+from agent_langgraph import (  # noqa: E402
+    _prioritize_focus_within_hunk,
+    _prioritize_unknown_type_name_within_hunk,
+    _prioritize_warnings_within_hunk,
+)
 
 errors = [
     {
@@ -273,6 +277,27 @@ assert "nsdb" in ranked[0]["msg"], ranked
 
 ranked2 = _prioritize_focus_within_hunk(_prioritize_warnings_within_hunk(errors), "")
 assert ranked2[0]["level"] == "warning", ranked2
+
+# Unknown-type ordering: prefer unknown type name errors first (even ahead of warnings).
+errors2 = [
+    {
+        "level": "warning",
+        "msg": "no previous prototype for function 'foo'",
+        "raw": "/src/x.c:1:1: warning: no previous prototype for function 'foo'",
+        "snippet": "warning block",
+    },
+    {
+        "level": "error",
+        "msg": "unknown type name 'foo_t'",
+        "raw": "/src/y.c:2:2: error: unknown type name 'foo_t'",
+        "snippet": "error block",
+    },
+]
+ranked3 = _prioritize_warnings_within_hunk(errors2)
+assert ranked3[0]["level"] == "warning", ranked3
+ranked4 = _prioritize_unknown_type_name_within_hunk(ranked3)
+assert ranked4[0]["level"] == "error", ranked4
+assert "unknown type name" in ranked4[0]["msg"], ranked4
 
 print("OK")
 PY
@@ -1923,9 +1948,10 @@ sys.path.insert(0, str(script_dir))
 
 from agent_langgraph import (  # noqa: E402
     AgentState,
-    _block_make_extra_patch_override_for_unknown_type_in_extra_hunk,
+    _block_make_extra_patch_override_for_extra_hunk,
 )
 
+# Test 1: unknown type name error inside _extra_* hunk
 err = "/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'"
 with tempfile.TemporaryDirectory() as td:
     base_path = Path(td) / "base.c"
@@ -1943,8 +1969,30 @@ with tempfile.TemporaryDirectory() as td:
     st.loop_base_func_code_artifact_path = str(base_path)
 
     decision = {"type": "tool", "tool": "make_extra_patch_override", "thought": "insert type", "args": {}}
-    forced = _block_make_extra_patch_override_for_unknown_type_in_extra_hunk(st, decision, remaining_steps=10)
+    forced = _block_make_extra_patch_override_for_extra_hunk(st, decision, remaining_steps=10)
     assert forced and forced.get("tool") == "read_artifact", forced
+    assert st.pending_patch and (st.pending_patch.get("tool") == "make_error_patch_override"), st.pending_patch
+
+# Test 2: ANY error inside _extra_* hunk should block make_extra_patch_override (not just unknown type name)
+err2 = "/src/libxml2/error.c:52:1: error: use of undeclared identifier 'SOME_MACRO'"
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text("int x = SOME_MACRO;\n", encoding="utf-8")
+
+    st = AgentState(
+        build_log_path="build.log",
+        patch_path="bundle.patch2",
+        error_scope="patch",
+        error_line=err2,
+        snippet="",
+    )
+    st.patch_key = "_extra_threads.c"
+    st.active_patch_key = "_extra_threads.c"
+    st.loop_base_func_code_artifact_path = str(base_path)
+
+    decision = {"type": "tool", "tool": "make_extra_patch_override", "thought": "insert macro", "args": {}}
+    forced = _block_make_extra_patch_override_for_extra_hunk(st, decision, remaining_steps=10)
+    assert forced and forced.get("tool") == "read_artifact", ("should block ANY error in _extra_* hunk", forced)
     assert st.pending_patch and (st.pending_patch.get("tool") == "make_error_patch_override"), st.pending_patch
 
 print("OK")
@@ -3338,6 +3386,112 @@ proto_patch_text = merged_bundle3.patches["_extra_proto.c"].patch_text or ""
 assert "\n-static int\n" in proto_patch_text, proto_patch_text
 assert "\n-int\n" not in proto_patch_text, proto_patch_text
 assert proto_patch_text.count("__revert_e11519_xmlHashGrow(") == 1, proto_patch_text
+
+# Regression: typedef/tag blocks must appear BEFORE prototypes in merged `_extra_*` hunks.
+# This tests both: (1) identical texts skip merge to preserve order, (2) category ordering puts typedef before prototype.
+typedef_dir = (artifact_dir / "_extra_typedef.c").resolve()
+typedef_dir.mkdir(parents=True, exist_ok=True)
+
+# Override diff with typedef BEFORE prototypes (the correct order)
+typedef_override_text = (
+    "diff --git a/typedef_test.c b/typedef_test.c\n"
+    "--- a/typedef_test.c\n"
+    "+++ b/typedef_test.c\n"
+    "@@ -1,10 +1,0 @@\n"
+    "-#define TEST_MACRO 42\n"
+    "-\n"
+    "-typedef struct _TestData {\n"
+    "-    int value;\n"
+    "-} TestData;\n"
+    "-\n"
+    "-TestData *\n"
+    "-__revert_e11519_createTestData(void);\n"
+    "-\n"
+    "-void\n"
+    "-__revert_e11519_freeTestData(TestData *data);\n"
+)
+typedef_override_path1 = typedef_dir / "override__extra_typedef.c.diff"
+typedef_override_path2 = typedef_dir / "make_error_patch_override_patch_text_typedef_test.c.diff"
+typedef_override_path1.write_text(typedef_override_text, encoding="utf-8", errors="replace")
+typedef_override_path2.write_text(typedef_override_text, encoding="utf-8", errors="replace")
+
+# Test 1: Two identical override diffs should skip merge and preserve original order
+out5 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(typedef_override_path1), str(typedef_override_path2)],
+    output_name="merged_test_typedef_identical.diff",
+)
+merged_path5 = Path(out5.get("merged_patch_file_path", "")).resolve()
+assert merged_path5.is_file(), out5
+merged_text5 = merged_path5.read_text(encoding="utf-8", errors="replace")
+
+# Find the typedef_test.c section
+hdr5 = "diff --git a/typedef_test.c b/typedef_test.c"
+start5 = merged_text5.find(hdr5)
+assert start5 >= 0, (hdr5, merged_path5)
+tail5 = merged_text5[start5:]
+end5 = tail5.find("\ndiff --git ")
+section5 = tail5 if end5 < 0 else tail5[: end5 + 1]
+
+# Verify typedef appears BEFORE the prototype that references it
+typedef_pos = section5.find("typedef struct _TestData")
+proto_pos = section5.find("__revert_e11519_createTestData")
+assert typedef_pos >= 0, ("typedef not found", section5)
+assert proto_pos >= 0, ("prototype not found", section5)
+assert typedef_pos < proto_pos, f"typedef must appear before prototype: typedef@{typedef_pos} proto@{proto_pos}\n{section5}"
+
+# Test 2: Different override diffs should merge and still put typedef before prototypes
+typedef_override_text2 = (
+    "diff --git a/typedef_test.c b/typedef_test.c\n"
+    "--- a/typedef_test.c\n"
+    "+++ b/typedef_test.c\n"
+    "@@ -1,5 +1,0 @@\n"
+    "-int\n"
+    "-__revert_e11519_processTestData(TestData *data);\n"
+    "-\n"
+    "-struct AnotherTag {\n"
+    "-    char name[64];\n"
+    "-};\n"
+)
+typedef_override_path3 = typedef_dir / "override__extra_typedef.c.2.diff"
+typedef_override_path3.write_text(typedef_override_text2, encoding="utf-8", errors="replace")
+
+out6 = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(typedef_override_path1), str(typedef_override_path3)],
+    output_name="merged_test_typedef_different.diff",
+)
+merged_path6 = Path(out6.get("merged_patch_file_path", "")).resolve()
+assert merged_path6.is_file(), out6
+merged_text6 = merged_path6.read_text(encoding="utf-8", errors="replace")
+
+# Find the typedef_test.c section
+start6 = merged_text6.find(hdr5)
+assert start6 >= 0, (hdr5, merged_path6)
+tail6 = merged_text6[start6:]
+end6 = tail6.find("\ndiff --git ")
+section6 = tail6 if end6 < 0 else tail6[: end6 + 1]
+
+# Verify ordering: macro < typedef < tag < prototypes
+macro_pos6 = section6.find("#define TEST_MACRO")
+typedef_pos6 = section6.find("typedef struct _TestData")
+tag_pos6 = section6.find("struct AnotherTag")
+proto_create_pos6 = section6.find("__revert_e11519_createTestData")
+proto_process_pos6 = section6.find("__revert_e11519_processTestData")
+
+assert macro_pos6 >= 0, ("macro not found", section6)
+assert typedef_pos6 >= 0, ("typedef not found", section6)
+assert tag_pos6 >= 0, ("tag not found", section6)
+assert proto_create_pos6 >= 0, ("createTestData proto not found", section6)
+assert proto_process_pos6 >= 0, ("processTestData proto not found", section6)
+
+# Verify correct ordering: macro < typedef/tag < prototypes
+assert macro_pos6 < typedef_pos6, f"macro must appear before typedef: macro@{macro_pos6} typedef@{typedef_pos6}"
+assert macro_pos6 < tag_pos6, f"macro must appear before tag: macro@{macro_pos6} tag@{tag_pos6}"
+assert typedef_pos6 < proto_create_pos6, f"typedef must appear before prototype: typedef@{typedef_pos6} proto@{proto_create_pos6}"
+assert typedef_pos6 < proto_process_pos6, f"typedef must appear before prototype: typedef@{typedef_pos6} proto@{proto_process_pos6}"
+assert tag_pos6 < proto_create_pos6, f"tag must appear before prototype: tag@{tag_pos6} proto@{proto_create_pos6}"
+assert tag_pos6 < proto_process_pos6, f"tag must appear before prototype: tag@{tag_pos6} proto@{proto_process_pos6}"
 PY
 
 # Multi-agent override collection: keep multiple `_extra_*` overrides (per origin hunk).
@@ -4092,6 +4246,156 @@ assert "Round 1" in text, text
 assert "error: e1" in text, text
 assert "Round 2" in text, text
 assert "error: e2" in text, text
+print("OK")
+PY
+
+# _extra_insert_block_semantic_id: skip comment lines when determining block type.
+# A typedef block with a preceding comment like /* Forward declaration */ should
+# still be classified as "typedef", not "text".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.ossfuzz_tools import _extra_insert_block_semantic_id, _is_comment_line  # noqa: E402
+
+# Test _is_comment_line helper
+assert _is_comment_line("// single line comment") is True
+assert _is_comment_line("/* block comment */") is True
+assert _is_comment_line("* continuation line in block comment") is True
+assert _is_comment_line("   /* indented comment */") is True
+assert _is_comment_line("   some text */") is True  # Multi-line comment end without leading /*
+assert _is_comment_line("typedef int Foo;") is False
+assert _is_comment_line("int x;") is False
+assert _is_comment_line("") is False
+
+# Test: typedef with preceding comment should be classified as "typedef"
+block_with_comment = [
+    "/* Forward declaration to satisfy references in this extra hunk. */",
+    "typedef struct _xmlParserNsData xmlParserNsData;",
+]
+kind, name = _extra_insert_block_semantic_id(block_with_comment)
+assert kind == "typedef", f"Expected 'typedef', got {kind!r}"
+assert name == "xmlParserNsData", f"Expected 'xmlParserNsData', got {name!r}"
+
+# Test: multi-line comment before typedef
+block_multiline_comment = [
+    "/*",
+    " * Some documentation",
+    " */",
+    "typedef int MyInt;",
+]
+kind, name = _extra_insert_block_semantic_id(block_multiline_comment)
+assert kind == "typedef", f"Expected 'typedef', got {kind!r}"
+assert name == "MyInt", f"Expected 'MyInt', got {name!r}"
+
+# Test: multi-line comment with continuation NOT starting with * (real-world case)
+block_multiline_no_star = [
+    "/* Forward declaration to satisfy references in this extra hunk. The full",
+    "   definition lives in the core headers; don't modify shared public types. */",
+    "typedef struct _xmlParserNsData xmlParserNsData;",
+]
+kind, name = _extra_insert_block_semantic_id(block_multiline_no_star)
+assert kind == "typedef", f"Expected 'typedef', got {kind!r}"
+assert name == "xmlParserNsData", f"Expected 'xmlParserNsData', got {name!r}"
+
+# Test: comment before #define
+block_comment_define = [
+    "/* Max buffer size */",
+    "#define MAX_BUF 1024",
+]
+kind, name = _extra_insert_block_semantic_id(block_comment_define)
+assert kind == "define", f"Expected 'define', got {kind!r}"
+assert name == "MAX_BUF", f"Expected 'MAX_BUF', got {name!r}"
+
+# Test: comment before function prototype
+block_comment_proto = [
+    "/* Initialize the parser */",
+    "void init_parser(int flags);",
+]
+kind, name = _extra_insert_block_semantic_id(block_comment_proto)
+assert kind == "prototype", f"Expected 'prototype', got {kind!r}"
+assert name == "init_parser", f"Expected 'init_parser', got {name!r}"
+
+# Test: pure comment block should be "text"
+block_only_comment = [
+    "/* Just a comment */",
+]
+kind, name = _extra_insert_block_semantic_id(block_only_comment)
+assert kind == "text", f"Expected 'text', got {kind!r}"
+
+print("OK")
+PY
+
+# Test: iter_linker_errors parses linker undefined reference errors.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from build_log import iter_linker_errors  # noqa: E402
+
+log = Path(script_dir / "fixtures" / "linker_undefined_reference.log").read_text(encoding="utf-8")
+errs = iter_linker_errors(log, snippet_lines=2)
+
+assert len(errs) == 2, f"Expected 2 linker errors, got {len(errs)}: {errs}"
+
+# First error: defaultHandlers
+err0 = errs[0]
+assert err0.get("kind") == "linker", err0
+assert "encoding.c" in err0.get("file", ""), err0
+assert err0.get("symbol") == "defaultHandlers", err0
+assert err0.get("function") == "__revert_e11519_xmlLookupCharEncodingHandler", err0
+assert "undefined reference" in err0.get("msg", ""), err0
+
+# Second error: xmlSaturatedAddSizeT
+err1 = errs[1]
+assert err1.get("kind") == "linker", err1
+assert "parser.c" in err1.get("file", ""), err1
+assert err1.get("symbol") == "xmlSaturatedAddSizeT", err1
+assert err1.get("function") == "__revert_e11519_xmlSkipBlankChars", err1
+
+print("OK")
+PY
+
+# Test: _error_type_priority returns correct priority for linker errors.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from multi_agent import _error_type_priority  # noqa: E402
+
+# Priority 0: unknown type name
+err_unknown_type = {"msg": "unknown type name 'xmlChar'"}
+assert _error_type_priority(err_unknown_type) == 0, f"Expected 0, got {_error_type_priority(err_unknown_type)}"
+
+# Priority 1: implicit declaration of function
+err_implicit = {"msg": "implicit declaration of function 'foo'"}
+assert _error_type_priority(err_implicit) == 1, f"Expected 1, got {_error_type_priority(err_implicit)}"
+
+# Priority 1: undeclared function
+err_undeclared = {"msg": "call to undeclared function 'bar'"}
+assert _error_type_priority(err_undeclared) == 1, f"Expected 1, got {_error_type_priority(err_undeclared)}"
+
+# Priority 2: linker error by kind
+err_linker_kind = {"kind": "linker", "msg": "undefined reference to `foo`"}
+assert _error_type_priority(err_linker_kind) == 2, f"Expected 2, got {_error_type_priority(err_linker_kind)}"
+
+# Priority 2: linker error by message content
+err_linker_msg = {"msg": "undefined reference to `bar`"}
+assert _error_type_priority(err_linker_msg) == 2, f"Expected 2, got {_error_type_priority(err_linker_msg)}"
+
+# Priority 3: other errors
+err_other = {"msg": "some other error"}
+assert _error_type_priority(err_other) == 3, f"Expected 3, got {_error_type_priority(err_other)}"
+
 print("OK")
 PY
 
