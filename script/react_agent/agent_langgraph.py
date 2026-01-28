@@ -21,7 +21,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     from langgraph_shim import END, StateGraph
 
-from build_log import find_first_fatal, iter_compiler_errors, load_build_log
+from build_log import find_first_fatal, iter_compiler_errors, iter_linker_errors, load_build_log
 from agent_tools import AgentTools, KbIndex, SourceManager
 from artifacts import offload_patch_output, resolve_artifact_dir
 from models import ChatModel, ModelError, OpenAIChatCompletionsModel, StubModel
@@ -1509,15 +1509,18 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         return [], sources, msg
 
     combined_errors: List[Dict[str, Any]] = []
+    linker_errors: List[Dict[str, Any]] = []
     try:
         if build_text:
             combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=2))
+            linker_errors.extend(iter_linker_errors(build_text, snippet_lines=2))
         if check_text:
             combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=2))
+            linker_errors.extend(iter_linker_errors(check_text, snippet_lines=2))
     except Exception as exc:  # noqa: BLE001
         return [], sources, f"Failed to parse OSS-Fuzz logs: {type(exc).__name__}: {exc}"
 
-    # De-dup across build/check_build while preserving order.
+    # De-dup compiler errors across build/check_build while preserving order.
     seen: set[tuple[str, int, int, str]] = set()
     deduped: List[Dict[str, Any]] = []
     for err in combined_errors:
@@ -1531,6 +1534,21 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         if key in seen:
             continue
         seen.add(key)
+        deduped.append(err)
+
+    # De-dup linker errors (use file+function+msg as key since line is always 0).
+    linker_seen: set[tuple[str, str, str]] = set()
+    for err in linker_errors:
+        fp = str(err.get("file", "") or "").strip()
+        fn = str(err.get("function", "") or "").strip()
+        msg = str(err.get("msg", "") or "").strip()
+        if not fp or not fn or not msg:
+            continue
+        key = (fp, fn, msg)
+        if key in linker_seen:
+            continue
+        linker_seen.add(key)
+        err["kind"] = "linker"
         deduped.append(err)
 
     # OSS-Fuzz can fail without emitting compiler diagnostics (e.g. build script errors).
@@ -1590,6 +1608,7 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
 
     try:
         from migration_tools.tools import _get_error_patch_from_bundle as _gepb  # type: ignore
+        from migration_tools.tools import _get_link_error_patch_from_bundle as _glepb  # type: ignore
     except Exception as exc:  # noqa: BLE001
         return {
             "status": "unknown",
@@ -1604,12 +1623,24 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
     for e in errors:
         fp = str(e.get("file", "") or "").strip()
         ln = int(e.get("line", 0) or 0)
-        if not fp or ln <= 0:
-            continue
+        fn = str(e.get("function", "") or "").strip()
+        is_linker = str(e.get("kind", "") or "").strip() == "linker"
+
+        # Skip invalid errors (compiler errors need line > 0, linker errors need function name)
+        if is_linker:
+            if not fp or not fn:
+                continue
+        else:
+            if not fp or ln <= 0:
+                continue
+
         mapping: Dict[str, Any] = {}
         patch_key = ""
         try:
-            raw_mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
+            if is_linker:
+                raw_mapping = _glepb(bundle, patch_path=state.patch_path, file_path=fp, function_name=fn)
+            else:
+                raw_mapping = _gepb(bundle, patch_path=state.patch_path, file_path=fp, line_number=ln)
             mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
             patch_key = str(mapping.get("patch_key") or "").strip()
         except Exception as exc:  # noqa: BLE001
@@ -1622,7 +1653,10 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             "col": int(e.get("col", 0) or 0),
             "msg": str(e.get("msg", "") or "").strip(),
             "patch_key": patch_key,
+            "kind": "linker" if is_linker else "compiler",
         }
+        if is_linker:
+            item["function"] = fn
         if mapping:
             for k in ("old_signature", "func_start_index", "func_end_index"):
                 if k in mapping:
@@ -5913,6 +5947,7 @@ def main(argv: List[str]) -> int:
     if cfg.error_scope == "patch" and patch_path:
         try:
             from tools.migration_tools import get_error_patch as map_error_patch  # noqa: PLC0415
+            from tools.migration_tools import get_link_error_patch  # noqa: PLC0415
 
             errs = iter_compiler_errors(build_log, snippet_lines=10)
             groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -5933,6 +5968,29 @@ def main(argv: List[str]) -> int:
                     if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
                         first_focus_key = key
                     groups.setdefault(key, []).append(enriched)
+
+            # Also process linker errors (undefined reference errors from the linker stage).
+            for err in iter_linker_errors(build_log, snippet_lines=10):
+                fp = str(err.get("file", "") or "").strip()
+                fn = str(err.get("function", "") or "").strip()
+                if not fp or not fn:
+                    continue
+                mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=fn)
+                key = str(mapping.get("patch_key") or "").strip()
+                if not key:
+                    continue
+                enriched = dict(err)
+                enriched["patch_key"] = key
+                enriched["old_signature"] = mapping.get("old_signature")
+                enriched["func_start_index"] = mapping.get("func_start_index")
+                enriched["func_end_index"] = mapping.get("func_end_index")
+                enriched["kind"] = "linker"
+                if not first_mapped_key:
+                    first_mapped_key = key
+                if focus_error and not first_focus_key and _error_matches_focus(enriched, focus_error):
+                    first_focus_key = key
+                groups.setdefault(key, []).append(enriched)
+
             if groups:
                 focus = str(getattr(args, "focus_patch_key", "") or "").strip()
                 if focus and focus in groups:
@@ -5997,6 +6055,20 @@ def main(argv: List[str]) -> int:
                     active_func_end_index = fe
         except Exception:
             pass
+
+    # Fallback for linker errors (line_number=0): extract func indices from grouped_errors if available.
+    if cfg.error_scope == "patch" and patch_path and grouped_errors and active_line_number == 0:
+        first_err = grouped_errors[0]
+        if not active_patch_key:
+            active_patch_key = str(first_err.get("patch_key", "") or "").strip()
+        if not active_old_signature:
+            active_old_signature = str(first_err.get("old_signature", "") or "").strip()
+        fs = first_err.get("func_start_index")
+        fe = first_err.get("func_end_index")
+        if isinstance(fs, int) and active_func_start_index is None:
+            active_func_start_index = fs
+        if isinstance(fe, int) and active_func_end_index is None:
+            active_func_end_index = fe
 
     active_patch_types: List[str] = []
     if cfg.error_scope == "patch" and patch_path and active_patch_key:
