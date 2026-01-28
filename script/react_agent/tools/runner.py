@@ -15,9 +15,11 @@ from .ossfuzz_tools import ossfuzz_apply_patch_and_test as ossfuzz_apply_patch_a
 
 from .migration_tools import (  # noqa: E402
     get_error_patch_context as get_error_patch_context_tool,
+    get_link_error_patch_context as get_link_error_patch_context_tool,
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
     make_error_patch_override as make_error_patch_override_tool,
+    make_link_error_patch_override as make_link_error_patch_override_tool,
     parse_build_errors as parse_build_errors_tool,
     search_patches as search_patches_tool,
 )
@@ -325,6 +327,41 @@ class ToolRunner:
                     output=out,
                 )
 
+            if tool == "get_link_error_patch_context":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                function_name = str(args.get("function_name", "")).strip()
+                error_text = str(args.get("error_text", "")).strip()
+                context_lines = _as_int(args.get("context_lines"), 30)
+                max_total_lines = _as_int(args.get("max_total_lines"), 200)
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if not function_name:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: function_name")
+                out = get_link_error_patch_context_tool(
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    function_name=function_name,
+                    error_text=error_text,
+                    context_lines=context_lines,
+                    max_total_lines=max_total_lines,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "function_name": function_name,
+                        "error_text": error_text[:2000],
+                        "context_lines": context_lines,
+                        "max_total_lines": max_total_lines,
+                    },
+                    output=out,
+                )
+
             if tool == "make_error_patch_override":
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
@@ -357,6 +394,46 @@ class ToolRunner:
                         "patch_path": patch_path,
                         "file_path": file_path,
                         "line_number": line_number,
+                        "context_lines": context_lines,
+                        "max_lines": max_lines,
+                        "max_chars": max_chars,
+                        "new_func_code": str(new_func_code)[:2000],
+                    },
+                    output=out,
+                )
+
+            if tool == "make_link_error_patch_override":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                function_name = str(args.get("function_name", "")).strip()
+                new_func_code = str(args.get("new_func_code", ""))
+                context_lines = _as_int(args.get("context_lines"), 0)
+                max_lines = _as_int(args.get("max_lines"), 2000)
+                max_chars = _as_int(args.get("max_chars"), 200000)
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if not function_name:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: function_name")
+                if not str(new_func_code).strip():
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: new_func_code")
+                out = make_link_error_patch_override_tool(
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    function_name=function_name,
+                    new_func_code=new_func_code,
+                    context_lines=context_lines,
+                    max_lines=max_lines,
+                    max_chars=max_chars,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "function_name": function_name,
                         "context_lines": context_lines,
                         "max_lines": max_lines,
                         "max_chars": max_chars,

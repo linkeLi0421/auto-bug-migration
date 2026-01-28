@@ -11,6 +11,112 @@ _COMPILER_ERROR_RE = re.compile(
 )
 _COMPILER_WARNING_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*warning:\s*(?P<msg>.*)$")
 
+_LD_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
+_LD_UNDEF_REF_SECTION_RE = re.compile(
+    r"(?P<file>[^:\s][^:\n]*):\((?P<section>[^)]*)\):\s*undefined reference to\s*[`'](?P<symbol>[^`']+)[`']"
+)
+_LD_UNDEF_REF_LINE_RE = re.compile(
+    r"(?P<file>[^:\s][^:\n]*):(?P<line>\d+):\s*undefined reference to\s*[`'](?P<symbol>[^`']+)[`']"
+)
+
+
+def _extract_func_from_ld_section(section: str) -> str:
+    """Best-effort parse a function name from ld section strings like `.text.foo[foo]+0x1a`."""
+    raw = str(section or "").strip()
+    if not raw:
+        return ""
+    m = re.search(r"\.text\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)\b", raw)
+    if m:
+        return str(m.group("func") or "").strip()
+    return ""
+
+
+def iter_linker_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict[str, Any]]:
+    """Return linker undefined-reference errors parsed from the log in order.
+
+    Output items:
+      - kind='linker', file, line (0 if unknown), function (when available), symbol, msg, raw
+      - snippet: small context window around the error (includes `in function ...` when present)
+    """
+    lines = build_log.splitlines()
+    errors: List[Dict[str, Any]] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    current_func = ""
+    current_func_idx = -1
+
+    ctx_n = max(0, min(int(snippet_lines or 0), 50))
+
+    def make_snippet(idx: int) -> str:
+        start = idx
+        if current_func_idx >= 0 and 0 <= idx - current_func_idx <= 3:
+            start = current_func_idx
+        elif idx > 0 and _LD_IN_FUNCTION_RE.search(lines[idx - 1]):
+            start = idx - 1
+        end = min(idx + 1 + ctx_n, len(lines))
+        # Include a trailing clang/collect2 failure line when it's immediately after.
+        if end < len(lines):
+            nxt = lines[end].strip()
+            if nxt.startswith("clang: error:") or nxt.startswith("collect2:") or "linker command failed" in nxt:
+                end = min(end + 1, len(lines))
+        return "\n".join(lines[start:end]).strip()
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        m_func = _LD_IN_FUNCTION_RE.search(stripped)
+        if m_func:
+            cur = str(m_func.group("func") or "").strip()
+            if cur:
+                current_func = cur
+                current_func_idx = idx
+
+        m = _LD_UNDEF_REF_SECTION_RE.search(stripped) or _LD_UNDEF_REF_SECTION_RE.search(line)
+        file_path = ""
+        line_no = 0
+        section = ""
+        symbol = ""
+        if m:
+            file_path = str(m.group("file") or "").strip()
+            section = str(m.group("section") or "").strip()
+            symbol = str(m.group("symbol") or "").strip()
+        else:
+            m2 = _LD_UNDEF_REF_LINE_RE.search(stripped) or _LD_UNDEF_REF_LINE_RE.search(line)
+            if not m2:
+                continue
+            file_path = str(m2.group("file") or "").strip()
+            try:
+                line_no = int(m2.group("line") or 0)
+            except (TypeError, ValueError):
+                line_no = 0
+            symbol = str(m2.group("symbol") or "").strip()
+
+        if not file_path or not symbol:
+            continue
+
+        func = _extract_func_from_ld_section(section) or current_func
+        msg = f"undefined reference to `{symbol}`"
+        key = (file_path, int(line_no or 0), func, symbol)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        errors.append(
+            {
+                "kind": "linker",
+                "file": file_path,
+                "line": int(line_no or 0),
+                "col": 0,
+                "function": func,
+                "symbol": symbol,
+                "msg": msg,
+                "raw": stripped,
+                "level": "error",
+                "snippet": make_snippet(idx),
+            }
+        )
+    return errors
+
+
 def load_build_log(path_or_stdin: Optional[str]) -> str:
     """Load a build log from a file path, or stdin when path_or_stdin is '-' / None."""
     if not path_or_stdin or path_or_stdin == "-":
@@ -35,6 +141,11 @@ def find_first_fatal(build_log: str) -> Tuple[str, str]:
                     end = j
                     break
             return stripped, "\n".join(lines[idx:end]).strip()
+
+    linker_errors = iter_linker_errors(build_log, snippet_lines=6)
+    if linker_errors:
+        first = linker_errors[0]
+        return str(first.get("raw", "") or "").strip(), str(first.get("snippet", "") or "").strip()
 
     # Best-effort fallback if the log doesn't match file:line:col format.
     for idx, line in enumerate(lines):
