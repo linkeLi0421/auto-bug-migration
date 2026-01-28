@@ -19,6 +19,7 @@ class PromptContext:
     macro_tokens_not_defined_in_slice: bool
     incomplete_type: bool
     missing_prototypes: bool
+    linker_error: bool
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -82,6 +83,7 @@ def _context_from_state(state: Any) -> PromptContext:
     macro_tokens_not_defined_in_slice = bool(getattr(state, "macro_tokens_not_defined_in_slice", None) or [])
     incomplete_type = ("incomplete" in err_lower and "type" in err_lower) or ("incomplete" in snip_lower and "type" in snip_lower)
     missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
+    linker_error = "undefined reference to" in err_lower or "undefined reference to" in snip_lower
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -94,6 +96,7 @@ def _context_from_state(state: Any) -> PromptContext:
         macro_tokens_not_defined_in_slice=macro_tokens_not_defined_in_slice,
         incomplete_type=incomplete_type,
         missing_prototypes=missing_prototypes,
+        linker_error=linker_error,
     )
 
 
@@ -162,6 +165,11 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if missing_prototypes:
             parts.append(missing_prototypes)
 
+    if ctx.linker_error:
+        linker_error = _load_fragment("system_linker_error.txt")
+        if linker_error:
+            parts.append(linker_error)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -183,6 +191,8 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_incomplete_type.txt")
         if ctx.missing_prototypes:
             names.append("system_missing_prototypes.txt")
+        if ctx.linker_error:
+            names.append("system_linker_error.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"
