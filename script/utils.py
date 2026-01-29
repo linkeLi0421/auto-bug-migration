@@ -22,6 +22,31 @@ def extract_extra_patches(patches_without_context: Dict[str, Any]) -> Dict[str, 
     }
 
 
+def _extract_func_name(signature_or_name: str) -> str:
+    """
+    Extract function name from a signature or bare name.
+
+    Examples:
+        'void xmlTextReaderFreeNode(xmlTextReaderPtr reader, xmlNodePtr cur)' -> 'xmlTextReaderFreeNode'
+        'int foo(void)' -> 'foo'
+        'xmlTextReaderFreeNode' -> 'xmlTextReaderFreeNode'
+    """
+    if not signature_or_name:
+        return ''
+    # If it contains '(', it's a signature - extract name before '('
+    if '(' in signature_or_name:
+        # Get the part before '('
+        before_paren = signature_or_name.split('(')[0].strip()
+        # The function name is the last word (after return type, pointer symbols, etc.)
+        parts = before_paren.split()
+        if parts:
+            # Remove any leading * or & from the name
+            name = parts[-1].lstrip('*&')
+            return name
+    # Otherwise it's already just a name
+    return signature_or_name.strip()
+
+
 def filter_patches_by_trace(
     all_patch_keys: List[str],
     diff_results: Dict[str, Any],
@@ -33,7 +58,14 @@ def filter_patches_by_trace(
     or are dependencies of trace-related functions.
     """
     trace_functions = {func for func, _ in trace_func_list}
-    trace_files = {loc.split(':')[0] for _, loc in trace_func_list if ':' in loc}
+    # Extract trace file basenames (strip leading / and get filename)
+    trace_file_basenames = set()
+    for _, loc in trace_func_list:
+        if ':' in loc:
+            file_part = loc.split(':')[0].lstrip('/')
+            # Get basename for matching
+            basename = file_part.split('/')[-1] if '/' in file_part else file_part
+            trace_file_basenames.add(basename)
 
     # First pass: find patches directly in trace
     direct_matches = set()
@@ -42,14 +74,20 @@ def filter_patches_by_trace(
         if not patch:
             continue
         patch_file = getattr(patch, 'file_path_old', None) or getattr(patch, 'file_path_new', None)
-        func_old = getattr(patch, 'old_function_name', '') or ''
-        func_new = getattr(patch, 'new_function_name', '') or ''
+        # Extract function names - handle both bare names and full signatures
+        func_old_raw = getattr(patch, 'old_function_name', '') or ''
+        func_new_raw = getattr(patch, 'new_function_name', '') or ''
+        func_old = _extract_func_name(func_old_raw)
+        func_new = _extract_func_name(func_new_raw)
 
+        # Check if function matches trace
         if func_old in trace_functions or func_new in trace_functions:
-            for trace_file in trace_files:
-                if patch_file and trace_file in patch_file:
+            # Check if file matches trace (compare basenames)
+            if patch_file:
+                patch_basename = patch_file.split('/')[-1] if '/' in patch_file else patch_file
+                if patch_basename in trace_file_basenames:
                     direct_matches.add(key)
-                    break
+                    logger.debug(f"Matched patch {key}: func={func_old or func_new}, file={patch_basename}")
 
     # Second pass: expand with dependency graph (transitive closure)
     result = set(direct_matches)
