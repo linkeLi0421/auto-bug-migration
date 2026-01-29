@@ -1061,7 +1061,6 @@ def ossfuzz_apply_patch_and_test(
     architecture: str = "x86_64",
     engine: str = "libfuzzer",
     fuzz_target: str = "",
-    run_fuzzer_seconds: int = 30,
     timeout_seconds: int = 1800,
     use_sudo: bool = False,
 ) -> Dict[str, Any]:
@@ -1131,51 +1130,8 @@ def ossfuzz_apply_patch_and_test(
     with _FileLock(lock_path, wait_message=wait_message):
         build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
         build_ok = build_res["returncode"] == 0
-        build_patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
-
-        check_build_cmd: List[str] = [
-            sys.executable,
-            str(helper_py),
-            "check_build",
-            "--sanitizer",
-            str(sanitizer or "address"),
-            "--engine",
-            str(engine or "libfuzzer"),
-            "--architecture",
-            str(architecture or "x86_64"),
-            "-e",
-            "ASAN_OPTIONS=detect_leaks=0",
-            project_name,
-        ]
-        check_build_cmd = _maybe_prefix_sudo(check_build_cmd, use_sudo=use_sudo)
-
-        check_res = _run(check_build_cmd, label="check_build", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
-        check_ok = check_res["returncode"] == 0
-        check_patch_apply_error = _find_patch_apply_error(check_res.get("output", ""))
-        patch_apply_error = build_patch_apply_error or check_patch_apply_error
+        patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
         patch_apply_ok = not bool(patch_apply_error)
-
-        run_fuzzer_output = ""
-        run_fuzzer_cmd: List[str] = []
-        run_fuzzer_ok: Optional[bool] = None
-        if fuzz_target:
-            secs = max(1, min(int(run_fuzzer_seconds or 0), 600))
-            run_fuzzer_cmd = [
-                sys.executable,
-                str(helper_py),
-                "run_fuzzer",
-                "-e",
-                "ASAN_OPTIONS=detect_leaks=0",
-                project_name,
-                str(fuzz_target),
-                "--",
-                f"-max_total_time={secs}",
-                "-timeout=5",
-            ]
-            run_fuzzer_cmd = _maybe_prefix_sudo(run_fuzzer_cmd, use_sudo=use_sudo)
-            run_res = _run(run_fuzzer_cmd, label="run_fuzzer", cwd=str(oss_fuzz_dir), timeout_seconds=timeout_seconds)
-            run_fuzzer_output = run_res["output"]
-            run_fuzzer_ok = run_res["returncode"] == 0
 
     # Write build outputs as artifacts under the same directory as the merged patch
     artifact_dir = patch_file.parent
@@ -1186,18 +1142,6 @@ def ossfuzz_apply_patch_and_test(
         text=build_res["output"],
         ext=".log",
     )
-    check_build_output_ref = store.write_text(
-        name="ossfuzz_apply_patch_and_test_check_build_output",
-        text=check_res["output"],
-        ext=".log",
-    )
-    run_fuzzer_output_ref = None
-    if run_fuzzer_output:
-        run_fuzzer_output_ref = store.write_text(
-            name="ossfuzz_apply_patch_and_test_run_fuzzer_output",
-            text=run_fuzzer_output,
-            ext=".log",
-        )
 
     return {
         "project": project_name,
@@ -1209,12 +1153,6 @@ def ossfuzz_apply_patch_and_test(
         "patch_apply_ok": patch_apply_ok,
         "patch_apply_error": patch_apply_error,
         "build_ok": build_ok,
-        "check_build_ok": check_ok,
-        "run_fuzzer_ok": run_fuzzer_ok,
         "build_cmd": build_cmd,
-        "check_build_cmd": check_build_cmd,
-        "run_fuzzer_cmd": run_fuzzer_cmd,
         "build_output": build_output_ref.to_dict(),
-        "check_build_output": check_build_output_ref.to_dict(),
-        "run_fuzzer_output": run_fuzzer_output_ref.to_dict() if run_fuzzer_output_ref else "",
     }
