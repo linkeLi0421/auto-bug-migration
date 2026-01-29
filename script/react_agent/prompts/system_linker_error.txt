@@ -29,3 +29,18 @@ When using make_error_patch_override for linker errors:
 - Use get_link_error_patch_context first to get the function code containing the reference.
 - Modify only the lines that reference the missing symbol.
 - Test with ossfuzz_apply_patch_and_test to verify the linker error is resolved.
+
+IMPORTANT: Check _extra_* patches for indirect references:
+- If the function doesn't directly reference the missing symbol, check the _extra_* patch for the same file.
+- Use list_patch_bundle to find `_extra_<filename>` entries (e.g., `_extra_encoding.c` for encoding.c).
+- Use get_patch to view the _extra_* patch content.
+- Look for variable declarations that reference the missing symbol, e.g.:
+  `static const Handler *myHandler = &missingSymbol[4];`
+- If the function uses such a variable (e.g., `myHandler`), the linker error is caused indirectly.
+- Fix: Modify the FUNCTION CODE to not use the variable. Use make_link_error_patch_override to:
+  - Replace uses of `myHandler` with NULL or a safe default
+  - Remove or guard code that depends on `myHandler`
+- Example: If `_extra_encoding.c` has `static const xmlCharEncodingHandler *xmlLatin1Handler = &defaultHandlers[4];`
+  and the function uses `xmlLatin1Handler`, modify the function to replace `xmlLatin1Handler` with NULL:
+  `handler = xmlLatin1Handler;` → `handler = NULL;`
+  This avoids the indirect reference to `defaultHandlers` without modifying the _extra_* patch.

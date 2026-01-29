@@ -11,6 +11,13 @@ _COMPILER_ERROR_RE = re.compile(
 )
 _COMPILER_WARNING_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*warning:\s*(?P<msg>.*)$")
 
+# Warnings about undeclared functions (treated as errors for our purposes)
+_UNDECLARED_FUNC_WARNING_PATTERNS = [
+    "call to undeclared function",
+    "implicit declaration of function",
+    "no previous prototype for function",
+]
+
 _LD_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LD_UNDEF_REF_SECTION_RE = re.compile(
     r"(?P<file>[^:\s][^:\n]*):\((?P<section>[^)]*)\):\s*undefined reference to\s*[`'](?P<symbol>[^`']+)[`']"
@@ -53,12 +60,27 @@ def iter_linker_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict[s
             start = current_func_idx
         elif idx > 0 and _LD_IN_FUNCTION_RE.search(lines[idx - 1]):
             start = idx - 1
-        end = min(idx + 1 + ctx_n, len(lines))
-        # Include a trailing clang/collect2 failure line when it's immediately after.
-        if end < len(lines):
-            nxt = lines[end].strip()
-            if nxt.startswith("clang: error:") or nxt.startswith("collect2:") or "linker command failed" in nxt:
-                end = min(end + 1, len(lines))
+        # Calculate initial end based on ctx_n lines after the error
+        max_end = min(idx + 1 + ctx_n, len(lines))
+        end = idx + 1  # Start with just the error line
+        # Extend end up to max_end, but stop if we hit another linker error or "in function" for a different func
+        for j in range(idx + 1, max_end):
+            line_j = lines[j].strip()
+            # Stop if we hit another "in function" line (indicates a new error block)
+            m_func_j = _LD_IN_FUNCTION_RE.search(line_j)
+            if m_func_j:
+                func_j = str(m_func_j.group("func") or "").strip()
+                # Allow if it's the same function as current error, otherwise stop
+                if func_j and func_j != current_func:
+                    break
+            # Stop if we hit another "undefined reference" line
+            if _LD_UNDEF_REF_SECTION_RE.search(line_j) or _LD_UNDEF_REF_LINE_RE.search(line_j):
+                break
+            # Include clang/collect2 failure lines
+            if line_j.startswith("clang: error:") or line_j.startswith("collect2:") or "linker command failed" in line_j:
+                end = j + 1
+                break
+            end = j + 1
         return "\n".join(lines[start:end]).strip()
 
     for idx, line in enumerate(lines):
@@ -124,16 +146,33 @@ def load_build_log(path_or_stdin: Optional[str]) -> str:
     return Path(path_or_stdin).read_text(encoding="utf-8", errors="replace")
 
 
+def _is_undeclared_func_warning(line: str) -> bool:
+    """Check if a warning line is about an undeclared function."""
+    lower = line.lower()
+    return any(pattern in lower for pattern in _UNDECLARED_FUNC_WARNING_PATTERNS)
+
+
 def find_first_fatal(build_log: str) -> Tuple[str, str]:
     """Return the first compiler error line and its full diagnostic block.
 
-    A diagnostic block starts at the first `file:line:col: error:` (or warning) line
+    A diagnostic block starts at the first `file:line:col: error:` (or undeclared function warning) line
     and includes all subsequent lines until the next `error:`/`warning:` diagnostic.
     """
     lines = build_log.splitlines()
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        # Check for errors
         if _COMPILER_ERROR_RE.match(stripped):
+            end = len(lines)
+            for j in range(idx + 1, len(lines)):
+                nxt = lines[j].strip()
+                if _COMPILER_ERROR_RE.match(nxt) or _COMPILER_WARNING_RE.match(nxt):
+                    end = j
+                    break
+            return stripped, "\n".join(lines[idx:end]).strip()
+        # Check for undeclared function warnings (treated as errors)
+        m_warn = _COMPILER_WARNING_RE.match(stripped)
+        if m_warn and _is_undeclared_func_warning(stripped):
             end = len(lines)
             for j in range(idx + 1, len(lines)):
                 nxt = lines[j].strip()

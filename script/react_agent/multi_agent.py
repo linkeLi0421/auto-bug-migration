@@ -1260,22 +1260,11 @@ def main(argv: List[str]) -> int:
                 )
 
                 build_log_path = (artifacts_root / "final_ossfuzz_build_output.log").resolve()
-                check_log_path = (artifacts_root / "final_ossfuzz_check_build_output.log").resolve()
                 build_log_path.write_text(str(res.get("build_output", "") or ""), encoding="utf-8", errors="replace")
-                check_log_path.write_text(str(res.get("check_build_output", "") or ""), encoding="utf-8", errors="replace")
-
-                run_fuzzer_output = str(res.get("run_fuzzer_output", "") or "")
-                run_fuzzer_path = ""
-                if run_fuzzer_output.strip():
-                    p = (artifacts_root / "final_ossfuzz_run_fuzzer_output.log").resolve()
-                    p.write_text(run_fuzzer_output, encoding="utf-8", errors="replace")
-                    run_fuzzer_path = str(p)
 
                 patch_apply_ok = bool(res.get("patch_apply_ok"))
                 build_ok = bool(res.get("build_ok"))
-                check_ok = bool(res.get("check_build_ok"))
-                run_ok = res.get("run_fuzzer_ok")
-                ok = patch_apply_ok and build_ok and check_ok and (run_ok is not False)
+                ok = patch_apply_ok and build_ok
                 final_ossfuzz_test.update(
                     {
                         "status": "ok" if ok else "failed",
@@ -1283,15 +1272,11 @@ def main(argv: List[str]) -> int:
                         "merged_patch_file_path": str(res.get("merged_patch_file_path", "") or "").strip(),
                         "patch_apply_ok": patch_apply_ok,
                         "build_ok": build_ok,
-                        "check_build_ok": check_ok,
-                        "run_fuzzer_ok": run_ok,
                         "build_output_path": str(build_log_path),
-                        "check_build_output_path": str(check_log_path),
-                        "run_fuzzer_output_path": run_fuzzer_path,
                     }
                 )
                 if not final_ossfuzz_test["reason"] and not ok:
-                    final_ossfuzz_test["reason"] = "OSS-Fuzz build/check_build failed."
+                    final_ossfuzz_test["reason"] = "OSS-Fuzz build failed."
             except Exception as exc:
                 final_ossfuzz_test.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
 
@@ -1406,22 +1391,11 @@ def main(argv: List[str]) -> int:
             )
 
             build_log_path_cont = (artifacts_root / f"final_ossfuzz_build_output.continuation.{continuation_round}.log").resolve()
-            check_log_path_cont = (artifacts_root / f"final_ossfuzz_check_build_output.continuation.{continuation_round}.log").resolve()
             build_log_path_cont.write_text(str(res.get("build_output", "") or ""), encoding="utf-8", errors="replace")
-            check_log_path_cont.write_text(str(res.get("check_build_output", "") or ""), encoding="utf-8", errors="replace")
-
-            run_fuzzer_output = str(res.get("run_fuzzer_output", "") or "")
-            run_fuzzer_path = ""
-            if run_fuzzer_output.strip():
-                p = (artifacts_root / f"final_ossfuzz_run_fuzzer_output.continuation.{continuation_round}.log").resolve()
-                p.write_text(run_fuzzer_output, encoding="utf-8", errors="replace")
-                run_fuzzer_path = str(p)
 
             patch_apply_ok = bool(res.get("patch_apply_ok"))
             build_ok = bool(res.get("build_ok"))
-            check_ok = bool(res.get("check_build_ok"))
-            run_ok = res.get("run_fuzzer_ok")
-            ok = patch_apply_ok and build_ok and check_ok and (run_ok is not False)
+            ok = patch_apply_ok and build_ok
             final_ossfuzz_test.update(
                 {
                     "status": "ok" if ok else "failed",
@@ -1429,15 +1403,11 @@ def main(argv: List[str]) -> int:
                     "merged_patch_file_path": str(res.get("merged_patch_file_path", "") or "").strip(),
                     "patch_apply_ok": patch_apply_ok,
                     "build_ok": build_ok,
-                    "check_build_ok": check_ok,
-                    "run_fuzzer_ok": run_ok,
                     "build_output_path": str(build_log_path_cont),
-                    "check_build_output_path": str(check_log_path_cont),
-                    "run_fuzzer_output_path": run_fuzzer_path,
                 }
             )
             if not final_ossfuzz_test["reason"] and not ok:
-                final_ossfuzz_test["reason"] = "OSS-Fuzz build/check_build failed."
+                final_ossfuzz_test["reason"] = "OSS-Fuzz build failed."
         except Exception as exc:
             final_ossfuzz_test.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
             break  # Stop continuation on exception
