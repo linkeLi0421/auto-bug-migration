@@ -11,6 +11,13 @@ _COMPILER_ERROR_RE = re.compile(
 )
 _COMPILER_WARNING_RE = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+):\s*warning:\s*(?P<msg>.*)$")
 
+# Warnings about undeclared functions (treated as errors for our purposes)
+_UNDECLARED_FUNC_WARNING_PATTERNS = [
+    "call to undeclared function",
+    "implicit declaration of function",
+    "no previous prototype for function",
+]
+
 _LD_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LD_UNDEF_REF_SECTION_RE = re.compile(
     r"(?P<file>[^:\s][^:\n]*):\((?P<section>[^)]*)\):\s*undefined reference to\s*[`'](?P<symbol>[^`']+)[`']"
@@ -139,16 +146,33 @@ def load_build_log(path_or_stdin: Optional[str]) -> str:
     return Path(path_or_stdin).read_text(encoding="utf-8", errors="replace")
 
 
+def _is_undeclared_func_warning(line: str) -> bool:
+    """Check if a warning line is about an undeclared function."""
+    lower = line.lower()
+    return any(pattern in lower for pattern in _UNDECLARED_FUNC_WARNING_PATTERNS)
+
+
 def find_first_fatal(build_log: str) -> Tuple[str, str]:
     """Return the first compiler error line and its full diagnostic block.
 
-    A diagnostic block starts at the first `file:line:col: error:` (or warning) line
+    A diagnostic block starts at the first `file:line:col: error:` (or undeclared function warning) line
     and includes all subsequent lines until the next `error:`/`warning:` diagnostic.
     """
     lines = build_log.splitlines()
     for idx, line in enumerate(lines):
         stripped = line.strip()
+        # Check for errors
         if _COMPILER_ERROR_RE.match(stripped):
+            end = len(lines)
+            for j in range(idx + 1, len(lines)):
+                nxt = lines[j].strip()
+                if _COMPILER_ERROR_RE.match(nxt) or _COMPILER_WARNING_RE.match(nxt):
+                    end = j
+                    break
+            return stripped, "\n".join(lines[idx:end]).strip()
+        # Check for undeclared function warnings (treated as errors)
+        m_warn = _COMPILER_WARNING_RE.match(stripped)
+        if m_warn and _is_undeclared_func_warning(stripped):
             end = len(lines)
             for j in range(idx + 1, len(lines)):
                 nxt = lines[j].strip()
