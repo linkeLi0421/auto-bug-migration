@@ -4727,7 +4727,9 @@ def revert_patch_test(args):
             os.makedirs(os.path.dirname(min_patch_file_path))
         if os.path.exists(min_patch_file_path):
             with open(min_patch_file_path, 'r') as f:
-                patch_pair_list = json.load(f)[bug_id]
+                cached_patches = json.load(f)
+                if bug_id in cached_patches:
+                    patch_pair_list = cached_patches[bug_id]
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
