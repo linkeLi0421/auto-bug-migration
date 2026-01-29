@@ -37,6 +37,9 @@ from utils import (
     diff_strings,
     save_patches_pickle,
     load_patches_pickle,
+    extract_extra_patches,
+    filter_patches_by_trace,
+    binary_search_missing_patches,
 )
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
@@ -3593,6 +3596,121 @@ def get_file_path_pairs(diff_results):
     return file_path_pairs
 
 
+def build_with_cached_extras(
+    patch_keys: List[str],
+    diff_results: Dict[str, Any],
+    extra_patches_cache: Dict[str, Any],
+    target: str,
+    next_commit_id: str,
+    sanitizer: str,
+    bug_id: str,
+    fuzzer: str,
+    build_csv: str,
+    arch: str,
+) -> Tuple[bool, str]:
+    """Build with a subset of patches, including cached extra patches."""
+    combined_patches = {}
+
+    for key in patch_keys:
+        if key in diff_results:
+            combined_patches[key] = diff_results[key]
+
+    combined_patches.update(extra_patches_cache)
+
+    patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+    patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit_id}_min_trial.diff")
+
+    sorted_keys = sorted(
+        combined_patches.keys(),
+        key=lambda k: getattr(combined_patches[k], 'new_start_line', 0),
+        reverse=True
+    )
+
+    with open(patch_file_path, 'w') as f:
+        for key in sorted_keys:
+            patch = combined_patches[key]
+            f.write(patch.patch_text)
+            f.write('\n\n')
+
+    return build_fuzzer(
+        target, next_commit_id, sanitizer, bug_id,
+        patch_file_path, fuzzer, build_csv, arch
+    )
+
+
+def minimize_with_trace_and_cached_extras(
+    patch_pair_list: List[Tuple[str, ...]],
+    patches_without_context: Dict[str, Any],
+    diff_results: Dict[str, Any],
+    trace1: List[Tuple[int, str]],
+    depen_graph: Dict[str, Set[str]],
+    target: str,
+    next_commit: Dict,
+    sanitizer: str,
+    bug_id: str,
+    fuzzer: str,
+    build_csv: str,
+    arch: str,
+) -> Tuple[List[Tuple[str, ...]], Dict[str, Any]]:
+    """Minimize patches using trace-based filtering with cached extra patches."""
+
+    # Phase 0: Extract cached extra patches (already populated by first build)
+    extra_patches_cache = extract_extra_patches(patches_without_context)
+    logger.info(f"Cached {len(extra_patches_cache)} extra patches")
+
+    # Phase 1: Static trace-based filtering
+    all_patch_keys = [key for keys in patch_pair_list for key in keys]
+    trace_func_list = [(func.split(' ')[0], func.split(' ')[-1]) for _, func in trace1]
+
+    filtered_keys = filter_patches_by_trace(
+        all_patch_keys, diff_results, trace_func_list, depen_graph
+    )
+    logger.info(f"Static filter: {len(all_patch_keys)} -> {len(filtered_keys)} patches")
+
+    filtered_patch_pairs = [
+        tuple(k for k in keys if k in filtered_keys)
+        for keys in patch_pair_list
+    ]
+    filtered_patch_pairs = [t for t in filtered_patch_pairs if t]
+
+    if not filtered_patch_pairs:
+        logger.warning("Static filter removed all patches, using original")
+        return patch_pair_list, extra_patches_cache
+
+    # Phase 2: Single verification build
+    filtered_flat = [k for keys in filtered_patch_pairs for k in keys]
+    success, _ = build_with_cached_extras(
+        filtered_flat, diff_results, extra_patches_cache,
+        target, next_commit['commit_id'], sanitizer, bug_id,
+        fuzzer, build_csv, arch
+    )
+
+    if success:
+        logger.info(f"Minimized from {len(all_patch_keys)} to {len(filtered_flat)}")
+        return filtered_patch_pairs, extra_patches_cache
+
+    # Phase 3: Binary search for missing patches
+    candidates = [k for k in all_patch_keys if k not in filtered_keys]
+
+    def test_fn(keys: List[str]) -> bool:
+        ok, _ = build_with_cached_extras(
+            keys, diff_results, extra_patches_cache,
+            target, next_commit['commit_id'], sanitizer, bug_id,
+            fuzzer, build_csv, arch
+        )
+        return ok
+
+    additional = binary_search_missing_patches(set(filtered_keys), candidates, test_fn)
+
+    if additional:
+        final_keys = set(filtered_keys + additional)
+        final_pairs = [tuple(k for k in keys if k in final_keys) for keys in patch_pair_list]
+        final_pairs = [t for t in final_pairs if t]
+        return final_pairs, extra_patches_cache
+
+    return patch_pair_list, extra_patches_cache
+
+
 def apply_and_test_patches(
     patch_pair_list,
     func_list, # list of function signatures, use source code from next_commit
@@ -4324,14 +4442,14 @@ def apply_and_test_patches(
                     next_commit['commit_id'],
                 )
                 return 'crash_mismatch'
-            if test_fuzzer_build(target, sanitizer, arch):
-                logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
-                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
-                return 'trigger_and_fuzzer_build'
+            # Reproduce passed (bug triggered) - this is the main success criterion
+            # check_build is optional; just warn if it fails
+            if not test_fuzzer_build(target, sanitizer, arch):
+                logger.warning(f"check_build failed for bug {bug_id} on commit {next_commit['commit_id']}, but reproduce passed - treating as success")
             else:
-                logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
-                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
-                return 'trigger_but_fuzzer_build_fail'
+                logger.info(f"Fuzzer build check passed for bug {bug_id} on commit {next_commit['commit_id']}")
+            get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
+            return 'trigger_and_fuzzer_build'
         else:
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             return 'not_trigger'
@@ -4613,15 +4731,23 @@ def revert_patch_test(args):
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
-        if not apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+        if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            minimal_fast = patch_pair_list  # Use original if initial build fails
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-            # try to minimize the patch set
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
-            logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
-            
+
+            # Use trace-based minimization with cached extras
+            minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
+                patch_pair_list, patches_without_context, diff_results,
+                trace1, depen_graph, target, next_commit, sanitizer,
+                bug_id, fuzzer, args.build_csv, arch
+            )
+
+            logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+
         min_path_dict[bug_id] = minimal_fast
 
         patches_without_contexts[

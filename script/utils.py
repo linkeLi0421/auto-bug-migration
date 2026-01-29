@@ -1,4 +1,4 @@
-from typing import List, Any, Callable, Dict, Tuple
+from typing import List, Any, Callable, Dict, Tuple, Set
 import copy
 import re
 import difflib
@@ -11,6 +11,100 @@ from pathlib import Path
 TestFn = Callable[[List[Any]], bool]
 
 logger = logging.getLogger(__name__)
+
+
+def extract_extra_patches(patches_without_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract _extra_* patches from the patch dictionary."""
+    return {
+        key: copy.deepcopy(patch)
+        for key, patch in patches_without_context.items()
+        if key.startswith('_extra_')
+    }
+
+
+def filter_patches_by_trace(
+    all_patch_keys: List[str],
+    diff_results: Dict[str, Any],
+    trace_func_list: List[Tuple[str, str]],
+    depen_graph: Dict[str, Set[str]],
+) -> List[str]:
+    """
+    Filter patches to only those whose functions appear in the execution trace
+    or are dependencies of trace-related functions.
+    """
+    trace_functions = {func for func, _ in trace_func_list}
+    trace_files = {loc.split(':')[0] for _, loc in trace_func_list if ':' in loc}
+
+    # First pass: find patches directly in trace
+    direct_matches = set()
+    for key in all_patch_keys:
+        patch = diff_results.get(key)
+        if not patch:
+            continue
+        patch_file = getattr(patch, 'file_path_old', None) or getattr(patch, 'file_path_new', None)
+        func_old = getattr(patch, 'old_function_name', '') or ''
+        func_new = getattr(patch, 'new_function_name', '') or ''
+
+        if func_old in trace_functions or func_new in trace_functions:
+            for trace_file in trace_files:
+                if patch_file and trace_file in patch_file:
+                    direct_matches.add(key)
+                    break
+
+    # Second pass: expand with dependency graph (transitive closure)
+    result = set(direct_matches)
+    worklist = list(direct_matches)
+    while worklist:
+        key = worklist.pop()
+        for callee_key in depen_graph.get(key, set()):
+            if callee_key not in result:
+                result.add(callee_key)
+                worklist.append(callee_key)
+
+    return list(result)
+
+
+def binary_search_missing_patches(
+    known_good: Set[str],
+    candidates: List[str],
+    test_fn: Callable[[List[str]], bool],
+) -> List[str]:
+    """Binary search to find minimal additional patches needed for build success."""
+    if not candidates:
+        return []
+
+    full_set = list(known_good) + candidates
+    if not test_fn(full_set):
+        return []  # Even with all patches it fails
+
+    if test_fn(list(known_good)):
+        return []  # Already works without candidates
+
+    needed = []
+    remaining = list(candidates)
+
+    while remaining:
+        mid = len(remaining) // 2
+        if mid == 0:
+            needed.append(remaining[0])
+            remaining = remaining[1:]
+            continue
+
+        first_half = remaining[:mid]
+        second_half = remaining[mid:]
+
+        test_set = list(known_good) + needed + first_half
+        if test_fn(test_set):
+            remaining = first_half
+        else:
+            test_set = list(known_good) + needed + second_half
+            if test_fn(test_set):
+                remaining = second_half
+            else:
+                needed.extend(first_half)
+                remaining = second_half
+
+    return needed
 
 def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
     """
