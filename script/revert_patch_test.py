@@ -3677,17 +3677,30 @@ def apply_and_test_patches(
             arch=arch,
         )
 
-        if agent_result["success"]:
+        # Reload the updated patch bundle and regenerate the .diff file
+        updated_patches = load_patches_pickle(patch_file_binary)
+        patches_without_context.update(updated_patches)
+        with open(patch_file_path, 'w') as patch_file:
+            for key in updated_patches:
+                patch = updated_patches[key]
+                patch_file.write(patch.patch_text)
+                patch_file.write('\n\n')
+        logger.info(f"Regenerated {patch_file_path} from updated patch bundle")
+        # Rebuild to verify
+        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        if build_success:
             logger.info("React multi-agent successfully fixed build errors")
-            # The agent may have updated the patch bundle, rebuild to verify
-            build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
-            if build_success:
-                break
+            break
         else:
-            logger.info(f"React multi-agent did not fully fix errors (returncode={agent_result['returncode']})")
+            logger.info(f"React multi-agent did not fully fix errors, build still fails")
+            # Write verification build errors to a separate log
+            verify_log_path = os.path.join(data_path, "tmp_patch", f"{target}_verify_build.log")
+            with open(verify_log_path, 'w') as f:
+                f.write(error_log)
+            logger.info(f"Verification build errors written to {verify_log_path}")
         break
 
-        # Continue with existing manual error handling as fallback
+        # Rule-based error handling below is skipped - using react multi-agent only
         undeclared_identifier, undeclared_functions, miss_member_structs, function_sig_changes, incomplete_types = handle_build_error(error_log)
         
         # Check if build error results are the same as last iteration
