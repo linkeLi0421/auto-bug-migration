@@ -4,6 +4,8 @@ import subprocess
 import json
 import os
 import tempfile
+import time
+import shutil
 from git import Repo, GitCommandError
 import logging
 from pathlib import Path
@@ -1591,6 +1593,7 @@ def call_react_agent(
     ]
 
     logger.info(f"Calling react multi-agent: {' '.join(cmd)}")
+    start_time = time.time()
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
 
     try:
@@ -1598,13 +1601,36 @@ def call_react_agent(
     except json.JSONDecodeError:
         output = {"raw_stdout": result.stdout, "raw_stderr": result.stderr}
 
-    # Check if agent succeeded - multi_agent uses returncode 0 for success
-    success = result.returncode == 0
+    # Find the latest multi_* artifacts directory created after start_time
+    artifacts_base = os.path.join(data_path, "react_agent_artifacts")
+    merged_diff_path = ""
+    artifacts_dir = ""
+    if os.path.isdir(artifacts_base):
+        multi_dirs = sorted(
+            [d for d in os.listdir(artifacts_base) if d.startswith("multi_")],
+            key=lambda x: os.path.getmtime(os.path.join(artifacts_base, x)),
+            reverse=True,
+        )
+        for d in multi_dirs:
+            dir_path = os.path.join(artifacts_base, d)
+            if os.path.getmtime(dir_path) >= start_time:
+                summary_path = os.path.join(dir_path, "summary.json")
+                if os.path.isfile(summary_path):
+                    try:
+                        with open(summary_path) as f:
+                            summary = json.load(f)
+                        merged_diff_path = summary.get("final_ossfuzz_test", {}).get("merged_patch_file_path", "")
+                        artifacts_dir = dir_path
+                        break
+                    except Exception:
+                        pass
 
     return {
-        "success": success,
+        "success": result.returncode == 0,
         "output": output,
         "returncode": result.returncode,
+        "merged_diff_path": merged_diff_path,
+        "artifacts_dir": artifacts_dir,
     }
 
 
@@ -3677,15 +3703,21 @@ def apply_and_test_patches(
             arch=arch,
         )
 
-        # Reload the updated patch bundle and regenerate the .diff file
-        updated_patches = load_patches_pickle(patch_file_binary)
-        patches_without_context.update(updated_patches)
-        with open(patch_file_path, 'w') as patch_file:
-            for key in updated_patches:
-                patch = updated_patches[key]
-                patch_file.write(patch.patch_text)
-                patch_file.write('\n\n')
-        logger.info(f"Regenerated {patch_file_path} from updated patch bundle")
+        # Use the merged diff from the agent directly
+        merged_diff = agent_result.get("merged_diff_path", "")
+        if merged_diff and os.path.isfile(merged_diff):
+            shutil.copy(merged_diff, patch_file_path)
+            logger.info(f"Copied merged diff from {merged_diff} to {patch_file_path}")
+        else:
+            # Fallback: reload the updated patch bundle and regenerate the .diff file
+            updated_patches = load_patches_pickle(patch_file_binary)
+            patches_without_context.update(updated_patches)
+            with open(patch_file_path, 'w') as patch_file:
+                for key in updated_patches:
+                    patch = updated_patches[key]
+                    patch_file.write(patch.patch_text)
+                    patch_file.write('\n\n')
+            logger.info(f"Regenerated {patch_file_path} from updated patch bundle (fallback)")
         # Rebuild to verify
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:

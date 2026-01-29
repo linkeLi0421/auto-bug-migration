@@ -58,11 +58,10 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "architecture": "string?",
             "engine": "string?",
             "fuzz_target": "string?",
-            "run_fuzzer_seconds": "int?",
             "timeout_seconds": "int?",
             "use_sudo": "bool?",
         },
-    "description": "Merge a tmp_patch bundle with override patch diff files, then run OSS-Fuzz Docker build/check_build.",
+    "description": "Merge a tmp_patch bundle with override patch diff files, then run OSS-Fuzz Docker build.",
     },
     {
         "name": "list_patch_bundle",

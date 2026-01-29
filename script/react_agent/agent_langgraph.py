@@ -616,11 +616,11 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
     if not isinstance(out, dict):
         return {"status": "unknown", "reason": "Missing OSS-Fuzz tool output."}
 
-    build_text, check_text, sources, read_err = _read_ossfuzz_logs(out)
-    if not build_text and not check_text:
+    build_text, sources, read_err = _read_ossfuzz_logs(out)
+    if not build_text:
         return {"status": "unknown", "reason": read_err or "Empty OSS-Fuzz logs.", "log_artifacts": sources}
 
-    infra = _ossfuzz_infra_failure(build_text, check_text)
+    infra = _ossfuzz_infra_failure(build_text)
     if infra:
         payload: Dict[str, Any] = {
             "status": "failed",
@@ -633,7 +633,7 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             payload["hint"] = hint
         return payload
 
-    patch_apply = _ossfuzz_patch_apply_failure(build_text, check_text)
+    patch_apply = _ossfuzz_patch_apply_failure(build_text)
     if patch_apply:
         payload = {
             "status": "failed",
@@ -651,14 +651,11 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
         if build_text:
             combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=0))
             combined_errors.extend(iter_linker_errors(build_text, snippet_lines=0))
-        if check_text:
-            combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=0))
-            combined_errors.extend(iter_linker_errors(check_text, snippet_lines=0))
     except Exception as exc:  # noqa: BLE001
         return {"status": "unknown", "reason": f"Failed to parse logs: {exc}", "log_artifacts": sources}
 
     if not combined_errors:
-        noncompiler = _ossfuzz_non_compiler_failure_from_output(out, build_text=build_text, check_text=check_text)
+        noncompiler = _ossfuzz_non_compiler_failure_from_output(out, build_text=build_text)
         if noncompiler:
             kind = str(noncompiler.get("kind", "") or "").strip()
             reason = str(noncompiler.get("reason", "") or "").strip()
@@ -671,7 +668,7 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                 "log_artifacts": sources,
             }
             if kind == "build":
-                payload["hint"] = "OSS-Fuzz failed without emitting compiler diagnostics; inspect build/check_build logs and ensure the build environment is healthy."
+                payload["hint"] = "OSS-Fuzz failed without emitting compiler diagnostics; inspect build logs and ensure the build environment is healthy."
             elif kind == "patch_apply":
                 payload["hint"] = "OSS-Fuzz reported a patch-apply failure; regenerate a complete unified diff override and retry."
             return payload
@@ -1028,65 +1025,42 @@ def _pick_ossfuzz_failure_line(blob: str) -> str:
 
 
 def _ossfuzz_non_compiler_failure_from_output(
-    output: Dict[str, Any], *, build_text: str, check_text: str
+    output: Dict[str, Any], *, build_text: str
 ) -> Optional[Dict[str, str]]:
     """Return failure reason when OSS-Fuzz indicates failure but logs have no compiler diagnostics."""
     patch_apply_ok = output.get("patch_apply_ok")
     if isinstance(patch_apply_ok, bool) and patch_apply_ok is False:
         reason = str(output.get("patch_apply_error", "") or "").strip()
         if not reason:
-            reason = _pick_ossfuzz_failure_line(build_text) or _pick_ossfuzz_failure_line(check_text) or "patch_apply_ok=false"
+            reason = _pick_ossfuzz_failure_line(build_text) or "patch_apply_ok=false"
         return {"kind": "patch_apply", "reason": reason}
 
     build_ok = output.get("build_ok")
-    check_ok = output.get("check_build_ok")
-    failed_steps: List[str] = []
     if isinstance(build_ok, bool) and build_ok is False:
-        failed_steps.append("build_version")
-    if isinstance(check_ok, bool) and check_ok is False:
-        failed_steps.append("check_build")
-    if not failed_steps:
-        return None
-
-    hint = ""
-    if "build_version" in failed_steps:
         hint = _pick_ossfuzz_failure_line(build_text)
-    if not hint and "check_build" in failed_steps:
-        hint = _pick_ossfuzz_failure_line(check_text)
-    if not hint:
-        hint = _pick_ossfuzz_failure_line(build_text) or _pick_ossfuzz_failure_line(check_text)
+        reason = "build_version failed"
+        if hint:
+            reason += f": {hint}"
+        return {"kind": "build", "reason": reason}
 
-    reason = f"{', '.join(failed_steps)} failed"
-    if hint:
-        reason += f": {hint}"
-    return {"kind": "build", "reason": reason}
-
-
-def _ossfuzz_infra_failure(build_text: str, check_text: str) -> Optional[Dict[str, str]]:
-    for blob in (build_text, check_text):
-        hit = _ossfuzz_infra_failure_reason(blob)
-        if hit:
-            return hit
     return None
 
 
-def _ossfuzz_patch_apply_failure(build_text: str, check_text: str) -> Optional[Dict[str, str]]:
-    for blob in (build_text, check_text):
-        hit = _ossfuzz_patch_apply_failure_reason(blob)
-        if hit:
-            return hit
-    return None
+def _ossfuzz_infra_failure(build_text: str) -> Optional[Dict[str, str]]:
+    return _ossfuzz_infra_failure_reason(build_text)
 
 
-def _read_ossfuzz_logs(output: Dict[str, Any]) -> tuple[str, str, List[str], Optional[str]]:
+def _ossfuzz_patch_apply_failure(build_text: str) -> Optional[Dict[str, str]]:
+    return _ossfuzz_patch_apply_failure_reason(build_text)
+
+
+def _read_ossfuzz_logs(output: Dict[str, Any]) -> tuple[str, List[str], Optional[str]]:
     build_path = _ossfuzz_artifact_path(output, "build_output")
-    check_path = _ossfuzz_artifact_path(output, "check_build_output")
-    if not build_path and not check_path:
-        return "", "", [], "No build/check_build log artifacts found."
+    if not build_path:
+        return "", [], "No build log artifacts found."
 
     sources: List[str] = []
     build_text = ""
-    check_text = ""
     read_errors: List[str] = []
     if build_path:
         sources.append(build_path)
@@ -1094,16 +1068,10 @@ def _read_ossfuzz_logs(output: Dict[str, Any]) -> tuple[str, str, List[str], Opt
             build_text = _read_text(build_path)
         except Exception as exc:  # noqa: BLE001
             read_errors.append(f"Failed to read build log: {type(exc).__name__}: {exc}")
-    if check_path:
-        sources.append(check_path)
-        try:
-            check_text = _read_text(check_path)
-        except Exception as exc:  # noqa: BLE001
-            read_errors.append(f"Failed to read check_build log: {type(exc).__name__}: {exc}")
 
-    if read_errors and not (build_text or check_text):
-        return "", "", sources, "; ".join(read_errors)
-    return build_text, check_text, sources, ("; ".join(read_errors) if read_errors else None)
+    if read_errors and not build_text:
+        return "", sources, "; ".join(read_errors)
+    return build_text, sources, ("; ".join(read_errors) if read_errors else None)
 
 
 def _reindex_patch_bundle(bundle: Any) -> Any:
@@ -1560,11 +1528,11 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
     if not isinstance(out, dict):
         return [], [], "Missing OSS-Fuzz tool output."
 
-    build_text, check_text, sources, read_err = _read_ossfuzz_logs(out)
-    if not build_text and not check_text:
+    build_text, sources, read_err = _read_ossfuzz_logs(out)
+    if not build_text:
         return [], sources, read_err or "Empty OSS-Fuzz logs."
 
-    infra = _ossfuzz_infra_failure(build_text, check_text)
+    infra = _ossfuzz_infra_failure(build_text)
     if infra:
         reason = str(infra.get("reason") or "").strip()
         hint = str(infra.get("hint") or "").strip()
@@ -1573,7 +1541,7 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
             msg += f" Hint: {hint}"
         return [], sources, msg
 
-    patch_apply = _ossfuzz_patch_apply_failure(build_text, check_text)
+    patch_apply = _ossfuzz_patch_apply_failure(build_text)
     if patch_apply:
         reason = str(patch_apply.get("reason") or "").strip()
         hint = str(patch_apply.get("hint") or "").strip()
@@ -1588,13 +1556,10 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
         if build_text:
             combined_errors.extend(iter_compiler_errors(build_text, snippet_lines=2))
             linker_errors.extend(iter_linker_errors(build_text, snippet_lines=2))
-        if check_text:
-            combined_errors.extend(iter_compiler_errors(check_text, snippet_lines=2))
-            linker_errors.extend(iter_linker_errors(check_text, snippet_lines=2))
     except Exception as exc:  # noqa: BLE001
         return [], sources, f"Failed to parse OSS-Fuzz logs: {type(exc).__name__}: {exc}"
 
-    # De-dup compiler errors across build/check_build while preserving order.
+    # De-dup compiler errors while preserving order.
     seen: set[tuple[str, int, int, str]] = set()
     deduped: List[Dict[str, Any]] = []
     for err in combined_errors:
@@ -1628,7 +1593,7 @@ def _iter_ossfuzz_compiler_errors(state: AgentState) -> tuple[List[Dict[str, Any
     # OSS-Fuzz can fail without emitting compiler diagnostics (e.g. build script errors).
     # Do not treat an empty compiler-error set as "clean" when OSS-Fuzz indicates failure.
     if not deduped:
-        noncompiler = _ossfuzz_non_compiler_failure_from_output(out, build_text=build_text, check_text=check_text)
+        noncompiler = _ossfuzz_non_compiler_failure_from_output(out, build_text=build_text)
         if noncompiler:
             kind = str(noncompiler.get("kind", "") or "").strip()
             reason = str(noncompiler.get("reason", "") or "").strip()
