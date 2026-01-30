@@ -448,9 +448,10 @@ class OpenAIChatCompletionsModel(ChatModel):
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
         org = os.environ.get("OPENAI_ORG", "").strip()
         project = os.environ.get("OPENAI_PROJECT", "").strip()
+        timeout_s = int(os.environ.get("OPENAI_TIMEOUT", "") or 300)  # 5 min default for large rewrites
         if not api_key:
             raise ModelError("OPENAI_API_KEY is required")
-        return cls(api_key=api_key, model=model, base_url=base_url, org=org, project=project)
+        return cls(api_key=api_key, model=model, base_url=base_url, org=org, project=project, timeout_s=timeout_s)
 
     def complete_with_raw(self, messages: List[Message]) -> tuple[str, ModelResponseDebug]:
         url = self.base_url.rstrip("/") + "/chat/completions"
