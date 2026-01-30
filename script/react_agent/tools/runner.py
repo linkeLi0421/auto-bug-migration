@@ -19,6 +19,7 @@ from .migration_tools import (  # noqa: E402
     get_patch as get_patch_tool,
     list_patch_bundle as list_patch_bundle_tool,
     make_error_patch_override as make_error_patch_override_tool,
+    make_func_call_fix as make_func_call_fix_tool,
     make_link_error_patch_override as make_link_error_patch_override_tool,
     parse_build_errors as parse_build_errors_tool,
     search_patches as search_patches_tool,
@@ -435,6 +436,42 @@ class ToolRunner:
                         "max_lines": max_lines,
                         "max_chars": max_chars,
                         "new_func_code": str(new_func_code)[:2000],
+                    },
+                    output=out,
+                )
+
+            if tool == "make_func_call_fix":
+                patch_path = str(args.get("patch_path", "")).strip()
+                file_path = str(args.get("file_path", "")).strip()
+                line_number = _as_int(args.get("line_number"), 0)
+                old_call = str(args.get("old_call", "")).strip()
+                new_call = str(args.get("new_call", "")).strip()
+                if not patch_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
+                if not file_path:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
+                if line_number <= 0:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: line_number")
+                if not old_call:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: old_call")
+                if not new_call:
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: new_call")
+                out = make_func_call_fix_tool(
+                    patch_path=patch_path,
+                    file_path=file_path,
+                    line_number=line_number,
+                    old_call=old_call,
+                    new_call=new_call,
+                )
+                return ToolObservation(
+                    True,
+                    tool,
+                    {
+                        "patch_path": patch_path,
+                        "file_path": file_path,
+                        "line_number": line_number,
+                        "old_call": old_call,
+                        "new_call": new_call,
                     },
                     output=out,
                 )

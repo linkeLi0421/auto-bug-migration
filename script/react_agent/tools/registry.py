@@ -15,6 +15,7 @@ ToolName = Literal[
     "make_extra_patch_override",
     "make_error_patch_override",
     "make_link_error_patch_override",
+    "make_func_call_fix",
     "parse_build_errors",
 ]
 
@@ -153,6 +154,23 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "Deterministically extend a file's `_extra_*` hunk to provide a missing declaration/define/typedef. "
             "Use for undeclared function/type/macro issues (including warning-level diagnostics like 'call to undeclared function ...'). "
             "The tool infers the `_extra_<file>` patch_key from file_path and returns a full override diff (never truncated)."
+        ),
+    },
+    {
+        "name": "make_func_call_fix",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "line_number": "int",
+            "old_call": "string",
+            "new_call": "string",
+        },
+        "description": (
+            "Apply a targeted line-level fix for function call argument errors (too few/many arguments). "
+            "Instead of rewriting the entire function body, this replaces just the specific call site. "
+            "old_call: the existing call expression (e.g., 'xmlParseEndTag2(ctxt, &ctxt->pushTab[ctxt->nameNr - 1])'). "
+            "new_call: the fixed call expression with correct arguments. "
+            "Use after get_error_patch_context and search_definition(callee, v2) to find the new signature."
         ),
     },
     {
