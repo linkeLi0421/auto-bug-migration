@@ -87,7 +87,9 @@ def _context_from_state(state: Any) -> PromptContext:
     missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
     linker_error = "undefined reference to" in err_lower or "undefined reference to" in snip_lower
     func_sig_change = ("too few arguments" in err_lower) or ("too many arguments" in err_lower)
-    conflicting_types = "conflicting types for" in err_lower or "conflicting types for" in snip_lower
+    # Only handle conflicting_types when there are NO undeclared symbol errors.
+    # Undeclared function errors are the root cause; fixing them properly resolves the conflict.
+    conflicting_types = ("conflicting types for" in err_lower or "conflicting types for" in snip_lower) and not undeclared_symbol
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
