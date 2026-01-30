@@ -490,9 +490,11 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
     # Also process linker errors (undefined reference errors from the linker stage).
     for err in iter_linker_errors(build_log_text, snippet_lines=10):
         fp = str(err.get("file", "") or "").strip()
-        fn = str(err.get("function", "") or "").strip()
-        if not fp or not fn:
+        symbol = str(err.get("symbol", "") or "").strip()
+        if not fp or not symbol:
             continue
+        # Strip __revert_<commit>_ prefix from symbol to get original function name
+        fn = re.sub(r"^__revert_[a-fA-F0-9]+_", "", symbol)
         mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=fn)
         key = str(mapping.get("patch_key") or "").strip()
         if not key:
