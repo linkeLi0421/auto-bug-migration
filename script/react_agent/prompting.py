@@ -20,6 +20,7 @@ class PromptContext:
     incomplete_type: bool
     missing_prototypes: bool
     linker_error: bool
+    func_sig_change: bool  # "too few/many arguments to function call"
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -84,6 +85,7 @@ def _context_from_state(state: Any) -> PromptContext:
     incomplete_type = ("incomplete" in err_lower and "type" in err_lower) or ("incomplete" in snip_lower and "type" in snip_lower)
     missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
     linker_error = "undefined reference to" in err_lower or "undefined reference to" in snip_lower
+    func_sig_change = ("too few arguments" in err_lower) or ("too many arguments" in err_lower)
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -97,6 +99,7 @@ def _context_from_state(state: Any) -> PromptContext:
         incomplete_type=incomplete_type,
         missing_prototypes=missing_prototypes,
         linker_error=linker_error,
+        func_sig_change=func_sig_change,
     )
 
 
@@ -170,6 +173,11 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if linker_error:
             parts.append(linker_error)
 
+    if ctx.func_sig_change:
+        func_sig_change = _load_fragment("system_func_sig_change.txt")
+        if func_sig_change:
+            parts.append(func_sig_change)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -193,6 +201,8 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_missing_prototypes.txt")
         if ctx.linker_error:
             names.append("system_linker_error.txt")
+        if ctx.func_sig_change:
+            names.append("system_func_sig_change.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"

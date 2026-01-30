@@ -1,0 +1,22 @@
+Function signature change errors (too few/many arguments):
+- These errors occur when a callee function's signature changed between V1 and V2.
+- Error patterns: "too few arguments to function call", "too many arguments to function call"
+- EFFICIENT FIX STRATEGY: Do NOT rewrite the entire function body. Instead:
+  1. Use `search_definition` to find the NEW callee function signature in V2.
+  2. Use `make_func_call_fix` tool to fix ONLY the specific call site line(s).
+  3. The tool will apply a targeted line-level edit without regenerating the whole function.
+
+- When using `make_func_call_fix`:
+  - Provide the error message (includes file:line:col)
+  - Provide the new callee signature from V2
+  - Provide the fixed call expression (just the call, not the whole function)
+
+- Example fix for "too few arguments":
+  OLD: xmlParseEndTag2(ctxt, &ctxt->pushTab[ctxt->nameNr - 1]);
+  NEW: xmlParseEndTag2(ctxt, tag->prefix, tag->URI, tag->line, tag->nsNr, tag->tlen);
+
+- Rules for fixing calls:
+  - If parameters were ADDED: use existing local variables if available, otherwise NULL/0
+  - If parameters were REMOVED: delete them from the call
+  - Do NOT invent new struct fields or variables that don't exist
+  - Check the caller function for existing local variables that match the new parameter types
