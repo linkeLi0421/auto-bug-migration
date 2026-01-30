@@ -1260,7 +1260,14 @@ def main(argv: List[str]) -> int:
                 )
 
                 build_log_path = (artifacts_root / "final_ossfuzz_build_output.log").resolve()
-                build_log_path.write_text(str(res.get("build_output", "") or ""), encoding="utf-8", errors="replace")
+                # build_output is an artifact ref dict; read actual content from artifact_path
+                build_output_ref = res.get("build_output") or {}
+                build_output_artifact = build_output_ref.get("artifact_path", "") if isinstance(build_output_ref, dict) else ""
+                if build_output_artifact and Path(build_output_artifact).is_file():
+                    build_log_text = Path(build_output_artifact).read_text(encoding="utf-8", errors="replace")
+                else:
+                    build_log_text = str(build_output_ref)
+                build_log_path.write_text(build_log_text, encoding="utf-8", errors="replace")
 
                 patch_apply_ok = bool(res.get("patch_apply_ok"))
                 build_ok = bool(res.get("build_ok"))
@@ -1391,7 +1398,14 @@ def main(argv: List[str]) -> int:
             )
 
             build_log_path_cont = (artifacts_root / f"final_ossfuzz_build_output.continuation.{continuation_round}.log").resolve()
-            build_log_path_cont.write_text(str(res.get("build_output", "") or ""), encoding="utf-8", errors="replace")
+            # build_output is an artifact ref dict; read actual content from artifact_path
+            build_output_ref = res.get("build_output") or {}
+            build_output_artifact = build_output_ref.get("artifact_path", "") if isinstance(build_output_ref, dict) else ""
+            if build_output_artifact and Path(build_output_artifact).is_file():
+                build_log_text = Path(build_output_artifact).read_text(encoding="utf-8", errors="replace")
+            else:
+                build_log_text = str(build_output_ref)
+            build_log_path_cont.write_text(build_log_text, encoding="utf-8", errors="replace")
 
             patch_apply_ok = bool(res.get("patch_apply_ok"))
             build_ok = bool(res.get("build_ok"))
