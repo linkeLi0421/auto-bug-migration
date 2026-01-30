@@ -21,6 +21,7 @@ class PromptContext:
     missing_prototypes: bool
     linker_error: bool
     func_sig_change: bool  # "too few/many arguments to function call"
+    conflicting_types: bool  # "conflicting types for 'func'"
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -86,6 +87,7 @@ def _context_from_state(state: Any) -> PromptContext:
     missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
     linker_error = "undefined reference to" in err_lower or "undefined reference to" in snip_lower
     func_sig_change = ("too few arguments" in err_lower) or ("too many arguments" in err_lower)
+    conflicting_types = "conflicting types for" in err_lower or "conflicting types for" in snip_lower
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -100,6 +102,7 @@ def _context_from_state(state: Any) -> PromptContext:
         missing_prototypes=missing_prototypes,
         linker_error=linker_error,
         func_sig_change=func_sig_change,
+        conflicting_types=conflicting_types,
     )
 
 
@@ -178,6 +181,11 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if func_sig_change:
             parts.append(func_sig_change)
 
+    if ctx.conflicting_types:
+        conflicting_types = _load_fragment("system_conflicting_types.txt")
+        if conflicting_types:
+            parts.append(conflicting_types)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -203,6 +211,8 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_linker_error.txt")
         if ctx.func_sig_change:
             names.append("system_func_sig_change.txt")
+        if ctx.conflicting_types:
+            names.append("system_conflicting_types.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"
