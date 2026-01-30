@@ -2110,8 +2110,18 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
             return False
         return True
 
-    # Macro-expansion errors: prioritize the macro name and macro-like tokens from the snippet.
+    err = str(state.error_line or "")
     snippet = str(state.snippet or "")
+
+    # Function signature change errors: extract the callee function name from snippet.
+    # For "too few/many arguments to function call", the snippet contains the actual call site.
+    if "too few arguments" in err.lower() or "too many arguments" in err.lower():
+        # Extract function call names from snippet (pattern: identifier followed by '(')
+        for func_name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet):
+            if keep(func_name) and len(func_name) > 5:  # Skip short names like "if", "for"
+                terms.append(func_name)
+
+    # Macro-expansion errors: prioritize the macro name and macro-like tokens from the snippet.
     if snippet:
         for macro_name in re.findall(r"expanded from macro '([^']+)'", snippet):
             if keep(macro_name):
@@ -2125,7 +2135,7 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
     # a missing-member diagnostic. Patch-scope runs can include many other errors
     # in the same patch_key; including unrelated struct tokens can skew truncation
     # windows and confuse the model.
-    if _MISSING_MEMBER_RE.search(str(state.error_line or "")) and state.missing_struct_members:
+    if _MISSING_MEMBER_RE.search(err) and state.missing_struct_members:
         for item in state.missing_struct_members or []:
             if not isinstance(item, dict):
                 continue
@@ -2137,7 +2147,6 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
             if keep(struct_name):
                 terms.append(struct_name)
     # Also include a few tokens from the error line itself.
-    err = str(state.error_line or "")
     for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", err):
         if keep(tok):
             terms.append(tok)
