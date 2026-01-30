@@ -1,10 +1,15 @@
 Mapped-slice rewrites (make_error_patch_override):
 
-CRITICAL - FUNCTION NAME PRESERVATION:
+CRITICAL - FUNCTION SIGNATURE PRESERVATION:
+- NEVER change the function signature (return type, function name, or parameters).
 - The `old_signature` field shows the EXACT function signature you must use.
-- If old_signature is `__revert_5f664a_xmlParseTryOrFinish(...)`, your new_func_code MUST start with that EXACT name.
-- NEVER strip the `__revert_*` prefix! Writing `xmlParseTryOrFinish` instead of `__revert_5f664a_xmlParseTryOrFinish` will cause redefinition errors.
-- Copy the function signature character-for-character from old_signature, then edit only the body.
+- If the BASE slice has `void __revert_5f664a_xmlRegisterCharEncodingHandler(...)`, your new_func_code MUST use:
+  - SAME return type: `void` (not `int`, not anything else)
+  - SAME function name: `__revert_5f664a_xmlRegisterCharEncodingHandler` (not stripped prefix)
+  - SAME parameters: exactly as shown
+- NEVER strip the `__revert_*` prefix! Writing `xmlParseTryOrFinish` instead of `__revert_5f664a_xmlParseTryOrFinish` causes redefinition errors.
+- NEVER change return type! Writing `int foo()` when BASE has `void foo()` causes conflicting types errors.
+- Copy the function signature character-for-character from the BASE slice, then edit ONLY the body.
 
 General rules:
 - Read the BASE slice artifact (read_artifact) and apply minimal edits; do not drop unrelated lines or omit the tail.
