@@ -1533,6 +1533,83 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     return True, ''
 
 
+def prepare_v1_v2_repos(
+    source_repo_path: str,
+    v1_repo_base: str,
+    v2_repo_base: str,
+    target: str,
+    v1_commit: str,
+    v2_commit: str,
+) -> tuple:
+    """Prepare separate V1 and V2 source directories by checkout and copy.
+
+    The react agent needs two separate source trees to read code from both versions.
+    This function checks out each commit in the source repo and copies the source
+    files to the V1/V2 directories.
+
+    Args:
+        source_repo_path: Path to the source repo (REPO_PATH/<target>)
+        v1_repo_base: Base directory for V1 source (e.g., /home/user/tasks-git-v1)
+        v2_repo_base: Base directory for V2 source (e.g., /home/user/tasks-git-v2)
+        target: Project name (e.g., libxml2)
+        v1_commit: Commit hash for V1 (old version)
+        v2_commit: Commit hash for V2 (new version)
+
+    Returns:
+        Tuple of (v1_src_path, v2_src_path)
+    """
+    v1_target_path = os.path.join(v1_repo_base, target)
+    v2_target_path = os.path.join(v2_repo_base, target)
+
+    # Checkout V1 commit in source repo and copy to V1 path
+    logger.info(f"Checking out V1 commit {v1_commit} in {source_repo_path}")
+    subprocess.run(
+        ["git", "clean", "-fdx"],
+        cwd=source_repo_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-f", v1_commit],
+        cwd=source_repo_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Remove old V1 target and copy fresh
+    if os.path.exists(v1_target_path):
+        shutil.rmtree(v1_target_path)
+    os.makedirs(v1_repo_base, exist_ok=True)
+    logger.info(f"Copying source to {v1_target_path}")
+    shutil.copytree(source_repo_path, v1_target_path, symlinks=True)
+
+    # Checkout V2 commit in source repo and copy to V2 path
+    logger.info(f"Checking out V2 commit {v2_commit} in {source_repo_path}")
+    subprocess.run(
+        ["git", "clean", "-fdx"],
+        cwd=source_repo_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-f", v2_commit],
+        cwd=source_repo_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Remove old V2 target and copy fresh
+    if os.path.exists(v2_target_path):
+        shutil.rmtree(v2_target_path)
+    os.makedirs(v2_repo_base, exist_ok=True)
+    logger.info(f"Copying source to {v2_target_path}")
+    shutil.copytree(source_repo_path, v2_target_path, symlinks=True)
+
+    return v1_target_path, v2_target_path
+
+
 def call_react_agent(
     build_log_path: str,
     patch_path: str,
@@ -3732,6 +3809,8 @@ def apply_and_test_patches(
     file_path_pairs,
     data_path,
     depen_graph,
+    v1_repo_path,
+    v2_repo_path,
     ):
     if not patch_pair_list:
         logger.error("No patch pairs to apply")
@@ -3805,6 +3884,17 @@ def apply_and_test_patches(
         # Call react multi-agent to fix build errors
         v1_json_dir = os.path.join(data_path, f"{target}-{commit['commit_id']}")
         v2_json_dir = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
+
+        # Prepare separate V1/V2 source trees checked out to correct commits
+        v1_src_path, v2_src_path = prepare_v1_v2_repos(
+            source_repo_path=target_repo_path,
+            v1_repo_base=v1_repo_path,
+            v2_repo_base=v2_repo_path,
+            target=target,
+            v1_commit=commit['commit_id'],
+            v2_commit=next_commit['commit_id'],
+        )
+
         agent_result = call_react_agent(
             build_log_path=build_log_temp,
             patch_path=patch_file_binary,
@@ -3815,8 +3905,8 @@ def apply_and_test_patches(
             fuzz_target=fuzzer,
             v1_json_dir=v1_json_dir,
             v2_json_dir=v2_json_dir,
-            v1_src=target_repo_path,
-            v2_src=target_repo_path,
+            v1_src=v1_src_path,
+            v2_src=v2_src_path,
             sanitizer=sanitizer,
             arch=arch,
         )
@@ -4514,6 +4604,13 @@ def revert_patch_test(args):
     if not repo_path:
         logger.info("REPO_PATH environment variable not set. Exiting.")
         exit(1)
+    # Get separate V1/V2 repo paths for react agent (old and new source versions)
+    v1_repo_path = os.getenv('V1_REPO_PATH', '')
+    v2_repo_path = os.getenv('V2_REPO_PATH', '')
+    if not v1_repo_path or not v2_repo_path:
+        logger.warning("V1_REPO_PATH or V2_REPO_PATH not set. React agent may not work correctly.")
+        v1_repo_path = v1_repo_path or repo_path
+        v2_repo_path = v2_repo_path or repo_path
     testcases_env = os.getenv('TESTCASES', '')
     if not testcases_env:
         logger.info("TESTCASES environment variable not set. Exiting.")
@@ -4711,7 +4808,8 @@ def revert_patch_test(args):
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
         inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
-            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
+            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
+            v1_repo_path, v2_repo_path)
         signature_change_list = []
         mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
