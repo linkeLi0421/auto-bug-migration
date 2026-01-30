@@ -435,10 +435,10 @@ class OpenAIChatCompletionsModel(ChatModel):
     org: str = ""
     project: str = ""
     temperature: float = 0.0
-    max_tokens: int = 800
+    max_tokens: int = 16000  # Enough for large function rewrites (~1000 lines)
     json_mode: bool = True
     reasoning_effort: str = "low"
-    timeout_s: int = 120
+    timeout_s: int = 600  # 10 min default for large rewrites
     max_debug_body_chars: int = 200_000
 
     @classmethod
@@ -448,10 +448,11 @@ class OpenAIChatCompletionsModel(ChatModel):
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or "https://api.openai.com/v1"
         org = os.environ.get("OPENAI_ORG", "").strip()
         project = os.environ.get("OPENAI_PROJECT", "").strip()
-        timeout_s = int(os.environ.get("OPENAI_TIMEOUT", "") or 300)  # 5 min default for large rewrites
+        timeout_s = int(os.environ.get("OPENAI_TIMEOUT", "") or 600)  # 10 min default for large rewrites
+        max_tokens = int(os.environ.get("OPENAI_MAX_TOKENS", "") or 16000)  # Enough for ~1000 line functions
         if not api_key:
             raise ModelError("OPENAI_API_KEY is required")
-        return cls(api_key=api_key, model=model, base_url=base_url, org=org, project=project, timeout_s=timeout_s)
+        return cls(api_key=api_key, model=model, base_url=base_url, org=org, project=project, timeout_s=timeout_s, max_tokens=max_tokens)
 
     def complete_with_raw(self, messages: List[Message]) -> tuple[str, ModelResponseDebug]:
         url = self.base_url.rstrip("/") + "/chat/completions"

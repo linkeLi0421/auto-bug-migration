@@ -1,22 +1,32 @@
 Function signature change errors (too few/many arguments):
 - These errors occur when a callee function's signature changed between V1 and V2.
 - Error patterns: "too few arguments to function call", "too many arguments to function call"
-- EFFICIENT FIX STRATEGY: Do NOT rewrite the entire function body. Instead:
-  1. Use `search_definition` to find the NEW callee function signature in V2.
-  2. Use `make_func_call_fix` tool to fix ONLY the specific call site line(s).
-  3. The tool will apply a targeted line-level edit without regenerating the whole function.
 
-- When using `make_func_call_fix`:
-  - Provide the error message (includes file:line:col)
-  - Provide the new callee signature from V2
-  - Provide the fixed call expression (just the call, not the whole function)
+FIX WORKFLOW - Follow these steps in order:
 
-- Example fix for "too few arguments":
-  OLD: xmlParseEndTag2(ctxt, &ctxt->pushTab[ctxt->nameNr - 1]);
-  NEW: xmlParseEndTag2(ctxt, tag->prefix, tag->URI, tag->line, tag->nsNr, tag->tlen);
+1. GET CALLER CODE: Use `get_error_patch_context` with the error file_path and line_number.
+   - This returns `error_func_code` containing the caller function that has the bad call site.
+   - Note the `old_signature` field - this is the caller function you need to fix.
 
-- Rules for fixing calls:
-  - If parameters were ADDED: use existing local variables if available, otherwise NULL/0
-  - If parameters were REMOVED: delete them from the call
-  - Do NOT invent new struct fields or variables that don't exist
-  - Check the caller function for existing local variables that match the new parameter types
+2. GET CALLEE SIGNATURE: Use `search_definition(callee_name, version="v2")` to find the NEW callee signature.
+   - The callee name is the function being called at the error location.
+   - V2 is the target version - this gives you the new expected signature.
+
+3. FIX THE CALLER: Use `make_error_patch_override` with a fixed version of the caller function.
+   - Keep the ENTIRE function body from `error_func_code`.
+   - Only modify the specific call site(s) to match the new callee signature.
+   - The function name (including any __revert_* prefix) MUST be preserved exactly.
+
+RULES FOR FIXING CALL SITES:
+- If parameters were ADDED to callee: use existing local variables if available, otherwise NULL/0
+- If parameters were REMOVED from callee: delete them from the call
+- Do NOT invent new struct fields or variables that don't exist in the caller
+- Check the caller function for existing local variables that match the new parameter types
+- When in doubt, use NULL for pointers and 0 for integers
+
+EXAMPLE:
+Error: "too few arguments to function call 'xmlParseEndTag2'"
+1. get_error_patch_context -> returns caller function with old call: xmlParseEndTag2(ctxt, tag)
+2. search_definition("xmlParseEndTag2", "v2") -> returns: void xmlParseEndTag2(xmlParserCtxtPtr ctxt, const xmlChar *prefix, const xmlChar *URI, int line, int nsNr, int tlen)
+3. make_error_patch_override -> provide the FULL caller function with the fixed call:
+   xmlParseEndTag2(ctxt, tag->prefix, tag->URI, tag->line, tag->nsNr, 0)
