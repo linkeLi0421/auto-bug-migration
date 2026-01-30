@@ -20,6 +20,11 @@ _PATCH_APPLY_ERROR_PATTERNS = [
     re.compile(r"^patch:\s+\*{4}.*$", re.IGNORECASE),
     re.compile(r"^fatal:\s+patch failed.*$", re.IGNORECASE),
 ]
+# Warnings about undeclared functions (treated as errors for build_ok)
+_UNDECLARED_FUNC_WARNING_PATTERNS = [
+    "call to undeclared function",
+    "implicit declaration of function",
+]
 _SCRIPT_DIR = Path(__file__).resolve().parents[2]
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
@@ -156,6 +161,12 @@ def _find_patch_apply_error(text: str) -> str:
             if pat.search(stripped):
                 return stripped
     return ""
+
+
+def _has_undeclared_func_warning(text: str) -> bool:
+    """Check if build output contains undeclared function warnings (treated as errors)."""
+    raw = str(text or "").lower()
+    return any(pattern in raw for pattern in _UNDECLARED_FUNC_WARNING_PATTERNS)
 
 
 def _allowed_patch_roots_from_env() -> list[str] | None:
@@ -1129,8 +1140,10 @@ def ossfuzz_apply_patch_and_test(
 
     with _FileLock(lock_path, wait_message=wait_message):
         build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
-        build_ok = build_res["returncode"] == 0
-        patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
+        build_output = build_res.get("output", "")
+        # build_ok requires: (1) zero exit code and (2) no undeclared function warnings
+        build_ok = build_res["returncode"] == 0 and not _has_undeclared_func_warning(build_output)
+        patch_apply_error = _find_patch_apply_error(build_output)
         patch_apply_ok = not bool(patch_apply_error)
 
     # Write build outputs as artifacts under the same directory as the merged patch
