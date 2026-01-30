@@ -490,13 +490,20 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
     # Also process linker errors (undefined reference errors from the linker stage).
     for err in iter_linker_errors(build_log_text, snippet_lines=10):
         fp = str(err.get("file", "") or "").strip()
+        fn = str(err.get("function", "") or "").strip()
         symbol = str(err.get("symbol", "") or "").strip()
-        if not fp or not symbol:
+        if not fp or not (fn or symbol):
             continue
-        # Strip __revert_<commit>_ prefix from symbol to get original function name
-        fn = re.sub(r"^__revert_[a-fA-F0-9]+_", "", symbol)
-        mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=fn)
-        key = str(mapping.get("patch_key") or "").strip()
+        mapping: Dict[str, Any] = {}
+        key = ""
+        for cand in (fn, symbol):
+            c = str(cand or "").strip()
+            if not c:
+                continue
+            mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=c)
+            key = str(mapping.get("patch_key") or "").strip()
+            if key:
+                break
         if not key:
             continue
         enriched = dict(err)
@@ -546,6 +553,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="If a hunk is not fixed, delete its artifacts dir and rerun (default: 0).",
     )
     p.add_argument("--jobs", type=int, default=1, help="Max concurrent agents to run (default: 1).")
+    p.add_argument(
+        "--agent-timeout",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_TIMEOUT", "1800") or 1800),
+        help="Timeout in seconds for each agent subprocess (default: 1800 = 30 min).",
+    )
     p.add_argument("--output-format", choices=["none", "auto", "json", "json-pretty", "text"], default="none")
     p.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     p.add_argument("--tools", choices=["real", "fake"], default="real")
@@ -933,12 +946,18 @@ def main(argv: List[str]) -> int:
                 patch_key=patch_key,
                 patch_key_dirname=out_dir.name,
             )
-            proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+            agent_timeout = getattr(args, "agent_timeout", 1800) or 1800
+            try:
+                proc = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=agent_timeout)
+                stdout = (proc.stdout or "").strip()
+                stderr = (proc.stderr or "").strip()
+            except subprocess.TimeoutExpired as te:
+                stdout = str(te.stdout or "") if te.stdout else ""
+                stderr = str(te.stderr or "") if te.stderr else ""
+                stderr += f"\n\n[multi_agent] Agent timed out after {agent_timeout} seconds."
             duration_sec = max(0.0, time.monotonic() - started_mono)
             finished_at = time.time()
 
-            stdout = (proc.stdout or "").strip()
-            stderr = (proc.stderr or "").strip()
             parsed, parse_error = _try_parse_agent_output(stdout)
 
             (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
