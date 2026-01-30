@@ -191,7 +191,6 @@ class ToolRunner:
                 architecture = str(args.get("architecture", "")).strip() or "x86_64"
                 engine = str(args.get("engine", "")).strip() or "libfuzzer"
                 fuzz_target = str(args.get("fuzz_target", "")).strip()
-                run_fuzzer_seconds = _as_int(args.get("run_fuzzer_seconds"), 30)
                 timeout_seconds = _as_int(args.get("timeout_seconds"), 1800)
                 use_sudo = _as_bool(args.get("use_sudo"), False)
                 if not project:
@@ -210,7 +209,6 @@ class ToolRunner:
                     architecture=architecture,
                     engine=engine,
                     fuzz_target=fuzz_target,
-                    run_fuzzer_seconds=run_fuzzer_seconds,
                     timeout_seconds=timeout_seconds,
                     use_sudo=use_sudo,
                 )
@@ -227,7 +225,6 @@ class ToolRunner:
                         "architecture": architecture,
                         "engine": engine,
                         "fuzz_target": fuzz_target,
-                        "run_fuzzer_seconds": run_fuzzer_seconds,
                         "timeout_seconds": timeout_seconds,
                         "use_sudo": use_sudo,
                     },
