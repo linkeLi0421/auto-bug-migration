@@ -947,8 +947,11 @@ def main(argv: List[str]) -> int:
                 patch_key_dirname=out_dir.name,
             )
             agent_timeout = getattr(args, "agent_timeout", 1800) or 1800
+            # Use per-hunk artifact root so merged diffs go to per-hunk subdirectory, not multi-agent root.
+            agent_env = dict(env)
+            agent_env["REACT_AGENT_ARTIFACT_ROOT"] = str(out_dir)
             try:
-                proc = subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=agent_timeout)
+                proc = subprocess.run(cmd, text=True, capture_output=True, env=agent_env, timeout=agent_timeout)
                 stdout = (proc.stdout or "").strip()
                 stderr = (proc.stderr or "").strip()
             except subprocess.TimeoutExpired as te:
