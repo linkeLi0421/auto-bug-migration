@@ -1229,6 +1229,30 @@ def make_error_patch_override(
     mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
     patch_key = mapping.get("patch_key")
 
+    # Validate that new_func_code preserves the function name from old_signature.
+    # This prevents accidentally changing e.g. __revert_xxx_funcName to funcName.
+    old_sig = str(mapping.get("old_signature") or "").strip()
+    if old_sig:
+        expected_func_name = _func_name_from_sig(old_sig)
+        if expected_func_name:
+            # Extract the function name from the new code's first non-empty line that looks like a function signature.
+            # Only validate if the line contains '(' (indicates a function definition).
+            new_func_name = ""
+            for line in new_code.splitlines():
+                line = line.strip()
+                if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+                    continue
+                # Only parse as function signature if line contains '(' (function definition pattern)
+                if "(" in line:
+                    new_func_name = _func_name_from_sig(line)
+                break
+            if new_func_name and new_func_name != expected_func_name:
+                raise ValueError(
+                    f"new_func_code changes the function name from '{expected_func_name}' to '{new_func_name}'. "
+                    f"The function name must be preserved exactly (including any __revert_* prefix). "
+                    f"Expected signature pattern: {old_sig}"
+                )
+
     if not patch_key or str(patch_key) not in bundle.patches:
         return {
             **mapping,
@@ -1437,7 +1461,7 @@ def make_link_error_patch_override(
     max_chars: int = 200000,
     allowed_roots: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Rewrite a mapped patch slice for linker errors by replacing its `-` lines.
+    r"""Rewrite a mapped patch slice for linker errors by replacing its `-` lines.
 
     This is the link-time counterpart to make_error_patch_override for errors like:
       `encoding.c:(.text.__revert_...): undefined reference to \`defaultHandlers'`
@@ -1449,6 +1473,29 @@ def make_link_error_patch_override(
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
     mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
     patch_key = mapping.get("patch_key")
+
+    # Validate that new_func_code preserves the function name from old_signature.
+    # This prevents accidentally changing e.g. __revert_xxx_funcName to funcName.
+    old_sig = str(mapping.get("old_signature") or "").strip()
+    if old_sig:
+        expected_func_name = _func_name_from_sig(old_sig)
+        if expected_func_name:
+            # Extract the function name from the new code's first non-empty line that looks like a function signature.
+            # Only validate if the line contains '(' (indicates a function definition).
+            new_func_name = ""
+            for line in new_code.splitlines():
+                line = line.strip()
+                if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+                    continue
+                if "(" in line:
+                    new_func_name = _func_name_from_sig(line)
+                break
+            if new_func_name and new_func_name != expected_func_name:
+                raise ValueError(
+                    f"new_func_code changes the function name from '{expected_func_name}' to '{new_func_name}'. "
+                    f"The function name must be preserved exactly (including any __revert_* prefix). "
+                    f"Expected signature pattern: {old_sig}"
+                )
 
     if not patch_key or str(patch_key) not in bundle.patches:
         return {
