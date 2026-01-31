@@ -845,7 +845,7 @@ def main(argv: List[str]) -> int:
         p.write_text(str(text or ""), encoding="utf-8", errors="replace")
         return str(p)
 
-    def _report_snapshot(*, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _report_snapshot(*, results: List[Dict[str, Any]], ongoing: Optional[List[str]] = None) -> Dict[str, Any]:
         hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
         hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
         hunks_unknown = sum(1 for r in results if r.get("hunk_fixed") is None)
@@ -894,6 +894,7 @@ def main(argv: List[str]) -> int:
             "not_fixed": not_fixed[:50],
             "results": results,
             "resumed_from": str(resumed_report.get("_resume_source", "") or "").strip(),
+            "ongoing": ongoing or [],
         }
 
     items: Dict[int, Dict[str, Any]] = {}
@@ -950,14 +951,17 @@ def main(argv: List[str]) -> int:
             # Use per-hunk artifact root so merged diffs go to per-hunk subdirectory, not multi-agent root.
             agent_env = dict(env)
             agent_env["REACT_AGENT_ARTIFACT_ROOT"] = str(out_dir)
+            proc_returncode: int = -1  # Default for timeout case
             try:
                 proc = subprocess.run(cmd, text=True, capture_output=True, env=agent_env, timeout=agent_timeout)
                 stdout = (proc.stdout or "").strip()
                 stderr = (proc.stderr or "").strip()
+                proc_returncode = proc.returncode
             except subprocess.TimeoutExpired as te:
                 stdout = str(te.stdout or "") if te.stdout else ""
                 stderr = str(te.stderr or "") if te.stderr else ""
                 stderr += f"\n\n[multi_agent] Agent timed out after {agent_timeout} seconds."
+                proc_returncode = -1  # Indicate timeout with non-zero exit code
             duration_sec = max(0.0, time.monotonic() - started_mono)
             finished_at = time.time()
 
@@ -1001,7 +1005,7 @@ def main(argv: List[str]) -> int:
 
             task_status = "unknown"
             task_success: Optional[bool] = None
-            if int(proc.returncode) != 0:
+            if int(proc_returncode) != 0:
                 task_status = "agent_failed"
                 task_success = False
             elif parse_error:
@@ -1023,7 +1027,7 @@ def main(argv: List[str]) -> int:
             attempt_history.append(
                 {
                     "attempt": attempt,
-                    "agent_exit_code": int(proc.returncode),
+                    "agent_exit_code": int(proc_returncode),
                     "agent_output_parse_error": parse_error,
                     "task_status": task_status,
                     "task_success": task_success,
@@ -1038,7 +1042,7 @@ def main(argv: List[str]) -> int:
                 "patch_key_dirname": out_dir.name,
                 "errors": len(errs),
                 "primary_error": primary,
-                "agent_exit_code": int(proc.returncode),
+                "agent_exit_code": int(proc_returncode),
                 "agent_summary": agent_summary,
                 "agent_next_step": agent_next_step,
                 "agent_error_line": agent_error_line,
@@ -1103,6 +1107,10 @@ def main(argv: List[str]) -> int:
             groups = current_groups
             attempted_keys.add(next_key)
 
+            # Write progress showing this key as ongoing before starting
+            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[next_key])
+            _write_progress_json(artifacts_root, snap)
+
             _, item = run_one(
                 next_key,
                 dyn_idx,
@@ -1112,7 +1120,7 @@ def main(argv: List[str]) -> int:
             items[dyn_idx] = item
             dyn_idx += 1
 
-            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[])
             _write_progress_json(artifacts_root, snap)
 
             if str(item.get("task_status", "") or "").strip() != "fixed":
@@ -1165,22 +1173,37 @@ def main(argv: List[str]) -> int:
     else:
         if jobs == 1:
             for idx, key in to_run:
+                # Write progress showing this key as ongoing before starting
+                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[key])
+                _write_progress_json(artifacts_root, snap)
                 _, item = run_one(key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path)
                 items[idx] = item
-                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[])
                 _write_progress_json(artifacts_root, snap)
         else:
             with ThreadPoolExecutor(max_workers=jobs) as ex:
-                futs = [
-                    ex.submit(
+                # Track ongoing patch keys
+                ongoing_keys: set[str] = set()
+                fut_to_key: Dict[Any, str] = {}
+                futs = []
+                for idx, key in to_run:
+                    ongoing_keys.add(key)
+                    fut = ex.submit(
                         run_one, key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path
                     )
-                    for idx, key in to_run
-                ]
+                    futs.append(fut)
+                    fut_to_key[fut] = key
+                # Write initial progress with all ongoing
+                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=sorted(ongoing_keys))
+                _write_progress_json(artifacts_root, snap)
                 for fut in as_completed(futs):
                     idx, item = fut.result()
                     items[idx] = item
-                    snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())])
+                    # Remove completed key from ongoing
+                    completed_key = fut_to_key.get(fut)
+                    if completed_key:
+                        ongoing_keys.discard(completed_key)
+                    snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=sorted(ongoing_keys))
                     _write_progress_json(artifacts_root, snap)
         results = [items[i] for i in sorted(items.keys())]
 
@@ -1345,6 +1368,8 @@ def main(argv: List[str]) -> int:
         keys_to_process = new_keys[:max_groups_requested - len(results)] if max_groups_requested else new_keys
         for key in keys_to_process:
             dyn_idx = max((r.get("_idx", 0) for r in results), default=-1) + 1
+            # Write progress showing this key as ongoing before starting
+            _write_progress_json(artifacts_root, _report_snapshot(results=results, ongoing=[key]))
             _, item = run_one(
                 key, dyn_idx,
                 patch_path_for_agent=current_patch_path,
@@ -1353,7 +1378,7 @@ def main(argv: List[str]) -> int:
             item["_idx"] = dyn_idx
             item["continuation_round"] = continuation_round
             results.append(item)
-            _write_progress_json(artifacts_root, _report_snapshot(results=results))
+            _write_progress_json(artifacts_root, _report_snapshot(results=results, ongoing=[]))
 
         # Re-collect overrides and re-run final OSS-Fuzz test
         overrides = _collect_final_override_diffs(results, patch_path=patch_path)
