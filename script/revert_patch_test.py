@@ -1610,11 +1610,17 @@ def prepare_v1_v2_repos(
     return v1_target_path, v2_target_path
 
 
-def call_react_agent(
+def _has_sanitizer_error(build_log_text: str) -> bool:
+    """Check if build log contains sanitizer runtime errors (which means build succeeded)."""
+    import re
+    # Sanitizer errors like "ERROR: AddressSanitizer", "ERROR: MemorySanitizer", etc.
+    return bool(re.search(r"ERROR:\s*\w*Sanitizer", build_log_text))
+
+
+def _run_single_multi_agent_round(
     build_log_path: str,
     patch_path: str,
     project: str,
-    old_commit: str,
     new_commit: str,
     build_csv: str,
     fuzz_target: str,
@@ -1622,20 +1628,17 @@ def call_react_agent(
     v2_json_dir: str,
     v1_src: str,
     v2_src: str,
-    sanitizer: str = "address",
-    arch: str = "x86_64",
-    max_steps: int = 100,
-    jobs: int = 10,
-    max_groups: int = 100,
-    ossfuzz_loop_max: int = 100,
-    max_restarts_per_hunk: int = 3,
-    openai_model: str = "gpt-5-mini",
-    openai_max_tokens: int = 64000,
+    sanitizer: str,
+    arch: str,
+    max_steps: int,
+    jobs: int,
+    max_groups: int,
+    ossfuzz_loop_max: int,
+    max_restarts_per_hunk: int,
+    openai_model: str,
+    openai_max_tokens: int,
 ) -> dict:
-    """Call the multi-agent to fix build errors.
-
-    Returns dict with keys: success, output, returncode
-    """
+    """Run a single round of multi-agent fixing."""
     agent_script = os.path.join(current_file_path, "react_agent", "multi_agent.py")
 
     cmd = [
@@ -1684,7 +1687,12 @@ def call_react_agent(
     # Find the latest multi_* artifacts directory created after start_time
     artifacts_base = os.path.join(data_path, "react_agent_artifacts")
     merged_diff_path = ""
+    merged_patch_bundle_path = ""
     artifacts_dir = ""
+    summary = {}
+    final_build_log_path = ""
+    not_fixed = []
+
     if os.path.isdir(artifacts_base):
         multi_dirs = sorted(
             [d for d in os.listdir(artifacts_base) if d.startswith("multi_")],
@@ -1699,7 +1707,11 @@ def call_react_agent(
                     try:
                         with open(summary_path) as f:
                             summary = json.load(f)
-                        merged_diff_path = summary.get("final_ossfuzz_test", {}).get("merged_patch_file_path", "")
+                        final_ossfuzz = summary.get("final_ossfuzz_test", {})
+                        merged_diff_path = final_ossfuzz.get("merged_patch_file_path", "")
+                        merged_patch_bundle_path = final_ossfuzz.get("merged_patch_bundle_path", "")
+                        final_build_log_path = final_ossfuzz.get("build_output_path", "")
+                        not_fixed = summary.get("not_fixed", [])
                         artifacts_dir = dir_path
                         break
                     except Exception:
@@ -1710,7 +1722,142 @@ def call_react_agent(
         "output": output,
         "returncode": result.returncode,
         "merged_diff_path": merged_diff_path,
+        "merged_patch_bundle_path": merged_patch_bundle_path,
         "artifacts_dir": artifacts_dir,
+        "summary": summary,
+        "final_build_log_path": final_build_log_path,
+        "not_fixed": not_fixed,
+    }
+
+
+def call_react_agent(
+    build_log_path: str,
+    patch_path: str,
+    project: str,
+    old_commit: str,
+    new_commit: str,
+    build_csv: str,
+    fuzz_target: str,
+    v1_json_dir: str,
+    v2_json_dir: str,
+    v1_src: str,
+    v2_src: str,
+    sanitizer: str = "address",
+    arch: str = "x86_64",
+    max_steps: int = 100,
+    jobs: int = 10,
+    max_groups: int = 100,
+    ossfuzz_loop_max: int = 100,
+    max_restarts_per_hunk: int = 3,
+    openai_model: str = "gpt-5-mini",
+    openai_max_tokens: int = 64000,
+    max_multi_agent_rounds: int = 5,
+) -> dict:
+    """Call the multi-agent to fix build errors with iterative rounds.
+
+    Iterates multiple rounds if:
+    - All individual errors in a round are fixed (not_fixed is empty)
+    - The merged build still fails with new errors
+    - The build log does NOT contain sanitizer errors (which indicates runtime success)
+
+    Returns dict with keys: success, output, returncode, merged_diff_path, artifacts_dir, rounds
+    """
+    current_build_log = build_log_path
+    current_patch = patch_path
+    rounds = []
+    final_result = None
+
+    for round_num in range(1, max_multi_agent_rounds + 1):
+        logger.info(f"=== Multi-agent round {round_num}/{max_multi_agent_rounds} ===")
+        logger.info(f"  Build log: {current_build_log}")
+        logger.info(f"  Patch: {current_patch}")
+
+        round_result = _run_single_multi_agent_round(
+            build_log_path=current_build_log,
+            patch_path=current_patch,
+            project=project,
+            new_commit=new_commit,
+            build_csv=build_csv,
+            fuzz_target=fuzz_target,
+            v1_json_dir=v1_json_dir,
+            v2_json_dir=v2_json_dir,
+            v1_src=v1_src,
+            v2_src=v2_src,
+            sanitizer=sanitizer,
+            arch=arch,
+            max_steps=max_steps,
+            jobs=jobs,
+            max_groups=max_groups,
+            ossfuzz_loop_max=ossfuzz_loop_max,
+            max_restarts_per_hunk=max_restarts_per_hunk,
+            openai_model=openai_model,
+            openai_max_tokens=openai_max_tokens,
+        )
+        round_result["round"] = round_num
+        rounds.append(round_result)
+        final_result = round_result
+
+        # Check if we should continue to next round
+        not_fixed = round_result.get("not_fixed", [])
+        summary = round_result.get("summary", {})
+        final_ossfuzz = summary.get("final_ossfuzz_test", {})
+        final_status = final_ossfuzz.get("status", "")
+
+        # If some individual errors couldn't be fixed, stop
+        if not_fixed:
+            logger.info(f"Round {round_num}: {len(not_fixed)} errors not fixed individually, stopping")
+            break
+
+        # If final build succeeded, we're done
+        if final_status == "ok":
+            logger.info(f"Round {round_num}: Build succeeded!")
+            break
+
+        # Check if build log has sanitizer errors (means build succeeded, runtime issue)
+        final_build_log_path = round_result.get("final_build_log_path", "")
+        if final_build_log_path and os.path.isfile(final_build_log_path):
+            with open(final_build_log_path, 'r') as f:
+                final_build_log_text = f.read()
+            if _has_sanitizer_error(final_build_log_text):
+                logger.info(f"Round {round_num}: Sanitizer error detected (build succeeded), stopping")
+                final_result["success"] = True  # Treat as success
+                break
+
+        # Check if we have output for next round
+        merged_patch_bundle = round_result.get("merged_patch_bundle_path", "")
+        if not merged_patch_bundle or not os.path.isfile(merged_patch_bundle):
+            logger.info(f"Round {round_num}: No merged patch bundle found, stopping")
+            break
+
+        if not final_build_log_path or not os.path.isfile(final_build_log_path):
+            logger.info(f"Round {round_num}: No final build log found, stopping")
+            break
+
+        # Setup for next round
+        current_patch = merged_patch_bundle
+        current_build_log = final_build_log_path
+        logger.info(f"Round {round_num}: Individual errors fixed but build still fails, continuing to next round")
+
+    # Build final result from last round
+    if final_result is None:
+        return {
+            "success": False,
+            "output": {},
+            "returncode": 1,
+            "merged_diff_path": "",
+            "artifacts_dir": "",
+            "rounds": rounds,
+            "total_rounds": 0,
+        }
+
+    return {
+        "success": final_result.get("success", False),
+        "output": final_result.get("output", {}),
+        "returncode": final_result.get("returncode", 1),
+        "merged_diff_path": final_result.get("merged_diff_path", ""),
+        "artifacts_dir": final_result.get("artifacts_dir", ""),
+        "rounds": rounds,
+        "total_rounds": len(rounds),
     }
 
 
