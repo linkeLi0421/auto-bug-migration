@@ -5098,20 +5098,3 @@ if __name__ == "__main__":
     
         for bug_id, affected_bugs in test_local_bug_after_patch.items():
             logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
-
-    for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
-        logger.info(f'bug_id {bug_id}')
-        for key in patch_dict:
-            patch = patch_dict[key]
-            if patch.hiden_func_dict:
-                for func_sig in patch.hiden_func_dict:
-                    logger.info(f'-->{func_sig}\n')
-            else:
-                if patch.new_signature:
-                    logger.info(f'-->{patch.new_signature}')
-                elif patch.old_signature:
-                    logger.info(f'-->{patch.old_signature}')
-        patch_not_context = remove_context(patch_dict)
-        for key in patch_not_context:
-            patch = patch_not_context[key]
-        patches_without_contexts[(bug_id, commit_id, fuzzer, input_functions)] = patch_not_context
