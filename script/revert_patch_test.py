@@ -3915,8 +3915,13 @@ def minimize_with_trace_and_cached_extras(
 
     # Phase 3: Binary search for missing patches
     candidates = [k for k in all_patch_keys if k not in filtered_keys]
+    logger.info(f"Binary search: {len(filtered_keys)} base + {len(candidates)} candidates")
+
+    trial_count = [0]  # Use list to allow mutation in closure
 
     def test_fn(keys: List[str]) -> bool:
+        trial_count[0] += 1
+        logger.info(f"Trial {trial_count[0]}: testing {len(keys)} patches")
         ok, _ = build_with_cached_extras(
             keys, diff_results, extra_patches_cache,
             target, next_commit['commit_id'], sanitizer, bug_id,
@@ -3925,9 +3930,11 @@ def minimize_with_trace_and_cached_extras(
         return ok
 
     additional = binary_search_missing_patches(set(filtered_keys), candidates, test_fn)
+    logger.info(f"Binary search found {len(additional)} additional patches needed")
 
     if additional:
         final_keys = set(filtered_keys + additional)
+        logger.info(f"Final patch count: {len(final_keys)} ({len(filtered_keys)} filtered + {len(additional)} additional)")
         final_pairs = [tuple(k for k in keys if k in final_keys) for keys in patch_pair_list]
         final_pairs = [t for t in final_pairs if t]
         return final_pairs, extra_patches_cache
