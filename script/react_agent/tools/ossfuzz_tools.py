@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from artifacts import ArtifactStore
+from build_log import iter_linker_errors
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -174,6 +175,11 @@ def _has_undeclared_func_warning(text: str) -> bool:
 def _has_compiler_errors(text: str) -> bool:
     """Check if build output contains compiler errors (file:line:col: error: msg)."""
     return bool(_COMPILER_ERROR_RE.search(text or ""))
+
+
+def _has_linker_errors(text: str) -> bool:
+    """Check if build output contains linker errors (undefined reference)."""
+    return bool(iter_linker_errors(text or ""))
 
 
 def _allowed_patch_roots_from_env() -> list[str] | None:
@@ -1150,7 +1156,11 @@ def ossfuzz_apply_patch_and_test(
         build_output = build_res.get("output", "")
         # build_ok is based on parsing the build output for actual errors, not the return code.
         # This ensures accurate status even if the subprocess exit code is unreliable.
-        build_ok = not _has_compiler_errors(build_output) and not _has_undeclared_func_warning(build_output)
+        build_ok = (
+            not _has_compiler_errors(build_output)
+            and not _has_undeclared_func_warning(build_output)
+            and not _has_linker_errors(build_output)
+        )
         patch_apply_error = _find_patch_apply_error(build_output)
         patch_apply_ok = not bool(patch_apply_error)
 

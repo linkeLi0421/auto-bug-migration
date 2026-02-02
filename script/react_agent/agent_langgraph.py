@@ -813,7 +813,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                 }
             )
 
-        fixed = len(remaining_in_active_func) == 0
+        # Only count compiler errors for determining fixed status. Linker errors are handled by
+        # multi-agent --auto-continue-on-link-errors, not counted against individual function status.
+        compiler_remaining = [e for e in remaining_in_active_func if e.get("kind") != "linker"]
+        fixed = len(compiler_remaining) == 0
         other = [
             {
                 "raw": str(e.get("raw", "") or "").strip(),
@@ -881,7 +884,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             matched_keys.add(k)
             matched.append({"raw": err.get("raw", ""), "file": fp, "line": ln, "function": fn, "kind": "linker" if is_linker else "compiler", "patch_key": err_patch_key, "msg": msg})
 
-    fixed = len(matched) == 0
+    # Only count compiler errors for determining fixed status. Linker errors are handled by
+    # multi-agent --auto-continue-on-link-errors, not counted against individual target status.
+    compiler_matched = [e for e in matched if e.get("kind") != "linker"]
+    fixed = len(compiler_matched) == 0
     other = [
         {
             "raw": str(e.get("raw", "") or "").strip(),
@@ -1704,11 +1710,14 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             enriched.append(item)
 
     in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key] if active_key else []
+    # Only count compiler errors for remaining_in_active_patch_key. Linker errors are handled by
+    # multi-agent --auto-continue-on-link-errors, not counted against individual hunk status.
+    compiler_in_active = [e for e in in_active if e.get("kind") != "linker"]
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     return {
         "status": "ok",
         "active_patch_key": active_key,
-        "remaining_in_active_patch_key": len(in_active),
+        "remaining_in_active_patch_key": len(compiler_in_active),
         "errors": in_active[:10],
         "function_groups": func_groups,
         "function_groups_total": func_total,
@@ -1997,10 +2006,13 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     state.patch_result = None
     # Keep accumulated override diffs across iterations; OSS-Fuzz testing uses the base bundle + overrides.
     state.ossfuzz_test_attempted = False
-    state.last_observation = None
 
     if not fp or ln <= 0:
+        # Don't clear last_observation here - verdict computation needs it.
         return None
+
+    # Clear last_observation only when we're actually going to continue the loop.
+    state.last_observation = None
 
     # Prefer stable, line-number-based mapping for forced auto-loop restarts. Passing `error_text`
     # can cause get_error_patch_context to return a very narrow token slice (e.g. just `foo_t`)
