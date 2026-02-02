@@ -1745,7 +1745,7 @@ def call_react_agent(
     sanitizer: str = "address",
     arch: str = "x86_64",
     max_steps: int = 100,
-    jobs: int = 10,
+    jobs: int = int(os.environ.get("REACT_AGENT_JOBS", "4")),
     max_groups: int = 100,
     ossfuzz_loop_max: int = 100,
     max_restarts_per_hunk: int = 3,

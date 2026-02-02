@@ -22,6 +22,7 @@ class PromptContext:
     linker_error: bool
     func_sig_change: bool  # "too few/many arguments to function call"
     conflicting_types: bool  # "conflicting types for 'func'"
+    static_nonstatic_decl: bool  # "static declaration follows non-static declaration"
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -90,6 +91,9 @@ def _context_from_state(state: Any) -> PromptContext:
     # Only handle conflicting_types when there are NO undeclared symbol errors.
     # Undeclared function errors are the root cause; fixing them properly resolves the conflict.
     conflicting_types = ("conflicting types for" in err_lower or "conflicting types for" in snip_lower) and not undeclared_symbol
+    # Only handle static/non-static declaration mismatch when there are NO undeclared symbol errors.
+    # The undeclared function causes an implicit (non-static) declaration; fixing it resolves this error.
+    static_nonstatic_decl = ("static declaration" in err_lower and "follows non-static" in err_lower) and not undeclared_symbol
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -105,6 +109,7 @@ def _context_from_state(state: Any) -> PromptContext:
         linker_error=linker_error,
         func_sig_change=func_sig_change,
         conflicting_types=conflicting_types,
+        static_nonstatic_decl=static_nonstatic_decl,
     )
 
 
