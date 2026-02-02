@@ -226,6 +226,13 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
             starts.append((idx, "warning", m_warn))
             continue
 
+    # Check if there are any undeclared function warnings in the build log.
+    # If so, we filter out "static declaration follows non-static declaration" errors
+    # because they're a symptom of the undeclared function, not a root cause.
+    has_undeclared_func_warning = any(
+        _is_undeclared_func_warning(m.group(0)) for _, level, m in starts if level == "warning"
+    )
+
     for i, (idx, level, m) in enumerate(starts):
         file_path = str(m.group("file"))
         line_no = int(m.group("line"))
@@ -241,6 +248,12 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
                 and "no previous prototype for function" not in msg
             ):
                 continue
+
+        # Skip "static declaration follows non-static declaration" errors when there are
+        # undeclared function warnings. The undeclared function causes an implicit non-static
+        # declaration; fixing it (by adding proper declaration) resolves this error.
+        if has_undeclared_func_warning and "static declaration" in msg and "follows non-static" in msg:
+            continue
 
         key = (file_path, line_no, col_no, msg)
         if key in seen:
