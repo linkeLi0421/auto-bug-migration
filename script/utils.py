@@ -112,18 +112,25 @@ def binary_search_missing_patches(
         return []
 
     full_set = list(known_good) + candidates
+    logger.info(f"Testing full set ({len(known_good)} base + {len(candidates)} candidates = {len(full_set)} total)")
     if not test_fn(full_set):
+        logger.info("Full set fails, cannot find minimal set")
         return []  # Even with all patches it fails
 
+    logger.info(f"Testing base set only ({len(known_good)} patches)")
     if test_fn(list(known_good)):
+        logger.info("Base set already works, no additional patches needed")
         return []  # Already works without candidates
 
     needed = []
     remaining = list(candidates)
+    iteration = 0
 
     while remaining:
+        iteration += 1
         mid = len(remaining) // 2
         if mid == 0:
+            logger.info(f"Iteration {iteration}: adding last candidate, needed={len(needed)+1}")
             needed.append(remaining[0])
             remaining = remaining[1:]
             continue
@@ -131,17 +138,21 @@ def binary_search_missing_patches(
         first_half = remaining[:mid]
         second_half = remaining[mid:]
 
+        logger.info(f"Iteration {iteration}: testing first half ({mid} patches), remaining={len(remaining)}, needed={len(needed)}")
         test_set = list(known_good) + needed + first_half
         if test_fn(test_set):
             remaining = first_half
         else:
+            logger.info(f"Iteration {iteration}: testing second half ({len(second_half)} patches)")
             test_set = list(known_good) + needed + second_half
             if test_fn(test_set):
                 remaining = second_half
             else:
+                logger.info(f"Iteration {iteration}: both halves needed, adding first half ({mid} patches)")
                 needed.extend(first_half)
                 remaining = second_half
 
+    logger.info(f"Binary search complete: found {len(needed)} additional patches needed")
     return needed
 
 def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
