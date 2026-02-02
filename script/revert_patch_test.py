@@ -1751,7 +1751,7 @@ def call_react_agent(
     max_restarts_per_hunk: int = 3,
     openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
-    max_multi_agent_rounds: int = 5,
+    max_multi_agent_rounds: int = 10,
 ) -> dict:
     """Call the multi-agent to fix build errors with iterative rounds.
 
@@ -4063,6 +4063,13 @@ def apply_and_test_patches(
         if merged_diff and os.path.isfile(merged_diff):
             shutil.copy(merged_diff, patch_file_path)
             logger.info(f"Copied merged diff from {merged_diff} to {patch_file_path}")
+            # Also load the merged patch bundle so patches_without_context includes
+            # react agent's _extra_* patches for later minimization
+            merged_bundle = agent_result.get("merged_patch_bundle_path", "")
+            if merged_bundle and os.path.isfile(merged_bundle):
+                updated_patches = load_patches_pickle(merged_bundle)
+                patches_without_context.update(updated_patches)
+                logger.info(f"Loaded {len(updated_patches)} patches from merged bundle for minimization")
         else:
             # Fallback: reload the updated patch bundle and regenerate the .diff file
             updated_patches = load_patches_pickle(patch_file_binary)

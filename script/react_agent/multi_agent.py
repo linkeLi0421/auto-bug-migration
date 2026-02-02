@@ -1337,7 +1337,7 @@ def main(argv: List[str]) -> int:
     # Auto-continue on linker errors
     auto_continue = bool(getattr(args, "auto_continue_on_link_errors", False))
     continuation_round = 0
-    max_continuation_rounds = 5  # Safety limit
+    max_continuation_rounds = 10  # Safety limit
 
     while auto_continue and final_ossfuzz_test.get("status") == "failed" and continuation_round < max_continuation_rounds:
         continuation_round += 1
