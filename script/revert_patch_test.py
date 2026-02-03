@@ -5029,14 +5029,14 @@ def revert_patch_test(args):
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
 
-            # Use trace-based minimization with cached extras
-            minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
-                patch_pair_list, patches_without_context, diff_results,
-                trace1, depen_graph, target, next_commit, sanitizer,
-                bug_id, fuzzer, args.build_csv, arch
+            # Use greedy minimization
+            tmp = copy.deepcopy(inmutable_args)
+            minimal_fast = minimize_greedy(
+                patch_pair_list, apply_and_test_patches, patches_without_context,
+                mutable_args, tmp
             )
 
-            logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+            logger.info(f'Minimal patch set after greedy minimization: {len(minimal_fast)}')
 
         min_path_dict[bug_id] = minimal_fast
 

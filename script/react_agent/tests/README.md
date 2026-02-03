@@ -41,18 +41,24 @@ This is a smoke-test log for `script/react_agent/tests/tool_cli.py`.
 
 ### Environment
 
+First, source the environment setup:
+```bash
+source script/setenv.sh
+```
+
+Test environment used:
 - Timestamp: `2025-12-31T00:25:57+00:00`
-- Python: `Python 3.12.3` (from `/home/user/pyenv/venv/bin/python3`)
-- V1 JSON dir: `/home/user/oss-fuzz-build/data/libxml2-e11519`
-- V2 JSON dir: `/home/user/oss-fuzz-build/data/libxml2-f0fd1b`
-- V1 src root: `/home/user/tasks-git/libxml2/`
-- V2 src root: `/home/user/tasks-git1/libxml2/`
+- Python: `Python 3.12.3` (use `$PYTHON_PATH` or system `python3`)
+- V1 JSON dir: `data/libxml2-e11519`
+- V2 JSON dir: `data/libxml2-f0fd1b`
+- V1 src root: `$V1_REPO_PATH/libxml2/`
+- V2 src root: `$V2_REPO_PATH/libxml2/`
 
 ### 1) Help text
 
 Command:
 ```bash
-/home/user/pyenv/venv/bin/python3 script/react_agent/tests/tool_cli.py -h
+python3 script/react_agent/tests/tool_cli.py -h
 ```
 
 Output:
@@ -83,11 +89,11 @@ options:
 
 Command:
 ```bash
-/home/user/pyenv/venv/bin/python3 script/react_agent/tests/tool_cli.py ctxt \
-  --v1-json-dir /home/user/oss-fuzz-build/data/libxml2-e11519 \
-  --v2-json-dir /home/user/oss-fuzz-build/data/libxml2-f0fd1b \
-  --v1-src /home/user/tasks-git/libxml2/ \
-  --v2-src /home/user/tasks-git1/libxml2/
+python3 script/react_agent/tests/tool_cli.py ctxt \
+  --v1-json-dir data/libxml2-e11519 \
+  --v2-json-dir data/libxml2-f0fd1b \
+  --v1-src $V1_REPO_PATH/libxml2/ \
+  --v2-src $V2_REPO_PATH/libxml2/
 ```
 
 Output:
@@ -108,9 +114,9 @@ Code:
 
 Command:
 ```bash
-/home/user/pyenv/venv/bin/python3 script/react_agent/tests/tool_cli.py ctxt \
-  --v1-json-dir /home/user/oss-fuzz-build/data/libxml2-e11519 \
-  --v2-json-dir /home/user/oss-fuzz-build/data/libxml2-f0fd1b \
+python3 script/react_agent/tests/tool_cli.py ctxt \
+  --v1-json-dir data/libxml2-e11519 \
+  --v2-json-dir data/libxml2-f0fd1b \
   --list --limit 10
 ```
 
@@ -145,11 +151,11 @@ HTMLparser.c:112:10 DECL_REF_EXPR
 
 Command:
 ```bash
-/home/user/pyenv/venv/bin/python3 script/react_agent/tests/tool_cli.py xmlSAX2ErrMemory \
-  --v1-json-dir /home/user/oss-fuzz-build/data/libxml2-e11519 \
-  --v2-json-dir /home/user/oss-fuzz-build/data/libxml2-f0fd1b \
-  --v1-src /home/user/tasks-git/libxml2/ \
-  --v2-src /home/user/tasks-git1/libxml2/
+python3 script/react_agent/tests/tool_cli.py xmlSAX2ErrMemory \
+  --v1-json-dir data/libxml2-e11519 \
+  --v2-json-dir data/libxml2-f0fd1b \
+  --v1-src $V1_REPO_PATH/libxml2/ \
+  --v2-src $V2_REPO_PATH/libxml2/
 ```
 
 Output:
