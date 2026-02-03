@@ -506,7 +506,7 @@ def handle_func_deled(func_deled, patch_key_list, diff_results, extra_patches, t
         for node in ast_nodes:
             if node['spelling'] == func_name and node['kind'] == 'MACRO_DEFINITION':
                 is_macro = True
-                type_def_to_add.setdefault(file_path_new, dict())[f'{node['extent']['start']['file']}:{node['extent']['start']['line']}:{node['extent']['end']['line']}'] = func_name
+                type_def_to_add.setdefault(file_path_new, dict())[f"{node['extent']['start']['file']}:{node['extent']['start']['line']}:{node['extent']['end']['line']}"] = func_name
                 break
             if node['spelling'] == func_name and \
                 node['kind'] in call_kinds and 'callee' in node and\
@@ -2105,7 +2105,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         )
         patch = diff_results[key]
         if 'Function body change' in patch.patch_type and patch.file_path_old:
-            parsing_path = os.path.join(data_path, f'{target_repo_path.split('/')[-1]}-{old_commit}', f'{patch.file_path_old}_analysis.json')
+            parsing_path = os.path.join(data_path, f"{target_repo_path.split('/')[-1]}-{old_commit}", f'{patch.file_path_old}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
             # filter for call expressions (clang cursors for function calls)
@@ -2797,7 +2797,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
 
                 # Create patch lines for reverting __revert_commit_ functions back to original names
                 rm_line = rename_func(f'-{function_line}', node['spelling'], commit)[0]
-                add_line = f'+{function_line.replace('\n', '')}'
+                add_line = f"+{function_line.replace(chr(10), '')}"
                 
                 # Construct complete patch text
                 patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
@@ -2908,7 +2908,7 @@ def handle_function_signature_changes(function_sig_changes, patch_key_list, diff
                 node['kind'] == 'FUNCTION_DECL' and\
                 node['spelling'] in [callee_name for callee_name, _ in callee_list]:
                 # Define in other file, find out the definition
-                def_parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{node['location']['file']}_analysis.json')
+                def_parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f"{node['location']['file']}_analysis.json")
                 with open(def_parsing_path, 'r') as f:
                     def_ast_nodes = json.load(f)
                 for def_ast_node in def_ast_nodes:
@@ -3690,15 +3690,15 @@ def get_corresponding_bb(target_repo_path, bb1s, file_path, commit, next_commit,
 def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_results, extra_patches, target, next_commit: str, commit: str, arch, build_csv, target_repo_path, signature_change_list):
     relative_file_path = file_path.split('/', 3)[-1]
     line_num_after_patch_list = line_num_list
-    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt')):
+    if not os.path.exists(os.path.join(data_path, f"cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt")):
         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', next_commit, '--build_csv', build_csv,
                     '--architecture', arch, '--target_file', relative_file_path, target]
-        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+        logger.info(f"Running command: {' '.join(get_cfg_cmd)}")
         result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not os.path.exists(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt')):
+    if not os.path.exists(os.path.join(data_path, f"cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt")):
         get_cfg_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'get_cfg', '--commit', commit, '--build_csv', build_csv,
                     '--architecture', arch, '--target_file', relative_file_path, target]
-        logger.info(f"Running command: {" ".join(get_cfg_cmd)}")
+        logger.info(f"Running command: {' '.join(get_cfg_cmd)}")
         result = subprocess.run(get_cfg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # line_num after patch -> line number in old commit
@@ -3706,9 +3706,9 @@ def get_bb_change_pair_from_line(file_path, line_num_list, final_patches, diff_r
     for line_num_after_patch in line_num_after_patch_list:
         line_num_in_old_commit_list.append(get_old_line_num(relative_file_path, line_num_after_patch, final_patches, diff_results, extra_patches, target, commit))
     
-    with open(os.path.join(data_path, f'cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+    with open(os.path.join(data_path, f"cfg-{target}-{commit}-{relative_file_path.replace('/', '-')}.txt"), 'r') as cfg_file:
         cfgs1 = parse_cfg_text(cfg_file.read())
-    with open(os.path.join(data_path, f'cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt'), 'r') as cfg_file:
+    with open(os.path.join(data_path, f"cfg-{target}-{next_commit}-{relative_file_path.replace('/', '-')}.txt"), 'r') as cfg_file:
         cfgs2 = parse_cfg_text(cfg_file.read())
     if not cfgs1:
         logger.error(f'Cannot find cfg for {file_path} at line {line_num_in_old_commit_list} line after patch {line_num_after_patch_list}')
@@ -4238,7 +4238,7 @@ def apply_and_test_patches(
                 continue
             if identifier.startswith(f'__revert_cons_{commit["commit_id"]}_'):
                 identifier = identifier.split(f'__revert_cons_{commit["commit_id"]}_')[-1]
-            parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{file_path_old}_analysis.json')
+            parsing_path = os.path.join(data_path, f"{target}-{commit['commit_id']}", f'{file_path_old}_analysis.json')
             def search_ids_in_ast_nodes(con_to_add, var_del_to_add, un_dec_vars_to_add, union_to_add, type_def_to_add, func_def_to_add, miss_decls, file_path_new, recreated_cons):
                 if os.path.exists(parsing_path):
                     with open(parsing_path, 'r') as f:
@@ -4247,25 +4247,25 @@ def apply_and_test_patches(
                     for ast_node in ast_nodes:
                         if ast_node['kind'] in {'ENUM_CONSTANT_DECL'} and ast_node['spelling'] == identifier:
                             found = True
-                            con_to_add.setdefault(file_path_new, dict())[f'__revert_cons_{commit["commit_id"]}_{ast_node['spelling']} = {ast_node['enum_value']},\n'] = identifier
+                            con_to_add.setdefault(file_path_new, dict())[f"__revert_cons_{commit['commit_id']}_{ast_node['spelling']} = {ast_node['enum_value']},\n"] = identifier
                             recreated_cons.add(identifier)
                             break
                         if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == identifier:
                             found = True
-                            var_del_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                            var_del_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = identifier
                             break
                         if ast_node['kind'] in {'DECL_REF_EXPR'} and ast_node['spelling'] == identifier:
                             # A reference (use) of a declared entity such as a variable, function, or enum constant.
                             found = True
                             if 'type_ref' in ast_node and ast_node['type_ref']['target_kind'] == 'VAR_DECL':
-                                un_dec_vars_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
+                                un_dec_vars_to_add.setdefault(file_path_new, dict())[f"{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}"] = identifier
                             else: 
                                 miss_decls.append((ast_node['spelling'], location.split(':')[0], int(location.split(':')[1])))
                             break
                         if ast_node['kind'] in {'UNION_DECL', 'ENUM_DECL'} and ast_node['spelling'] == identifier:
                             # typedef union{...}...; typedef enum{...}...;
                             found = True
-                            union_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                            union_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = identifier
                             break
                         if ast_node['kind'] in {'TYPEDEF_DECL'} and ast_node['spelling'] == identifier:
                             found = True
@@ -4276,23 +4276,23 @@ def apply_and_test_patches(
                                         add_start = node1['type_ref']['underlying']['extent']['start']['line']
                                         add_end = node1['type_ref']['underlying']['extent']['end']['line']
                                         pure_type = node1['type_ref']['underlying']['name']
-                                        type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                                        type_def_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = identifier
                                         if pure_type:
                                             type_def_to_add.setdefault(file_path_new, dict())[f'{add_file_path}:{add_start}:{add_end}'] = pure_type
                                         break
                             else:
-                                type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = identifier
+                                type_def_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = identifier
                             break
                         if ast_node['kind'] in {'TYPE_REF'} and ast_node['spelling'] == identifier:
                             found = True
-                            type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}'] = identifier
+                            type_def_to_add.setdefault(file_path_new, dict())[f"{ast_node['type_ref']['typedef_extent']['start']['file']}:{ast_node['type_ref']['typedef_extent']['start']['line']}:{ast_node['type_ref']['typedef_extent']['end']['line']}"] = identifier
                             break
                     if not found:
                         # 1. Functions added by DECL_REF_EXPR branch above, search FUNCTION_DECL and FUNCTION_DEFI
                         for ast_node in ast_nodes:
                             if ast_node['kind'] == 'FUNCTION_DEFI' and ast_node['spelling'] == identifier:
                                 found = True
-                                key = (file_path_new, f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}', f'{ast_node['signature']}')
+                                key = (file_path_new, f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}", f"{ast_node['signature']}")
                                 if key not in func_def_to_add or (key in func_def_to_add and func_def_to_add[key] > int(location.split(':')[1])):
                                     func_def_to_add[key] = int(location.split(':')[1])
                                 break
@@ -4300,13 +4300,13 @@ def apply_and_test_patches(
                         for ast_node in ast_nodes:
                             if ast_node['kind'] == 'FUNCTION_DECL' and ast_node['spelling'] == identifier:
                                 # Define in other file, find out the definition
-                                def_parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{ast_node['location']['file']}_analysis.json')
+                                def_parsing_path = os.path.join(data_path, f"{target}-{commit['commit_id']}", f"{ast_node['location']['file']}_analysis.json")
                                 with open(def_parsing_path, 'r') as f:
                                     def_ast_nodes = json.load(f)
                                 for def_ast_node in def_ast_nodes:
                                     if def_ast_node['kind'] == 'FUNCTION_DEFI' and def_ast_node['spelling'] == identifier:
                                         found = True
-                                        key = (file_path_new, f'{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}', f'{def_ast_node['signature']}')
+                                        key = (file_path_new, f"{def_ast_node['extent']['start']['file']}:{def_ast_node['extent']['start']['line']}:{def_ast_node['extent']['end']['line']}", f"{def_ast_node['signature']}")
                                         if key not in func_def_to_add or (key in func_def_to_add and func_def_to_add[key] > int(location.split(':')[1])):
                                             func_def_to_add[key] = int(location.split(':')[1])
                                         break
@@ -4345,13 +4345,13 @@ def apply_and_test_patches(
                 file_path_old = file_path_new
             if not func_name.startswith(f'__revert_{commit["commit_id"]}_'):
                 # Check if this function is a 'macro' function
-                parsing_path = os.path.join(data_path, f'{target}-{commit['commit_id']}', f'{file_path_old}_analysis.json')
+                parsing_path = os.path.join(data_path, f"{target}-{commit['commit_id']}", f'{file_path_old}_analysis.json')
                 with open(parsing_path, 'r') as f:
                     ast_nodes = json.load(f)
                 is_macro = False
                 for ast_node in ast_nodes:
                     if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
-                        type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                        type_def_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = func_name
                         is_macro = True
                         break
                 if not is_macro:
@@ -4366,7 +4366,7 @@ def apply_and_test_patches(
                                 ast_nodes = json.load(f)
                             for ast_node in ast_nodes:
                                 if ast_node['kind'] in {'MACRO_DEFINITION'} and ast_node['spelling'] == func_name:
-                                    type_def_to_add.setdefault(file_path_new, dict())[f'{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}'] = func_name
+                                    type_def_to_add.setdefault(file_path_new, dict())[f"{ast_node['extent']['start']['file']}:{ast_node['extent']['start']['line']}:{ast_node['extent']['end']['line']}"] = func_name
                                     is_macro = True
                                     break
                         break
@@ -4435,7 +4435,7 @@ def apply_and_test_patches(
                     for func_info in recreated_functions:
                         if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
-                            func_decl_text += f'-{' '.join(func_info.keywords)} {safe_func_decl};\n'
+                            func_decl_text += f"-{' '.join(func_info.keywords)} {safe_func_decl};\n"
                     if not flag:
                         func_decl_text += f'-static {safe_func_decl};\n'
                     func_decl_len += 1
@@ -4450,7 +4450,7 @@ def apply_and_test_patches(
                     for func_info in recreated_functions:
                         if func_info.signature == func_decl.replace(prefix, "") and func_info.func_used_file == file_path:
                             flag = True
-                            func_decl_text_moveforward += f'-{' '.join(func_info.keywords)} {safe_func_decl};\n'
+                            func_decl_text_moveforward += f"-{' '.join(func_info.keywords)} {safe_func_decl};\n"
                     if not flag:
                         func_decl_text_moveforward += f'-static {safe_func_decl};\n'
                     func_decl_len_moveforward += 1
@@ -4527,14 +4527,14 @@ def apply_and_test_patches(
                     var_len += end_line - start_line + 1
                     with open(os.path.join(target_repo_path, path), 'r', encoding="latin-1") as f:
                         file_content = f.readlines()
-                        new_identifier = f'__rervert_var_{commit['commit_id']}_{identifier}'
+                        new_identifier = f"__rervert_var_{commit['commit_id']}_{identifier}"
                         var_text += ''.join(f'-{line.replace(identifier, new_identifier)}' for line in file_content[start_line-1:end_line])
                 for key in patch_key_list:
                     patch = diff_results[key]
                     if patch.file_path_new == file_path:
                         for identifier in ids:
-                            patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}'))
-                            var_text = '\n'.join(rename_func(var_text, identifier, None, f'__rervert_var_{commit['commit_id']}_{identifier}')) + '\n'
+                            patch.patch_text = '\n'.join(rename_func(patch.patch_text, identifier, None, f"__rervert_var_{commit['commit_id']}_{identifier}"))
+                            var_text = '\n'.join(rename_func(var_text, identifier, None, f"__rervert_var_{commit['commit_id']}_{identifier}")) + '\n'
             
             # solution_path = os.path.join(data_path, 'openai', str(bug_id), f'{file_path}-{stable_hash(include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text)}-check.txt')
             checked_code = include_text + func_decl_text_moveforward + enum_text + union_text + var_text + func_decl_text
@@ -4856,11 +4856,11 @@ def revert_patch_test(args):
         else:
             arch = 'x86_64'
         crash_test_input = select_crash_test_input(bug_id, testcases_env)
-        trace_path1 = os.path.join(data_path, f'target_trace-{commit['commit_id']}-{crash_test_input}.txt')
-        trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-{crash_test_input}.txt')
+        trace_path1 = os.path.join(data_path, f"target_trace-{commit['commit_id']}-{crash_test_input}.txt")
+        trace_path2 = os.path.join(data_path, f"target_trace-{next_commit['commit_id']}-{crash_test_input}.txt")
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
-            trace_path2 = os.path.join(data_path, f'target_trace-{next_commit['commit_id']}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt')
+            trace_path2 = os.path.join(data_path, f"target_trace-{next_commit['commit_id']}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt")
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
@@ -4976,7 +4976,7 @@ def revert_patch_test(args):
 
         if not os.path.exists(trace_path1) or os.path.exists(trace_path1) and 'No such file or directory' in open(trace_path1).read():
             # logger.info the command being executed
-            logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
+            logger.info(f"Running command: {' '.join(collect_trace_cmd)}")
             # Execute the command
             try:
                 result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4986,7 +4986,7 @@ def revert_patch_test(args):
         if not os.path.exists(trace_path2):
             collect_trace_cmd[4] = next_commit['commit_id']
             # logger.info the command being executed
-            logger.info(f"Running command: {" ".join(collect_trace_cmd)}")
+            logger.info(f"Running command: {' '.join(collect_trace_cmd)}")
             # Execute the command
             try:
                 result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -5167,7 +5167,7 @@ def revert_patch_test(args):
 
         if not os.path.exists(os.path.join(data_path, 'signature_change_list')):
             os.makedirs(os.path.join(data_path, 'signature_change_list'))
-        with open(os.path.join(data_path, 'signature_change_list', f'{bug_id}_{next_commit['commit_id']}.json'), 'w') as f:
+        with open(os.path.join(data_path, 'signature_change_list', f"{bug_id}_{next_commit['commit_id']}.json"), 'w') as f:
             json.dump(signature_change_list, f, indent=4)
 
         get_patched_traces, transitions, signature_change_list = mutable_args

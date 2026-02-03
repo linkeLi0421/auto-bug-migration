@@ -2384,7 +2384,7 @@ def get_poc_for_new_version(args):
     run_args.pop()
 
   # Get the function trace in the target commit with patch that reverts some patches
-  if not os.path.exists(f'{result_dir}/target_trace-{args.target_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt'):
+  if not os.path.exists(f"{result_dir}/target_trace-{args.target_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt"):
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name)
     run_args.extend([get_trace_log_bash(args.target_commit, args, apply_patch = True)])
     clean(args, out_dir)
@@ -2552,7 +2552,7 @@ def fuzz_one(args):
     docker_run(run_args, architecture=args.architecture)
     run_args.pop()
 
-  if not os.path.exists(f'{result_dir}/target_trace-{args.base_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt') and \
+  if not os.path.exists(f"{result_dir}/target_trace-{args.base_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt") and \
     args.base_commit != args.buggy_commit2:
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
     run_args.extend([get_trace_log_bash(args.base_commit, args, apply_patch = True)])
