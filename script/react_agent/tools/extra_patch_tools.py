@@ -250,9 +250,14 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
 
     Heuristic: place insertions after leading comment + preprocessor/header region, but never inside an
     unterminated preprocessor conditional block.
+
+    Special case: if the entire file is wrapped in #ifdef (common for feature-guarded code),
+    fall back to inserting after the last #include statement.
     """
     in_block_comment = False
     pp_nesting = 0
+    last_include_idx = -1
+
     for idx, raw in enumerate(lines):
         stripped = str(raw or "").lstrip()
         if in_block_comment:
@@ -268,6 +273,8 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
         if not stripped:
             continue
         if stripped.startswith("#"):
+            if stripped.startswith("#include"):
+                last_include_idx = idx
             if _PP_IF_RE.match(stripped):
                 pp_nesting += 1
             elif _PP_ENDIF_RE.match(stripped):
@@ -276,6 +283,11 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
         if pp_nesting > 0:
             continue
         return idx
+
+    # If we couldn't find a safe spot (e.g., entire file wrapped in #ifdef),
+    # insert after the last #include to ensure types are defined.
+    if last_include_idx >= 0:
+        return last_include_idx + 1
     return 0
 
 
