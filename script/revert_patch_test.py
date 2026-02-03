@@ -2573,15 +2573,44 @@ def handle_build_error(error_log):
     return undeclared_identifiers, undeclared_functions, missing_struct_members, function_sig_changes, incomplete_types
 
 
-def find_first_code_line(target: str, commit: str, file_path: str) -> int:
+def find_first_code_line(target: str, commit: str, file_path: str, target_repo_path: str = None) -> int:
+    """
+    Find a safe insertion point for forward declarations.
+    Returns the line number of the first function definition, but ensures
+    it's AFTER all #include statements to avoid 'conflicting types' errors.
+    """
     parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{file_path}_analysis.json')
     with open(parsing_path, 'r', encoding="utf-8") as f:
         ast_nodes = json.load(f)
+
+    first_func_line = -1
     for node in ast_nodes:
         if node['kind'] == 'FUNCTION_DEFI' and file_path == node['location']['file']:
-            return node['extent']['start']['line']
-    # No function code here
-    return -1
+            first_func_line = node['extent']['start']['line']
+            break
+
+    if first_func_line == -1:
+        return -1
+
+    # Find the last #include line to ensure we insert after all includes
+    last_include_line = 0
+    if target_repo_path:
+        try:
+            full_path = os.path.join(target_repo_path, file_path)
+            with open(full_path, 'r', encoding="latin-1") as f:
+                for i, line in enumerate(f, 1):
+                    stripped = line.strip()
+                    if stripped.startswith('#include'):
+                        last_include_line = i
+                    # Stop searching after hitting the first function line
+                    if i >= first_func_line:
+                        break
+        except Exception:
+            pass
+
+    # Return the later of: first function line or line after last include
+    # Add 1 to last_include_line to insert AFTER the include
+    return max(first_func_line, last_include_line + 1)
 
 
 def get_line_context(file_path, line_number, context=3):
@@ -4556,7 +4585,7 @@ def apply_and_test_patches(
             os.chdir(target_repo_path)
             subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "checkout", '-f', next_commit['commit_id']], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            insert_point = find_first_code_line(target, next_commit['commit_id'], file_path)
+            insert_point = find_first_code_line(target, next_commit['commit_id'], file_path, target_repo_path)
             context1, context2, start, end = get_line_context(os.path.join(target_repo_path, file_path), insert_point, context=3)
             merge_flag = 0
             

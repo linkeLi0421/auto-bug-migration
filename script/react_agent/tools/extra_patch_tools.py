@@ -250,9 +250,14 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
 
     Heuristic: place insertions after leading comment + preprocessor/header region, but never inside an
     unterminated preprocessor conditional block.
+
+    Special case: if the entire file is wrapped in #ifdef (common for feature-guarded code),
+    fall back to inserting after the last #include statement.
     """
     in_block_comment = False
     pp_nesting = 0
+    last_include_idx = -1
+
     for idx, raw in enumerate(lines):
         stripped = str(raw or "").lstrip()
         if in_block_comment:
@@ -268,6 +273,8 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
         if not stripped:
             continue
         if stripped.startswith("#"):
+            if stripped.startswith("#include"):
+                last_include_idx = idx
             if _PP_IF_RE.match(stripped):
                 pp_nesting += 1
             elif _PP_ENDIF_RE.match(stripped):
@@ -276,6 +283,11 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
         if pp_nesting > 0:
             continue
         return idx
+
+    # If we couldn't find a safe spot (e.g., entire file wrapped in #ifdef),
+    # insert after the last #include to ensure types are defined.
+    if last_include_idx >= 0:
+        return last_include_idx + 1
     return 0
 
 
@@ -304,6 +316,16 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         idx = insert_line - 1
         if 0 <= idx < len(lines):
             insert_at = idx
+
+    # Find the last #include line to ensure we don't insert before type definitions
+    last_include_idx = -1
+    for i, raw in enumerate(lines):
+        if str(raw or "").lstrip().startswith("#include"):
+            last_include_idx = i
+
+    # Ensure insert_at is after all #include statements
+    if last_include_idx >= 0 and insert_at <= last_include_idx:
+        insert_at = last_include_idx + 1
 
     if insert_at < 0:
         insert_at = _find_file_scope_insertion_index(lines)
