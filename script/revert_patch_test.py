@@ -4026,7 +4026,9 @@ def apply_and_test_patches(
     if not os.path.exists(os.path.join(data_path, "tmp_patch")):
         os.makedirs(os.path.join(data_path, "tmp_patch"), exist_ok=True)
     patch_file_binary = os.path.join(data_path, "tmp_patch", f"{target}.patch2")
-    save_patches_pickle(patches_without_context, patch_file_binary)
+    # Only save patches for keys in current patch_key_list (avoid stale entries from previous attempts)
+    current_patches = {key: patches_without_context[key] for key in patch_key_list}
+    save_patches_pickle(current_patches, patch_file_binary)
     
     #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
