@@ -606,12 +606,18 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
                 last_minus_end_index()
             )
 
+    # Retrieve new_signature from patch if available
+    new_function_signature: Optional[str] = None
+    if key_of_line_num and key_of_line_num in bundle.patches:
+        new_function_signature = bundle.patches[key_of_line_num].new_signature
+
     return {
         "patch_path": str(Path(patch_path)),
         "file_path": file_path,
         "line_number": ln,
         "patch_key": key_of_line_num,
         "old_signature": old_function_signature,
+        "new_signature": new_function_signature,
         "func_start_index": func_start_index,
         "func_end_index": func_end_index,
     }
@@ -770,6 +776,9 @@ def _get_link_error_patch_from_bundle(
                 func_start_index = front
                 func_end_index = last_minus_end_index(body)
 
+    # Retrieve new_signature from patch
+    new_function_signature: Optional[str] = patch.new_signature
+
     return {
         "patch_path": str(Path(patch_path)),
         "file_path": file_path,
@@ -777,6 +786,7 @@ def _get_link_error_patch_from_bundle(
         "function_name": func,
         "patch_key": best_key,
         "old_signature": old_function_signature,
+        "new_signature": new_function_signature,
         "func_start_index": func_start_index,
         "func_end_index": func_end_index,
         "mapping_note": "Mapped linker undefined-reference location by file_path + function_name.",
@@ -1289,6 +1299,32 @@ def make_error_patch_override(
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
 
+    # Validate that new_func_code preserves the function name by parsing it from the actual '-' lines.
+    # This is more reliable than using metadata (old_signature/new_signature) which may be missing or incorrect.
+    old_func_name = ""
+    for line in old_func_code_full.splitlines():
+        line = line.strip()
+        if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+            continue
+        if "(" in line:
+            old_func_name = _func_name_from_sig(line)
+        break
+
+    if old_func_name:
+        new_func_name = ""
+        for line in new_code.splitlines():
+            line = line.strip()
+            if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+                continue
+            if "(" in line:
+                new_func_name = _func_name_from_sig(line)
+            break
+        if new_func_name and new_func_name != old_func_name:
+            raise ValueError(
+                f"new_func_code changes the function name from '{old_func_name}' to '{new_func_name}'. "
+                f"The function name must be preserved exactly (including any __revert_* prefix)."
+            )
+
     def _norm_for_compare(text: str) -> str:
         return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
 
@@ -1437,7 +1473,7 @@ def make_link_error_patch_override(
     max_chars: int = 200000,
     allowed_roots: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Rewrite a mapped patch slice for linker errors by replacing its `-` lines.
+    r"""Rewrite a mapped patch slice for linker errors by replacing its `-` lines.
 
     This is the link-time counterpart to make_error_patch_override for errors like:
       `encoding.c:(.text.__revert_...): undefined reference to \`defaultHandlers'`
@@ -1509,6 +1545,32 @@ def make_link_error_patch_override(
     slice_lines = patch_lines[slice_start:slice_end]
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
+
+    # Validate that new_func_code preserves the function name by parsing it from the actual '-' lines.
+    # This is more reliable than using metadata (old_signature/new_signature) which may be missing or incorrect.
+    old_func_name = ""
+    for line in old_func_code_full.splitlines():
+        line = line.strip()
+        if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+            continue
+        if "(" in line:
+            old_func_name = _func_name_from_sig(line)
+        break
+
+    if old_func_name:
+        new_func_name = ""
+        for line in new_code.splitlines():
+            line = line.strip()
+            if not line or line.startswith("//") or line.startswith("/*") or line.startswith("*"):
+                continue
+            if "(" in line:
+                new_func_name = _func_name_from_sig(line)
+            break
+        if new_func_name and new_func_name != old_func_name:
+            raise ValueError(
+                f"new_func_code changes the function name from '{old_func_name}' to '{new_func_name}'. "
+                f"The function name must be preserved exactly (including any __revert_* prefix)."
+            )
 
     def _norm_for_compare(text: str) -> str:
         return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()

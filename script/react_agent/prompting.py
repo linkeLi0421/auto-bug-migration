@@ -20,6 +20,9 @@ class PromptContext:
     incomplete_type: bool
     missing_prototypes: bool
     linker_error: bool
+    func_sig_change: bool  # "too few/many arguments to function call"
+    conflicting_types: bool  # "conflicting types for 'func'"
+    static_nonstatic_decl: bool  # "static declaration follows non-static declaration"
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -84,6 +87,13 @@ def _context_from_state(state: Any) -> PromptContext:
     incomplete_type = ("incomplete" in err_lower and "type" in err_lower) or ("incomplete" in snip_lower and "type" in snip_lower)
     missing_prototypes = ("no previous prototype" in err_lower) or ("missing-prototypes" in err_lower)
     linker_error = "undefined reference to" in err_lower or "undefined reference to" in snip_lower
+    func_sig_change = ("too few arguments" in err_lower) or ("too many arguments" in err_lower)
+    # Only handle conflicting_types when there are NO undeclared symbol errors.
+    # Undeclared function errors are the root cause; fixing them properly resolves the conflict.
+    conflicting_types = ("conflicting types for" in err_lower or "conflicting types for" in snip_lower) and not undeclared_symbol
+    # Only handle static/non-static declaration mismatch when there are NO undeclared symbol errors.
+    # The undeclared function causes an implicit (non-static) declaration; fixing it resolves this error.
+    static_nonstatic_decl = ("static declaration" in err_lower and "follows non-static" in err_lower) and not undeclared_symbol
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -97,6 +107,9 @@ def _context_from_state(state: Any) -> PromptContext:
         incomplete_type=incomplete_type,
         missing_prototypes=missing_prototypes,
         linker_error=linker_error,
+        func_sig_change=func_sig_change,
+        conflicting_types=conflicting_types,
+        static_nonstatic_decl=static_nonstatic_decl,
     )
 
 
@@ -170,6 +183,16 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if linker_error:
             parts.append(linker_error)
 
+    if ctx.func_sig_change:
+        func_sig_change = _load_fragment("system_func_sig_change.txt")
+        if func_sig_change:
+            parts.append(func_sig_change)
+
+    if ctx.conflicting_types:
+        conflicting_types = _load_fragment("system_conflicting_types.txt")
+        if conflicting_types:
+            parts.append(conflicting_types)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -193,6 +216,10 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_missing_prototypes.txt")
         if ctx.linker_error:
             names.append("system_linker_error.txt")
+        if ctx.func_sig_change:
+            names.append("system_func_sig_change.txt")
+        if ctx.conflicting_types:
+            names.append("system_conflicting_types.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"

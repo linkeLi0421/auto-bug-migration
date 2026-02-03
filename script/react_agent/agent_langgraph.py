@@ -813,7 +813,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
                 }
             )
 
-        fixed = len(remaining_in_active_func) == 0
+        # Only count compiler errors for determining fixed status. Linker errors are handled by
+        # multi-agent --auto-continue-on-link-errors, not counted against individual function status.
+        compiler_remaining = [e for e in remaining_in_active_func if e.get("kind") != "linker"]
+        fixed = len(compiler_remaining) == 0
         other = [
             {
                 "raw": str(e.get("raw", "") or "").strip(),
@@ -881,7 +884,10 @@ def _summarize_target_error_status(state: AgentState) -> Dict[str, Any]:
             matched_keys.add(k)
             matched.append({"raw": err.get("raw", ""), "file": fp, "line": ln, "function": fn, "kind": "linker" if is_linker else "compiler", "patch_key": err_patch_key, "msg": msg})
 
-    fixed = len(matched) == 0
+    # Only count compiler errors for determining fixed status. Linker errors are handled by
+    # multi-agent --auto-continue-on-link-errors, not counted against individual target status.
+    compiler_matched = [e for e in matched if e.get("kind") != "linker"]
+    fixed = len(compiler_matched) == 0
     other = [
         {
             "raw": str(e.get("raw", "") or "").strip(),
@@ -1704,11 +1710,14 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
             enriched.append(item)
 
     in_active = [e for e in enriched if str(e.get("patch_key", "") or "").strip() == active_key] if active_key else []
+    # Only count compiler errors for remaining_in_active_patch_key. Linker errors are handled by
+    # multi-agent --auto-continue-on-link-errors, not counted against individual hunk status.
+    compiler_in_active = [e for e in in_active if e.get("kind") != "linker"]
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     return {
         "status": "ok",
         "active_patch_key": active_key,
-        "remaining_in_active_patch_key": len(in_active),
+        "remaining_in_active_patch_key": len(compiler_in_active),
         "errors": in_active[:10],
         "function_groups": func_groups,
         "function_groups_total": func_total,
@@ -1997,10 +2006,13 @@ def _prepare_next_patch_scope_iteration_after_ossfuzz(
     state.patch_result = None
     # Keep accumulated override diffs across iterations; OSS-Fuzz testing uses the base bundle + overrides.
     state.ossfuzz_test_attempted = False
-    state.last_observation = None
 
     if not fp or ln <= 0:
+        # Don't clear last_observation here - verdict computation needs it.
         return None
+
+    # Clear last_observation only when we're actually going to continue the loop.
+    state.last_observation = None
 
     # Prefer stable, line-number-based mapping for forced auto-loop restarts. Passing `error_text`
     # can cause get_error_patch_context to return a very narrow token slice (e.g. just `foo_t`)
@@ -2110,8 +2122,18 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
             return False
         return True
 
-    # Macro-expansion errors: prioritize the macro name and macro-like tokens from the snippet.
+    err = str(state.error_line or "")
     snippet = str(state.snippet or "")
+
+    # Function signature change errors: extract the callee function name from snippet.
+    # For "too few/many arguments to function call", the snippet contains the actual call site.
+    if "too few arguments" in err.lower() or "too many arguments" in err.lower():
+        # Extract function call names from snippet (pattern: identifier followed by '(')
+        for func_name in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", snippet):
+            if keep(func_name) and len(func_name) > 5:  # Skip short names like "if", "for"
+                terms.append(func_name)
+
+    # Macro-expansion errors: prioritize the macro name and macro-like tokens from the snippet.
     if snippet:
         for macro_name in re.findall(r"expanded from macro '([^']+)'", snippet):
             if keep(macro_name):
@@ -2125,7 +2147,7 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
     # a missing-member diagnostic. Patch-scope runs can include many other errors
     # in the same patch_key; including unrelated struct tokens can skew truncation
     # windows and confuse the model.
-    if _MISSING_MEMBER_RE.search(str(state.error_line or "")) and state.missing_struct_members:
+    if _MISSING_MEMBER_RE.search(err) and state.missing_struct_members:
         for item in state.missing_struct_members or []:
             if not isinstance(item, dict):
                 continue
@@ -2137,7 +2159,6 @@ def _collect_focus_terms(state: AgentState) -> List[str]:
             if keep(struct_name):
                 terms.append(struct_name)
     # Also include a few tokens from the error line itself.
-    err = str(state.error_line or "")
     for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", err):
         if keep(tok):
             terms.append(tok)

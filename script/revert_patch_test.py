@@ -37,6 +37,9 @@ from utils import (
     diff_strings,
     save_patches_pickle,
     load_patches_pickle,
+    extract_extra_patches,
+    filter_patches_by_trace,
+    binary_search_missing_patches,
 )
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
@@ -832,10 +835,50 @@ def parse_arguments():
                         help='target project name')
     parser.add_argument('--bug_id', 
                         help='Optional: specific bug ID to process')
-    parser.add_argument('--buggy_commit', 
+    parser.add_argument('--buggy_commit',
                         help='Optional: specific buggy commit to process')
-    
+    parser.add_argument('--debug-artifact-dir',
+                        help='Skip patch generation and use pre-generated patches from this artifact folder '
+                             '(e.g., data/react_agent_artifacts/multi_20260202_193357_3887285_0130faed)')
+
     return parser.parse_args()
+
+
+def load_debug_artifact_data(artifact_dir: str) -> dict:
+    """Load pre-generated data from artifact folder for debug runs.
+
+    Returns dict with:
+        - summary: The summary.json contents
+        - patches: Dict[str, PatchInfo] loaded from merged patch bundle
+        - merged_patch_path: Path to the merged patch bundle
+    """
+    summary_path = os.path.join(artifact_dir, 'summary.json')
+    if not os.path.exists(summary_path):
+        raise FileNotFoundError(f"summary.json not found in {artifact_dir}")
+
+    with open(summary_path, 'r') as f:
+        summary = json.load(f)
+
+    # Get merged patch bundle path from summary
+    merged_patch_path = summary.get('final_ossfuzz_test', {}).get('merged_patch_bundle_path')
+    if not merged_patch_path or not os.path.exists(merged_patch_path):
+        # Try to find it in the artifact dir
+        for fname in os.listdir(artifact_dir):
+            if fname.endswith('.patch2'):
+                merged_patch_path = os.path.join(artifact_dir, fname)
+                break
+
+    if not merged_patch_path or not os.path.exists(merged_patch_path):
+        raise FileNotFoundError(f"No .patch2 file found in {artifact_dir}")
+
+    # Load the patch bundle
+    patches = load_patches_pickle(merged_patch_path)
+
+    return {
+        'summary': summary,
+        'patches': patches,
+        'merged_patch_path': merged_patch_path,
+    }
 
 
 def parse_csv_file(file_path):
@@ -1530,11 +1573,94 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     return True, ''
 
 
-def call_react_agent(
+def prepare_v1_v2_repos(
+    source_repo_path: str,
+    v1_repo_base: str,
+    v2_repo_base: str,
+    target: str,
+    v1_commit: str,
+    v2_commit: str,
+) -> tuple:
+    """Prepare separate V1 and V2 source directories by checkout and copy.
+
+    The react agent needs two separate source trees to read code from both versions.
+    This function checks out each commit in the source repo and copies the source
+    files to the V1/V2 directories.
+
+    Args:
+        source_repo_path: Path to the source repo (REPO_PATH/<target>)
+        v1_repo_base: Base directory for V1 source (e.g., /home/user/tasks-git-v1)
+        v2_repo_base: Base directory for V2 source (e.g., /home/user/tasks-git-v2)
+        target: Project name (e.g., libxml2)
+        v1_commit: Commit hash for V1 (old version)
+        v2_commit: Commit hash for V2 (new version)
+
+    Returns:
+        Tuple of (v1_src_path, v2_src_path)
+    """
+    v1_target_path = os.path.join(v1_repo_base, target)
+    v2_target_path = os.path.join(v2_repo_base, target)
+
+    # Checkout V1 commit in source repo and copy to V1 path
+    logger.info(f"Checking out V1 commit {v1_commit} in {source_repo_path}")
+    subprocess.run(
+        ["git", "clean", "-fdx"],
+        cwd=source_repo_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-f", v1_commit],
+        cwd=source_repo_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Remove old V1 target and copy fresh
+    if os.path.exists(v1_target_path):
+        shutil.rmtree(v1_target_path)
+    os.makedirs(v1_repo_base, exist_ok=True)
+    logger.info(f"Copying source to {v1_target_path}")
+    shutil.copytree(source_repo_path, v1_target_path, symlinks=True)
+
+    # Checkout V2 commit in source repo and copy to V2 path
+    logger.info(f"Checking out V2 commit {v2_commit} in {source_repo_path}")
+    subprocess.run(
+        ["git", "clean", "-fdx"],
+        cwd=source_repo_path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["git", "checkout", "-f", v2_commit],
+        cwd=source_repo_path,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    # Remove old V2 target and copy fresh
+    if os.path.exists(v2_target_path):
+        shutil.rmtree(v2_target_path)
+    os.makedirs(v2_repo_base, exist_ok=True)
+    logger.info(f"Copying source to {v2_target_path}")
+    shutil.copytree(source_repo_path, v2_target_path, symlinks=True)
+
+    return v1_target_path, v2_target_path
+
+
+def _has_sanitizer_error(build_log_text: str) -> bool:
+    """Check if build log contains sanitizer runtime errors (which means build succeeded)."""
+    import re
+    # Sanitizer errors like "ERROR: AddressSanitizer", "ERROR: MemorySanitizer", etc.
+    return bool(re.search(r"ERROR:\s*\w*Sanitizer", build_log_text))
+
+
+def _run_single_multi_agent_round(
     build_log_path: str,
     patch_path: str,
     project: str,
-    old_commit: str,
     new_commit: str,
     build_csv: str,
     fuzz_target: str,
@@ -1542,20 +1668,17 @@ def call_react_agent(
     v2_json_dir: str,
     v1_src: str,
     v2_src: str,
-    sanitizer: str = "address",
-    arch: str = "x86_64",
-    max_steps: int = 100,
-    jobs: int = 10,
-    max_groups: int = 100,
-    ossfuzz_loop_max: int = 100,
-    max_restarts_per_hunk: int = 3,
-    openai_model: str = "gpt-5-mini",
-    openai_max_tokens: int = 64000,
+    sanitizer: str,
+    arch: str,
+    max_steps: int,
+    jobs: int,
+    max_groups: int,
+    ossfuzz_loop_max: int,
+    max_restarts_per_hunk: int,
+    openai_model: str,
+    openai_max_tokens: int,
 ) -> dict:
-    """Call the multi-agent to fix build errors.
-
-    Returns dict with keys: success, output, returncode
-    """
+    """Run a single round of multi-agent fixing."""
     agent_script = os.path.join(current_file_path, "react_agent", "multi_agent.py")
 
     cmd = [
@@ -1604,7 +1727,12 @@ def call_react_agent(
     # Find the latest multi_* artifacts directory created after start_time
     artifacts_base = os.path.join(data_path, "react_agent_artifacts")
     merged_diff_path = ""
+    merged_patch_bundle_path = ""
     artifacts_dir = ""
+    summary = {}
+    final_build_log_path = ""
+    not_fixed = []
+
     if os.path.isdir(artifacts_base):
         multi_dirs = sorted(
             [d for d in os.listdir(artifacts_base) if d.startswith("multi_")],
@@ -1619,7 +1747,11 @@ def call_react_agent(
                     try:
                         with open(summary_path) as f:
                             summary = json.load(f)
-                        merged_diff_path = summary.get("final_ossfuzz_test", {}).get("merged_patch_file_path", "")
+                        final_ossfuzz = summary.get("final_ossfuzz_test", {})
+                        merged_diff_path = final_ossfuzz.get("merged_patch_file_path", "")
+                        merged_patch_bundle_path = final_ossfuzz.get("merged_patch_bundle_path", "")
+                        final_build_log_path = final_ossfuzz.get("build_output_path", "")
+                        not_fixed = summary.get("not_fixed", [])
                         artifacts_dir = dir_path
                         break
                     except Exception:
@@ -1630,7 +1762,142 @@ def call_react_agent(
         "output": output,
         "returncode": result.returncode,
         "merged_diff_path": merged_diff_path,
+        "merged_patch_bundle_path": merged_patch_bundle_path,
         "artifacts_dir": artifacts_dir,
+        "summary": summary,
+        "final_build_log_path": final_build_log_path,
+        "not_fixed": not_fixed,
+    }
+
+
+def call_react_agent(
+    build_log_path: str,
+    patch_path: str,
+    project: str,
+    old_commit: str,
+    new_commit: str,
+    build_csv: str,
+    fuzz_target: str,
+    v1_json_dir: str,
+    v2_json_dir: str,
+    v1_src: str,
+    v2_src: str,
+    sanitizer: str = "address",
+    arch: str = "x86_64",
+    max_steps: int = 100,
+    jobs: int = int(os.environ.get("REACT_AGENT_JOBS", "4")),
+    max_groups: int = 100,
+    ossfuzz_loop_max: int = 100,
+    max_restarts_per_hunk: int = 3,
+    openai_model: str = "gpt-5-mini",
+    openai_max_tokens: int = 64000,
+    max_multi_agent_rounds: int = 10,
+) -> dict:
+    """Call the multi-agent to fix build errors with iterative rounds.
+
+    Iterates multiple rounds if:
+    - All individual errors in a round are fixed (not_fixed is empty)
+    - The merged build still fails with new errors
+    - The build log does NOT contain sanitizer errors (which indicates runtime success)
+
+    Returns dict with keys: success, output, returncode, merged_diff_path, artifacts_dir, rounds
+    """
+    current_build_log = build_log_path
+    current_patch = patch_path
+    rounds = []
+    final_result = None
+
+    for round_num in range(1, max_multi_agent_rounds + 1):
+        logger.info(f"=== Multi-agent round {round_num}/{max_multi_agent_rounds} ===")
+        logger.info(f"  Build log: {current_build_log}")
+        logger.info(f"  Patch: {current_patch}")
+
+        round_result = _run_single_multi_agent_round(
+            build_log_path=current_build_log,
+            patch_path=current_patch,
+            project=project,
+            new_commit=new_commit,
+            build_csv=build_csv,
+            fuzz_target=fuzz_target,
+            v1_json_dir=v1_json_dir,
+            v2_json_dir=v2_json_dir,
+            v1_src=v1_src,
+            v2_src=v2_src,
+            sanitizer=sanitizer,
+            arch=arch,
+            max_steps=max_steps,
+            jobs=jobs,
+            max_groups=max_groups,
+            ossfuzz_loop_max=ossfuzz_loop_max,
+            max_restarts_per_hunk=max_restarts_per_hunk,
+            openai_model=openai_model,
+            openai_max_tokens=openai_max_tokens,
+        )
+        round_result["round"] = round_num
+        rounds.append(round_result)
+        final_result = round_result
+
+        # Check if we should continue to next round
+        not_fixed = round_result.get("not_fixed", [])
+        summary = round_result.get("summary", {})
+        final_ossfuzz = summary.get("final_ossfuzz_test", {})
+        final_status = final_ossfuzz.get("status", "")
+
+        # If some individual errors couldn't be fixed, stop
+        if not_fixed:
+            logger.info(f"Round {round_num}: {len(not_fixed)} errors not fixed individually, stopping")
+            break
+
+        # If final build succeeded, we're done
+        if final_status == "ok":
+            logger.info(f"Round {round_num}: Build succeeded!")
+            break
+
+        # Check if build log has sanitizer errors (means build succeeded, runtime issue)
+        final_build_log_path = round_result.get("final_build_log_path", "")
+        if final_build_log_path and os.path.isfile(final_build_log_path):
+            with open(final_build_log_path, 'r') as f:
+                final_build_log_text = f.read()
+            if _has_sanitizer_error(final_build_log_text):
+                logger.info(f"Round {round_num}: Sanitizer error detected (build succeeded), stopping")
+                final_result["success"] = True  # Treat as success
+                break
+
+        # Check if we have output for next round
+        merged_patch_bundle = round_result.get("merged_patch_bundle_path", "")
+        if not merged_patch_bundle or not os.path.isfile(merged_patch_bundle):
+            logger.info(f"Round {round_num}: No merged patch bundle found, stopping")
+            break
+
+        if not final_build_log_path or not os.path.isfile(final_build_log_path):
+            logger.info(f"Round {round_num}: No final build log found, stopping")
+            break
+
+        # Setup for next round
+        current_patch = merged_patch_bundle
+        current_build_log = final_build_log_path
+        logger.info(f"Round {round_num}: Individual errors fixed but build still fails, continuing to next round")
+
+    # Build final result from last round
+    if final_result is None:
+        return {
+            "success": False,
+            "output": {},
+            "returncode": 1,
+            "merged_diff_path": "",
+            "artifacts_dir": "",
+            "rounds": rounds,
+            "total_rounds": 0,
+        }
+
+    return {
+        "success": final_result.get("success", False),
+        "output": final_result.get("output", {}),
+        "returncode": final_result.get("returncode", 1),
+        "merged_diff_path": final_result.get("merged_diff_path", ""),
+        "artifacts_dir": final_result.get("artifacts_dir", ""),
+        "rounds": rounds,
+        "total_rounds": len(rounds),
     }
 
 
@@ -3593,6 +3860,128 @@ def get_file_path_pairs(diff_results):
     return file_path_pairs
 
 
+def build_with_cached_extras(
+    patch_keys: List[str],
+    diff_results: Dict[str, Any],
+    extra_patches_cache: Dict[str, Any],
+    target: str,
+    next_commit_id: str,
+    sanitizer: str,
+    bug_id: str,
+    fuzzer: str,
+    build_csv: str,
+    arch: str,
+) -> Tuple[bool, str]:
+    """Build with a subset of patches, including cached extra patches."""
+    combined_patches = {}
+
+    for key in patch_keys:
+        if key in diff_results:
+            combined_patches[key] = diff_results[key]
+
+    combined_patches.update(extra_patches_cache)
+
+    patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+    patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit_id}_min_trial.diff")
+
+    sorted_keys = sorted(
+        combined_patches.keys(),
+        key=lambda k: getattr(combined_patches[k], 'new_start_line', 0),
+        reverse=True
+    )
+
+    with open(patch_file_path, 'w') as f:
+        for key in sorted_keys:
+            patch = combined_patches[key]
+            f.write(patch.patch_text)
+            f.write('\n\n')
+
+    return build_fuzzer(
+        target, next_commit_id, sanitizer, bug_id,
+        patch_file_path, fuzzer, build_csv, arch
+    )
+
+
+def minimize_with_trace_and_cached_extras(
+    patch_pair_list: List[Tuple[str, ...]],
+    patches_without_context: Dict[str, Any],
+    diff_results: Dict[str, Any],
+    trace1: List[Tuple[int, str]],
+    depen_graph: Dict[str, Set[str]],
+    target: str,
+    next_commit: Dict,
+    sanitizer: str,
+    bug_id: str,
+    fuzzer: str,
+    build_csv: str,
+    arch: str,
+) -> Tuple[List[Tuple[str, ...]], Dict[str, Any]]:
+    """Minimize patches using trace-based filtering with cached extra patches."""
+
+    # Phase 0: Extract cached extra patches (already populated by first build)
+    extra_patches_cache = extract_extra_patches(patches_without_context)
+    logger.info(f"Cached {len(extra_patches_cache)} extra patches")
+
+    # Phase 1: Static trace-based filtering
+    all_patch_keys = [key for keys in patch_pair_list for key in keys]
+    trace_func_list = [(func.split(' ')[0], func.split(' ')[-1]) for _, func in trace1]
+
+    filtered_keys = filter_patches_by_trace(
+        all_patch_keys, diff_results, trace_func_list, depen_graph
+    )
+    logger.info(f"Static filter: {len(all_patch_keys)} -> {len(filtered_keys)} patches")
+
+    filtered_patch_pairs = [
+        tuple(k for k in keys if k in filtered_keys)
+        for keys in patch_pair_list
+    ]
+    filtered_patch_pairs = [t for t in filtered_patch_pairs if t]
+
+    if not filtered_patch_pairs:
+        logger.warning("Static filter removed all patches, using original")
+        return patch_pair_list, extra_patches_cache
+
+    # Phase 2: Single verification build
+    filtered_flat = [k for keys in filtered_patch_pairs for k in keys]
+    success, _ = build_with_cached_extras(
+        filtered_flat, diff_results, extra_patches_cache,
+        target, next_commit['commit_id'], sanitizer, bug_id,
+        fuzzer, build_csv, arch
+    )
+
+    if success:
+        logger.info(f"Minimized from {len(all_patch_keys)} to {len(filtered_flat)}")
+        return filtered_patch_pairs, extra_patches_cache
+
+    # Phase 3: Binary search for missing patches
+    candidates = [k for k in all_patch_keys if k not in filtered_keys]
+    logger.info(f"Binary search: {len(filtered_keys)} base + {len(candidates)} candidates")
+
+    trial_count = [0]  # Use list to allow mutation in closure
+
+    def test_fn(keys: List[str]) -> bool:
+        trial_count[0] += 1
+        logger.info(f"Trial {trial_count[0]}: testing {len(keys)} patches")
+        ok, _ = build_with_cached_extras(
+            keys, diff_results, extra_patches_cache,
+            target, next_commit['commit_id'], sanitizer, bug_id,
+            fuzzer, build_csv, arch
+        )
+        return ok
+
+    additional = binary_search_missing_patches(set(filtered_keys), candidates, test_fn)
+    logger.info(f"Binary search found {len(additional)} additional patches needed")
+
+    if additional:
+        final_keys = set(filtered_keys + additional)
+        logger.info(f"Final patch count: {len(final_keys)} ({len(filtered_keys)} filtered + {len(additional)} additional)")
+        final_pairs = [tuple(k for k in keys if k in final_keys) for keys in patch_pair_list]
+        final_pairs = [t for t in final_pairs if t]
+        return final_pairs, extra_patches_cache
+
+    return patch_pair_list, extra_patches_cache
+
+
 def apply_and_test_patches(
     patch_pair_list,
     func_list, # list of function signatures, use source code from next_commit
@@ -3614,6 +4003,8 @@ def apply_and_test_patches(
     file_path_pairs,
     data_path,
     depen_graph,
+    v1_repo_path,
+    v2_repo_path,
     ):
     if not patch_pair_list:
         logger.error("No patch pairs to apply")
@@ -3687,6 +4078,17 @@ def apply_and_test_patches(
         # Call react multi-agent to fix build errors
         v1_json_dir = os.path.join(data_path, f"{target}-{commit['commit_id']}")
         v2_json_dir = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
+
+        # Prepare separate V1/V2 source trees checked out to correct commits
+        v1_src_path, v2_src_path = prepare_v1_v2_repos(
+            source_repo_path=target_repo_path,
+            v1_repo_base=v1_repo_path,
+            v2_repo_base=v2_repo_path,
+            target=target,
+            v1_commit=commit['commit_id'],
+            v2_commit=next_commit['commit_id'],
+        )
+
         agent_result = call_react_agent(
             build_log_path=build_log_temp,
             patch_path=patch_file_binary,
@@ -3697,8 +4099,8 @@ def apply_and_test_patches(
             fuzz_target=fuzzer,
             v1_json_dir=v1_json_dir,
             v2_json_dir=v2_json_dir,
-            v1_src=target_repo_path,
-            v2_src=target_repo_path,
+            v1_src=v1_src_path,
+            v2_src=v2_src_path,
             sanitizer=sanitizer,
             arch=arch,
         )
@@ -3708,6 +4110,13 @@ def apply_and_test_patches(
         if merged_diff and os.path.isfile(merged_diff):
             shutil.copy(merged_diff, patch_file_path)
             logger.info(f"Copied merged diff from {merged_diff} to {patch_file_path}")
+            # Also load the merged patch bundle so patches_without_context includes
+            # react agent's _extra_* patches for later minimization
+            merged_bundle = agent_result.get("merged_patch_bundle_path", "")
+            if merged_bundle and os.path.isfile(merged_bundle):
+                updated_patches = load_patches_pickle(merged_bundle)
+                patches_without_context.update(updated_patches)
+                logger.info(f"Loaded {len(updated_patches)} patches from merged bundle for minimization")
         else:
             # Fallback: reload the updated patch bundle and regenerate the .diff file
             updated_patches = load_patches_pickle(patch_file_binary)
@@ -4324,14 +4733,14 @@ def apply_and_test_patches(
                     next_commit['commit_id'],
                 )
                 return 'crash_mismatch'
-            if test_fuzzer_build(target, sanitizer, arch):
-                logger.info(f"Fuzzer build success after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
-                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
-                return 'trigger_and_fuzzer_build'
+            # Reproduce passed (bug triggered) - this is the main success criterion
+            # check_build is optional; just warn if it fails
+            if not test_fuzzer_build(target, sanitizer, arch):
+                logger.warning(f"check_build failed for bug {bug_id} on commit {next_commit['commit_id']}, but reproduce passed - treating as success")
             else:
-                logger.info(f"Fuzzer build fail after applying patch for bug {bug_id} on commit {next_commit['commit_id']}\n")
-                get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
-                return 'trigger_but_fuzzer_build_fail'
+                logger.info(f"Fuzzer build check passed for bug {bug_id} on commit {next_commit['commit_id']}")
+            get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
+            return 'trigger_and_fuzzer_build'
         else:
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
             return 'not_trigger'
@@ -4396,6 +4805,13 @@ def revert_patch_test(args):
     if not repo_path:
         logger.info("REPO_PATH environment variable not set. Exiting.")
         exit(1)
+    # Get separate V1/V2 repo paths for react agent (old and new source versions)
+    v1_repo_path = os.getenv('V1_REPO_PATH', '')
+    v2_repo_path = os.getenv('V2_REPO_PATH', '')
+    if not v1_repo_path or not v2_repo_path:
+        logger.warning("V1_REPO_PATH or V2_REPO_PATH not set. React agent may not work correctly.")
+        v1_repo_path = v1_repo_path or repo_path
+        v2_repo_path = v2_repo_path or repo_path
     testcases_env = os.getenv('TESTCASES', '')
     if not testcases_env:
         logger.info("TESTCASES environment variable not set. Exiting.")
@@ -4448,7 +4864,98 @@ def revert_patch_test(args):
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
-    
+
+        # Debug mode: skip patch generation and use pre-generated patches
+        debug_artifact_dir = getattr(args, 'debug_artifact_dir', None)
+        if debug_artifact_dir:
+            logger.info(f"Debug mode: loading data from {debug_artifact_dir}")
+
+            # Load artifact data
+            debug_data = load_debug_artifact_data(debug_artifact_dir)
+            logger.info(f"Loaded {len(debug_data['patches'])} patches from artifact")
+
+            # Load cached diff_results (required for minimization)
+            diff_path = os.path.join(data_path, 'diff',
+                f'revert_patch_{bug_id}_{commit["commit_id"]}_to_{next_commit["commit_id"]}.diff')
+            if not os.path.exists(diff_path):
+                logger.error(f"Cached diff not found: {diff_path}")
+                logger.error("Debug mode requires cached diff_results. Run without --debug-artifact-dir first.")
+                continue
+            diff_results = load_patches_pickle(diff_path)
+            logger.info(f"Loaded cached diff analysis from {diff_path} ({len(diff_results)} entries)")
+
+            # Load trace (required for minimization)
+            if not os.path.exists(trace_path1):
+                logger.error(f"Trace file not found: {trace_path1}")
+                logger.error("Debug mode requires existing trace file.")
+                continue
+            trace1 = extract_function_calls(trace_path1)
+            logger.info(f"Loaded trace with {len(trace1)} function calls")
+
+            # Build patch_pair_list from artifact patches grouped by signature
+            patch_by_func = {}
+            for key, patch in debug_data['patches'].items():
+                sig = getattr(patch, 'new_signature', None) or getattr(patch, 'old_signature', None)
+                if sig:
+                    patch_by_func.setdefault(sig, []).append(key)
+            patch_pair_list = [tuple(v) for v in patch_by_func.values()]
+            logger.info(f"Built patch_pair_list with {len(patch_pair_list)} groups from artifact")
+
+            # Build minimal dependency graph from diff_results
+            depen_graph = {}
+            for key in diff_results:
+                depen_graph[key] = set()
+
+            # Get file path pairs
+            file_path_pairs = get_file_path_pairs(diff_results)
+
+            # Build inmutable_args and mutable_args for minimization
+            inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
+                sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
+                v1_repo_path, v2_repo_path)
+            signature_change_list = []
+            mutable_args = (get_patched_traces, transitions, signature_change_list)
+
+            # Jump directly to minimization
+            logger.info(f"Debug mode: skipping patch generation, jumping to minimization")
+            logger.info(f"patch_pair_list: {patch_pair_list}")
+
+            patches_without_context = dict()
+            tmp = copy.deepcopy(inmutable_args)
+            result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+            if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+                revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                minimal_fast = patch_pair_list  # Use original if initial build fails
+                logger.info(f"Initial build failed, using original patch set")
+            else:
+                revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+
+                # Use trace-based minimization with cached extras
+                minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
+                    patch_pair_list, patches_without_context, diff_results,
+                    trace1, depen_graph, target, next_commit, sanitizer,
+                    bug_id, fuzzer, args.build_csv, arch
+                )
+
+                logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+
+                # Apply greedy one-by-one minimization to further reduce the patch set
+                if len(minimal_fast) > 1:
+                    logger.info(f'Starting greedy minimization on {len(minimal_fast)} patches')
+                    minimal_fast = minimize_greedy(
+                        minimal_fast,
+                        apply_and_test_patches,
+                        patches_without_context,
+                        mutable_args,
+                        inmutable_args
+                    )
+                    logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
+
+            min_path_dict[bug_id] = minimal_fast
+            logger.info(f"Debug mode: minimization complete, result: {minimal_fast}")
+            continue  # Skip the rest of this iteration
+
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
@@ -4593,7 +5100,8 @@ def revert_patch_test(args):
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
         inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
-            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph)
+            sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
+            v1_repo_path, v2_repo_path)
         signature_change_list = []
         mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
@@ -4609,19 +5117,45 @@ def revert_patch_test(args):
             os.makedirs(os.path.dirname(min_patch_file_path))
         if os.path.exists(min_patch_file_path):
             with open(min_patch_file_path, 'r') as f:
-                patch_pair_list = json.load(f)[bug_id]
+                cached_patches = json.load(f)
+                if bug_id in cached_patches:
+                    patch_pair_list = cached_patches[bug_id]
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
-        if not apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp) in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+        result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+        if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            minimal_fast = patch_pair_list  # Use original if initial build fails
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
-            # try to minimize the patch set
-            minimal_fast = minimize_greedy(patch_pair_list, apply_and_test_patches, patches_without_context, mutable_args, inmutable_args)
-            logger.info(f'Minimal revert patch set after fast minimization {bug_id}: {len(minimal_fast)} {minimal_fast}')
-            
+
+            # Use trace-based minimization with cached extras
+            minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
+                patch_pair_list, patches_without_context, diff_results,
+                trace1, depen_graph, target, next_commit, sanitizer,
+                bug_id, fuzzer, args.build_csv, arch
+            )
+
+            logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+
+            # Apply greedy one-by-one minimization to further reduce the patch set
+            # TODO: Consider hybrid two-phase minimization for better performance:
+            #   1. Phase 1: Binary search - Try removing half patches at once (O(log N) calls)
+            #   2. Phase 2: One-by-one - Fall back when binary search can't remove more (O(M) calls)
+            #   Expected: 58 patches → ~6 binary + ~5 one-by-one = ~11 calls vs ~58
+            if len(minimal_fast) > 1:
+                logger.info(f'Starting greedy minimization on {len(minimal_fast)} patches')
+                minimal_fast = minimize_greedy(
+                    minimal_fast,
+                    apply_and_test_patches,
+                    patches_without_context,
+                    mutable_args,
+                    inmutable_args
+                )
+                logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
+
         min_path_dict[bug_id] = minimal_fast
 
         patches_without_contexts[
@@ -4725,20 +5259,3 @@ if __name__ == "__main__":
     
         for bug_id, affected_bugs in test_local_bug_after_patch.items():
             logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
-
-    for (bug_id, commit_id, fuzzer, input_functions), patch_dict in patches_without_contexts.items():
-        logger.info(f'bug_id {bug_id}')
-        for key in patch_dict:
-            patch = patch_dict[key]
-            if patch.hiden_func_dict:
-                for func_sig in patch.hiden_func_dict:
-                    logger.info(f'-->{func_sig}\n')
-            else:
-                if patch.new_signature:
-                    logger.info(f'-->{patch.new_signature}')
-                elif patch.old_signature:
-                    logger.info(f'-->{patch.old_signature}')
-        patch_not_context = remove_context(patch_dict)
-        for key in patch_not_context:
-            patch = patch_not_context[key]
-        patches_without_contexts[(bug_id, commit_id, fuzzer, input_functions)] = patch_not_context

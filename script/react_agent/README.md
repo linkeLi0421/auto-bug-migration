@@ -115,7 +115,11 @@ Notes:
 - Limit fan-out: `--max-groups 10`
 - Run only specific hunks: `--only-patch-keys p1,p2,p3`
 - Retry a failing hunk from a clean slate: `--max-restarts-per-hunk 1`
-- Run one final OSS-Fuzz build/check_build with *all* hunks’ overrides:
+- Handle linker errors after compiler errors are fixed: `--auto-continue-on-link-errors`
+  - Runs up to 10 continuation rounds to fix linker errors (e.g., `undefined reference`)
+  - Linker errors don't count against individual hunk "fixed" status
+  - The progression compiler error → linker error means the compiler error IS fixed
+- Run one final OSS-Fuzz build/check_build with *all* hunks' overrides:
   - `--final-ossfuzz-test always` (default): run regardless of per-hunk status (still requires `--tools real`)
   - `--final-ossfuzz-test auto`: only when all hunks are `fixed` and `--tools real`
   - `--final-ossfuzz-test never`: skip
