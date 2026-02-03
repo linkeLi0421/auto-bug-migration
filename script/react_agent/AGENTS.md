@@ -17,7 +17,7 @@ Plans live in `script/react_agent/tasks/TASKS.md`.
 The agent can query libclang-produced JSON for V1/V2 symbol definitions and locations.
 
 ### Input Data Format
-The input is a directory of JSON files (`*_analysis.json`). You can check example in /home/user/oss-fuzz-build/data/libxml2-e11519
+The input is a directory of JSON files (`*_analysis.json`). You can check example in `data/libxml2-e11519`
 Each JSON file contains a list of dictionaries. The structure of a single entry is strictly based on this schema:
 
 ```jsonc

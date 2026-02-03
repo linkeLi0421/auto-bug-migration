@@ -1,4 +1,6 @@
 #!/bin/bash
+# Python interpreter path (defaults to system python3 if not set)
+export PYTHON_PATH="/home/user/pyenv/venv/bin/python3"
 export LOG_PATH="/home/user/log"
 export STORAGE_PATH="/mnt/nas/linke"
 export TESTCASES="/home/user/oss-fuzz-for-select/pocs/tmp"

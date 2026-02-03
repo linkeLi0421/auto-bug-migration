@@ -11,11 +11,19 @@
 
 ## Basic Usage
 
+First, source the environment setup:
+
 ```bash
-OPENAI_API_KEY=dummy /home/user/pyenv/venv/bin/python3 script/patch_merge.py \
-  --bug_distribution_csv /home/user/log/c-blosc2.csv \
+source script/setenv.sh
+```
+
+Then run the script:
+
+```bash
+OPENAI_API_KEY=dummy python3 script/patch_merge.py \
+  --bug_distribution_csv $LOG_PATH/c-blosc2.csv \
   script/patches.pkl.gz \
-  --graphviz_output /home/user/oss-fuzz-build/log/patch_compatibility.dot
+  --graphviz_output log/patch_compatibility.dot
 ```
 
 Key positional/optional arguments:
@@ -37,15 +45,15 @@ The script logs:
 To have `patch_merge` call `revert_patch_test` when a Group 1 bug needs a refreshed patch, provide all the `--revert_*` flags:
 
 ```bash
-OPENAI_API_KEY=dummy /home/user/pyenv/venv/bin/python3 script/patch_merge.py \
-  --bug_distribution_csv /home/user/log/c-blosc2.csv \
+OPENAI_API_KEY=dummy python3 script/patch_merge.py \
+  --bug_distribution_csv $LOG_PATH/c-blosc2.csv \
   script/patches.pkl.gz \
-  --graphviz_output /home/user/oss-fuzz-build/log/patch_compatibility.dot \
-  --revert_target_test_result /home/user/log/c-blosc2.csv \
-  --revert_bug_info /home/user/oss-fuzz-for-select/osv_testcases_summary.json \
-  --revert_build_csv /home/user/log/c-blosc2_builds.csv \
+  --graphviz_output log/patch_compatibility.dot \
+  --revert_target_test_result $LOG_PATH/c-blosc2.csv \
+  --revert_bug_info $BUGINFO_PATH \
+  --revert_build_csv $LOG_PATH/c-blosc2_builds.csv \
   --revert_target c-blosc2 \
-  --revert_output_dir /home/user/oss-fuzz-build/log/revert_patch
+  --revert_output_dir log/revert_patch
 ```
 
 These flags map 1:1 to the `revert_patch_test.py` arguments:
