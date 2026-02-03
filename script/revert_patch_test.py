@@ -835,10 +835,50 @@ def parse_arguments():
                         help='target project name')
     parser.add_argument('--bug_id', 
                         help='Optional: specific bug ID to process')
-    parser.add_argument('--buggy_commit', 
+    parser.add_argument('--buggy_commit',
                         help='Optional: specific buggy commit to process')
-    
+    parser.add_argument('--debug-artifact-dir',
+                        help='Skip patch generation and use pre-generated patches from this artifact folder '
+                             '(e.g., data/react_agent_artifacts/multi_20260202_193357_3887285_0130faed)')
+
     return parser.parse_args()
+
+
+def load_debug_artifact_data(artifact_dir: str) -> dict:
+    """Load pre-generated data from artifact folder for debug runs.
+
+    Returns dict with:
+        - summary: The summary.json contents
+        - patches: Dict[str, PatchInfo] loaded from merged patch bundle
+        - merged_patch_path: Path to the merged patch bundle
+    """
+    summary_path = os.path.join(artifact_dir, 'summary.json')
+    if not os.path.exists(summary_path):
+        raise FileNotFoundError(f"summary.json not found in {artifact_dir}")
+
+    with open(summary_path, 'r') as f:
+        summary = json.load(f)
+
+    # Get merged patch bundle path from summary
+    merged_patch_path = summary.get('final_ossfuzz_test', {}).get('merged_patch_bundle_path')
+    if not merged_patch_path or not os.path.exists(merged_patch_path):
+        # Try to find it in the artifact dir
+        for fname in os.listdir(artifact_dir):
+            if fname.endswith('.patch2'):
+                merged_patch_path = os.path.join(artifact_dir, fname)
+                break
+
+    if not merged_patch_path or not os.path.exists(merged_patch_path):
+        raise FileNotFoundError(f"No .patch2 file found in {artifact_dir}")
+
+    # Load the patch bundle
+    patches = load_patches_pickle(merged_patch_path)
+
+    return {
+        'summary': summary,
+        'patches': patches,
+        'merged_patch_path': merged_patch_path,
+    }
 
 
 def parse_csv_file(file_path):
@@ -4824,7 +4864,98 @@ def revert_patch_test(args):
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
         else:
             logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
-    
+
+        # Debug mode: skip patch generation and use pre-generated patches
+        debug_artifact_dir = getattr(args, 'debug_artifact_dir', None)
+        if debug_artifact_dir:
+            logger.info(f"Debug mode: loading data from {debug_artifact_dir}")
+
+            # Load artifact data
+            debug_data = load_debug_artifact_data(debug_artifact_dir)
+            logger.info(f"Loaded {len(debug_data['patches'])} patches from artifact")
+
+            # Load cached diff_results (required for minimization)
+            diff_path = os.path.join(data_path, 'diff',
+                f'revert_patch_{bug_id}_{commit["commit_id"]}_to_{next_commit["commit_id"]}.diff')
+            if not os.path.exists(diff_path):
+                logger.error(f"Cached diff not found: {diff_path}")
+                logger.error("Debug mode requires cached diff_results. Run without --debug-artifact-dir first.")
+                continue
+            diff_results = load_patches_pickle(diff_path)
+            logger.info(f"Loaded cached diff analysis from {diff_path} ({len(diff_results)} entries)")
+
+            # Load trace (required for minimization)
+            if not os.path.exists(trace_path1):
+                logger.error(f"Trace file not found: {trace_path1}")
+                logger.error("Debug mode requires existing trace file.")
+                continue
+            trace1 = extract_function_calls(trace_path1)
+            logger.info(f"Loaded trace with {len(trace1)} function calls")
+
+            # Build patch_pair_list from artifact patches grouped by signature
+            patch_by_func = {}
+            for key, patch in debug_data['patches'].items():
+                sig = getattr(patch, 'new_signature', None) or getattr(patch, 'old_signature', None)
+                if sig:
+                    patch_by_func.setdefault(sig, []).append(key)
+            patch_pair_list = [tuple(v) for v in patch_by_func.values()]
+            logger.info(f"Built patch_pair_list with {len(patch_pair_list)} groups from artifact")
+
+            # Build minimal dependency graph from diff_results
+            depen_graph = {}
+            for key in diff_results:
+                depen_graph[key] = set()
+
+            # Get file path pairs
+            file_path_pairs = get_file_path_pairs(diff_results)
+
+            # Build inmutable_args and mutable_args for minimization
+            inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
+                sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
+                v1_repo_path, v2_repo_path)
+            signature_change_list = []
+            mutable_args = (get_patched_traces, transitions, signature_change_list)
+
+            # Jump directly to minimization
+            logger.info(f"Debug mode: skipping patch generation, jumping to minimization")
+            logger.info(f"patch_pair_list: {patch_pair_list}")
+
+            patches_without_context = dict()
+            tmp = copy.deepcopy(inmutable_args)
+            result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+            if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+                revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                minimal_fast = patch_pair_list  # Use original if initial build fails
+                logger.info(f"Initial build failed, using original patch set")
+            else:
+                revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
+
+                # Use trace-based minimization with cached extras
+                minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
+                    patch_pair_list, patches_without_context, diff_results,
+                    trace1, depen_graph, target, next_commit, sanitizer,
+                    bug_id, fuzzer, args.build_csv, arch
+                )
+
+                logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+
+                # Apply greedy one-by-one minimization to further reduce the patch set
+                if len(minimal_fast) > 1:
+                    logger.info(f'Starting greedy minimization on {len(minimal_fast)} patches')
+                    minimal_fast = minimize_greedy(
+                        minimal_fast,
+                        apply_and_test_patches,
+                        patches_without_context,
+                        mutable_args,
+                        inmutable_args
+                    )
+                    logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
+
+            min_path_dict[bug_id] = minimal_fast
+            logger.info(f"Debug mode: minimization complete, result: {minimal_fast}")
+            continue  # Skip the rest of this iteration
+
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
@@ -5008,6 +5139,22 @@ def revert_patch_test(args):
             )
 
             logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+
+            # Apply greedy one-by-one minimization to further reduce the patch set
+            # TODO: Consider hybrid two-phase minimization for better performance:
+            #   1. Phase 1: Binary search - Try removing half patches at once (O(log N) calls)
+            #   2. Phase 2: One-by-one - Fall back when binary search can't remove more (O(M) calls)
+            #   Expected: 58 patches → ~6 binary + ~5 one-by-one = ~11 calls vs ~58
+            if len(minimal_fast) > 1:
+                logger.info(f'Starting greedy minimization on {len(minimal_fast)} patches')
+                minimal_fast = minimize_greedy(
+                    minimal_fast,
+                    apply_and_test_patches,
+                    patches_without_context,
+                    mutable_args,
+                    inmutable_args
+                )
+                logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
 
         min_path_dict[bug_id] = minimal_fast
 
