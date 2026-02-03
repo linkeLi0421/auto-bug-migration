@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from artifacts import ArtifactStore
+from build_log import iter_linker_errors
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -20,6 +21,13 @@ _PATCH_APPLY_ERROR_PATTERNS = [
     re.compile(r"^patch:\s+\*{4}.*$", re.IGNORECASE),
     re.compile(r"^fatal:\s+patch failed.*$", re.IGNORECASE),
 ]
+# Warnings about undeclared functions (treated as errors for build_ok)
+_UNDECLARED_FUNC_WARNING_PATTERNS = [
+    "call to undeclared function",
+    "implicit declaration of function",
+]
+# Regex to detect compiler errors in build output (file:line:col: error: msg)
+_COMPILER_ERROR_RE = re.compile(r"^[^:\n]+:\d+:\d+:\s*(?:fatal\s+)?error:", re.MULTILINE)
 _SCRIPT_DIR = Path(__file__).resolve().parents[2]
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
@@ -156,6 +164,22 @@ def _find_patch_apply_error(text: str) -> str:
             if pat.search(stripped):
                 return stripped
     return ""
+
+
+def _has_undeclared_func_warning(text: str) -> bool:
+    """Check if build output contains undeclared function warnings (treated as errors)."""
+    raw = str(text or "").lower()
+    return any(pattern in raw for pattern in _UNDECLARED_FUNC_WARNING_PATTERNS)
+
+
+def _has_compiler_errors(text: str) -> bool:
+    """Check if build output contains compiler errors (file:line:col: error: msg)."""
+    return bool(_COMPILER_ERROR_RE.search(text or ""))
+
+
+def _has_linker_errors(text: str) -> bool:
+    """Check if build output contains linker errors (undefined reference)."""
+    return bool(iter_linker_errors(text or ""))
 
 
 def _allowed_patch_roots_from_env() -> list[str] | None:
@@ -1129,8 +1153,15 @@ def ossfuzz_apply_patch_and_test(
 
     with _FileLock(lock_path, wait_message=wait_message):
         build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
-        build_ok = build_res["returncode"] == 0
-        patch_apply_error = _find_patch_apply_error(build_res.get("output", ""))
+        build_output = build_res.get("output", "")
+        # build_ok is based on parsing the build output for actual errors, not the return code.
+        # This ensures accurate status even if the subprocess exit code is unreliable.
+        build_ok = (
+            not _has_compiler_errors(build_output)
+            and not _has_undeclared_func_warning(build_output)
+            and not _has_linker_errors(build_output)
+        )
+        patch_apply_error = _find_patch_apply_error(build_output)
         patch_apply_ok = not bool(patch_apply_error)
 
     # Write build outputs as artifacts under the same directory as the merged patch

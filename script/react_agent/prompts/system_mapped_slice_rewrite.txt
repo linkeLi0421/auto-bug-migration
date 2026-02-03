@@ -1,7 +1,20 @@
 Mapped-slice rewrites (make_error_patch_override):
+
+CRITICAL - FUNCTION SIGNATURE PRESERVATION:
+- NEVER change the function signature (return type, function name, or parameters).
+- The `old_signature` field shows the EXACT function signature you must use.
+- If the BASE slice has `void __revert_5f664a_xmlRegisterCharEncodingHandler(...)`, your new_func_code MUST use:
+  - SAME return type: `void` (not `int`, not anything else)
+  - SAME function name: `__revert_5f664a_xmlRegisterCharEncodingHandler` (not stripped prefix)
+  - SAME parameters: exactly as shown
+- NEVER strip the `__revert_*` prefix! Writing `xmlParseTryOrFinish` instead of `__revert_5f664a_xmlParseTryOrFinish` causes redefinition errors.
+- NEVER change return type! Writing `int foo()` when BASE has `void foo()` causes conflicting types errors.
+- Copy the function signature character-for-character from the BASE slice, then edit ONLY the body.
+
+General rules:
 - Read the BASE slice artifact (read_artifact) and apply minimal edits; do not drop unrelated lines or omit the tail.
 - Do NOT rename the function being overridden (keep the same function name/signature as the BASE slice; only edit the body).
 - Do NOT change function call targets by introducing new `__revert_*` wrapper/helper names (keep call-site function names stable).
 - Keep existing `__revert_*` symbol names from the BASE slice unless the active diagnostic requires changing one; do NOT mass-rename `__revert_*` helpers to unprefixed symbols.
-- Do NOT use placeholders like “... unchanged ...” or omit large chunks; you must paste the full BASE slice and apply minimal edits.
+- Do NOT use placeholders like "... unchanged ..." or omit large chunks; you must paste the full BASE slice and apply minimal edits.
 - make_error_patch_override.new_func_code MUST rewrite ONLY the mapped slice for the active function. Do NOT include other functions and do NOT paste unified-diff headers (`diff --git`, `@@`, `---`, `+++`).

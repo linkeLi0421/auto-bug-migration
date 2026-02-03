@@ -1,0 +1,42 @@
+Function signature change errors (too few/many arguments):
+- These errors occur when a callee function's signature changed between V1 and V2.
+- Error patterns: "too few arguments to function call", "too many arguments to function call"
+
+CRITICAL - FUNCTION NAME PRESERVATION:
+- The `old_signature` field in get_error_patch_context shows the EXACT caller function name.
+- If old_signature is `__revert_5f664a_xmlParseTryOrFinish(...)`, your new_func_code MUST use that EXACT name.
+- NEVER strip the `__revert_*` prefix! Writing `xmlParseTryOrFinish` instead of `__revert_5f664a_xmlParseTryOrFinish` causes redefinition errors.
+
+FIX WORKFLOW - Follow these steps in order:
+
+1. GET CALLER CODE: Use `get_error_patch_context` with the error file_path and line_number.
+   - This returns `error_func_code` containing the caller function that has the bad call site.
+   - Note the `old_signature` field - this is the EXACT function signature you must preserve.
+
+2. GET CALLEE SIGNATURE: Use `search_definition(callee_name, version="v2")` to find the NEW callee signature.
+   - The callee name is the function being called at the error location.
+   - V2 is the target version - this gives you the new expected signature.
+
+3. FIX THE CALLER: Use `make_error_patch_override` with a fixed version of the caller function.
+   - Start with the EXACT function signature from `old_signature` (including any __revert_* prefix).
+   - Keep the ENTIRE function body from `error_func_code`.
+   - Only modify the specific call site(s) to match the new callee signature.
+
+RULES FOR FIXING CALL SITES:
+- If parameters were ADDED to callee: use existing local variables if available, otherwise NULL/0
+- If parameters were REMOVED from callee: delete them from the call
+- Do NOT invent new struct fields or variables that don't exist in the caller
+- Check the caller function for existing local variables that match the new parameter types
+- When in doubt, use NULL for pointers and 0 for integers
+
+EXAMPLE:
+Error: "too few arguments to function call 'xmlParseEndTag2'"
+old_signature: "__revert_5f664a_xmlParseTryOrFinish(xmlParserCtxtPtr ctxt, int terminate)"
+
+1. get_error_patch_context -> returns caller function with old call: xmlParseEndTag2(ctxt, tag)
+2. search_definition("xmlParseEndTag2", "v2") -> new signature with 6 params
+3. make_error_patch_override -> new_func_code MUST start with:
+   static int
+   __revert_5f664a_xmlParseTryOrFinish(xmlParserCtxtPtr ctxt, int terminate) {
+       // ... fixed body with updated call site ...
+   }

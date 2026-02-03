@@ -1,4 +1,4 @@
-from typing import List, Any, Callable, Dict, Tuple
+from typing import List, Any, Callable, Dict, Tuple, Set
 import copy
 import re
 import difflib
@@ -11,6 +11,149 @@ from pathlib import Path
 TestFn = Callable[[List[Any]], bool]
 
 logger = logging.getLogger(__name__)
+
+
+def extract_extra_patches(patches_without_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract _extra_* patches from the patch dictionary."""
+    return {
+        key: copy.deepcopy(patch)
+        for key, patch in patches_without_context.items()
+        if key.startswith('_extra_')
+    }
+
+
+def _extract_func_name(signature_or_name: str) -> str:
+    """
+    Extract function name from a signature or bare name.
+
+    Examples:
+        'void xmlTextReaderFreeNode(xmlTextReaderPtr reader, xmlNodePtr cur)' -> 'xmlTextReaderFreeNode'
+        'int foo(void)' -> 'foo'
+        'xmlTextReaderFreeNode' -> 'xmlTextReaderFreeNode'
+    """
+    if not signature_or_name:
+        return ''
+    # If it contains '(', it's a signature - extract name before '('
+    if '(' in signature_or_name:
+        # Get the part before '('
+        before_paren = signature_or_name.split('(')[0].strip()
+        # The function name is the last word (after return type, pointer symbols, etc.)
+        parts = before_paren.split()
+        if parts:
+            # Remove any leading * or & from the name
+            name = parts[-1].lstrip('*&')
+            return name
+    # Otherwise it's already just a name
+    return signature_or_name.strip()
+
+
+def filter_patches_by_trace(
+    all_patch_keys: List[str],
+    diff_results: Dict[str, Any],
+    trace_func_list: List[Tuple[str, str]],
+    depen_graph: Dict[str, Set[str]],
+) -> List[str]:
+    """
+    Filter patches to only those whose functions appear in the execution trace
+    or are dependencies of trace-related functions.
+    """
+    trace_functions = {func for func, _ in trace_func_list}
+    # Extract trace file basenames (strip leading / and get filename)
+    trace_file_basenames = set()
+    for _, loc in trace_func_list:
+        if ':' in loc:
+            file_part = loc.split(':')[0].lstrip('/')
+            # Get basename for matching
+            basename = file_part.split('/')[-1] if '/' in file_part else file_part
+            trace_file_basenames.add(basename)
+
+    # First pass: find patches directly in trace
+    direct_matches = set()
+    for key in all_patch_keys:
+        patch = diff_results.get(key)
+        if not patch:
+            continue
+        patch_file = getattr(patch, 'file_path_old', None) or getattr(patch, 'file_path_new', None)
+        # Extract function names - handle both bare names and full signatures
+        func_old_raw = getattr(patch, 'old_function_name', '') or ''
+        func_new_raw = getattr(patch, 'new_function_name', '') or ''
+        func_old = _extract_func_name(func_old_raw)
+        func_new = _extract_func_name(func_new_raw)
+
+        # Check if function matches trace
+        if func_old in trace_functions or func_new in trace_functions:
+            # Check if file matches trace (compare basenames)
+            if patch_file:
+                patch_basename = patch_file.split('/')[-1] if '/' in patch_file else patch_file
+                if patch_basename in trace_file_basenames:
+                    direct_matches.add(key)
+                    logger.debug(f"Matched patch {key}: func={func_old or func_new}, file={patch_basename}")
+
+    # Second pass: expand with dependency graph (transitive closure)
+    result = set(direct_matches)
+    worklist = list(direct_matches)
+    while worklist:
+        key = worklist.pop()
+        for callee_key in depen_graph.get(key, set()):
+            if callee_key not in result:
+                result.add(callee_key)
+                worklist.append(callee_key)
+
+    return list(result)
+
+
+def binary_search_missing_patches(
+    known_good: Set[str],
+    candidates: List[str],
+    test_fn: Callable[[List[str]], bool],
+) -> List[str]:
+    """Binary search to find minimal additional patches needed for build success."""
+    if not candidates:
+        return []
+
+    full_set = list(known_good) + candidates
+    logger.info(f"Testing full set ({len(known_good)} base + {len(candidates)} candidates = {len(full_set)} total)")
+    if not test_fn(full_set):
+        logger.info("Full set fails, cannot find minimal set")
+        return []  # Even with all patches it fails
+
+    logger.info(f"Testing base set only ({len(known_good)} patches)")
+    if test_fn(list(known_good)):
+        logger.info("Base set already works, no additional patches needed")
+        return []  # Already works without candidates
+
+    needed = []
+    remaining = list(candidates)
+    iteration = 0
+
+    while remaining:
+        iteration += 1
+        mid = len(remaining) // 2
+        if mid == 0:
+            logger.info(f"Iteration {iteration}: adding last candidate, needed={len(needed)+1}")
+            needed.append(remaining[0])
+            remaining = remaining[1:]
+            continue
+
+        first_half = remaining[:mid]
+        second_half = remaining[mid:]
+
+        logger.info(f"Iteration {iteration}: testing first half ({mid} patches), remaining={len(remaining)}, needed={len(needed)}")
+        test_set = list(known_good) + needed + first_half
+        if test_fn(test_set):
+            remaining = first_half
+        else:
+            logger.info(f"Iteration {iteration}: testing second half ({len(second_half)} patches)")
+            test_set = list(known_good) + needed + second_half
+            if test_fn(test_set):
+                remaining = second_half
+            else:
+                logger.info(f"Iteration {iteration}: both halves needed, adding first half ({mid} patches)")
+                needed.extend(first_half)
+                remaining = second_half
+
+    logger.info(f"Binary search complete: found {len(needed)} additional patches needed")
+    return needed
 
 def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context: Dict[str, Any], mutable_args: Tuple, inmutable_args: Tuple) -> List[Any]:
     """
