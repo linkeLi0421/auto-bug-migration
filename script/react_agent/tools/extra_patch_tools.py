@@ -317,6 +317,16 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         if 0 <= idx < len(lines):
             insert_at = idx
 
+    # Find the last #include line to ensure we don't insert before type definitions
+    last_include_idx = -1
+    for i, raw in enumerate(lines):
+        if str(raw or "").lstrip().startswith("#include"):
+            last_include_idx = i
+
+    # Ensure insert_at is after all #include statements
+    if last_include_idx >= 0 and insert_at <= last_include_idx:
+        insert_at = last_include_idx + 1
+
     if insert_at < 0:
         insert_at = _find_file_scope_insertion_index(lines)
     start_line = insert_at + 1
