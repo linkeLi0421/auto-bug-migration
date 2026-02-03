@@ -4066,7 +4066,9 @@ def apply_and_test_patches(
     if not os.path.exists(os.path.join(data_path, "tmp_patch")):
         os.makedirs(os.path.join(data_path, "tmp_patch"), exist_ok=True)
     patch_file_binary = os.path.join(data_path, "tmp_patch", f"{target}.patch2")
-    save_patches_pickle(patches_without_context, patch_file_binary)
+    # Only save patches for keys in current patch_key_list (avoid stale entries from previous attempts)
+    current_patches = {key: patches_without_context[key] for key in patch_key_list}
+    save_patches_pickle(current_patches, patch_file_binary)
     
     #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
@@ -5160,14 +5162,14 @@ def revert_patch_test(args):
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
 
-            # Use trace-based minimization with cached extras
-            minimal_fast, extra_cache = minimize_with_trace_and_cached_extras(
-                patch_pair_list, patches_without_context, diff_results,
-                trace1, depen_graph, target, next_commit, sanitizer,
-                bug_id, fuzzer, args.build_csv, arch
+            # Use greedy minimization
+            tmp = copy.deepcopy(inmutable_args)
+            minimal_fast = minimize_greedy(
+                patch_pair_list, apply_and_test_patches, patches_without_context,
+                mutable_args, tmp
             )
 
-            logger.info(f'Minimal patch set after trace-based minimization: {len(minimal_fast)}')
+            logger.info(f'Minimal patch set after greedy minimization: {len(minimal_fast)}')
 
             # Apply greedy one-by-one minimization to further reduce the patch set
             # TODO: Consider hybrid two-phase minimization for better performance:

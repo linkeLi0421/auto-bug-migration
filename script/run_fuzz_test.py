@@ -5,7 +5,8 @@ import json
 import os
 from buildAndtest import checkout_latest_commit
 
-py3 = "/home/user/pyenv/venv/bin/python3"
+# Python interpreter path from environment variable (set in setenv.sh)
+py3 = os.getenv('PYTHON_PATH', 'python3')
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description='Run fuzzing tests with trace collection')
@@ -126,6 +127,7 @@ def run_fuzz_test(args):
         
 
 if __name__ == "__main__":
-    # python3 script/run_fuzz_test.py --target_bugs xx.json --bug_info merged_bugs.json --build_csv xx_builds.csv
+    # Usage: source script/setenv.sh && python3 script/run_fuzz_test.py \
+    #   --target_bugs xx.json --bug_info $BUGINFO_PATH --build_csv $LOG_PATH/xx_builds.csv
     args = parse_arguments()
     run_fuzz_test(args)
