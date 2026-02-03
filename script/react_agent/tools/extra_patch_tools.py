@@ -252,11 +252,12 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
     unterminated preprocessor conditional block.
 
     Special case: if the entire file is wrapped in #ifdef (common for feature-guarded code),
-    fall back to inserting after the last #include statement.
+    fall back to inserting after the last #include statement in the initial header section.
     """
     in_block_comment = False
     pp_nesting = 0
     last_include_idx = -1
+    header_section_ended = False  # Track if we've left the initial header/preprocessor section
 
     for idx, raw in enumerate(lines):
         stripped = str(raw or "").lstrip()
@@ -274,7 +275,10 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
             continue
         if stripped.startswith("#"):
             if stripped.startswith("#include"):
-                last_include_idx = idx
+                # Only track includes in the initial header section
+                # Stop tracking once we've seen function definitions or global declarations
+                if not header_section_ended:
+                    last_include_idx = idx
             if _PP_IF_RE.match(stripped):
                 pp_nesting += 1
             elif _PP_ENDIF_RE.match(stripped):
@@ -282,10 +286,16 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
             continue
         if pp_nesting > 0:
             continue
+        # We've found a non-preprocessor, non-comment line at file scope
+        # This marks the end of the header section (includes are typically before declarations/definitions)
+        # However, we only mark the section as ended if this looks like a function or variable declaration
+        # (to allow for interleaved defines/typedefs after includes)
+        if "(" in stripped or stripped.rstrip().endswith(";") or stripped.rstrip().endswith("{"):
+            header_section_ended = True
         return idx
 
     # If we couldn't find a safe spot (e.g., entire file wrapped in #ifdef),
-    # insert after the last #include to ensure types are defined.
+    # insert after the last #include in the initial header section.
     if last_include_idx >= 0:
         return last_include_idx + 1
     return 0
@@ -317,18 +327,26 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         if 0 <= idx < len(lines):
             insert_at = idx
 
-    # Find the last #include line to ensure we don't insert before type definitions
-    last_include_idx = -1
-    for i, raw in enumerate(lines):
-        if str(raw or "").lstrip().startswith("#include"):
-            last_include_idx = i
-
-    # Ensure insert_at is after all #include statements
-    if last_include_idx >= 0 and insert_at <= last_include_idx:
-        insert_at = last_include_idx + 1
-
     if insert_at < 0:
         insert_at = _find_file_scope_insertion_index(lines)
+
+    # Find the last #include line in the initial header section to ensure we don't insert before type definitions
+    # Stop tracking includes once we've seen actual code (to avoid late includes in the file)
+    last_include_idx = -1
+    seen_code = False
+    for i, raw in enumerate(lines):
+        stripped = str(raw or "").lstrip()
+        # Track includes only in the header section
+        if stripped.startswith("#include"):
+            if not seen_code:
+                last_include_idx = i
+        # Mark that we've seen code if this is a non-preprocessor, non-comment, non-blank line
+        elif stripped and not stripped.startswith("#") and not stripped.startswith("//") and not stripped.startswith("/*"):
+            seen_code = True
+
+    # Ensure insert_at is after all #include statements in the header section
+    if last_include_idx >= 0 and insert_at <= last_include_idx:
+        insert_at = last_include_idx + 1
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
     if not ctx:
