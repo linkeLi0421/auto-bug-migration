@@ -3,4 +3,4 @@
 	url = https://github.com/google/oss-fuzz.git
 [submodule "cfg-clang"]
 	path = cfg-clang
-	url = git@github.com:linkeLi0421/cfg-clang.git
+	url = https://github.com/linkeLi0421/cfg-clang.git
