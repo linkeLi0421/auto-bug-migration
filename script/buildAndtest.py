@@ -16,6 +16,9 @@ sanitizer_mapping = {
 
 os.environ["ASAN_OPTIONS"] = "detect_leaks=0"
 
+# Use PYTHON_PATH env var if set, otherwise default to 'python3'
+py3 = os.getenv('PYTHON_PATH', 'python3')
+
 # Create a logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -199,7 +202,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 continue
 
             cmd = [
-                "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
+                py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
                 target
             ]
 
@@ -298,7 +301,7 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
             return
 
         cmd = [
-            'python3', f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
+            py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
         ]
         try:
             logger.info(' '.join(cmd))
