@@ -5312,16 +5312,10 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    # Use absolute path for the cache file
-    cache_file = os.path.join(data_path, "patches", f"{args.target}_patches.pkl.gz")
-    # Create cache_file's folder if it doesn't exist
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-    if os.path.exists(cache_file):
-        patches_without_contexts = load_patches_pickle(cache_file)
-    else:
-        patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
-        # Save the patches to cache file
-        save_patches_pickle(patches_without_contexts, cache_file)
-    
-        for bug_id, affected_bugs in test_local_bug_after_patch.items():
-            logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
+    # Note: Cache loading/saving is now handled incrementally inside revert_patch_test()
+    # The function loads existing cache at start and saves after each bug completes
+    patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
+
+    # Log compatibility results
+    for bug_id, affected_bugs in test_local_bug_after_patch.items():
+        logger.info(f'local bug {bug_id} is compatible with: {len(affected_bugs)} {affected_bugs}')
