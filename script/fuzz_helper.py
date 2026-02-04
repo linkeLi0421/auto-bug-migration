@@ -1945,10 +1945,10 @@ def clean(args, out_dir):
               architecture=args.architecture)
   if not os.listdir(out_dir):
       logger.info('Out directory is empty. Deleting the folder.')
-      shutil.rmtree(out_dir)
+      subprocess.run(['sudo', 'rm', '-rf', out_dir], check=False)
   if not os.listdir(args.project.work):
       logger.info('Work directory is empty. Deleting the folder.')
-      shutil.rmtree(args.project.work)
+      subprocess.run(['sudo', 'rm', '-rf', args.project.work], check=False)
 
 
 def build_version(args):
