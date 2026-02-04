@@ -4829,6 +4829,19 @@ def revert_patch_test(args):
     checkout_latest_commit(ossfuzz_path)
     revert_and_trigger_set = set()
     patches_without_contexts = dict()
+
+    # Load existing cache if available for incremental processing
+    cache_file = os.path.join(data_path, "patches", f"{args.target}_patches.pkl.gz")
+    if not os.path.exists(os.path.dirname(cache_file)):
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    if os.path.exists(cache_file):
+        try:
+            patches_without_contexts = load_patches_pickle(cache_file)
+            logger.info(f"Loaded cache with {len(patches_without_contexts)} existing bug results from {cache_file}")
+        except Exception as e:
+            logger.warning(f"Failed to load cache file {cache_file}: {e}")
+            patches_without_contexts = dict()
+
     revert_and_trigger_fail_set = set()
     min_path_dict = dict()
     # Get repo path from environment variable
@@ -4878,6 +4891,19 @@ def revert_patch_test(args):
         logger.info(f'target commit id: {next_commit["commit_id"]}')
         bug_info = bug_info_dataset[bug_id]
         fuzzer = bug_info['reproduce']['fuzz_target']
+
+        # Check if bug is already cached - skip expensive processing if found
+        # Cache key is (bug_id, commit_id, fuzzer, function_names_tuple)
+        # We check if any cached key matches the first 3 elements
+        bug_partial_key = (bug_id, commit['commit_id'], fuzzer)
+        bug_already_cached = any(
+            key[:3] == bug_partial_key
+            for key in patches_without_contexts.keys()
+        )
+        if bug_already_cached:
+            logger.info(f"Bug {bug_id} (commit {commit['commit_id']}, fuzzer {fuzzer}) already cached, skipping...")
+            continue
+
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
         bug_type = bug_info['reproduce']['crash_type']
         job_type = bug_info['reproduce']['job_type']
@@ -5193,6 +5219,13 @@ def revert_patch_test(args):
             (bug_id, commit['commit_id'], fuzzer,
             tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
         ] = patches_without_context
+
+        # Save cache incrementally after each bug completes
+        try:
+            save_patches_pickle(patches_without_contexts, cache_file)
+            logger.info(f"Saved cache with {len(patches_without_contexts)} bug results to {cache_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save cache for bug {bug_id}: {e}")
 
         get_patched_traces, transitions, signature_change_list = mutable_args
 
