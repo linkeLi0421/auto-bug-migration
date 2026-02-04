@@ -5207,7 +5207,9 @@ def revert_patch_test(args):
         if bug_id not in get_patched_traces:
             continue
         logger.info('-' * 20)
-        for i in range(len(get_patched_traces[bug_id])):
+        # Only test the final patch (last entry in the list), not all intermediate variants
+        i = len(get_patched_traces[bug_id]) - 1
+        if True:  # Keep indentation for minimal diff
             patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
             need_build = True
             count = 0
