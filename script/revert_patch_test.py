@@ -5108,10 +5108,6 @@ def revert_patch_test(args):
             
         logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         logger.info(f"Total diff results: {len(diff_results)}")
-        if diff_results:
-            logger.info(f"Sample diff result keys: {list(diff_results.keys())[:5]}")
-            for key, val in list(diff_results.items())[:3]:
-                logger.info(f"  Key: {key}, new_sig: {val.new_signature}, old_sig: {val.old_signature}, file_old: {val.file_path_old}, file_new: {val.file_path_new}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue

@@ -1,0 +1,184 @@
+2026-02-05 13:06:09,408 - INFO - all bugs count: 11
+2026-02-05 13:06:09,408 - INFO - bug_ids_trigger: 5 {'OSV-2020-1380', 'OSV-2020-1521', 'OSV-2020-1478', 'OSV-2020-1372', 'OSV-2020-1472'}
+2026-02-05 13:06:09,408 - INFO - bugs need transplant count: 2 dict_keys(['OSV-2021-1239', 'OSV-2021-1787'])
+2026-02-05 13:06:09,408 - INFO - bugs cant use count: 4 {'OSV-2021-979', 'OSV-2020-1892', 'OSV-2020-1897', 'poc count'}
+
+2026-02-05 13:06:09,408 - INFO - bug trigger commit: 8c15cc
+2026-02-05 13:06:09,408 - INFO - target commit id: e14064
+2026-02-05 13:06:09,408 - INFO - Processing transition for bug OSV-2021-1239 from commit 8c15cc to e14064
+2026-02-05 13:06:09,428 - INFO - Loaded cached diff analysis from /users/linke/oss-fuzz-for-select/data/diff/revert_patch_OSV-2021-1239_8c15cc_to_e14064.diff
+2026-02-05 13:06:09,445 - INFO - Trace function set: 57 [('LLVMFuzzerTestOneInput', '/tests/stbi_read_fuzzer.c:11:0'), ('stbi_info_from_memory', '/tests/../stb_image.h:7538:0'), ('stbi__start_mem', '/tests/../stb_image.h:802:0'), ('stbi__info_main', '/tests/../stb_image.h:7436:0'), ('stbi__jpeg_info', '/tests/../stb_image.h:3972:0'), ('stbi__malloc', '/tests/../stb_image.h:961:0'), ('stbi__jpeg_info_raw', '/tests/../stb_image.h:3960:0'), ('stbi__decode_jpeg_header', '/tests/../stb_image.h:3296:0'), ('stbi__get_marker', '/tests/../stb_image.h:2858:0'), ('stbi__get8', '/tests/../stb_image.h:1567:0'), ('stbi__err', '/tests/../stb_image.h:954:0'), ('stbi__rewind', '/tests/../stb_image.h:862:0'), ('stbi__png_info', '/tests/../stb_image.h:5188:0'), ('stbi__png_info_raw', '/tests/../stb_image.h:5176:0'), ('stbi__parse_png_file', '/tests/../stb_image.h:4953:0'), ('stbi__check_png_header', '/tests/../stb_image.h:4501:0'), ('stbi__gif_info', '/tests/../stb_image.h:6893:0'), ('stbi__gif_info_raw', '/tests/../stb_image.h:6470:0'), ('stbi__gif_header', '/tests/../stb_image.h:6439:0'), ('stbi__bmp_info', '/tests/../stb_image.h:7151:0'), ('stbi__bmp_parse_header', '/tests/../stb_image.h:5288:0'), ('stbi__psd_info', '/tests/../stb_image.h:7174:0'), ('stbi__get32be', '/tests/../stb_image.h:1657:0'), ('stbi__get16be', '/tests/../stb_image.h:1647:0'), ('stbi__pic_info', '/tests/../stb_image.h:7238:0'), ('stbi__pic_is4', '/tests/../stb_image.h:6168:0'), ('stbi__pnm_info', '/tests/../stb_image.h:7388:0'), ('stbi__pnm_skip_whitespace', '/tests/../stb_image.h:7357:0'), ('stbi__at_eof', '/tests/../stb_image.h:1581:0'), ('stbi__pnm_isspace', '/tests/../stb_image.h:7352:0'), ('stbi__pnm_getinteger', '/tests/../stb_image.h:7376:0'), ('stbi__pnm_isdigit', '/tests/../stb_image.h:7371:0'), ('stbi_load_from_memory', '/tests/../stb_image.h:1382:0'), ('stbi__load_and_postprocess_8bit', '/tests/../stb_image.h:1213:0'), ('stbi__load_main', '/tests/../stb_image.h:1096:0'), ('stbi__jpeg_test', '/tests/../stb_image.h:3948:0'), ('stbi__setup_jpeg', '/tests/../stb_image.h:3733:0'), ('stbi__sse2_available', '/tests/../stb_image.h:744:0'), ('stbi__png_test', '/tests/../stb_image.h:5168:0'), ('stbi__bmp_test', '/tests/../stb_image.h:5227:0'), ('stbi__bmp_test_raw', '/tests/../stb_image.h:5212:0'), ('stbi__gif_test', '/tests/../stb_image.h:6421:0'), ('stbi__gif_test_raw', '/tests/../stb_image.h:6411:0'), ('stbi__psd_test', '/tests/../stb_image.h:5913:0'), ('stbi__pic_test', '/tests/../stb_image.h:6372:0'), ('stbi__pic_test_core', '/tests/../stb_image.h:6178:0'), ('stbi__pnm_test', '/tests/../stb_image.h:7310:0'), ('stbi__pnm_load', '/tests/../stb_image.h:7322:0'), ('stbi__mad4sizes_valid', '/tests/../stb_image.h:1015:0'), ('stbi__mul2sizes_valid', '/tests/../stb_image.h:990:0'), ('stbi__addsizes_valid', '/tests/../stb_image.h:978:0'), ('stbi__malloc_mad4', '/tests/../stb_image.h:1038:0'), ('stbi__getn', '/tests/../stb_image.h:1619:0'), ('stbi__convert_format', '/tests/../stb_image.h:1707:0'), ('stbi__malloc_mad3', '/tests/../stb_image.h:1031:0'), ('stbi__mad3sizes_valid', '/tests/../stb_image.h:1007:0'), ('stbi__convert_16_to_8', '/tests/../stb_image.h:1143:0')]
+2026-02-05 13:06:09,445 - INFO - Total diff results: 8
+2026-02-05 13:06:09,933 - INFO - Patch_pair_list: [['stb_image.hstb_image.h-7426,8+7402,6', 'stb_image.hstb_image.h-7418,7+7401,0'], ['stb_image.hstb_image.h-7337,7+7320,7', 'stb_image.hstb_image.h-7326,3+7310,2']]
+2026-02-05 13:06:09,933 - INFO - Applying and testing 2 ['int stbi__pnm_is16(stbi__context * s)', 'int stbi__pnm_info(stbi__context * s, int * x, int * y, int * comp)', 'void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)', 'void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)'] 
+2026-02-05 13:06:15,592 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:06:19,325 - INFO - Build failed after patch reversion for bug OSV-2021-1239
+
+2026-02-05 13:06:19,325 - INFO - Checking out V1 commit 8c15cc in /users/linke/tasks-git/stb
+2026-02-05 13:06:19,349 - INFO - Copying source to /users/linke/tasks-git-v1/stb
+2026-02-05 13:06:19,391 - INFO - Checking out V2 commit e14064 in /users/linke/tasks-git/stb
+2026-02-05 13:06:19,416 - INFO - Copying source to /users/linke/tasks-git-v2/stb
+2026-02-05 13:06:19,457 - INFO - === Multi-agent round 1/10 ===
+2026-02-05 13:06:19,457 - INFO -   Build log: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log
+2026-02-05 13:06:19,457 - INFO -   Patch: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2
+2026-02-05 13:06:19,457 - INFO - Calling react multi-agent: /usr/bin/python3 /users/linke/oss-fuzz-for-select/script/react_agent/multi_agent.py /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log --patch-path /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2 --jobs 10 --max-groups 100 --model openai --tools real --max-steps 100 --recursion-limit 0 --ossfuzz-project stb --ossfuzz-commit e14064 --ossfuzz-build-csv /users/linke/log/stb_builds.csv --ossfuzz-sanitizer address --ossfuzz-arch x86_64 --ossfuzz-engine libfuzzer --ossfuzz-fuzz-target stbi_read_fuzzer --ossfuzz-use-sudo --auto-ossfuzz-loop --ossfuzz-loop-max 100 --v1-json-dir /users/linke/oss-fuzz-for-select/data/stb-8c15cc --v2-json-dir /users/linke/oss-fuzz-for-select/data/stb-e14064 --v1-src /users/linke/tasks-git-v1/stb --v2-src /users/linke/tasks-git-v2/stb --openai-model gpt-5-mini --openai-base-url https://api.openai.com/v1 --openai-max-tokens 64000 --output-format none --max-restarts-per-hunk 3 --auto-continue-on-link-errors --refresh-error-queue never
+2026-02-05 13:06:51,468 - INFO - Round 1: Build succeeded!
+2026-02-05 13:06:51,468 - INFO - Copied merged diff from /users/linke/oss-fuzz-for-select/data/react_agent_artifacts/multi_20260205_130619_156886_aa2e41ff/extra_stb_image.h/ossfuzz_merged_stb_e14064.diff to /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches.diff
+2026-02-05 13:06:51,468 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:06:57,542 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2021-1239
+2026-02-05 13:06:57,542 - INFO - React multi-agent successfully fixed build errors
+2026-02-05 13:06:57,542 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2021-1239 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:06:58,369 - DEBUG - [*] Running check_build for project: stb
+2026-02-05 13:06:58,370 - DEBUG - [*] Sanitizer: address, Engine: libfuzzer
+2026-02-05 13:06:58,370 - DEBUG - sudo -E python3 /users/linke/oss-fuzz-for-select/oss-fuzz/infra/helper.py check_build --sanitizer address --engine libfuzzer --architecture x86_64 -e ASAN_OPTIONS=detect_leaks=0 stb
+2026-02-05 13:06:58,518 - DEBUG - [*] check_build completed in 0 seconds
+2026-02-05 13:06:58,519 - DEBUG - [*] Return code: 127
+2026-02-05 13:06:58,519 - DEBUG - [*] Output:
+docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "test_all": executable file not found in $PATH
+
+Run 'docker run --help' for more information
+Running: docker run --rm --privileged -i -e FUZZING_ENGINE=libfuzzer -e SANITIZER=address -e ARCHITECTURE=x86_64 -e ASAN_OPTIONS=detect_leaks=0 -v /users/linke/oss-fuzz-for-select/oss-fuzz/build/out/stb:/out -t gcr.io/oss-fuzz-base/base-runner test_all
+Check build failed.
+
+2026-02-05 13:06:58,519 - ERROR - [-] check_build FAILED - Build has issues
+2026-02-05 13:06:58,519 - WARNING - check_build failed for bug OSV-2021-1239 on commit e14064, but reproduce passed - treating as success
+2026-02-05 13:06:58,519 - INFO - Initial revert patch set: 2 [['stb_image.hstb_image.h-7426,8+7402,6', 'stb_image.hstb_image.h-7418,7+7401,0'], ['stb_image.hstb_image.h-7337,7+7320,7', 'stb_image.hstb_image.h-7326,3+7310,2']]
+2026-02-05 13:06:58,520 - INFO - Patch_pair_list: [['stb_image.hstb_image.h-7337,7+7320,7', 'stb_image.hstb_image.h-7326,3+7310,2']]
+2026-02-05 13:06:58,520 - INFO - Applying and testing 1 ['void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)', 'void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)'] 
+2026-02-05 13:07:03,775 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:07:06,670 - INFO - Build failed after patch reversion for bug OSV-2021-1239
+
+2026-02-05 13:07:06,670 - INFO - Checking out V1 commit 8c15cc in /users/linke/tasks-git/stb
+2026-02-05 13:07:06,694 - INFO - Copying source to /users/linke/tasks-git-v1/stb
+2026-02-05 13:07:06,737 - INFO - Checking out V2 commit e14064 in /users/linke/tasks-git/stb
+2026-02-05 13:07:06,761 - INFO - Copying source to /users/linke/tasks-git-v2/stb
+2026-02-05 13:07:06,802 - INFO - === Multi-agent round 1/10 ===
+2026-02-05 13:07:06,802 - INFO -   Build log: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log
+2026-02-05 13:07:06,802 - INFO -   Patch: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2
+2026-02-05 13:07:06,802 - INFO - Calling react multi-agent: /usr/bin/python3 /users/linke/oss-fuzz-for-select/script/react_agent/multi_agent.py /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log --patch-path /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2 --jobs 10 --max-groups 100 --model openai --tools real --max-steps 100 --recursion-limit 0 --ossfuzz-project stb --ossfuzz-commit e14064 --ossfuzz-build-csv /users/linke/log/stb_builds.csv --ossfuzz-sanitizer address --ossfuzz-arch x86_64 --ossfuzz-engine libfuzzer --ossfuzz-fuzz-target stbi_read_fuzzer --ossfuzz-use-sudo --auto-ossfuzz-loop --ossfuzz-loop-max 100 --v1-json-dir /users/linke/oss-fuzz-for-select/data/stb-8c15cc --v2-json-dir /users/linke/oss-fuzz-for-select/data/stb-e14064 --v1-src /users/linke/tasks-git-v1/stb --v2-src /users/linke/tasks-git-v2/stb --openai-model gpt-5-mini --openai-base-url https://api.openai.com/v1 --openai-max-tokens 64000 --output-format none --max-restarts-per-hunk 3 --auto-continue-on-link-errors --refresh-error-queue never
+2026-02-05 13:07:42,879 - INFO - Round 1: Build succeeded!
+2026-02-05 13:07:42,880 - INFO - Copied merged diff from /users/linke/oss-fuzz-for-select/data/react_agent_artifacts/multi_20260205_130706_160582_5c4eff65/extra_stb_image.h/ossfuzz_merged_stb_e14064.diff to /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff
+2026-02-05 13:07:42,880 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:07:49,035 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2021-1239
+2026-02-05 13:07:49,035 - INFO - React multi-agent successfully fixed build errors
+2026-02-05 13:07:49,036 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2021-1239 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:07:49,886 - INFO - Bug OSV-2021-1239 not triggered with fuzzer stbi_read_fuzzer on commit e14064
+
+2026-02-05 13:07:49,886 - INFO - Patch_pair_list: [['stb_image.hstb_image.h-7426,8+7402,6', 'stb_image.hstb_image.h-7418,7+7401,0']]
+2026-02-05 13:07:49,886 - INFO - Applying and testing 1 ['int stbi__pnm_is16(stbi__context * s)', 'int stbi__pnm_info(stbi__context * s, int * x, int * y, int * comp)'] 
+2026-02-05 13:07:55,215 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:07:58,157 - INFO - Build failed after patch reversion for bug OSV-2021-1239
+
+2026-02-05 13:07:58,157 - INFO - Checking out V1 commit 8c15cc in /users/linke/tasks-git/stb
+2026-02-05 13:07:58,181 - INFO - Copying source to /users/linke/tasks-git-v1/stb
+2026-02-05 13:07:58,223 - INFO - Checking out V2 commit e14064 in /users/linke/tasks-git/stb
+2026-02-05 13:07:58,248 - INFO - Copying source to /users/linke/tasks-git-v2/stb
+2026-02-05 13:07:58,289 - INFO - === Multi-agent round 1/10 ===
+2026-02-05 13:07:58,289 - INFO -   Build log: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log
+2026-02-05 13:07:58,289 - INFO -   Patch: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2
+2026-02-05 13:07:58,289 - INFO - Calling react multi-agent: /usr/bin/python3 /users/linke/oss-fuzz-for-select/script/react_agent/multi_agent.py /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log --patch-path /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2 --jobs 10 --max-groups 100 --model openai --tools real --max-steps 100 --recursion-limit 0 --ossfuzz-project stb --ossfuzz-commit e14064 --ossfuzz-build-csv /users/linke/log/stb_builds.csv --ossfuzz-sanitizer address --ossfuzz-arch x86_64 --ossfuzz-engine libfuzzer --ossfuzz-fuzz-target stbi_read_fuzzer --ossfuzz-use-sudo --auto-ossfuzz-loop --ossfuzz-loop-max 100 --v1-json-dir /users/linke/oss-fuzz-for-select/data/stb-8c15cc --v2-json-dir /users/linke/oss-fuzz-for-select/data/stb-e14064 --v1-src /users/linke/tasks-git-v1/stb --v2-src /users/linke/tasks-git-v2/stb --openai-model gpt-5-mini --openai-base-url https://api.openai.com/v1 --openai-max-tokens 64000 --output-format none --max-restarts-per-hunk 3 --auto-continue-on-link-errors --refresh-error-queue never
+2026-02-05 13:08:33,465 - INFO - Round 1: Build succeeded!
+2026-02-05 13:08:33,465 - INFO - Copied merged diff from /users/linke/oss-fuzz-for-select/data/react_agent_artifacts/multi_20260205_130758_163419_abbe39ac/ossfuzz_merged_stb_e14064.diff to /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff
+2026-02-05 13:08:33,465 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:08:39,614 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2021-1239
+2026-02-05 13:08:39,614 - INFO - React multi-agent successfully fixed build errors
+2026-02-05 13:08:39,614 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2021-1239 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:08:40,457 - INFO - Bug OSV-2021-1239 not triggered with fuzzer stbi_read_fuzzer on commit e14064
+
+2026-02-05 13:08:40,457 - INFO - Minimal patch set after greedy minimization: 2
+2026-02-05 13:08:40,457 - INFO - Starting greedy minimization on 2 patches
+2026-02-05 13:08:40,458 - INFO - Patch_pair_list: [['stb_image.hstb_image.h-7337,7+7320,7', 'stb_image.hstb_image.h-7326,3+7310,2']]
+2026-02-05 13:08:40,458 - INFO - Applying and testing 1 ['void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)', 'void * stbi__pnm_load(stbi__context * s, int * x, int * y, int * comp, int req_comp, stbi__result_info * ri)'] 
+2026-02-05 13:08:45,741 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:08:48,628 - INFO - Build failed after patch reversion for bug OSV-2021-1239
+
+2026-02-05 13:08:48,629 - INFO - Checking out V1 commit 8c15cc in /users/linke/tasks-git/stb
+2026-02-05 13:08:48,653 - INFO - Copying source to /users/linke/tasks-git-v1/stb
+2026-02-05 13:08:48,694 - INFO - Checking out V2 commit e14064 in /users/linke/tasks-git/stb
+2026-02-05 13:08:48,718 - INFO - Copying source to /users/linke/tasks-git-v2/stb
+2026-02-05 13:08:48,759 - INFO - === Multi-agent round 1/10 ===
+2026-02-05 13:08:48,759 - INFO -   Build log: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log
+2026-02-05 13:08:48,759 - INFO -   Patch: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2
+2026-02-05 13:08:48,759 - INFO - Calling react multi-agent: /usr/bin/python3 /users/linke/oss-fuzz-for-select/script/react_agent/multi_agent.py /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log --patch-path /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2 --jobs 10 --max-groups 100 --model openai --tools real --max-steps 100 --recursion-limit 0 --ossfuzz-project stb --ossfuzz-commit e14064 --ossfuzz-build-csv /users/linke/log/stb_builds.csv --ossfuzz-sanitizer address --ossfuzz-arch x86_64 --ossfuzz-engine libfuzzer --ossfuzz-fuzz-target stbi_read_fuzzer --ossfuzz-use-sudo --auto-ossfuzz-loop --ossfuzz-loop-max 100 --v1-json-dir /users/linke/oss-fuzz-for-select/data/stb-8c15cc --v2-json-dir /users/linke/oss-fuzz-for-select/data/stb-e14064 --v1-src /users/linke/tasks-git-v1/stb --v2-src /users/linke/tasks-git-v2/stb --openai-model gpt-5-mini --openai-base-url https://api.openai.com/v1 --openai-max-tokens 64000 --output-format none --max-restarts-per-hunk 3 --auto-continue-on-link-errors --refresh-error-queue never
+2026-02-05 13:09:20,831 - INFO - Round 1: Build succeeded!
+2026-02-05 13:09:20,831 - INFO - Copied merged diff from /users/linke/oss-fuzz-for-select/data/react_agent_artifacts/multi_20260205_130848_166754_b7f789f6/extra_stb_image.h/ossfuzz_merged_stb_e14064.diff to /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff
+2026-02-05 13:09:20,831 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:09:27,064 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2021-1239
+2026-02-05 13:09:27,064 - INFO - React multi-agent successfully fixed build errors
+2026-02-05 13:09:27,065 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2021-1239 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:09:27,936 - INFO - Bug OSV-2021-1239 not triggered with fuzzer stbi_read_fuzzer on commit e14064
+
+2026-02-05 13:09:27,936 - INFO - Patch_pair_list: [['stb_image.hstb_image.h-7426,8+7402,6', 'stb_image.hstb_image.h-7418,7+7401,0']]
+2026-02-05 13:09:27,937 - INFO - Applying and testing 1 ['int stbi__pnm_is16(stbi__context * s)', 'int stbi__pnm_info(stbi__context * s, int * x, int * y, int * comp)'] 
+2026-02-05 13:09:33,272 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:09:36,146 - INFO - Build failed after patch reversion for bug OSV-2021-1239
+
+2026-02-05 13:09:36,147 - INFO - Checking out V1 commit 8c15cc in /users/linke/tasks-git/stb
+2026-02-05 13:09:36,171 - INFO - Copying source to /users/linke/tasks-git-v1/stb
+2026-02-05 13:09:36,213 - INFO - Checking out V2 commit e14064 in /users/linke/tasks-git/stb
+2026-02-05 13:09:36,238 - INFO - Copying source to /users/linke/tasks-git-v2/stb
+2026-02-05 13:09:36,279 - INFO - === Multi-agent round 1/10 ===
+2026-02-05 13:09:36,279 - INFO -   Build log: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log
+2026-02-05 13:09:36,279 - INFO -   Patch: /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2
+2026-02-05 13:09:36,279 - INFO - Calling react multi-agent: /usr/bin/python3 /users/linke/oss-fuzz-for-select/script/react_agent/multi_agent.py /users/linke/oss-fuzz-for-select/data/tmp_patch/stb_build.log --patch-path /users/linke/oss-fuzz-for-select/data/tmp_patch/stb.patch2 --jobs 10 --max-groups 100 --model openai --tools real --max-steps 100 --recursion-limit 0 --ossfuzz-project stb --ossfuzz-commit e14064 --ossfuzz-build-csv /users/linke/log/stb_builds.csv --ossfuzz-sanitizer address --ossfuzz-arch x86_64 --ossfuzz-engine libfuzzer --ossfuzz-fuzz-target stbi_read_fuzzer --ossfuzz-use-sudo --auto-ossfuzz-loop --ossfuzz-loop-max 100 --v1-json-dir /users/linke/oss-fuzz-for-select/data/stb-8c15cc --v2-json-dir /users/linke/oss-fuzz-for-select/data/stb-e14064 --v1-src /users/linke/tasks-git-v1/stb --v2-src /users/linke/tasks-git-v2/stb --openai-model gpt-5-mini --openai-base-url https://api.openai.com/v1 --openai-max-tokens 64000 --output-format none --max-restarts-per-hunk 3 --auto-continue-on-link-errors --refresh-error-queue never
+2026-02-05 13:10:17,786 - INFO - Round 1: Build succeeded!
+2026-02-05 13:10:17,786 - INFO - Copied merged diff from /users/linke/oss-fuzz-for-select/data/react_agent_artifacts/multi_20260205_130936_169680_613cfd67/ossfuzz_merged_stb_e14064.diff to /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff
+2026-02-05 13:10:17,786 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer address --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches1.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:10:23,997 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2021-1239
+2026-02-05 13:10:23,997 - INFO - React multi-agent successfully fixed build errors
+2026-02-05 13:10:23,997 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2021-1239 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:24,812 - INFO - Bug OSV-2021-1239 not triggered with fuzzer stbi_read_fuzzer on commit e14064
+
+2026-02-05 13:10:24,813 - INFO - Minimal revert patch set after greedy: 2 [['stb_image.hstb_image.h-7426,8+7402,6', 'stb_image.hstb_image.h-7418,7+7401,0'], ['stb_image.hstb_image.h-7337,7+7320,7', 'stb_image.hstb_image.h-7326,3+7310,2']]
+2026-02-05 13:10:24,813 - INFO - Saved cache with 1 bug results to /users/linke/oss-fuzz-for-select/data/patches/stb_patches.pkl.gz
+2026-02-05 13:10:24,813 - INFO - --------------------
+2026-02-05 13:10:24,819 - INFO - python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py build_version --commit e14064 --sanitizer memory --patch /users/linke/oss-fuzz-for-select/patch/OSV-2021-1239_e14064_patches.diff --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 stb
+2026-02-05 13:10:31,635 - INFO - Successfully built fuzzer after reverting patch for bug OSV-2020-1380
+2026-02-05 13:10:31,635 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2020-1380 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:32,474 - INFO - Collecting crash log for bug OSV-2020-1380 using input testcase-OSV-2020-1380: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py collect_crash --commit e14064 --sanitizer memory --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 --testcases /users/linke/oss-fuzz-for-select/pocs/tmp --test_input testcase-OSV-2020-1380 stb stbi_read_fuzzer
+2026-02-05 13:10:37,464 - INFO - 	OSV-2021-1239 trigger local bug OSV-2020-1380 (stack match)
+
+2026-02-05 13:10:37,469 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2020-1521 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:38,290 - INFO - Collecting crash log for bug OSV-2020-1521 using input testcase-OSV-2020-1521: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py collect_crash --commit e14064 --sanitizer memory --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 --testcases /users/linke/oss-fuzz-for-select/pocs/tmp --test_input testcase-OSV-2020-1521 stb stbi_read_fuzzer
+2026-02-05 13:10:43,305 - INFO - 	OSV-2021-1239 trigger local bug OSV-2020-1521 (stack match)
+
+2026-02-05 13:10:43,310 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2020-1478 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:44,301 - INFO - 	OSV-2021-1239 not trigger local bug OSV-2020-1478
+2026-02-05 13:10:44,305 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2020-1372 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:45,190 - INFO - 	OSV-2021-1239 not trigger local bug OSV-2020-1372
+2026-02-05 13:10:45,194 - INFO - Running reproduce command: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py reproduce stb stbi_read_fuzzer /users/linke/oss-fuzz-for-select/pocs/tmp/testcase-OSV-2020-1472 -e ASAN_OPTIONS=detect_leaks=0
+2026-02-05 13:10:47,762 - INFO - 	OSV-2021-1239 not trigger local bug OSV-2020-1472
+2026-02-05 13:10:47,762 - INFO - 	OSV-2021-1239 total local bugs triggered: 2
+
+2026-02-05 13:10:47,762 - INFO - bug trigger commit: b1826c
+2026-02-05 13:10:47,762 - INFO - target commit id: e14064
+2026-02-05 13:10:47,762 - INFO - Processing transition for bug OSV-2021-1787 from commit b1826c to e14064
+2026-02-05 13:10:51,358 - INFO - Collecting crash log for bug OSV-2021-1787 using input testcase-OSV-2021-1787: python3 /users/linke/oss-fuzz-for-select/script/fuzz_helper.py collect_crash --commit b1826c --sanitizer address --build_csv /users/linke/log/stb_builds.csv --architecture x86_64 --testcases /users/linke/oss-fuzz-for-select/pocs/tmp --test_input testcase-OSV-2021-1787 stb stbi_read_fuzzer
+2026-02-05 13:11:27,396 - INFO - Loaded cached diff analysis from /users/linke/oss-fuzz-for-select/data/diff/revert_patch_OSV-2021-1787_b1826c_to_e14064.diff
+2026-02-05 13:11:28,077 - INFO - Trace function set: 71 [('LLVMFuzzerTestOneInput', '/tests/stbi_read_fuzzer.c:11:0'), ('stbi_info_from_memory', '/tests/../stb_image.h:7644:0'), ('stbi__start_mem', '/tests/../stb_image.h:824:0'), ('stbi__info_main', '/tests/../stb_image.h:7542:0'), ('stbi__jpeg_info', '/tests/../stb_image.h:4013:0'), ('stbi__malloc', '/tests/../stb_image.h:983:0'), ('stbi__jpeg_info_raw', '/tests/../stb_image.h:4001:0'), ('stbi__decode_jpeg_header', '/tests/../stb_image.h:3331:0'), ('stbi__get_marker', '/tests/../stb_image.h:2886:0'), ('stbi__get8', '/tests/../stb_image.h:1595:0'), ('stbi__process_frame_header', '/tests/../stb_image.h:3230:0'), ('stbi__get16be', '/tests/../stb_image.h:1675:0'), ('stbi_load_from_memory', '/tests/../stb_image.h:1410:0'), ('stbi__load_and_postprocess_8bit', '/tests/../stb_image.h:1241:0'), ('stbi__load_main', '/tests/../stb_image.h:1118:0'), ('stbi__png_test', '/tests/../stb_image.h:5239:0'), ('stbi__check_png_header', '/tests/../stb_image.h:4544:0'), ('stbi__err', '/tests/../stb_image.h:976:0'), ('stbi__rewind', '/tests/../stb_image.h:884:0'), ('stbi__bmp_test', '/tests/../stb_image.h:5298:0'), ('stbi__bmp_test_raw', '/tests/../stb_image.h:5283:0'), ('stbi__gif_test', '/tests/../stb_image.h:6513:0'), ('stbi__gif_test_raw', '/tests/../stb_image.h:6503:0'), ('stbi__psd_test', '/tests/../stb_image.h:6004:0'), ('stbi__get32be', '/tests/../stb_image.h:1685:0'), ('stbi__pic_test', '/tests/../stb_image.h:6464:0'), ('stbi__pic_test_core', '/tests/../stb_image.h:6269:0'), ('stbi__pic_is4', '/tests/../stb_image.h:6259:0'), ('stbi__jpeg_test', '/tests/../stb_image.h:3988:0'), ('stbi__setup_jpeg', '/tests/../stb_image.h:3768:0'), ('stbi__sse2_available', '/tests/../stb_image.h:763:0'), ('stbi__jpeg_load', '/tests/../stb_image.h:3975:0'), ('load_jpeg_image', '/tests/../stb_image.h:3812:0'), ('stbi__decode_jpeg_image', '/tests/../stb_image.h:3356:0'), ('stbi__mad3sizes_valid', '/tests/../stb_image.h:1029:0'), ('stbi__mul2sizes_valid', '/tests/../stb_image.h:1012:0'), ('stbi__addsizes_valid', '/tests/../stb_image.h:1000:0'), ('stbi__malloc_mad2', '/tests/../stb_image.h:1046:0'), ('stbi__mad2sizes_valid', '/tests/../stb_image.h:1022:0'), ('stbi__process_scan_header', '/tests/../stb_image.h:3169:0'), ('stbi__parse_entropy_coded_data', '/tests/../stb_image.h:2916:0'), ('stbi__jpeg_reset', '/tests/../stb_image.h:2903:0'), ('stbi__jpeg_decode_block', '/tests/../stb_image.h:2183:0'), ('stbi__grow_buffer_unsafe', '/tests/../stb_image.h:2053:0'), ('stbi__jpeg_huff_decode', '/tests/../stb_image.h:2075:0'), ('stbi__idct_simd', '/tests/../stb_image.h:2497:0'), ('_mm_setr_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_set_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_set1_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_set_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_load_si128', 'stbi_read_fuzzer.c:0:0'), ('_mm_unpacklo_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_unpackhi_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_madd_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_add_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_sub_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_setzero_si128', 'stbi_read_fuzzer.c:0:0'), ('_mm_srai_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_add_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_sub_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_packs_epi32', 'stbi_read_fuzzer.c:0:0'), ('_mm_packus_epi16', 'stbi_read_fuzzer.c:0:0'), ('_mm_unpacklo_epi8', 'stbi_read_fuzzer.c:0:0'), ('_mm_unpackhi_epi8', 'stbi_read_fuzzer.c:0:0'), ('_mm_storel_epi64', 'stbi_read_fuzzer.c:0:0'), ('stbi__at_eof', '/tests/../stb_image.h:1609:0'), ('stbi__process_marker', '/tests/../stb_image.h:3066:0'), ('stbi__build_huffman', '/tests/../stb_image.h:1984:0'), ('stbi__build_fast_ac', '/tests/../stb_image.h:2028:0'), ('stbi__cleanup_jpeg', '/tests/../stb_image.h:3790:0'), ('stbi__free_jpeg_components', '/tests/../stb_image.h:3208:0')]
+2026-02-05 13:11:28,077 - INFO - Total diff results: 39
+Loaded 3 signature groups from /users/linke/oss-fuzz-for-select/data/signature_change_list/OSV-2021-1239_e14064.json
+Traceback (most recent call last):
+  File "/users/linke/oss-fuzz-for-select/script/revert_patch_test.py", line 5330, in <module>
+    patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
+  File "/users/linke/oss-fuzz-for-select/script/revert_patch_test.py", line 5195, in revert_patch_test
+    tmp = copy.deepcopy(inmutable_args)
+  File "/usr/lib/python3.10/copy.py", line 146, in deepcopy
+    y = copier(x, memo)
+  File "/usr/lib/python3.10/copy.py", line 211, in _deepcopy_tuple
+    y = [deepcopy(a, memo) for a in x]
+  File "/usr/lib/python3.10/copy.py", line 211, in <listcomp>
+    y = [deepcopy(a, memo) for a in x]
+  File "/usr/lib/python3.10/copy.py", line 146, in deepcopy
+    y = copier(x, memo)
+  File "/usr/lib/python3.10/copy.py", line 206, in _deepcopy_list
+    append(deepcopy(a, memo))
+  File "/usr/lib/python3.10/copy.py", line 146, in deepcopy
+    y = copier(x, memo)
+  File "/usr/lib/python3.10/copy.py", line 211, in _deepcopy_tuple
+    y = [deepcopy(a, memo) for a in x]
+  File "/usr/lib/python3.10/copy.py", line 211, in <listcomp>
+    y = [deepcopy(a, memo) for a in x]
+  File "/usr/lib/python3.10/copy.py", line 128, in deepcopy
+    def deepcopy(x, memo=None, _nil=[]):
+KeyboardInterrupt
