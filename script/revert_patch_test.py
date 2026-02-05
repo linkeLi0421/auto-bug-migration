@@ -18,7 +18,11 @@ from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Any, Optional
 from dataclasses import dataclass, field
 
-from buildAndtest import checkout_latest_commit, get_commit_timestamp
+from buildAndtest import (
+    checkout_latest_commit,
+    get_commit_timestamp,
+    get_latest_images_before_year,
+)
 from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
@@ -840,6 +844,12 @@ def parse_arguments():
     parser.add_argument('--debug-artifact-dir',
                         help='Skip patch generation and use pre-generated patches from this artifact folder '
                              '(e.g., data/react_agent_artifacts/multi_20260202_193357_3887285_0130faed)')
+    parser.add_argument('--fixed-image', type=int, metavar='YEAR',
+                        help='Pin Docker images to latest versions before the given year (e.g., 2022). '
+                             'Uses get_latest_images_before_year() from buildAndtest.py')
+    parser.add_argument('--auto-select-images', action='store_true',
+                        help='Automatically select Docker images based on commit timestamp for collect_trace/collect_crash. '
+                             'By default, images are not automatically selected unless this flag is set or --fixed-image is used.')
 
     return parser.parse_args()
 
@@ -936,6 +946,8 @@ def get_crash_stack(
     target: str,
     fuzzer: str,
     target_repo_path: str = None,
+    fixed_builder_digest: Optional[str] = None,
+    auto_select_images: bool = False,
 ) -> str:
     """
     Ensure the crash log for the given commit/input exists, invoking the helper script if needed.
@@ -964,8 +976,13 @@ def get_crash_stack(
         arch,
     ]
 
-    # Add automatic Docker image selection based on commit date
-    if target_repo_path:
+    # Add Docker image selection based on flags
+    # collect_crash uses base-builder image
+    if fixed_builder_digest:
+        # Use the single fixed builder image digest for all commits
+        collect_crash_cmd.extend(['--runner-image', fixed_builder_digest])
+    elif auto_select_images and target_repo_path:
+        # Add automatic Docker image selection based on commit date (no upper bound)
         try:
             commit_timestamp = get_commit_timestamp(target_repo_path, commit_id)
             collect_crash_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
@@ -4878,6 +4895,18 @@ def revert_patch_test(args):
     target = args.target
     target_repo_path = os.path.join(repo_path, target)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
+
+    # Handle fixed image selection if --fixed-image is specified
+    fixed_builder_digest = None
+    fixed_runner_digest = None
+    if args.fixed_image:
+        fixed_builder_digest, fixed_runner_digest = get_latest_images_before_year(args.fixed_image)
+        logger.info(f"Using fixed images (latest before {args.fixed_image}):")
+        logger.info(f"  base-builder: {fixed_builder_digest}")
+        logger.info(f"  base-runner:  {fixed_runner_digest}")
+        logger.info(f"  collect_trace/collect_crash will use base-builder")
+        logger.info(f"  reproduce will use base-runner")
+
     bug_ids_trigger, bugs_need_transplant, max_poc_row = prepare_transplant(parsed_data, target_repo_path)
     
     get_patched_traces = dict()
@@ -5026,25 +5055,34 @@ def revert_patch_test(args):
             logger.info(f"Debug mode: minimization complete, result: {minimal_fast}")
             continue  # Skip the rest of this iteration
 
-        # Get commit timestamps for automatic Docker image selection
-        try:
-            commit_timestamp = get_commit_timestamp(target_repo_path, commit['commit_id'])
-            next_commit_timestamp = get_commit_timestamp(target_repo_path, next_commit['commit_id'])
-        except Exception as e:
-            logger.warning(f"Could not get commit timestamps: {e}")
-            commit_timestamp = None
-            next_commit_timestamp = None
+        # Get commit timestamps for automatic Docker image selection (only if needed)
+        commit_timestamp = None
+        next_commit_timestamp = None
+        if args.auto_select_images:
+            try:
+                commit_timestamp = get_commit_timestamp(target_repo_path, commit['commit_id'])
+                next_commit_timestamp = get_commit_timestamp(target_repo_path, next_commit['commit_id'])
+            except Exception as e:
+                logger.warning(f"Could not get commit timestamps: {e}")
 
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
-            if next_commit_timestamp:
+            # Add Docker image selection based on flags
+            # collect_trace uses base-builder image
+            if fixed_builder_digest:
+                collect_trace_cmd.extend(['--runner-image', fixed_builder_digest])
+            elif args.auto_select_images and next_commit_timestamp:
                 collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
             collect_trace_cmd.extend(['--patch', get_patched_traces[bug_id][-1]])
         else:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
-            if commit_timestamp:
+            # Add Docker image selection based on flags
+            # collect_trace uses base-builder image
+            if fixed_builder_digest:
+                collect_trace_cmd.extend(['--runner-image', fixed_builder_digest])
+            elif args.auto_select_images and commit_timestamp:
                 collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
         collect_trace_cmd.extend(['--testcases', testcases_env])
 
@@ -5071,7 +5109,11 @@ def revert_patch_test(args):
             # Rebuild command for next_commit (trace2)
             collect_trace_cmd_2 = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
-            if next_commit_timestamp:
+            # Add Docker image selection based on flags
+            # collect_trace uses base-builder image
+            if fixed_builder_digest:
+                collect_trace_cmd_2.extend(['--runner-image', fixed_builder_digest])
+            elif args.auto_select_images and next_commit_timestamp:
                 collect_trace_cmd_2.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
             collect_trace_cmd_2.extend(['--testcases', testcases_env])
             collect_trace_cmd_2.extend(['--build_csv', args.build_csv])
@@ -5102,6 +5144,8 @@ def revert_patch_test(args):
             target=target,
             fuzzer=fuzzer,
             target_repo_path=target_repo_path,
+            fixed_builder_digest=fixed_builder_digest,
+            auto_select_images=args.auto_select_images,
         )
         
         trace1 = extract_function_calls(trace_path1)
@@ -5327,6 +5371,8 @@ def revert_patch_test(args):
                     target=target,
                     fuzzer=trigger_fuzzer,
                     target_repo_path=target_repo_path,
+                    fixed_builder_digest=fixed_builder_digest,
+                    auto_select_images=args.auto_select_images,
                 )
                 signature_file_trigger = os.path.join(
                     data_path,
