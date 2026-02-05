@@ -54,8 +54,20 @@ BASE_BUILDER_IMAGES = [
 ]
 
 # Base-runner images sorted by date (for reproduce compatibility)
+# Each entry: (date_str, digest, openssl_version)
+# Note: These SHAs are from OSS-Fuzz gcr.io/oss-fuzz-base/base-runner images
+# Verify and update these digests as needed for your specific use case
 BASE_RUNNER_IMAGES = [
-    ('2020-01-07', 'sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e', '1.0.0'),  # testing
+    ('2019-12-01', 'sha256:caba4ce727f6dfe43a68b4554efdd617052ad3b634bbc6e28b97f6e3ca1a92ac', '1.0.0'),  # Dec 2019
+    ('2020-01-07', 'sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e', '1.0.0'),  # Jan 2020, testing
+    ('2020-11-01', 'sha256:5aeba6054f1fc806d3fd9a4934e4dfd9092615c8777ed6e5cff5993ff05f4008', '1.0.0'),  # Nov 2020
+    ('2021-08-23', 'sha256:83dc2104f6325551cf7b2dd928b63a3545bd283d00c3179827dcd963cff7764b', '1.0.0'),  # Mid 2021, approx xenial timeframe
+    ('2022-07-30', 'sha256:3a190cfbada024425c48aebd06558a0e974e819f69625e886b1fe2b1a138064d', '1.1'),    # Mid 2022, test
+    # Add more recent images as needed:
+    # To find the correct SHA for a specific date, check:
+    # - OSS-Fuzz build logs at https://oss-fuzz-build-logs.storage.googleapis.com/
+    # - Git history: cd oss-fuzz && git log --grep="base-runner" --since="2022-01-01"
+    # - Docker inspect: docker pull gcr.io/oss-fuzz-base/base-runner@sha256:... && docker inspect ...
 ]
 
 
@@ -77,6 +89,28 @@ def get_base_builder_for_date(commit_timestamp: int) -> str:
     # If no image found before commit date, use the earliest available
     if best_image is None:
         best_image = BASE_BUILDER_IMAGES[0][1]
+
+    return best_image
+
+
+def get_base_runner_for_date(commit_timestamp: int) -> str:
+    """
+    Get the appropriate base-runner image digest for a given commit timestamp.
+    Returns the latest image that was available before or on the commit date.
+    """
+    commit_date = datetime.fromtimestamp(commit_timestamp).date()
+
+    best_image = None
+    for date_str, digest, _ in BASE_RUNNER_IMAGES:
+        image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        if image_date <= commit_date:
+            best_image = digest
+        else:
+            break
+
+    # If no image found before commit date, use the earliest available
+    if best_image is None:
+        best_image = BASE_RUNNER_IMAGES[0][1]
 
     return best_image
 

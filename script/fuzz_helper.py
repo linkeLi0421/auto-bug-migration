@@ -506,6 +506,13 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                                 nargs='*')
   reproduce_parser.add_argument('--fuzzer_path',
                                 help='path to the fuzzer binary')
+  reproduce_parser.add_argument('--runner-image',
+                                help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
+                                default=None)
+  reproduce_parser.add_argument('--commit-date',
+                                type=int,
+                                help='commit timestamp for automatic image selection (requires --runner-image=auto)',
+                                default=None)
   _add_environment_args(reproduce_parser)
   _add_external_project_args(reproduce_parser)
   _add_architecture_args(reproduce_parser)
@@ -559,6 +566,13 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='test_input name')
   collect_trace_parser.add_argument('--patch',
                             help='patch file to apply in the builder')
+  collect_trace_parser.add_argument('--runner-image',
+                            help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
+                            default=None)
+  collect_trace_parser.add_argument('--commit-date',
+                            type=int,
+                            help='commit timestamp for automatic image selection (requires --runner-image=auto)',
+                            default=None)
   _add_architecture_args(collect_trace_parser)
   _add_engine_args(collect_trace_parser)
   _add_sanitizer_args(collect_trace_parser)
@@ -584,6 +598,13 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='test_input name')
   collect_crash_parser.add_argument('--patch',
                             help='patch file to apply in the builder')
+  collect_crash_parser.add_argument('--runner-image',
+                            help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
+                            default=None)
+  collect_crash_parser.add_argument('--commit-date',
+                            type=int,
+                            help='commit timestamp for automatic image selection (requires --runner-image=auto)',
+                            default=None)
   _add_architecture_args(collect_crash_parser)
   _add_engine_args(collect_crash_parser)
   _add_sanitizer_args(collect_crash_parser)
@@ -639,6 +660,13 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   build_version_parser.add_argument('--no_corpus',
                             action='store_true',
                             help='do not download corpus backup from OSS-Fuzz; use empty corpus')
+  build_version_parser.add_argument('--runner-image',
+                            help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
+                            default=None)
+  build_version_parser.add_argument('--commit-date',
+                            type=int,
+                            help='commit timestamp for automatic image selection (requires --runner-image=auto)',
+                            default=None)
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -1734,7 +1762,10 @@ def fuzzbench_measure(args):
 def reproduce(args):
   """Reproduces a specific test case from a specific project."""
   return reproduce_impl(args.project, args.fuzzer_name, args.valgrind, args.e,
-                        args.fuzzer_args, args.testcase_path, args.architecture, fuzzer_path=args.fuzzer_path)
+                        args.fuzzer_args, args.testcase_path, args.architecture,
+                        fuzzer_path=args.fuzzer_path,
+                        runner_image=getattr(args, 'runner_image', None),
+                        commit_date=getattr(args, 'commit_date', None))
 
 
 def reproduce_impl(  # pylint: disable=too-many-arguments
@@ -1748,6 +1779,8 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
     run_function=docker_run,
     fuzzer_path=None,
     err_result=False,
+    runner_image=None,
+    commit_date=None,
     ):
   """Reproduces a testcase in the container."""
   if not check_project_exists(project):
@@ -1773,8 +1806,26 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
   if env_to_add:
     env += env_to_add
 
-  # Use 2020 base-runner:testing image for library compatibility (OpenSSL 1.0.0)
-  reproduce_image = 'gcr.io/oss-fuzz-base/base-runner@sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e'
+  # Determine base-runner image to use
+  if runner_image == 'auto' and commit_date:
+    # Import here to avoid circular dependency
+    import sys
+    import os
+    script_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    sys.path.insert(0, os.path.join(script_dir, 'script'))
+    from buildAndtest import get_base_runner_for_date
+    image_digest = get_base_runner_for_date(commit_date)
+    reproduce_image = f'gcr.io/oss-fuzz-base/base-runner@{image_digest}'
+  elif runner_image and runner_image.startswith('sha256:'):
+    # Custom image digest provided
+    reproduce_image = f'gcr.io/oss-fuzz-base/base-runner@{runner_image}'
+  elif runner_image:
+    # Full image URL provided
+    reproduce_image = runner_image
+  else:
+    # Use default 2020 base-runner:testing image for library compatibility (OpenSSL 1.0.0)
+    reproduce_image = 'gcr.io/oss-fuzz-base/base-runner@sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e'
+
   run_args = _env_to_docker_args(env) + [
       '-v',
       '%s:/out' % project.out,
@@ -1955,11 +2006,17 @@ def clean(args, out_dir):
 
 def build_version(args):
   """Build in a specific commit."""
+  # Determine builder image digest from runner-image args
+  builder_digest = _get_builder_image_digest(
+    getattr(args, 'runner_image', None),
+    getattr(args, 'commit_date', None)
+  )
+
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
       csv_lines = csvfile.readlines()
-      
+
     for line in csv_lines:
       parts = line.strip().split(',')
       if len(parts) == 4 and parts[0] == args.project.name:
@@ -1967,10 +2024,10 @@ def build_version(args):
         oss_fuzz_commit = parts[2]
 
         if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s',
                 args.commit, oss_fuzz_commit)
           break
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   if not build_image_impl(args.project):
     return False
 
@@ -2234,20 +2291,63 @@ def build_llvm_from_source():
   return bash_commands
 
 
-def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
-  """Prepares the repository by checking out to the specific commit and modifying the Dockerfile."""
+def _get_builder_image_digest(runner_image, commit_date):
+  """Helper to get base-builder image digest from runner-image args.
+
+  Args:
+    runner_image: Value from --runner-image argument
+    commit_date: Value from --commit-date argument
+
+  Returns:
+    Builder image digest string or None
+  """
+  if runner_image == 'auto' and commit_date:
+    # Import here to avoid circular dependency
+    import sys
+    import os
+    script_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    sys.path.insert(0, os.path.join(script_dir, 'script'))
+    from buildAndtest import get_base_builder_for_date
+    return get_base_builder_for_date(commit_date)
+  elif runner_image and runner_image.startswith('sha256:'):
+    # Custom digest provided - use it for builder too
+    return runner_image
+  return None
+
+
+def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_digest=None):
+  """Prepares the repository by checking out to the specific commit and modifying the Dockerfile.
+
+  Args:
+    oss_fuzz_dir: Path to OSS-Fuzz directory
+    oss_fuzz_commit: Commit hash to checkout
+    target: Project name
+    builder_image_digest: Optional base-builder image digest (e.g., 'sha256:...') to pin in Dockerfile
+  """
   os.chdir(oss_fuzz_dir)
   subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
   subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
   logger.info('Checked out OSS-FUZZ to commit %s', oss_fuzz_commit)
   target_dockerfile_path = f'{oss_fuzz_dir}/projects/{target}/Dockerfile'
-  # Replace '--depth=1' in the Dockerfile
+  # Replace '--depth=1' in the Dockerfile (to get full git history)
   with open(target_dockerfile_path, 'r') as dockerfile:
       dockerfile_content = dockerfile.read()
-  if '@sha256:859b694f542dbde5d0cf5aed20668eb201d9fbd93a08c6c5bb5da2347560169f' not in dockerfile_content:
-            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:859b694f542dbde5d0cf5aed20668eb201d9fbd93a08c6c5bb5da2347560169f')
+  # Remove depth restrictions from git clone commands
   updated_content = dockerfile_content.replace('--depth 1', '')
   updated_content = updated_content.replace('--depth=1', '')
+
+  # Optionally pin base-builder image to specific digest for reproducibility
+  if builder_image_digest:
+    if not builder_image_digest.startswith('sha256:'):
+      builder_image_digest = f'sha256:{builder_image_digest}'
+    # Only pin if not already pinned to avoid double-pinning
+    if f'@{builder_image_digest}' not in updated_content:
+      updated_content = updated_content.replace(
+        'gcr.io/oss-fuzz-base/base-builder',
+        f'gcr.io/oss-fuzz-base/base-builder@{builder_image_digest}'
+      )
+      logger.info('Pinned base-builder to %s', builder_image_digest)
+
   with open(target_dockerfile_path, 'w') as dockerfile:
       dockerfile.write(updated_content)
 
@@ -2367,7 +2467,7 @@ def get_poc_for_new_version(args):
   if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt'):
     run_args.extend([get_crash_log_bash(args.buggy_commit, args)])
     clean(args, out_dir)
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_buggy, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_buggy, args.project.name, None)
     docker_run(run_args, architecture=args.architecture)
     run_args.pop()
     
@@ -2387,7 +2487,7 @@ def get_poc_for_new_version(args):
 
   # Get the function trace in the target commit with patch that reverts some patches
   if not os.path.exists(f"{result_dir}/target_trace-{args.target_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt"):
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, None)
     run_args.extend([get_trace_log_bash(args.target_commit, args, apply_patch = True)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
@@ -2544,7 +2644,7 @@ def fuzz_one(args):
   if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit1[:6]}-{args.test_input}.txt'):
     run_args.extend([get_crash_log_bash(args.buggy_commit1, args)])
     clean(args, out_dir)
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name, None)
     docker_run(run_args, architecture=args.architecture)
     run_args.pop()
 
@@ -2556,7 +2656,7 @@ def fuzz_one(args):
 
   if not os.path.exists(f"{result_dir}/target_trace-{args.base_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt") and \
     args.base_commit != args.buggy_commit2:
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name, None)
     run_args.extend([get_trace_log_bash(args.base_commit, args, apply_patch = True)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
@@ -2565,7 +2665,7 @@ def fuzz_one(args):
   if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit2[:6]}-{args.test_input}.txt') or \
     not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-full-{args.test_input}.txt') or \
     not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'):
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name, None)
     run_args.extend([get_trace_log_bash(args.buggy_commit2, args, apply_patch = False) + get_allowlist_bash(args)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
@@ -2587,7 +2687,7 @@ def fuzz_one(args):
       '/bin/bash', '-c', get_runfuzzer_bash(args, 'diff')
   ])
   clean(args, out_dir)
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name, None)
   allowlist_path = f'{result_dir}/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'
   # Check if allowlist only contains "src:*"
   with open(allowlist_path, 'r') as f:
@@ -2682,7 +2782,7 @@ def get_dict(args):
       'gcr.io/%s/%s' % (image_project, args.project.name),
       '/bin/bash', '-c', bash_getdict
   ])
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, None)
   docker_run(run_args, architecture=args.architecture)
   return True
 
@@ -2692,12 +2792,19 @@ def collect_trace(args):
   if not args.commit:
     logger.error('collect_trace requires --commit to be specified.')
     return False
+
+  # Determine builder image digest from runner-image args
+  builder_digest = _get_builder_image_digest(
+    getattr(args, 'runner_image', None),
+    getattr(args, 'commit_date', None)
+  )
+
   oss_fuzz_commit = args.commit
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
       csv_lines = csvfile.readlines()
-      
+
     for line in csv_lines:
       parts = line.strip().split(',')
       if len(parts) == 4 and parts[0] == args.project.name:
@@ -2705,10 +2812,10 @@ def collect_trace(args):
         oss_fuzz_commit = parts[2]
 
         if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
+          logger.info('Found matching commit for base_commit in CSV: %s -> %s',
                 args.commit, oss_fuzz_commit)
           break
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   if not build_image_impl(args.project):
     return False
 
@@ -2790,6 +2897,12 @@ def collect_crash(args):
     logger.error('collect_crash requires both --testcases and --test_input.')
     return False
 
+  # Determine builder image digest from runner-image args
+  builder_digest = _get_builder_image_digest(
+    getattr(args, 'runner_image', None),
+    getattr(args, 'commit_date', None)
+  )
+
   oss_fuzz_commit = args.commit
   if args.build_csv:
     with open(args.build_csv, 'r') as csvfile:
@@ -2807,7 +2920,7 @@ def collect_crash(args):
           )
           break
 
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   if not build_image_impl(args.project):
     return False
 
@@ -2896,7 +3009,7 @@ def get_cfg(args):
           break
   else:
     logger.error('Need a build_csv')
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, None)
   if not build_image_impl(args.project):
     return False
 
