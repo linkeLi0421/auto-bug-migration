@@ -236,26 +236,9 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
     subprocess.run(["git", "checkout", '-f', oss_fuzz_commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8')
     logger.info(f"Building {target} with oss-fuzz in commit {oss_fuzz_commit} (month = {month})")
     
-    target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
-    # Replace '--depth=1' in the Dockerfile
-    # if not os.path.exists(target_dockerfile_path):
-    #     logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
-    #     return do_bug_build(target_path, bug_ids_path, bug_infos, commit_id, month+6, build_writer)
-    with open(target_dockerfile_path, 'r') as dockerfile:
-        dockerfile_content = dockerfile.read()
-    # Pin base-builder image based on oss_fuzz_commit date for compatibility
-    if '@sha256:' not in dockerfile_content:
-        oss_fuzz_timestamp = get_commit_timestamp(oss_fuzz_path, oss_fuzz_commit)
-        base_builder_digest = get_base_builder_for_date(oss_fuzz_timestamp)
-        logger.info(f"Using base-builder image: {base_builder_digest[:30]}... for commit date {datetime.fromtimestamp(oss_fuzz_timestamp).strftime('%Y-%m-%d')}")
-        dockerfile_content = dockerfile_content.replace(
-            'gcr.io/oss-fuzz-base/base-builder',
-            f'gcr.io/oss-fuzz-base/base-builder@{base_builder_digest}'
-        )
-    updated_content = dockerfile_content.replace('--depth 1', '')
-    updated_content = updated_content.replace('--depth=1', '')
-    with open(target_dockerfile_path, 'w') as dockerfile:
-        dockerfile.write(updated_content)
+    # Get commit timestamp for automatic image selection
+    oss_fuzz_timestamp = get_commit_timestamp(oss_fuzz_path, oss_fuzz_commit)
+    logger.info(f"OSS-Fuzz commit timestamp: {datetime.fromtimestamp(oss_fuzz_timestamp).strftime('%Y-%m-%d')}")
     
     sanitizers = set()
     archs = set()
@@ -284,6 +267,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
 
             cmd = [
                 py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
+                "--runner-image", "auto", "--commit-date", str(oss_fuzz_timestamp),
                 target
             ]
 
@@ -381,8 +365,11 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
             logger.error(f"Source directory or file does not exist: {source_dir}")
             return
 
+        # Use commit time for automatic runner image selection
         cmd = [
-            py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir, target, fuzz_target, poc_path
+            py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir,
+            '--runner-image', 'auto', '--commit-date', str(commit_time),
+            target, fuzz_target, poc_path
         ]
         try:
             logger.info(' '.join(cmd))
