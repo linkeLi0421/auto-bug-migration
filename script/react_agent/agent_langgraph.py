@@ -49,6 +49,44 @@ def _active_error_is_unknown_type_name(state: "AgentState") -> bool:
     return "unknown type name" in str(getattr(state, "error_line", "") or "").lower()
 
 
+def _extract_file_path_from_error(error_line: str) -> str:
+    """
+    Extract source file path from compiler/linker error messages.
+
+    Examples:
+      - "card-itacns.c:(.text.__revert_ca6627_sc_get_driver+0x14b): undefined reference..."
+        → "card-itacns.c"
+      - "/src/opensc/src/libopensc/card-myeid.c:1818:7: error: use of undeclared..."
+        → "card-myeid.c"
+      - "pkcs15.c:(.text.__revert_ca6627_sc_pkcs15_read_file+0x1a60): undefined reference..."
+        → "pkcs15.c"
+    """
+    err = str(error_line or "").strip()
+    if not err:
+        return ""
+
+    # Pattern 1: Linker errors - "file.c:(.text.function+offset):"
+    match = re.match(r'^([^:]+\.c):\(', err)
+    if match:
+        file_path = match.group(1)
+        # Strip directory path, keep only basename
+        return os.path.basename(file_path)
+
+    # Pattern 2: Compiler errors - "/path/to/file.c:line:col: error:"
+    match = re.match(r'^([^:]+\.c):\d+:\d+:', err)
+    if match:
+        file_path = match.group(1)
+        return os.path.basename(file_path)
+
+    # Pattern 3: Simple file path at start
+    match = re.match(r'^([^:]+\.c):', err)
+    if match:
+        file_path = match.group(1)
+        return os.path.basename(file_path)
+
+    return ""
+
+
 class Decision(TypedDict, total=False):
     type: Literal["tool", "final"]
     thought: str
@@ -5568,12 +5606,15 @@ def _run_langgraph(
         tool = str(decision["tool"])
 
         # Record which error the agent was targeting when making this tool call.
+        error_line = str(getattr(st, "error_line", "") or "").strip()
+        error_file_path = _extract_file_path_from_error(error_line)
         step_context = {
             "scope": str(st.error_scope),
             "pinned_patch_key": str(getattr(st, "patch_key", "") or "").strip(),
             "active_patch_key": str(getattr(st, "active_patch_key", "") or "").strip(),
             "active_old_signature": str(getattr(st, "active_old_signature", "") or "").strip(),
-            "error_line": str(getattr(st, "error_line", "") or "").strip(),
+            "error_line": error_line,
+            "error_file_path": error_file_path,
             "build_log_path": str(getattr(st, "build_log_path", "") or "").strip(),
         }
 

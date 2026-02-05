@@ -107,7 +107,10 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": (
             "Map a linker undefined-reference error to a patch slice using file_path + function_name and return "
             "the full unified-diff hunk excerpt (applyable) plus patch_minus_code (all '-' lines) and "
-            "error_func_code (the mapped '-' slice for that function)."
+            "error_func_code (the mapped '-' slice for that function). "
+            "IMPORTANT: file_path must be the actual source file name (e.g., 'card-itacns.c' or 'src/libopensc/card-itacns.c'), "
+            "NOT a patch_key. Extract the file name from the linker error message (e.g., 'card-itacns.c:(.text...)' → 'card-itacns.c'). "
+            "Use error_file_path from context if available."
         ),
     },
     {

@@ -27,6 +27,8 @@ Example transformations:
 
 When using make_error_patch_override for linker errors:
 - Use get_link_error_patch_context first to get the function code containing the reference.
+- For the file_path parameter: Use error_file_path from context if available (e.g., "card-itacns.c").
+  DO NOT use active_patch_key or pinned_patch_key as file_path - these are patch identifiers, not file paths.
 - Modify only the lines that reference the missing symbol.
 - Test with ossfuzz_apply_patch_and_test to verify the linker error is resolved.
 
