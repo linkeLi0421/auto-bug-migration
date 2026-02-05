@@ -239,7 +239,16 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
     # Get commit timestamp for automatic image selection
     oss_fuzz_timestamp = get_commit_timestamp(oss_fuzz_path, oss_fuzz_commit)
     logger.info(f"OSS-Fuzz commit timestamp: {datetime.fromtimestamp(oss_fuzz_timestamp).strftime('%Y-%m-%d')}")
-    
+
+    # Remove --depth 1 from Dockerfile to ensure full git history
+    target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
+    with open(target_dockerfile_path, 'r') as dockerfile:
+        dockerfile_content = dockerfile.read()
+    updated_content = dockerfile_content.replace('--depth 1', '')
+    updated_content = updated_content.replace('--depth=1', '')
+    with open(target_dockerfile_path, 'w') as dockerfile:
+        dockerfile.write(updated_content)
+
     sanitizers = set()
     archs = set()
     for bug_id in target_bug_ids:
