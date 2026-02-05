@@ -43,6 +43,44 @@ def get_commit_timestamp(repo_path: str, commit_hash: str) -> int:
     return int(ts)
 
 
+# Base-builder images sorted by date (oldest first)
+# Each entry: (date_str, digest, openssl_version)
+BASE_BUILDER_IMAGES = [
+    ('2019-05-13', 'sha256:bd7e28de7a1f69d828e94220a20f69692d2e3173f0908fbf6067fabdc7b8b947', '1.0.0'),  # testing
+    ('2021-08-23', 'sha256:859b694f542dbde5d0cf5aed20668eb201d9fbd93a08c6c5bb5da2347560169f', '1.0.0'),  # xenial
+    ('2022-07-30', 'sha256:5b714b0eb717ab8ee6129cb37adb7db76761cb93273d332d29afa62a4cdc7ed3', '1.1'),    # test
+    ('2022-08-11', 'sha256:2f5cdbf10998fa95559dbf971e11504a51c5e2a2557aa548ad1c3ac2154934e7', '1.1'),    # old
+    ('2022-10-31', 'sha256:4af219498733484fcec27ca3b6ceda96ed38aecb83fcd47f930811f5d5fad1b9', '1.1'),    # introspector
+]
+
+# Base-runner images sorted by date (for reproduce compatibility)
+BASE_RUNNER_IMAGES = [
+    ('2020-01-07', 'sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e', '1.0.0'),  # testing
+]
+
+
+def get_base_builder_for_date(commit_timestamp: int) -> str:
+    """
+    Get the appropriate base-builder image digest for a given commit timestamp.
+    Returns the latest image that was available before or on the commit date.
+    """
+    commit_date = datetime.fromtimestamp(commit_timestamp).date()
+
+    best_image = None
+    for date_str, digest, _ in BASE_BUILDER_IMAGES:
+        image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        if image_date <= commit_date:
+            best_image = digest
+        else:
+            break
+
+    # If no image found before commit date, use the earliest available
+    if best_image is None:
+        best_image = BASE_BUILDER_IMAGES[0][1]
+
+    return best_image
+
+
 def git_first_last_commit(target_bug_ids, bug_infos):
     # Initialize variables to store the oldest fixed and newest fixed commits
     oldest_introduced_commit = None
@@ -166,11 +204,20 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
     
     target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
     # Replace '--depth=1' in the Dockerfile
-    if not os.path.exists(target_dockerfile_path):
-        logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
-        return do_bug_build(target_path, bug_ids_path, bug_infos, commit_id, month+6, build_writer)
+    # if not os.path.exists(target_dockerfile_path):
+    #     logger.error(f"Target Dockerfile not found: {target_dockerfile_path} will try newer oss-fuzz again.")
+    #     return do_bug_build(target_path, bug_ids_path, bug_infos, commit_id, month+6, build_writer)
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
+    # Pin base-builder image based on oss_fuzz_commit date for compatibility
+    if '@sha256:' not in dockerfile_content:
+        oss_fuzz_timestamp = get_commit_timestamp(oss_fuzz_path, oss_fuzz_commit)
+        base_builder_digest = get_base_builder_for_date(oss_fuzz_timestamp)
+        logger.info(f"Using base-builder image: {base_builder_digest[:30]}... for commit date {datetime.fromtimestamp(oss_fuzz_timestamp).strftime('%Y-%m-%d')}")
+        dockerfile_content = dockerfile_content.replace(
+            'gcr.io/oss-fuzz-base/base-builder',
+            f'gcr.io/oss-fuzz-base/base-builder@{base_builder_digest}'
+        )
     updated_content = dockerfile_content.replace('--depth 1', '')
     updated_content = updated_content.replace('--depth=1', '')
     with open(target_dockerfile_path, 'w') as dockerfile:
@@ -229,7 +276,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 "failed with exit status"
             ]) or result.returncode != 0:
                 logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
-                return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month+6, build_writer)
+                # return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month+6, build_writer)
             else:
                 # build finish here
                 logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
