@@ -1809,8 +1809,6 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
   # Determine base-runner image to use
   if runner_image == 'auto' and commit_date:
     # Import here to avoid circular dependency
-    import sys
-    import os
     script_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     sys.path.insert(0, os.path.join(script_dir, 'script'))
     from buildAndtest import get_base_runner_for_date
@@ -2303,8 +2301,6 @@ def _get_builder_image_digest(runner_image, commit_date):
   """
   if runner_image == 'auto' and commit_date:
     # Import here to avoid circular dependency
-    import sys
-    import os
     script_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     sys.path.insert(0, os.path.join(script_dir, 'script'))
     from buildAndtest import get_base_builder_for_date
