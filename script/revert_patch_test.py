@@ -18,7 +18,7 @@ from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Any, Optional
 from dataclasses import dataclass, field
 
-from buildAndtest import checkout_latest_commit
+from buildAndtest import checkout_latest_commit, get_commit_timestamp
 from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
 from compare_trace import compare_traces
@@ -935,6 +935,7 @@ def get_crash_stack(
     testcases_env: str,
     target: str,
     fuzzer: str,
+    target_repo_path: str = None,
 ) -> str:
     """
     Ensure the crash log for the given commit/input exists, invoking the helper script if needed.
@@ -961,13 +962,24 @@ def get_crash_stack(
         build_csv,
         '--architecture',
         arch,
+    ]
+
+    # Add automatic Docker image selection based on commit date
+    if target_repo_path:
+        try:
+            commit_timestamp = get_commit_timestamp(target_repo_path, commit_id)
+            collect_crash_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
+        except Exception as e:
+            logger.warning(f"Could not get commit timestamp for {commit_id}: {e}")
+
+    collect_crash_cmd.extend([
         '--testcases',
         testcases_env,
         '--test_input',
         crash_test_input,
         target,
         fuzzer,
-    ]
+    ])
     logger.info(
         "Collecting crash log for bug %s using input %s: %s",
         bug_id,
@@ -5014,12 +5026,26 @@ def revert_patch_test(args):
             logger.info(f"Debug mode: minimization complete, result: {minimal_fast}")
             continue  # Skip the rest of this iteration
 
+        # Get commit timestamps for automatic Docker image selection
+        try:
+            commit_timestamp = get_commit_timestamp(target_repo_path, commit['commit_id'])
+            next_commit_timestamp = get_commit_timestamp(target_repo_path, next_commit['commit_id'])
+        except Exception as e:
+            logger.warning(f"Could not get commit timestamps: {e}")
+            commit_timestamp = None
+            next_commit_timestamp = None
+
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
-                                '--build_csv', args.build_csv, '--architecture', arch, '--patch', get_patched_traces[bug_id][-1]]
+                                '--build_csv', args.build_csv, '--architecture', arch]
+            if next_commit_timestamp:
+                collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
+            collect_trace_cmd.extend(['--patch', get_patched_traces[bug_id][-1]])
         else:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
+            if commit_timestamp:
+                collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
         collect_trace_cmd.extend(['--testcases', testcases_env])
 
         collect_trace_cmd.extend(['--build_csv', args.build_csv])
@@ -5042,12 +5068,22 @@ def revert_patch_test(args):
                 logger.info(f"Command failed with exit code {e.returncode}")
                 
         if not os.path.exists(trace_path2):
-            collect_trace_cmd[4] = next_commit['commit_id']
+            # Rebuild command for next_commit (trace2)
+            collect_trace_cmd_2 = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
+                                '--build_csv', args.build_csv, '--architecture', arch]
+            if next_commit_timestamp:
+                collect_trace_cmd_2.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
+            collect_trace_cmd_2.extend(['--testcases', testcases_env])
+            collect_trace_cmd_2.extend(['--build_csv', args.build_csv])
+            collect_trace_cmd_2.extend(['--test_input', crash_test_input])
+            collect_trace_cmd_2.append(target)
+            collect_trace_cmd_2.append(fuzzer)
+            collect_trace_cmd_2.extend(['-e', 'ASAN_OPTIONS=detect_leaks=0'])
             # logger.info the command being executed
-            logger.info(f"Running command: {' '.join(collect_trace_cmd)}")
+            logger.info(f"Running command: {' '.join(collect_trace_cmd_2)}")
             # Execute the command
             try:
-                result = subprocess.run(collect_trace_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                result = subprocess.run(collect_trace_cmd_2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except subprocess.CalledProcessError as e:
                 logger.info(f"Command failed with exit code {e.returncode}")
         
@@ -5065,6 +5101,7 @@ def revert_patch_test(args):
             testcases_env=testcases_env,
             target=target,
             fuzzer=fuzzer,
+            target_repo_path=target_repo_path,
         )
         
         trace1 = extract_function_calls(trace_path1)
@@ -5289,6 +5326,7 @@ def revert_patch_test(args):
                     testcases_env=testcases_env,
                     target=target,
                     fuzzer=trigger_fuzzer,
+                    target_repo_path=target_repo_path,
                 )
                 signature_file_trigger = os.path.join(
                     data_path,
