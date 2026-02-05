@@ -1773,13 +1773,15 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
   if env_to_add:
     env += env_to_add
 
+  # Use 2020 base-runner:testing image for library compatibility (OpenSSL 1.0.0)
+  reproduce_image = 'gcr.io/oss-fuzz-base/base-runner@sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e'
   run_args = _env_to_docker_args(env) + [
       '-v',
       '%s:/out' % project.out,
       '-v',
       '%s:/testcase' % _get_absolute_path(testcase_path),
       '-t',
-      'gcr.io/oss-fuzz-base/%s' % image_name,
+      reproduce_image,
       'reproduce',
       fuzzer_name,
       '-runs=10',
@@ -2242,8 +2244,8 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target):
   # Replace '--depth=1' in the Dockerfile
   with open(target_dockerfile_path, 'r') as dockerfile:
       dockerfile_content = dockerfile.read()
-  if '@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0' not in dockerfile_content:
-            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:d34b94e3cf868e49d2928c76ddba41fd4154907a1a381b3a263fafffb7c3dce0')
+  if '@sha256:859b694f542dbde5d0cf5aed20668eb201d9fbd93a08c6c5bb5da2347560169f' not in dockerfile_content:
+            dockerfile_content = dockerfile_content.replace('gcr.io/oss-fuzz-base/base-builder', 'gcr.io/oss-fuzz-base/base-builder@sha256:859b694f542dbde5d0cf5aed20668eb201d9fbd93a08c6c5bb5da2347560169f')
   updated_content = dockerfile_content.replace('--depth 1', '')
   updated_content = updated_content.replace('--depth=1', '')
   with open(target_dockerfile_path, 'w') as dockerfile:
