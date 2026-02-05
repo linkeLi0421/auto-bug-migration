@@ -8,7 +8,7 @@ This repository implements automated fuzzing workflows for OSS-Fuzz projects. Th
 
 ## Configurable Docker Images
 
-The fuzzing helper (`script/fuzz_helper.py`) supports configurable base-runner and base-builder Docker images for reproducibility across different time periods:
+The fuzzing helper (`script/fuzz_helper.py`) supports configurable base-runner and base-builder Docker images for reproducibility across different time periods.
 
 ### Usage
 ```bash
@@ -17,19 +17,23 @@ python3 script/fuzz_helper.py reproduce myproject fuzzer testcase.bin \
   --runner-image auto --commit-date 1630000000
 
 # Specify custom image digest
-python3 script/fuzz_helper.py build_version myproject src \
+python3 script/fuzz_helper.py build_version myproject \
   --commit abc123 --runner-image sha256:859b694f...
 
 # Works with: reproduce, build_version, collect_trace, collect_crash
 ```
 
 ### Image Selection
-- `--runner-image auto --commit-date <timestamp>`: Automatically selects appropriate base-builder/base-runner images based on commit timestamp (uses `buildAndtest.py::get_base_builder_for_date()` and `get_base_runner_for_date()`)
+- `--runner-image auto --commit-date <timestamp>`: Automatically selects appropriate base-builder/base-runner images based on commit timestamp (imports `buildAndtest.py::get_base_builder_for_date()` and `get_base_runner_for_date()`)
 - `--runner-image sha256:...`: Uses specified digest for both builder and runner
 - No arguments: Uses OSS-Fuzz Dockerfile defaults (no pinning)
 
 ### Available Images
-See `script/buildAndtest.py` for `BASE_BUILDER_IMAGES` and `BASE_RUNNER_IMAGES` lists with historical Docker image digests.
+See `script/buildAndtest.py` for `BASE_BUILDER_IMAGES` and `BASE_RUNNER_IMAGES` lists with historical Docker image digests from 2019-2022.
+
+### Implementation Details
+- **`fuzz_helper.py`**: Handles all Docker image pinning via `prepare_repository()`. Accepts `--runner-image` and `--commit-date` CLI arguments.
+- **`buildAndtest.py`**: Orchestrates builds/tests across commit ranges. Delegates image pinning to `fuzz_helper.py` by passing `--runner-image auto --commit-date <timestamp>` options. Also removes `--depth 1` from Dockerfiles to ensure full git history is available for bisection.
 
 ## Key Commands
 
