@@ -6,6 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository implements automated fuzzing workflows for OSS-Fuzz projects. The core component is a LangGraph-based ReAct agent (`script/react_agent/`) that triages build errors against patch bundles and iteratively produces override diffs to fix compilation failures during code migration.
 
+## Configurable Docker Images
+
+The fuzzing helper (`script/fuzz_helper.py`) supports configurable base-runner and base-builder Docker images for reproducibility across different time periods:
+
+### Usage
+```bash
+# Auto-select image based on commit date
+python3 script/fuzz_helper.py reproduce myproject fuzzer testcase.bin \
+  --runner-image auto --commit-date 1630000000
+
+# Specify custom image digest
+python3 script/fuzz_helper.py build_version myproject src \
+  --commit abc123 --runner-image sha256:859b694f...
+
+# Works with: reproduce, build_version, collect_trace, collect_crash
+```
+
+### Image Selection
+- `--runner-image auto --commit-date <timestamp>`: Automatically selects appropriate base-builder/base-runner images based on commit timestamp (uses `buildAndtest.py::get_base_builder_for_date()` and `get_base_runner_for_date()`)
+- `--runner-image sha256:...`: Uses specified digest for both builder and runner
+- No arguments: Uses OSS-Fuzz Dockerfile defaults (no pinning)
+
+### Available Images
+See `script/buildAndtest.py` for `BASE_BUILDER_IMAGES` and `BASE_RUNNER_IMAGES` lists with historical Docker image digests.
+
 ## Key Commands
 
 ### Install dependencies
