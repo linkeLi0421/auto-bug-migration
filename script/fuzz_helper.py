@@ -2012,6 +2012,7 @@ def build_version(args):
     getattr(args, 'commit_date', None)
   )
 
+  oss_fuzz_commit = None
   if args.build_csv:
     # Read the CSV file
     with open(args.build_csv, 'r') as csvfile:
@@ -2027,7 +2028,20 @@ def build_version(args):
           logger.info('Found matching commit for base_commit in CSV: %s -> %s',
                 args.commit, oss_fuzz_commit)
           break
+
+  # Apply Docker image pinning if builder_digest is specified
+  if builder_digest:
+    if not oss_fuzz_commit:
+      # If no specific OSS-Fuzz commit from CSV, use current HEAD
+      import subprocess
+      result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                            cwd=OSS_FUZZ_DIR,
+                            capture_output=True,
+                            text=True)
+      oss_fuzz_commit = result.stdout.strip()
+      logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
+
   if not build_image_impl(args.project):
     return False
 
