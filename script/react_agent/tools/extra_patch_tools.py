@@ -164,10 +164,12 @@ def _extra_skeleton_anchor_func_sig() -> str:
     return str(os.environ.get("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", "") or "").strip()
 
 
-def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2") -> int:
+def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2", symbol_name: str = "") -> int:
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
     Strategy: insert before a selected function definition start line (start.line).
+    - For __revert_* functions: insert AFTER the corresponding V2 function declaration (extent.end.line + 1).
+      This ensures types referenced by the function are already defined.
     - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
     - Otherwise, insert before the first function definition in the file (smallest start line).
     """
@@ -193,6 +195,32 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     nodes = file_index[ver].get(base) if isinstance(file_index[ver], dict) else None
     if not isinstance(nodes, list) or not nodes:
         return no_anchor()
+
+    # Special handling for __revert_* functions: insert after the V2 declaration of the underlying function.
+    # This ensures types used by the function are already defined.
+    symbol = str(symbol_name or "").strip()
+    if symbol.startswith("__revert_"):
+        # Extract underlying function name (e.g., "__revert_b1826c_stbi__jpeg_test" -> "stbi__jpeg_test")
+        kind, underlying = _symbol_underlying_name(symbol)
+        if kind == "revert_function" and underlying:
+            # Find the V2 declaration/definition of the underlying function
+            for n in nodes:
+                if not isinstance(n, dict):
+                    continue
+                spelling = str(n.get("spelling", "") or "").strip()
+                if spelling != underlying:
+                    continue
+                # Check if it's a function declaration or definition
+                node_kind = str(n.get("kind", "") or "").strip()
+                if node_kind not in _FUNC_DEF_KINDS and "FUNCTION" not in node_kind:
+                    continue
+                # Get the extent end line and insert after it
+                extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
+                end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
+                end_ln = int(end.get("line", 0) or 0)
+                if end_ln > 0:
+                    # Insert after the declaration line
+                    return end_ln + 1
 
     def in_file(node: dict) -> bool:
         extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
@@ -301,7 +329,7 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
     return 0
 
 
-def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3) -> str:
+def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3, symbol_name: str = "") -> str:
     """Create a minimal unified diff skeleton for a brand-new `_extra_*` patch key."""
     sm = getattr(agent_tools, "source_manager", None)
     if sm is None:
@@ -320,7 +348,9 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         return ""
 
     insert_at = -1
-    insert_line = _ast_insert_line_number_for_extra_skeleton(agent_tools, file_path=str(file_path or "").strip(), version="v2")
+    insert_line = _ast_insert_line_number_for_extra_skeleton(
+        agent_tools, file_path=str(file_path or "").strip(), version="v2", symbol_name=str(symbol_name or "").strip()
+    )
     if insert_line > 0:
         # We insert before the context line at insert_line; index is 0-based.
         idx = insert_line - 1
@@ -1465,7 +1495,7 @@ def make_extra_patch_override(
     patches = bundle.patches if isinstance(getattr(bundle, "patches", None), dict) else {}
     patch = patches.get(extra_key)
     if patch is None:
-        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s)
+        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol)
         if not existing.strip():
             return {
                 "patch_path": str(Path(patch_path_s).expanduser().resolve()),

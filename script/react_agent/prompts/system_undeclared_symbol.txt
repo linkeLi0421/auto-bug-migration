@@ -16,23 +16,37 @@ CRITICAL: When active patch_key is `_extra_*`:
 - Calling make_extra_patch_override while handling an `_extra_*` hunk would extend the same hunk, creating cascading issues or circular insertions.
 - For undeclared identifiers in `_extra_*` hunks:
   1. FIRST: Use search_definition(symbol_name="X", version="v1") to understand what X is.
-  2. If X is a complex V1 data structure (e.g., `defaultHandlers[]` array referencing other V1 symbols):
+  2. Distinguish between simple vs complex V1 symbols:
+     - SIMPLE: typedefs, structs, enums, simple function declarations → CAN be provided
+     - COMPLEX: static arrays with V1-only initializers, global data referencing other V1 symbols → CANNOT be provided
+  3. If X is a COMPLEX V1 data structure (e.g., `defaultHandlers[]` array referencing other V1 symbols):
      - Do NOT add an extern declaration - this will just cause linker errors.
      - Instead, REMOVE the line in the `_extra_*` hunk that references X.
      - Example: If `_extra_encoding.c` has `static const xmlCharEncodingHandler *xmlLatin1Handler = &defaultHandlers[4];`
        and `defaultHandlers` is a V1-only array, remove the entire `xmlLatin1Handler` line.
-  3. If X is a simple declaration that can be provided, add it to the `_extra_*` hunk.
+  4. If X is a SIMPLE declaration that can be provided (typedef, struct, enum, function declaration):
+     - ADD the definition to the `_extra_*` hunk.
+     - Do NOT remove code that references simple types.
+     - Example: If a `__revert_*` declaration references `stbi__context` (a simple struct), add the struct definition.
 - Use make_error_patch_override with a minimal slice rewrite to fix the `_extra_*` hunk.
 - This applies to ALL error types inside `_extra_*` hunks, not just undeclared symbols.
 
 Special handling for undeclared functions:
 
-For functions STARTING with "__revert_" (e.g., `__revert_e11519_xmlHashCreate`):
+For CALLS TO or DEFINITIONS OF functions STARTING with "__revert_" (e.g., `__revert_e11519_xmlHashCreate`):
 - These are migration-generated wrapper functions that SHOULD be used.
 - Do NOT remove or replace calls to `__revert_*` functions - they are correct!
-- The function just needs a forward declaration.
+- If the function is undeclared, it needs a forward declaration.
 - Use `make_extra_patch_override(symbol_name="__revert_e11519_xmlHashCreate", version="v1")` to add the declaration.
 - The tool will find the original function (e.g., `xmlHashCreate`) and generate the correct `__revert_*` declaration.
+
+For FORWARD DECLARATIONS of `__revert_*` functions that already exist in `_extra_*` hunks:
+- These declarations are correct and should be KEPT.
+- If the declaration references a missing type (e.g., `static int __revert_foo(missing_type *s);`):
+  - Do NOT remove the `__revert_*` declaration itself.
+  - Instead, provide the missing type definition.
+  - Use `make_error_patch_override` to rewrite the `_extra_*` hunk with both the type definition and the `__revert_*` declaration.
+  - Example: If `stbi__context` is missing, add the struct definition before the `__revert_*` declaration.
 
 For functions NOT starting with "__revert_":
 - This means the function is not reverted and cannot be used in this context.
