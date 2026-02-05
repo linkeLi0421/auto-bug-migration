@@ -1280,9 +1280,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
         path = path_b if 'dev/null' not in path_b else path_a
         # Derive file extension/type from path:
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
-        if ext not in ['c']:
-            # Skip non-C files
-            logger.debug(f'Skipping non-C file: {path}')
+        if ext not in ['c', 'h', 'cc', 'cpp', 'cxx', 'hh', 'hpp', 'hxx']:
+            # Skip non-C/C++ files
+            logger.debug(f'Skipping non-C/C++ file: {path}')
             continue
 
         patch_text = diff
@@ -2092,7 +2092,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
     visited_patches = set()
     trace_function_names = set()
     for index, func in trace1:
-        trace_function_names.add(func.split(' ')[0])
+        trace_function_names.add(func.split(' ')[0].split('(')[0])
     while patch_list:
         key = patch_list.pop()
         if key in visited_patches:
@@ -2643,11 +2643,12 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     trace_set = set() # avoid duplicate functions in loop
     recreated_names = {func.name for func in recreated_functions}
     for index, func in trace1:
-        fname = func.split(' ')[0]
+        fname = func.split(' ')[0].split('(')[0]
         if fname in recreated_names:
             continue
-        location = func.split(' ')[1]
+        location = func.split(' ')[-1]
         file_path = location.split(':')[0][1:]  # remove leading /
+        file_path = os.path.normpath(file_path)  # normalize paths like tests/../stb_image.h to stb_image.h
         trace_set.add((fname, file_path))
     for fname, file_path in trace_set:
         old_line_begin = None
@@ -2666,12 +2667,11 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             for node in ast_nodes:
                 if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
                     continue
-                if node['extent']['start']['file'] == file_path and node['signature'].split('(')[0].split(' ')[-1] == fname:
+                if node['extent']['start']['file'] == file_path and (node['signature'].split('(')[0].split(' ')[-1] == fname or node['spelling'] == fname):
                     # Found the function definition
                     old_line_begin = node['extent']['start']['line']
                     old_line_end = node['extent']['end']['line']
                     break
-
         if old_line_begin and old_line_end:
             # Create a patch to add the function call
             patch_header = f"diff --git a/{file_path} b/{file_path}\n"
@@ -2749,6 +2749,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
         if 'LLVMFuzzerTestOneInput' in trace:
             location = trace.split(' ')[1]
             fuzzer_file_path = location.split(':')[0][1:]  # remove leading /
+            fuzzer_file_path = os.path.normpath(fuzzer_file_path)  # normalize paths like tests/../file.h
             break
     
     # Step 1: Identify all patches that affect LLVMFuzzerTestOneInput function
@@ -3953,7 +3954,7 @@ def minimize_with_trace_and_cached_extras(
 
     # Phase 1: Static trace-based filtering
     all_patch_keys = [key for keys in patch_pair_list for key in keys]
-    trace_func_list = [(func.split(' ')[0], func.split(' ')[-1]) for _, func in trace1]
+    trace_func_list = [(func.split('(')[0], func.split(' ')[-1]) for _, func in trace1]
 
     filtered_keys = filter_patches_by_trace(
         all_patch_keys, diff_results, trace_func_list, depen_graph
@@ -5102,10 +5103,15 @@ def revert_patch_test(args):
             if func in func_dict:
                 continue
             func_loc = func.split(' ')[-1]
-            func_dict[func] = func.split(' ')[0]
+            func_dict[func] = func.split(' ')[0].split('(')[0]
             trace_func_list.append((func_dict[func], func_loc))
             
         logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
+        logger.info(f"Total diff results: {len(diff_results)}")
+        if diff_results:
+            logger.info(f"Sample diff result keys: {list(diff_results.keys())[:5]}")
+            for key, val in list(diff_results.items())[:3]:
+                logger.info(f"  Key: {key}, new_sig: {val.new_signature}, old_sig: {val.old_signature}, file_old: {val.file_path_old}, file_new: {val.file_path_new}")
         if not trace_func_list:
             logger.info(f'No function signatures found in trace for bug {bug_id}\n')
             continue
@@ -5140,12 +5146,23 @@ def revert_patch_test(args):
             else:
                 patch_file_path = diff_result.file_path_new
             update_type_set(diff_result)
-            
+
+            # Extract just the filename from patch_file_path for comparison
+            # patch_file_path might be like "b/stb_image.h" or "a/stb_image.h"
+            patch_filename = os.path.basename(patch_file_path)
             # If both bug commit's and fix commit's trace contain this patched function,
             # the patch of the function is likely related to the bug fixing. So try to
-            # revert it. 
+            # revert it.
+            matched = False
             for trace_func, func_loc in trace_func_list:
-                if patch_file_path in func_loc and (trace_func == patch_func_old or trace_func == patch_func_new):
+                # func_loc is like "/tests/../stb_image.h:7538:0", extract the filename part
+                func_loc_file = func_loc.split(':')[0]  # Remove :line:col part
+                func_loc_filename = os.path.basename(func_loc_file)
+                # trace_func might have parameters like "stbi__bmp_load(stbi__context*,"
+                # Extract just the function name by splitting on '('
+                trace_func_name = trace_func.split('(')[0]
+                if patch_filename == func_loc_filename and (trace_func_name == patch_func_old or trace_func_name == patch_func_new):
+                    matched = True
                     if not diff_result.old_signature:
                         diff_result.old_signature, diff_result.old_function_start_line, diff_result.old_function_end_line = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
                     if not diff_result.new_signature and diff_result.file_path_new != '/dev/null':

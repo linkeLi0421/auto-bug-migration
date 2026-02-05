@@ -1,11 +1,20 @@
 import os
 import json
-from clang.cindex import Index, CursorKind, Config
+from clang.cindex import Index, CursorKind, Config, Diagnostic
 from clang.cindex import TranslationUnit
 import subprocess
 
 Config.set_library_file('/usr/lib/llvm-18/lib/libclang.so')  # adjust for your system
 index = Index.create()
+
+
+def print_diagnostics(tu, path):
+    """Print any parsing errors/warnings from the translation unit"""
+    if not tu or not tu.diagnostics:
+        return
+    print(f"  Diagnostics for {path}:")
+    for diag in tu.diagnostics:
+        print(f"    [{diag.severity}] {diag.spelling} at {diag.location.file}:{diag.location.line}")
 
 
 def _extent_dict(cur, include_paths):
@@ -62,19 +71,52 @@ def get_defs(directory, src_file, args):
     
     if not os.path.exists(path):
         print(f"File does not exist: {path}")
-        return set()
-    tu = index.parse(path, args=args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
-    results = []
-    dir_path, file_name = os.path.split(path)
-    dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
-    out_path_set = set()
+        return {}
+    
+    # For header files, use a special strategy
+    is_header = src_file.endswith('.h') or src_file.endswith('.hpp')
+    
+    # Try multiple parsing strategies with different fallback options
+    parse_args = args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"]
+    
+    # Add -fsyntax-only for header files
+    if is_header and "-fsyntax-only" not in parse_args:
+        parse_args = parse_args + ["-fsyntax-only"]
+    
+    tu = None
+    try:
+        tu = index.parse(path, args=parse_args, options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+        if tu and tu.cursor:
+            print_diagnostics(tu, path)
+    except Exception as e:
+        print(f"Warning: First parse attempt failed for {path}: {e}")
+        print(f"  Args: {parse_args}")
+        # Fallback: try without resource-dir
+        try:
+            tu = index.parse(path, args=args[:-1], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+            if tu and tu.cursor:
+                print_diagnostics(tu, path)
+        except Exception as e2:
+            print(f"Warning: Second parse attempt failed for {path}: {e2}")
+            print(f"  Args: {args[:-1]}")
+            # Final fallback: try with minimal options (no args)
+            try:
+                tu = index.parse(path, args=[], options=0)
+                if tu and tu.cursor:
+                    print(f"  Success with minimal options for {path}")
+                    print_diagnostics(tu, path)
+            except Exception as e3:
+                print(f"Error: Could not parse {path} with any strategy: {e3}")
+                return {}
+    
     defs_by_usr = {}
     
-    for cursor in tu.cursor.walk_preorder():
-        if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition():
-            usr = cursor.get_usr()
-            if usr:
-                defs_by_usr[usr] = cursor
+    if tu and tu.cursor:
+        for cursor in tu.cursor.walk_preorder():
+            if cursor.kind == CursorKind.FUNCTION_DECL and cursor.is_definition():
+                usr = cursor.get_usr()
+                if usr:
+                    defs_by_usr[usr] = cursor
     return defs_by_usr
 
 
@@ -85,10 +127,48 @@ def analyze_file(directory, src_file, args, defs_by_usr):
     if not os.path.exists(path):
         print(f"File does not exist: {path}")
         return set()
-    tu = index.parse(path, args=args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+    
+    # For header files, use a special strategy
+    is_header = src_file.endswith('.h') or src_file.endswith('.hpp')
+    
+    # Try multiple parsing strategies with different fallback options
+    parse_args = args[:-1] + ["-resource-dir=/usr/local/lib/clang/18"]
+    
+    # Add -fsyntax-only for header files
+    if is_header and "-fsyntax-only" not in parse_args:
+        parse_args = parse_args + ["-fsyntax-only"]
+    
+    tu = None
+    try:
+        tu = index.parse(path, args=parse_args, options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+        if tu and tu.cursor:
+            print_diagnostics(tu, path)
+    except Exception as e:
+        print(f"Warning: First parse attempt failed for {path}: {e}")
+        # Fallback: try without resource-dir
+        try:
+            tu = index.parse(path, args=args[:-1], options=TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+            if tu and tu.cursor:
+                print_diagnostics(tu, path)
+        except Exception as e2:
+            print(f"Warning: Second parse attempt failed for {path}: {e2}")
+            # Final fallback: try with minimal options
+            try:
+                tu = index.parse(path, args=[], options=0)
+                if tu and tu.cursor:
+                    print(f"  Success with minimal options for {path}")
+                    print_diagnostics(tu, path)
+            except Exception as e3:
+                print(f"Error: Could not parse {path} with any strategy: {e3}")
+                return set()
+    
     dir_path, file_name = os.path.split(path)
     dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
     out_path_set = set()
+    
+    if not tu or not tu.cursor:
+        print(f"Warning: No cursor available for {path}")
+        return set()
     
     for cursor in tu.cursor.walk_preorder():
         file_path = os.path.normpath(str(cursor.location.file) if cursor.location.file else "")
