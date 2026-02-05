@@ -22,3 +22,5 @@ llvm_build_dirs
 /patch
 /pocs
 /log/
+
+/script/setenv.sh

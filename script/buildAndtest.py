@@ -71,6 +71,31 @@ BASE_RUNNER_IMAGES = [
 ]
 
 
+def get_latest_images_before_year(year: int) -> tuple:
+    """
+    Get the latest base-builder and base-runner image digests before a given year.
+
+    Returns:
+        (builder_digest, runner_digest) tuple of sha256 digest strings.
+    """
+    cutoff = f'{year}-01-01'
+    builder = None
+    for date_str, digest, _ in BASE_BUILDER_IMAGES:
+        if date_str < cutoff:
+            builder = digest
+    if builder is None:
+        builder = BASE_BUILDER_IMAGES[0][1]
+
+    runner = None
+    for date_str, digest, _ in BASE_RUNNER_IMAGES:
+        if date_str < cutoff:
+            runner = digest
+    if runner is None:
+        runner = BASE_RUNNER_IMAGES[0][1]
+
+    return builder, runner
+
+
 def get_base_builder_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-builder image digest for a given commit timestamp.
@@ -222,7 +247,8 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
     return valid_pocs
 
 
-def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer):
+def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer,
+                  fixed_builder=None, fixed_runner=None):
     '''
     Run helper.py build_image and build_fuzzers
     ''' 
@@ -274,9 +300,14 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
             if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str))) > 3:
                 continue
 
+            if fixed_builder:
+                image_args = ["--runner-image", fixed_builder]
+            else:
+                image_args = ["--runner-image", "auto", "--commit-date", str(oss_fuzz_timestamp)]
+
             cmd = [
                 py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
-                "--runner-image", "auto", "--commit-date", str(oss_fuzz_timestamp),
+                *image_args,
                 target
             ]
 
@@ -337,7 +368,8 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     else:
         return False
 
-def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
+def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos,
+                fixed_runner=None):
     '''
     Run helper.py reproduce
     '''
@@ -374,10 +406,15 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos):
             logger.error(f"Source directory or file does not exist: {source_dir}")
             return
 
-        # Use commit time for automatic runner image selection
+        # Use fixed runner image or auto-select based on commit time
+        if fixed_runner:
+            image_args = ['--runner-image', fixed_runner]
+        else:
+            image_args = ['--runner-image', 'auto', '--commit-date', str(commit_time)]
+
         cmd = [
             py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', '--fuzzer_path', source_dir,
-            '--runner-image', 'auto', '--commit-date', str(commit_time),
+            *image_args,
             target, fuzz_target, poc_path
         ]
         try:
@@ -656,8 +693,19 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["build", "test", "both"], default="both",
                        help="Specify the operation mode: 'build' for building only, 'test' for testing only, or 'both' for both operations")
     parser.add_argument("--fuzzer", help = "Harness to test")
+    parser.add_argument("--fixed-image", type=int, metavar="YEAR", default=None,
+                       help="Use fixed Docker images: latest base-builder/base-runner before YEAR (e.g., 2023)")
     args = parser.parse_args()
     target = args.target
+
+    # Resolve fixed image digests if requested
+    fixed_builder = None
+    fixed_runner = None
+    if args.fixed_image:
+        fixed_builder, fixed_runner = get_latest_images_before_year(args.fixed_image)
+        logger.info(f"Using fixed images (latest before {args.fixed_image}):")
+        logger.info(f"  base-builder: {fixed_builder}")
+        logger.info(f"  base-runner:  {fixed_runner}")
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     oss_fuzz_path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
     log_path = os.getenv('LOG_PATH')
@@ -714,7 +762,8 @@ if __name__ == "__main__":
             # Write header if file doesn't exist
             build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
             for commit in commits:  # from latest to old
-                do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer)
+                do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer,
+                             fixed_builder=fixed_builder, fixed_runner=fixed_runner)
         
     
     if args.mode in ["test", "both"]:
@@ -730,5 +779,6 @@ if __name__ == "__main__":
         test_writer.writerow(csv_header)  # Write the header
         
         for commit in commits: # from lastest to old
-            do_bug_test(repo_path, commit, test_writer, filter_bug_ids, bug_infos)
+            do_bug_test(repo_path, commit, test_writer, filter_bug_ids, bug_infos,
+                        fixed_runner=fixed_runner)
         test_csv_file.close()
