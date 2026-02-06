@@ -2363,6 +2363,13 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
   with open(target_dockerfile_path, 'w') as dockerfile:
       dockerfile.write(updated_content)
 
+  build_script = f'{oss_fuzz_dir}/projects/{target}/build.sh'
+  with open(build_script, 'r') as build_file:
+      build_content = build_file.read()
+  if target == 'opensc':
+    build_content = build_content.replace('./configure', './configure --disable-strict')
+  with open(build_script, 'w') as build_file:
+      build_file.write(build_content)
 
 def get_poc_for_new_version(args):
   """Use target fuzz to generate poc for new version. Use old poc as seed.
