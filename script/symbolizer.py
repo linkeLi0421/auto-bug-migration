@@ -8,6 +8,8 @@ symbol names and source locations.
 """
 import re
 import sys
+import os
+import shutil
 import argparse
 import subprocess
 from collections import defaultdict
@@ -19,9 +21,13 @@ def symbolize_funcs(all_offsets, binary_path):
 
     # Batch process all offsets in a single call
     # llvm-symbolizer expects hex addresses with 0x prefix
-    cmd_input = '\n'.join(["{} 0x{}".format(binary_path, offset) for offset in all_offsets])
+    cmd_input = '\n'.join(["{} {}".format(binary_path, offset) for offset in all_offsets])
+    if not os.path.exists('/out/llvm-symbolizer'):
+        llvm_symbolizer_path = shutil.which('llvm-symbolizer')
+    else:
+        llvm_symbolizer_path = '/out/llvm-symbolizer'
     
-    proc = subprocess.Popen(['/out/llvm-symbolizer'], 
+    proc = subprocess.Popen([llvm_symbolizer_path], 
                           stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE,

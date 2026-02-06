@@ -225,15 +225,27 @@ def find_macro_block(file_content, start_line):
     define_line = None
     undef_line = None
 
+    # Ensure we have valid content
+    if not file_content or start_line < 1:
+        return None
+
     # Search upward for #define XML_OP
-    for i in range(start_line - 2, -1, -1):
+    # Clamp search_start to valid range [0, len(file_content)-1]
+    search_start = min(start_line - 2, len(file_content) - 1)
+    search_start = max(0, search_start)
+
+    for i in range(search_start, -1, -1):
         if '#define XML_OP' in file_content[i]:
             define_line = i + 1
             break
 
     # Search downward for #undef XML_OP
     if define_line is not None:
-        for i in range(start_line - 1, len(file_content)):
+        # Clamp search_start_down to valid range
+        search_start_down = min(start_line - 1, len(file_content) - 1)
+        search_start_down = max(0, search_start_down)
+
+        for i in range(search_start_down, len(file_content)):
             if '#undef XML_OP' in file_content[i]:
                 undef_line = i + 1
                 break
