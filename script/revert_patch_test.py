@@ -5321,17 +5321,21 @@ def revert_patch_test(args):
 
         min_path_dict[bug_id] = minimal_fast
 
-        patches_without_contexts[
-            (bug_id, commit['commit_id'], fuzzer,
-            tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
-        ] = patches_without_context
+        # Only cache bugs that were triggered correctly
+        if result in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+            patches_without_contexts[
+                (bug_id, commit['commit_id'], fuzzer,
+                tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
+            ] = patches_without_context
 
-        # Save cache incrementally after each bug completes
-        try:
-            save_patches_pickle(patches_without_contexts, cache_file)
-            logger.info(f"Saved cache with {len(patches_without_contexts)} bug results to {cache_file}")
-        except Exception as e:
-            logger.warning(f"Failed to save cache for bug {bug_id}: {e}")
+            # Save cache incrementally after each bug completes
+            try:
+                save_patches_pickle(patches_without_contexts, cache_file)
+                logger.info(f"Saved cache with {len(patches_without_contexts)} bug results to {cache_file}")
+            except Exception as e:
+                logger.warning(f"Failed to save cache for bug {bug_id}: {e}")
+        else:
+            logger.info(f"Bug {bug_id} not triggered correctly (result={result}), skipping cache save")
 
         get_patched_traces, transitions, signature_change_list = mutable_args
 
