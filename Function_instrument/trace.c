@@ -8,17 +8,34 @@
 
 static FILE *trace_fp = NULL;
 
+__attribute__((no_instrument_function))
 void __cyg_profile_func_enter(void *func, void *caller) {
     if (!trace_fp) {
         trace_fp = fopen("/tmp/trace.txt", "w");
         if (!trace_fp) trace_fp = stderr;
     }
-    
+
     Dl_info info;
+
+#if defined(__clang__) && __clang_major__ >= 15
+    /* Clang 15+ (PIE default, offsets are meaningful) */
     if (dladdr(func, &info)) {
-      uintptr_t offset = (uintptr_t)func - (uintptr_t)info.dli_fbase;
-      uintptr_t caller_offset = (uintptr_t)caller - (uintptr_t)info.dli_fbase;
-      fprintf(trace_fp, "offset: %ld called by: %ld\n", offset, caller_offset);
-      fflush(trace_fp);
+        uintptr_t offset =
+            (uintptr_t)func - (uintptr_t)info.dli_fbase;
+        uintptr_t caller_offset =
+            (uintptr_t)caller - (uintptr_t)info.dli_fbase;
+
+        fprintf(trace_fp,
+                "offset: %ld called by: %ld\n",
+                offset, caller_offset);
+        fflush(trace_fp);
     }
+#else
+    /* Clang < 15 (non-PIE default, absolute addresses usable) */
+    if (dladdr(func, &info)) {
+        fprintf(trace_fp,
+                "offset: %ld called by: %ld\n",
+                func, caller);
+    }
+#endif
 }
