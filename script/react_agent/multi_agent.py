@@ -20,6 +20,16 @@ from tools.migration_tools import get_link_error_patch
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
+# Strip accumulated merge suffixes like ".merged_overrides", ".continuation.1", ".dynamic.3"
+# from patch bundle stems so filenames stay short across rounds.
+_MERGE_SUFFIX_RE = re.compile(r"(\.merged_overrides|\.continuation\.\d+|\.dynamic\.\d+)+$")
+
+
+def _patch_base_name(patch_path: str) -> str:
+    """Return a short base name from *patch_path*, stripping accumulated merge suffixes."""
+    stem = Path(patch_path).stem or "bundle"
+    return _MERGE_SUFFIX_RE.sub("", stem) or "bundle"
+
 
 def _safe_patch_key_dirname(name: str, *, max_len: int = 160) -> str:
     raw = str(name or "").strip()
@@ -1138,7 +1148,7 @@ def main(argv: List[str]) -> int:
                 os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
                 from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test, write_patch_bundle_with_overrides  # type: ignore
 
-                base = Path(patch_path).stem or "bundle"
+                base = _patch_base_name(patch_path)
                 out = write_patch_bundle_with_overrides(
                     patch_path=str(patch_path),
                     patch_override_paths=combined_override_paths,
@@ -1241,7 +1251,7 @@ def main(argv: List[str]) -> int:
             os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
             from tools.ossfuzz_tools import write_patch_bundle_with_overrides  # type: ignore
 
-            base = Path(patch_path).stem or "bundle"
+            base = _patch_base_name(patch_path)
             out = write_patch_bundle_with_overrides(
                 patch_path=str(patch_path),
                 patch_override_paths=combined_override_paths,
@@ -1393,7 +1403,7 @@ def main(argv: List[str]) -> int:
                 os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
                 from tools.ossfuzz_tools import write_patch_bundle_with_overrides  # type: ignore
 
-                base = Path(patch_path).stem or "bundle"
+                base = _patch_base_name(patch_path)
                 out = write_patch_bundle_with_overrides(
                     patch_path=str(patch_path),
                     patch_override_paths=combined_override_paths,

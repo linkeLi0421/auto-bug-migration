@@ -623,8 +623,11 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
     }
 
 
+_UNDEF_REF_RE = re.compile(r"undefined reference to [`']([^`']+)'")
+
+
 def _get_link_error_patch_from_bundle(
-    bundle: PatchBundle, *, patch_path: str, file_path: str, function_name: str
+    bundle: PatchBundle, *, patch_path: str, file_path: str, function_name: str, error_text: str = ""
 ) -> Dict[str, Any]:
     """Map a linker undefined-reference error to a patch slice using file + function name."""
     func = str(function_name or "").strip()
@@ -632,6 +635,13 @@ def _get_link_error_patch_from_bundle(
         raise ValueError("function_name must be non-empty")
 
     base = _strip_revert_prefix(func)
+
+    # Extract the undefined symbol (e.g. "cac_write_binary") from error_text for tiebreaking.
+    undef_symbol = ""
+    if error_text:
+        m = _UNDEF_REF_RE.search(str(error_text))
+        if m:
+            undef_symbol = m.group(1).strip()
 
     def locate_hit_index(body: List[str]) -> int:
         # Prefer exact `__revert_...` function name hits (most common for removed/recreated functions).
@@ -692,6 +702,10 @@ def _get_link_error_patch_from_bundle(
         hit_idx = locate_hit_index(body)
         if hit_idx >= 0:
             score += 5
+
+        # Tiebreaker: prefer hunks that contain the undefined symbol from the error.
+        if undef_symbol and undef_symbol in text:
+            score += 3
 
         if score > best_score:
             best_score = score
@@ -1016,7 +1030,7 @@ def get_link_error_patch_context(
 ) -> Dict[str, Any]:
     """Return patch context for a linker error mapped by file + function name."""
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
-    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
+    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name, error_text=error_text)
     patch_key = mapping.get("patch_key")
     if not patch_key or str(patch_key) not in bundle.patches:
         return {
