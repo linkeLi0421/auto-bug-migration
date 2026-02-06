@@ -2039,6 +2039,8 @@ def build_version(args):
       oss_fuzz_commit = result.stdout.strip()
       logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
+  else:
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
 
   if not build_image_impl(args.project):
     return False
