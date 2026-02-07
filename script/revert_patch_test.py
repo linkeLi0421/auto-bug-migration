@@ -1752,8 +1752,6 @@ def _run_single_multi_agent_round(
         "--openai-max-tokens", str(openai_max_tokens),
         "--output-format", "none",
         "--max-restarts-per-hunk", str(max_restarts_per_hunk),
-        "--auto-continue-on-link-errors",
-        "--refresh-error-queue", "never",
     ]
 
     logger.info(f"Calling react multi-agent: {' '.join(cmd)}")
