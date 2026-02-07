@@ -123,17 +123,11 @@ Agent outputs (diffs, logs, observations) go to `data/react_agent_artifacts/<run
 
 ### Error Types and Hunk Status
 - **Compiler errors**: Detected via `file:line:col: error:` patterns. These determine hunk "fixed" status.
-- **Linker errors**: Detected via `undefined reference to` patterns. These are handled separately by multi-agent continuation loop.
-- **Hunk fixed**: A hunk is marked "fixed" when all **compiler errors** in the active patch_key are resolved. Linker errors don't count against hunk status (they're a different class of error handled by `--auto-continue-on-link-errors`).
+- **Linker errors**: Detected via `undefined reference to` patterns. These are grouped by patch_key alongside compiler errors.
+- **Hunk fixed**: A hunk is marked "fixed" when all **compiler errors** in the active patch_key are resolved.
 
 ### Patch-Aware Workflow
 Recommended tool order: `parse_build_errors` → `get_error_patch_context` → `read_artifact` (BASE slice) → `make_error_patch_override` → `ossfuzz_apply_patch_and_test`
-
-### Multi-Agent Continuation Loop
-When using `--auto-continue-on-link-errors`, the multi-agent will:
-1. Run agents to fix compiler errors in each patch_key
-2. Collect override diffs and run a final OSS-Fuzz build
-3. If linker errors remain, spawn new agents to fix them (up to 10 rounds)
 
 ### Environment Variables
 - `OPENAI_API_KEY`: API key for OpenAI models
