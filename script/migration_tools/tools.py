@@ -1449,7 +1449,7 @@ def make_error_patch_override(
 
     # Never truncate the returned patch_text: the agent consumes it as an override diff artifact,
     # and truncation can produce a corrupt/unapplyable patch.
-    old_func_code, old_truncated, _, _ = _truncate_text(text=old_func_code_full, max_lines=200, max_chars=12000)
+    new_func_code_text, new_truncated, _, _ = _truncate_text(text=new_code_norm, max_lines=200, max_chars=12000)
     patch_text = patch_text_full
     patch_truncated = False
     patch_returned_lines = patch_total_lines
@@ -1457,8 +1457,8 @@ def make_error_patch_override(
     out: Dict[str, Any] = {
         **mapping,
         "file_path_patch": rel_file,
-        "old_func_code": old_func_code,
-        "old_func_code_truncated": old_truncated,
+        "old_func_code": new_func_code_text,
+        "old_func_code_truncated": new_truncated,
         "new_func_code_lines": new_len,
         "patch_text": patch_text,
         "patch_text_truncated": patch_truncated,
@@ -1690,7 +1690,7 @@ def make_link_error_patch_override(
     patch_total_lines = len(patch_lines)
 
     # Never truncate patch_text (always returned in full).
-    old_func_code, old_truncated, _, _ = _truncate_text(text=old_func_code_full, max_lines=200, max_chars=12000)
+    new_func_code_text, new_truncated, _, _ = _truncate_text(text=new_code_norm, max_lines=200, max_chars=12000)
     patch_text = patch_text_full
     patch_truncated = False
     patch_returned_lines = patch_total_lines
@@ -1698,8 +1698,8 @@ def make_link_error_patch_override(
     out: Dict[str, Any] = {
         **mapping,
         "file_path_patch": rel_file,
-        "old_func_code": old_func_code,
-        "old_func_code_truncated": old_truncated,
+        "old_func_code": new_func_code_text,
+        "old_func_code_truncated": new_truncated,
         "new_func_code_lines": new_len,
         "patch_text": patch_text,
         "patch_text_truncated": patch_truncated,
