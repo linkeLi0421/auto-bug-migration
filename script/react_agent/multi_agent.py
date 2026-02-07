@@ -931,6 +931,7 @@ def main(argv: List[str]) -> int:
             # Use per-hunk artifact root so merged diffs go to per-hunk subdirectory, not multi-agent root.
             agent_env = dict(env)
             agent_env["REACT_AGENT_ARTIFACT_ROOT"] = str(out_dir)
+            (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
             proc_returncode: int = -1  # Default for timeout case
             try:
                 proc = subprocess.run(cmd, text=True, capture_output=True, env=agent_env, timeout=agent_timeout)
@@ -947,7 +948,6 @@ def main(argv: List[str]) -> int:
 
             parsed, parse_error = _try_parse_agent_output(stdout)
 
-            (out_dir / "agent_cmd.txt").write_text(_redact_cmd_for_log(cmd), encoding="utf-8", errors="replace")
             (out_dir / "agent_stdout.json").write_text(stdout + ("\n" if stdout else ""), encoding="utf-8", errors="replace")
             if stderr:
                 (out_dir / "agent_stderr.log").write_text(stderr + "\n", encoding="utf-8", errors="replace")
@@ -1202,6 +1202,10 @@ def main(argv: List[str]) -> int:
                 else:
                     build_log_text = str(build_output_ref)
                 build_log_path.write_text(build_log_text, encoding="utf-8", errors="replace")
+
+                # Remove the redundant tool artifact (content already saved as final_ossfuzz_build_output.log)
+                if build_output_artifact and Path(build_output_artifact).is_file():
+                    Path(build_output_artifact).unlink(missing_ok=True)
 
                 patch_apply_ok = bool(res.get("patch_apply_ok"))
                 build_ok = bool(res.get("build_ok"))
