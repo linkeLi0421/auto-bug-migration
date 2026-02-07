@@ -668,6 +668,7 @@ def _get_link_error_patch_from_bundle(
     best_key: Optional[str] = None
     best_score = -1
     best_hit_idx = -1
+    best_minus_count = -1
 
     for key in bundle.keys_sorted:
         patch = bundle.patches[key]
@@ -707,10 +708,14 @@ def _get_link_error_patch_from_bundle(
         if undef_symbol and undef_symbol in text:
             score += 3
 
-        if score > best_score:
+        # Count '-' lines in body for secondary tiebreaker (prefer larger function bodies).
+        minus_count = sum(1 for line in body if line.startswith("-"))
+
+        if score > best_score or (score == best_score and minus_count > best_minus_count):
             best_score = score
             best_key = key
             best_hit_idx = hit_idx
+            best_minus_count = minus_count
 
     if not best_key or best_key not in bundle.patches:
         return {
@@ -1482,6 +1487,7 @@ def make_link_error_patch_override(
     file_path: str,
     function_name: str,
     new_func_code: str,
+    error_text: str = "",
     context_lines: int = 0,
     max_lines: int = 2000,
     max_chars: int = 200000,
@@ -1497,7 +1503,7 @@ def make_link_error_patch_override(
         raise ValueError("new_func_code must be non-empty")
 
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
-    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name)
+    mapping = _get_link_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, function_name=function_name, error_text=error_text)
     patch_key = mapping.get("patch_key")
 
     if not patch_key or str(patch_key) not in bundle.patches:

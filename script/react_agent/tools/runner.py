@@ -404,6 +404,7 @@ class ToolRunner:
                 file_path = str(args.get("file_path", "")).strip()
                 function_name = str(args.get("function_name", "")).strip()
                 new_func_code = str(args.get("new_func_code", ""))
+                error_text = str(args.get("error_text", "")).strip()
                 context_lines = _as_int(args.get("context_lines"), 0)
                 max_lines = _as_int(args.get("max_lines"), 2000)
                 max_chars = _as_int(args.get("max_chars"), 200000)
@@ -420,6 +421,7 @@ class ToolRunner:
                     file_path=file_path,
                     function_name=function_name,
                     new_func_code=new_func_code,
+                    error_text=error_text,
                     context_lines=context_lines,
                     max_lines=max_lines,
                     max_chars=max_chars,
@@ -431,6 +433,7 @@ class ToolRunner:
                         "patch_path": patch_path,
                         "file_path": file_path,
                         "function_name": function_name,
+                        "error_text": error_text,
                         "context_lines": context_lines,
                         "max_lines": max_lines,
                         "max_chars": max_chars,

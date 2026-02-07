@@ -143,6 +143,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "file_path": "string",
             "function_name": "string",
             "new_func_code": "string",
+            "error_text": "string?",
             "context_lines": "int?",
             "max_lines": "int?",
             "max_chars": "int?",

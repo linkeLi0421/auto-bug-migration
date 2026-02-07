@@ -6113,6 +6113,7 @@ def main(argv: List[str]) -> int:
 
     grouped_errors: List[Dict[str, Any]] = []
     patch_key = ""
+    focus_patch_key_error = ""
     missing_struct_members: List[Dict[str, Any]] = []
     active_old_signature = ""
     function_groups: List[Dict[str, Any]] = []
@@ -6186,13 +6187,39 @@ def main(argv: List[str]) -> int:
                     first_focus_key = key
                 groups.setdefault(key, []).append(enriched)
 
-            if groups:
-                focus = str(getattr(args, "focus_patch_key", "") or "").strip()
-                if focus and focus in groups:
+            focus = str(getattr(args, "focus_patch_key", "") or "").strip()
+            if focus:
+                if focus in groups:
                     patch_key = focus
-                elif first_focus_key and first_focus_key in groups:
-                    patch_key = first_focus_key
                 else:
+                    focus_exists_in_bundle = False
+                    try:
+                        from migration_tools.patch_bundle import load_patch_bundle as _load_patch_bundle  # type: ignore  # noqa: PLC0415
+
+                        bundle = _load_patch_bundle(patch_path)
+                        focus_exists_in_bundle = focus in getattr(bundle, "patches", {})
+                    except Exception:
+                        focus_exists_in_bundle = False
+
+                    mapped_keys = list(groups.keys())
+                    mapped_preview = ", ".join(mapped_keys[:8])
+                    if len(mapped_keys) > 8:
+                        mapped_preview = f"{mapped_preview}, ..."
+                    if focus_exists_in_bundle:
+                        focus_patch_key_error = (
+                            f"--focus-patch-key {focus!r} exists in the patch bundle but no current build-log "
+                            f"diagnostics map to it. Mapped patch_key values in this run: {mapped_preview or '<none>'}"
+                        )
+                    else:
+                        focus_patch_key_error = (
+                            f"--focus-patch-key {focus!r} was not found in the patch bundle. "
+                            f"Mapped patch_key values in this run: {mapped_preview or '<none>'}"
+                        )
+
+            if groups and not focus_patch_key_error:
+                if not patch_key and first_focus_key and first_focus_key in groups:
+                    patch_key = first_focus_key
+                if not patch_key:
                     patch_key = first_mapped_key if first_mapped_key in groups else max(groups.items(), key=lambda kv: len(kv[1]))[0]
                 ranked = _prioritize_unknown_type_name_within_hunk(_prioritize_warnings_within_hunk(groups[patch_key]))
                 full_grouped = _prioritize_focus_within_hunk(ranked, focus_error)
@@ -6217,6 +6244,18 @@ def main(argv: List[str]) -> int:
             grouped_errors = []
             patch_key = ""
             missing_struct_members = []
+
+    if focus_patch_key_error:
+        _emit(
+            {
+                "type": "final",
+                "thought": "Focus patch key mismatch.",
+                "summary": "",
+                "next_step": focus_patch_key_error,
+            },
+            args.output_format,
+        )
+        return 1
 
     target_errors = _extract_target_errors(error_line=error_line, grouped_errors=grouped_errors, patch_key=patch_key)
 
