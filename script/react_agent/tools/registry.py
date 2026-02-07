@@ -89,9 +89,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_total_lines": "int?",
         },
         "description": (
-            "Map a build error location to a patch and return the full unified-diff hunk excerpt (applyable) plus "
-            "merged/tail helpers: patch_minus_code (all '-' lines) and error_func_code (the mapped '-' slice that "
-            "contains the error location). Also returns pre_patch_* line mapping when available."
+            "Map a compiler/build error location (file_path + line_number) to a patch and return the full unified-diff "
+            "hunk excerpt (applyable) plus merged/tail helpers: patch_minus_code (all '-' lines) and error_func_code "
+            "(the mapped '-' slice that contains the error location). Also returns pre_patch_* line mapping when available. "
+            "Use this for ALL compiler errors (file:line:col: error/warning). "
+            "For linker 'undefined reference to' errors use get_link_error_patch_context instead."
         ),
     },
     {
@@ -105,9 +107,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_total_lines": "int?",
         },
         "description": (
+            "ONLY for linker 'undefined reference to' errors. "
             "Map a linker undefined-reference error to a patch slice using file_path + function_name and return "
             "the full unified-diff hunk excerpt (applyable) plus patch_minus_code (all '-' lines) and "
             "error_func_code (the mapped '-' slice for that function). "
+            "Do NOT use this for compiler errors (file:line:col: error/warning) — use get_error_patch_context instead. "
             "IMPORTANT: file_path must be the actual source file name (e.g., 'card-itacns.c' or 'src/libopensc/card-itacns.c'), "
             "NOT a patch_key. Extract the file name from the linker error message (e.g., 'card-itacns.c:(.text...)' → 'card-itacns.c'). "
             "Use error_file_path from context if available."
@@ -144,9 +148,11 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "max_chars": "int?",
         },
         "description": (
+            "ONLY for linker 'undefined reference to' errors. "
             "Rewrite a linker-error mapped patch slice by replacing its '-' lines with the provided code (each line stored as '-...') "
             "and recomputing hunk lengths. Use after get_link_error_patch_context when the build fails at link time "
-            "with 'undefined reference to ...' inside a __revert_* function."
+            "with 'undefined reference to ...' inside a __revert_* function. "
+            "Do NOT use this for compiler errors — use make_error_patch_override instead."
         ),
     },
     {

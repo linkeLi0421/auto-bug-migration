@@ -20,9 +20,9 @@ from tools.migration_tools import get_link_error_patch
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-# Strip accumulated merge suffixes like ".merged_overrides", ".continuation.1", ".dynamic.3"
+# Strip accumulated merge suffixes like ".merged_overrides"
 # from patch bundle stems so filenames stay short across rounds.
-_MERGE_SUFFIX_RE = re.compile(r"(\.merged_overrides|\.continuation\.\d+|\.dynamic\.\d+)+$")
+_MERGE_SUFFIX_RE = re.compile(r"(\.merged_overrides)+$")
 
 
 def _patch_base_name(patch_path: str) -> str:
@@ -594,16 +594,6 @@ def build_parser() -> argparse.ArgumentParser:
             "always=run regardless of per-hunk status; auto=only when all hunks are fixed and --tools real; never=skip."
         ),
     )
-    p.add_argument(
-        "--refresh-error-queue",
-        choices=["auto", "always", "never"],
-        default=str(os.environ.get("REACT_AGENT_REFRESH_ERROR_QUEUE", "auto") or "auto"),
-        help=(
-            "Refresh the patch_key error queue during runtime by re-running an OSS-Fuzz build with combined overrides "
-            "after each fixed hunk (jobs=1 only). auto=enable when --tools real and --jobs 1; always=force; never=disable."
-        ),
-    )
-
     p.add_argument("--v1-json-dir", default="", help="Root directory containing V1 *_analysis.json files")
     p.add_argument("--v2-json-dir", default="", help="Root directory containing V2 *_analysis.json files")
     p.add_argument("--v1-src", default="", help="Local filesystem root for V1 source code")
@@ -648,12 +638,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.environ.get("REACT_AGENT_OSSFUZZ_LOOP_MAX", "3") or 3),
         help="Forwarded to agent_langgraph.py (max ossfuzz_apply_patch_and_test calls when --auto-ossfuzz-loop is enabled).",
-    )
-    p.add_argument(
-        "--auto-continue-on-link-errors",
-        action="store_true",
-        default=str(os.environ.get("REACT_AGENT_AUTO_CONTINUE_LINK", "") or "").strip().lower() in {"1", "true", "yes"},
-        help="After final OSS-Fuzz test fails with linker errors, automatically continue processing them.",
     )
     return p
 
@@ -786,13 +770,6 @@ def main(argv: List[str]) -> int:
     if not str(args.ossfuzz_project).strip() or not str(args.ossfuzz_commit).strip():
         raise ValueError("--ossfuzz-project and --ossfuzz-commit are required (patch-scope agents must test before stopping)")
 
-    refresh_mode = str(getattr(args, "refresh_error_queue", "auto") or "auto").strip().lower()
-    if refresh_mode not in {"auto", "always", "never"}:
-        refresh_mode = "auto"
-    dynamic_queue_enabled = (
-        refresh_mode in {"auto", "always"} and str(args.tools) == "real" and max(1, int(args.jobs or 1)) == 1
-    )
-
     build_log_text = load_build_log(str(args.build_log))
     groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=patch_path)
     ranked_all = _rank_patch_keys(groups)
@@ -850,11 +827,6 @@ def main(argv: List[str]) -> int:
         env["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = merged
         os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = merged
 
-    def _write_build_log_snapshot(text: str, *, name: str) -> str:
-        p = (artifacts_root / name).resolve()
-        p.write_text(str(text or ""), encoding="utf-8", errors="replace")
-        return str(p)
-
     def _report_snapshot(*, results: List[Dict[str, Any]], ongoing: Optional[List[str]] = None) -> Dict[str, Any]:
         hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
         hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
@@ -890,8 +862,6 @@ def main(argv: List[str]) -> int:
             "patch_key_groups_selected": patch_key_groups_selected,
             "patch_keys_total": len(ranked),
             "jobs": max(1, int(args.jobs or 1)),
-            "refresh_error_queue": refresh_mode,
-            "dynamic_queue_enabled": dynamic_queue_enabled,
             "artifacts_root": str(artifacts_root),
             "summary_json_path": str(summary_path),
             "hunks_fixed": hunks_fixed,
@@ -1088,134 +1058,41 @@ def main(argv: List[str]) -> int:
         return idx, item
 
     jobs = max(1, int(args.jobs or 1))
-    if dynamic_queue_enabled:
-        # In dynamic mode, re-run OSS-Fuzz with accumulated overrides between hunks to discover newly-unblocked errors.
-        attempted_keys: set[str] = set()
-        fixed_keys: set[str] = set()
-        for it in items.values():
-            if str(it.get("task_status", "") or "").strip() == "fixed":
-                fixed_keys.add(str(it.get("patch_key", "") or "").strip())
-
-        current_patch_path = str(patch_path)
-        current_build_log_text = str(build_log_text)
-        current_build_log_path = str(agent_build_log_path)
-        dyn_idx = max(items.keys(), default=-1) + 1
-
-        while True:
-            if max_groups_requested and len(attempted_keys) >= max_groups_requested:
-                break
-            current_groups = _group_errors_by_patch_key(build_log_text=current_build_log_text, patch_path=current_patch_path)
-            current_ranked = _rank_patch_keys(current_groups)
-            if allow:
-                current_ranked = [k for k in current_ranked if k in allow]
-
-            next_key = next((k for k in current_ranked if k and k not in fixed_keys and k not in attempted_keys), "")
-            if not next_key:
-                break
-
-            # Keep the global groups mapping updated so run_one can compute "primary_error" for reporting.
-            groups = current_groups
-            attempted_keys.add(next_key)
-
+    if jobs == 1:
+        for idx, key in to_run:
             # Write progress showing this key as ongoing before starting
-            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[next_key])
+            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[key])
             _write_progress_json(artifacts_root, snap)
-
-            _, item = run_one(
-                next_key,
-                dyn_idx,
-                patch_path_for_agent=current_patch_path,
-                build_log_path_for_agent=current_build_log_path,
-            )
-            items[dyn_idx] = item
-            dyn_idx += 1
-
+            _, item = run_one(key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path)
+            items[idx] = item
             snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[])
             _write_progress_json(artifacts_root, snap)
-
-            if str(item.get("task_status", "") or "").strip() != "fixed":
-                break
-            fixed_keys.add(str(item.get("patch_key", "") or "").strip())
-
-            # Merge overrides into a new bundle and re-run OSS-Fuzz to refresh the build log and queue.
-            results = [items[i] for i in sorted(items.keys())]
-            overrides = _collect_final_override_diffs(results, patch_path=patch_path)
-            combined_override_paths: List[str] = list(overrides.get("override_paths") or [])
-            if not combined_override_paths:
-                break
-
-            try:
-                os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
-                from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test, write_patch_bundle_with_overrides  # type: ignore
-
-                base = _patch_base_name(patch_path)
-                out = write_patch_bundle_with_overrides(
-                    patch_path=str(patch_path),
-                    patch_override_paths=combined_override_paths,
-                    output_name=f"{base}.merged_overrides.dynamic.{len(attempted_keys)}.patch2",
-                )
-                merged_bundle = str(out.get("merged_patch_bundle_path", "") or "").strip()
-                if not merged_bundle:
-                    break
-                current_patch_path = merged_bundle
-
-                res = ossfuzz_apply_patch_and_test(
-                    project=str(args.ossfuzz_project),
-                    commit=str(args.ossfuzz_commit),
-                    patch_path=str(current_patch_path),
-                    patch_override_paths=[],
-                    build_csv=str(args.ossfuzz_build_csv),
-                    sanitizer=str(args.ossfuzz_sanitizer),
-                    architecture=str(args.ossfuzz_arch),
-                    engine=str(args.ossfuzz_engine),
-                    fuzz_target=str(args.ossfuzz_fuzz_target),
-                    use_sudo=bool(args.ossfuzz_use_sudo),
-                )
-                current_build_log_text = str(res.get("build_output", "") or "")
-                current_build_log_path = _write_build_log_snapshot(
-                    current_build_log_text,
-                    name=f"dynamic_queue_build_output.{len(attempted_keys)}.log",
-                )
-            except Exception:
-                break
-
-        results = [items[i] for i in sorted(items.keys())]
     else:
-        if jobs == 1:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            # Track ongoing patch keys
+            ongoing_keys: set[str] = set()
+            fut_to_key: Dict[Any, str] = {}
+            futs = []
             for idx, key in to_run:
-                # Write progress showing this key as ongoing before starting
-                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[key])
-                _write_progress_json(artifacts_root, snap)
-                _, item = run_one(key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path)
+                ongoing_keys.add(key)
+                fut = ex.submit(
+                    run_one, key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path
+                )
+                futs.append(fut)
+                fut_to_key[fut] = key
+            # Write initial progress with all ongoing
+            snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=sorted(ongoing_keys))
+            _write_progress_json(artifacts_root, snap)
+            for fut in as_completed(futs):
+                idx, item = fut.result()
                 items[idx] = item
-                snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[])
-                _write_progress_json(artifacts_root, snap)
-        else:
-            with ThreadPoolExecutor(max_workers=jobs) as ex:
-                # Track ongoing patch keys
-                ongoing_keys: set[str] = set()
-                fut_to_key: Dict[Any, str] = {}
-                futs = []
-                for idx, key in to_run:
-                    ongoing_keys.add(key)
-                    fut = ex.submit(
-                        run_one, key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path
-                    )
-                    futs.append(fut)
-                    fut_to_key[fut] = key
-                # Write initial progress with all ongoing
+                # Remove completed key from ongoing
+                completed_key = fut_to_key.get(fut)
+                if completed_key:
+                    ongoing_keys.discard(completed_key)
                 snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=sorted(ongoing_keys))
                 _write_progress_json(artifacts_root, snap)
-                for fut in as_completed(futs):
-                    idx, item = fut.result()
-                    items[idx] = item
-                    # Remove completed key from ongoing
-                    completed_key = fut_to_key.get(fut)
-                    if completed_key:
-                        ongoing_keys.discard(completed_key)
-                    snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=sorted(ongoing_keys))
-                    _write_progress_json(artifacts_root, snap)
-        results = [items[i] for i in sorted(items.keys())]
+    results = [items[i] for i in sorted(items.keys())]
 
     hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
     hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
@@ -1344,171 +1221,6 @@ def main(argv: List[str]) -> int:
             except Exception as exc:
                 final_ossfuzz_test.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
 
-    # Auto-continue on linker errors
-    auto_continue = bool(getattr(args, "auto_continue_on_link_errors", False))
-    continuation_round = 0
-    max_continuation_rounds = 10  # Safety limit
-
-    while auto_continue and final_ossfuzz_test.get("status") == "failed" and continuation_round < max_continuation_rounds:
-        continuation_round += 1
-
-        # Check if there are linker errors in the final build log
-        final_build_log_path = final_ossfuzz_test.get("build_output_path", "")
-        if not final_build_log_path or not Path(final_build_log_path).is_file():
-            break
-
-        final_build_log_text = Path(final_build_log_path).read_text(encoding="utf-8", errors="replace")
-        linker_errors = list(iter_linker_errors(final_build_log_text, snippet_lines=10))
-        if not linker_errors:
-            break  # No linker errors to process
-
-        # Re-group errors from final build log using the merged bundle
-        current_patch_path = final_ossfuzz_test.get("merged_patch_bundle_path") or patch_path
-        new_groups = _group_errors_by_patch_key(build_log_text=final_build_log_text, patch_path=current_patch_path)
-        new_ranked = _rank_patch_keys(new_groups)
-
-        # Filter to only new patch_keys not already attempted
-        already_done = {str(r.get("patch_key", "")).strip() for r in results}
-        new_keys = [k for k in new_ranked if k and k not in already_done]
-        if not new_keys:
-            break  # All errors already attempted
-
-        # Process new linker error hunks
-        groups = new_groups  # Update global groups for run_one()
-        keys_to_process = new_keys[:max_groups_requested - len(results)] if max_groups_requested else new_keys
-        for key in keys_to_process:
-            dyn_idx = max((r.get("_idx", 0) for r in results), default=-1) + 1
-            # Write progress showing this key as ongoing before starting
-            _write_progress_json(artifacts_root, _report_snapshot(results=results, ongoing=[key]))
-            _, item = run_one(
-                key, dyn_idx,
-                patch_path_for_agent=current_patch_path,
-                build_log_path_for_agent=final_build_log_path,
-            )
-            item["_idx"] = dyn_idx
-            item["continuation_round"] = continuation_round
-            results.append(item)
-            _write_progress_json(artifacts_root, _report_snapshot(results=results, ongoing=[]))
-
-        # Re-collect overrides and re-run final OSS-Fuzz test
-        overrides = _collect_final_override_diffs(results, patch_path=patch_path)
-        combined_override_paths = list(overrides.get("override_paths") or [])
-        combined_override_paths_count = len(combined_override_paths)
-
-        # Update merged patch bundle
-        merged_patch_bundle_path = ""
-        merged_patch_bundle_error = ""
-        if combined_override_paths:
-            try:
-                os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
-                from tools.ossfuzz_tools import write_patch_bundle_with_overrides  # type: ignore
-
-                base = _patch_base_name(patch_path)
-                out = write_patch_bundle_with_overrides(
-                    patch_path=str(patch_path),
-                    patch_override_paths=combined_override_paths,
-                    output_name=f"{base}.merged_overrides.continuation.{continuation_round}.patch2",
-                )
-                merged_patch_bundle_path = str(out.get("merged_patch_bundle_path", "") or "").strip()
-            except Exception as exc:  # noqa: BLE001
-                merged_patch_bundle_error = f"{type(exc).__name__}: {exc}"
-
-        # Re-run final OSS-Fuzz test
-        final_ossfuzz_test = {
-            "status": "skipped",
-            "mode": final_mode,
-            "reason": "",
-            "continuation_round": continuation_round,
-            "override_paths_count": combined_override_paths_count,
-            "override_paths": combined_override_paths,
-            "override_paths_sorted_by": "PatchInfo.new_start_line(desc)",
-            "combined_override_diffs_path": "",
-            "combined_override_diffs_note": "Disabled: multi_agent now writes a merged patch bundle instead of concatenating override diffs.",
-            "merged_patch_bundle_path": merged_patch_bundle_path,
-            "merged_patch_bundle_error": merged_patch_bundle_error,
-            "merged_patch_bundle_note": (
-                "Patch bundle (pickle) with per-hunk override diffs applied. "
-                "Use this as --patch-path for future patch-scope runs, or pass it to ossfuzz_apply_patch_and_test with patch_override_paths=[]."
-            ),
-            "override_diffs_per_hunk": list(overrides.get("per_hunk") or []),
-            "override_diffs_missing_patch_keys": list(overrides.get("missing_patch_keys") or []),
-            "override_diffs_sort_error": str(overrides.get("sort_error") or "").strip(),
-        }
-        try:
-            os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
-            from tools.ossfuzz_tools import ossfuzz_apply_patch_and_test  # type: ignore
-
-            patch_path_for_test = (
-                merged_patch_bundle_path if merged_patch_bundle_path and not merged_patch_bundle_error else str(args.patch_path)
-            )
-            override_paths_for_test: List[str] = [] if patch_path_for_test != str(args.patch_path) else combined_override_paths
-
-            res = ossfuzz_apply_patch_and_test(
-                project=str(args.ossfuzz_project),
-                commit=str(args.ossfuzz_commit),
-                patch_path=str(patch_path_for_test),
-                patch_override_paths=override_paths_for_test,
-                build_csv=str(args.ossfuzz_build_csv),
-                sanitizer=str(args.ossfuzz_sanitizer),
-                architecture=str(args.ossfuzz_arch),
-                engine=str(args.ossfuzz_engine),
-                fuzz_target=str(args.ossfuzz_fuzz_target),
-                use_sudo=bool(args.ossfuzz_use_sudo),
-            )
-
-            build_log_path_cont = (artifacts_root / f"final_ossfuzz_build_output.continuation.{continuation_round}.log").resolve()
-            # build_output is an artifact ref dict; read actual content from artifact_path
-            build_output_ref = res.get("build_output") or {}
-            build_output_artifact = build_output_ref.get("artifact_path", "") if isinstance(build_output_ref, dict) else ""
-            if build_output_artifact and Path(build_output_artifact).is_file():
-                build_log_text = Path(build_output_artifact).read_text(encoding="utf-8", errors="replace")
-            else:
-                build_log_text = str(build_output_ref)
-            build_log_path_cont.write_text(build_log_text, encoding="utf-8", errors="replace")
-
-            patch_apply_ok = bool(res.get("patch_apply_ok"))
-            build_ok = bool(res.get("build_ok"))
-            ok = patch_apply_ok and build_ok
-            final_ossfuzz_test.update(
-                {
-                    "status": "ok" if ok else "failed",
-                    "reason": str(res.get("patch_apply_error", "") or "").strip(),
-                    "merged_patch_file_path": str(res.get("merged_patch_file_path", "") or "").strip(),
-                    "patch_apply_ok": patch_apply_ok,
-                    "build_ok": build_ok,
-                    "build_output_path": str(build_log_path_cont),
-                }
-            )
-            if not final_ossfuzz_test["reason"] and not ok:
-                final_ossfuzz_test["reason"] = "OSS-Fuzz build failed."
-        except Exception as exc:
-            final_ossfuzz_test.update({"status": "failed", "reason": f"{type(exc).__name__}: {exc}"})
-            break  # Stop continuation on exception
-
-    # Recalculate summary stats after continuation loop (results may have grown)
-    hunks_fixed = sum(1 for r in results if r.get("hunk_fixed") is True)
-    hunks_not_fixed = sum(1 for r in results if r.get("hunk_fixed") is False)
-    hunks_unknown = sum(1 for r in results if r.get("hunk_fixed") is None)
-    agents_failed = sum(1 for r in results if int(r.get("agent_exit_code") or 0) != 0)
-    restarts_attempted_total = sum(int(r.get("restarts_attempted") or 0) for r in results)
-    hunks_restarted = sum(1 for r in results if int(r.get("restarts_attempted") or 0) > 0)
-    task_status_counts = {}
-    not_fixed = []
-    for r in results:
-        status = str(r.get("task_status", "") or "").strip() or "unknown"
-        task_status_counts[status] = task_status_counts.get(status, 0) + 1
-        if status != "fixed":
-            not_fixed.append(
-                {
-                    "patch_key": r.get("patch_key"),
-                    "task_status": status,
-                    "hunk_fixed": r.get("hunk_fixed"),
-                    "remaining_in_active_patch_key": r.get("remaining_in_active_patch_key"),
-                    "agent_exit_code": r.get("agent_exit_code"),
-                    "agent_output_parse_error": r.get("agent_output_parse_error"),
-                }
-            )
-
     summary_path = artifacts_root / "summary.json"
     report = {
         "type": "multi_agent",
@@ -1517,8 +1229,6 @@ def main(argv: List[str]) -> int:
         "max_groups_requested": max_groups_requested,
         "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
         "final_ossfuzz_test": final_ossfuzz_test,
-        "continuation_rounds": continuation_round,
-        "auto_continue_enabled": auto_continue,
         "patch_key_groups_found": patch_key_groups_found,
         "patch_key_groups_after_allowlist": patch_key_groups_after_allowlist,
         "patch_key_groups_selected": patch_key_groups_selected,
