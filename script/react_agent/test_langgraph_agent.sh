@@ -793,6 +793,128 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# Extra patch override tool: avoid confusing wasm3-style `_   (call());` statements with prototypes.
+# If the bundle only contains a call site, fall back to KB to synthesize a real prototype.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    # Minimal KB + sources: v1 has `int myfunc(int x) { ... }`.
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+    v1_src = td / "v1_src"
+    v2_src = td / "v2_src"
+    v1_src.mkdir()
+    v2_src.mkdir()
+
+    (v1_src / "dict.c").write_text("int myfunc(int x) {\\n  return x;\\n}\\n", encoding="utf-8")
+    (v2_src / "dict.c").write_text("/* v2 placeholder */\\n", encoding="utf-8")
+    node = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "myfunc",
+        "location": {"file": "dict.c", "line": 1, "column": 1},
+        "extent": {
+            "start": {"file": "dict.c", "line": 1, "column": 1},
+            "end": {"file": "dict.c", "line": 3, "column": 1},
+        },
+    }
+    (kb_v1 / "dict.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    kb_index = KbIndex(str(kb_v1), str(kb_v2))
+    source_manager = SourceManager(str(v1_src), str(v2_src))
+    agent_tools = AgentTools(kb_index, source_manager)
+
+    # Bundle with a call site at column 1: `_   (__revert_deadbeef_myfunc(...));`
+    bundle_path = td / "bundle.patch2"
+    extra_key = "_extra_dict.c"
+    main_key = "tail-dict.c-f1_"
+    extra_patch_text = (
+        "diff --git a/dict.c b/dict.c\\n"
+        "--- a/dict.c\\n"
+        "+++ b/dict.c\\n"
+        "@@ -1,1 +1,0 @@\\n"
+        "-/* extra decls */\\n"
+    )
+    main_patch_text = (
+        "diff --git a/dict.c b/dict.c\\n"
+        "--- a/dict.c\\n"
+        "+++ b/dict.c\\n"
+        "@@ -10,5 +10,0 @@\\n"
+        "-static int caller(void) {\\n"
+        "-_   (__revert_deadbeef_myfunc(123));\\n"
+        "-  return 0;\\n"
+        "-}\\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    main_patch = PatchInfo(
+        file_path_old="dict.c",
+        file_path_new="dict.c",
+        patch_text=main_patch_text,
+        file_type="c",
+        old_start_line=10,
+        old_end_line=13,
+        new_start_line=10,
+        new_end_line=10,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(
+        pickle.dumps({extra_key: extra_patch, main_key: main_patch}, protocol=pickle.HIGHEST_PROTOCOL)
+    )
+
+    out = make_extra_patch_override(
+        agent_tools,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="__revert_deadbeef_myfunc",
+        version="v1",
+    )
+    assert out.get("patch_key") == extra_key, out
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), p
+    text = p.read_text(encoding="utf-8", errors="replace")
+    assert "int __revert_deadbeef_myfunc(int x);" in text, text
+
+print("OK")
+PY
+
 # Extra patch override tool: for non-generated symbols that only appear as DECL_REF_EXPR,
 # use type_ref.typedef_extent to insert a VAR_DECL (not a statement) into the `_extra_*` hunk.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

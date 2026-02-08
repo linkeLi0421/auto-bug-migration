@@ -826,6 +826,10 @@ def _looks_like_statement(code_line: str) -> bool:
         return False
     if stripped.startswith("#"):
         return True
+    # wasm3-style TRY macro: `_   (Call(...));` often appears at column 1 inside a function body.
+    # Treat it as a statement so we don't mis-detect call sites as file-scope prototypes.
+    if re.match(r"^_\s*\(", stripped):
+        return True
     if _CONTROL_STMT_RE.match(stripped):
         return True
     return False
@@ -842,6 +846,10 @@ def _is_valid_function_prototype(lines: List[str], *, symbol_name: str) -> bool:
         return False
 
     joined = "\n".join(str(l) for l in lines)
+    # A C prototype should contain exactly one ';' terminator. Multiple semicolons usually means we
+    # accidentally captured statements (e.g. macro calls + other lines) rather than a declaration.
+    if joined.count(";") != 1:
+        return False
     if "{" in joined or "}" in joined:
         return False
     if want not in joined:

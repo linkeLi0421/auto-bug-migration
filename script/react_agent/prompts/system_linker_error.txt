@@ -1,9 +1,8 @@
-Linker error (undefined reference) strategy:
-- For "undefined reference to `symbol'" errors, the symbol does not exist in the target codebase.
-- Do NOT try to implement the missing symbol - it may have complex dependencies or side effects.
-- Instead, REMOVE or GUARD the code that references the missing symbol.
+Linker error strategy (undefined reference / multiple definition):
+- Treat `__revert_*` symbols as special: they are expected helpers created by the patch workflow.
+- For non-`__revert_*` missing symbols: prefer removing/guarding the reference (do NOT invent implementations).
 
-Strategy for fixing linker errors:
+Undefined reference strategy:
 1. Identify the function containing the undefined reference (shown in the error as `function_name[function_name]+offset`).
 2. Find the specific line(s) in that function that call/reference the missing symbol.
 3. Remove or guard those specific calls using one of these approaches:
@@ -12,12 +11,28 @@ Strategy for fixing linker errors:
    - Use `#if 0 ... #endif` to disable a block of code if removal would break syntax
    - For function pointers, set to NULL or a stub function
 
+Special-case: undefined reference to `__revert_<commit>_<func>`:
+- Prefer recreating the missing helper instead of deleting the call.
+- Workflow:
+  1) Derive `func` by stripping the `__revert_<commit>_` prefix.
+  2) `search_definition(symbol_name="func", version="v1")` to get the real definition/signature.
+  3) Insert a renamed copy as `__revert_<commit>_<func>` into a single `.c` file (NOT a header) using `make_error_patch_override`
+     (or rewrite an existing `_extra_*` hunk for that file). Keep the body identical.
+
+Multiple definition strategy ("multiple definition of `symbol`"):
+- This usually means the symbol is defined in a header (.h/.hpp) with external linkage, so every `.c` that includes it emits a global definition.
+- Fix by giving it internal linkage:
+  - Functions in headers: change the definition to `static inline ...` (or at minimum `static ...`).
+  - Variables in headers: change to `static ...` (or move the definition to a single `.c` and keep only an `extern` decl in the header).
+- If the duplicated symbol is `__revert_*` in a header: always make it `static inline` (do NOT make it a global).
+
 CRITICAL constraints:
-- ONLY modify the function that has the linker error - do NOT change other functions.
-- Keep changes minimal - only remove/guard the specific symbol references.
-- Do NOT add new function implementations to provide the missing symbol.
-- Do NOT modify function signatures or add new parameters.
-- Preserve the overall control flow and logic where possible.
+- Keep changes minimal; touch the smallest site that fixes the linker failure.
+- For non-`__revert_*` undefined references: do NOT implement the missing symbol; remove/guard the reference.
+- For `__revert_*` undefined references: it is OK to recreate the missing helper by copying V1 code and renaming it
+  (no new logic, no behavioral changes beyond restoring the old symbol).
+- For "multiple definition": fix linkage at the definition site (often a header) by adding `static`/`static inline`.
+- Do NOT change function signatures/parameters (except adding storage-class/`inline` keywords to fix linkage).
 
 Example transformations:
 - `xmlSaturatedAddSizeT(&size, delta);` → Remove the call (if size tracking is optional)
@@ -25,7 +40,7 @@ Example transformations:
 - `if (missingCheck()) { ... }` → `if (0) { ... }` or remove the entire block
 - `callback = &missingHandler;` → `callback = NULL;`
 
-When using make_error_patch_override for linker errors:
+When using make_link_error_patch_override:
 - Use get_link_error_patch_context first to get the function code containing the reference.
 - For the file_path parameter: Use error_file_path from context if available (e.g., "card-itacns.c").
   DO NOT use active_patch_key or pinned_patch_key as file_path - these are patch identifiers, not file paths.
