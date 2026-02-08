@@ -145,7 +145,27 @@ def normalize_function_pointer_params(signature: str) -> str:
     return re.sub(pattern, repl, signature)
 
 
-def replace_function_header(func_code: str, signature: str) -> str:
+def _ensure_static_inline_signature(sig: str) -> str:
+    """Ensure `sig` is prefixed with `static inline` (best-effort).
+
+    In header files, rewriting macro-generated function headers into concrete
+    signatures without `static` can easily create multiple-definition linker
+    errors because the header is included by many translation units.
+    """
+    s = str(sig or "").lstrip()
+    if not s:
+        return s
+    if re.match(r"^static\b", s):
+        if re.search(r"\binline\b", s.split("(", 1)[0]):
+            return s
+        # Insert inline after static.
+        return re.sub(r"^static\b", "static inline", s, count=1)
+    if re.match(r"^inline\b", s):
+        return "static " + s
+    return "static inline " + s
+
+
+def replace_function_header(func_code: str, signature: str, *, file_path: str | None = None) -> str:
     """
     Replace the function header in func_code with the libclang signature,
     BUT ONLY IF the signature's function name is NOT found before the
@@ -177,6 +197,11 @@ def replace_function_header(func_code: str, signature: str) -> str:
 
     # Optionally fix libclang's function-pointer param syntax
     cleaned_sig = normalize_function_pointer_params(signature)
+    # If we're rewriting a header-defined function (common: macro-generated ops)
+    # into a concrete signature, ensure internal linkage to avoid duplicate
+    # symbols at link time.
+    if file_path and str(file_path).lower().endswith((".h", ".hh", ".hpp", ".hxx")):
+        cleaned_sig = _ensure_static_inline_signature(cleaned_sig)
 
     # Build new header: 'int foo(...)' (no '{' yet)
     new_header = cleaned_sig.rstrip() + " "
@@ -288,7 +313,7 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
 
         # Only try to rewrite the header if this really looks like a function.
         if looks_like_real_function(func_code):
-            func_code = replace_function_header(func_code, ast_node["signature"])
+            func_code = replace_function_header(func_code, ast_node["signature"], file_path=file_path)
 
         # Compute length
         func_length = func_code.count("\n")
@@ -1349,7 +1374,7 @@ def call_react_agent(
     max_restarts_per_hunk: int = 3,
     openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
-    max_multi_agent_rounds: int = 10,
+    max_multi_agent_rounds: int = 20,
 ) -> dict:
     """Call the multi-agent to fix build errors with iterative rounds.
 

@@ -150,6 +150,34 @@ Output format:
 - Force JSON: `--output-format json` or `--output-format json-pretty`
 - When `--auto-ossfuzz-loop` is enabled, the agent may trim internal prompt context between iterations, but the final output still reports the full tool-step history for the whole run.
 
+## Agent output format (artifacts)
+
+The multi-agent driver always writes artifacts under
+`data/react_agent_artifacts/multi_<run_id>/`, even when stdout is empty. The
+primary report is `summary.json`. It is not a strict schema, but the common
+shape is:
+
+- Top-level metadata:
+  - `type`, `build_log`, `patch_path`, `jobs`, `patch_keys_total`, etc.
+- `final_ossfuzz_test`:
+  - `status`: `ok|failed`
+  - `reason`: human-readable failure reason
+  - `build_output_path`: path to `final_ossfuzz_build_output.log`
+  - `merged_patch_file_path`: merged `.diff` used for the final build test
+  - `merged_patch_bundle_path`: merged `.patch2` bundle with per-hunk overrides
+- `results`: one entry per `patch_key`, with fields such as:
+  - `patch_key`, `primary_error`, `task_status`, `task_success`, `attempts`
+  - `agent_stdout_path`: path to `agent_stdout.json` (per-hunk agent I/O)
+  - `artifacts_dir`: per-hunk artifact directory
+- `not_fixed`: list of errors that the patch-scope agent could not resolve
+
+Related files:
+
+- `final_ossfuzz_build_output.log`: compiler output for the final combined build.
+- `<patch_key>/agent_stdout.json`: per-hunk agent output (tool calls, steps, and
+  next-step hints).
+- `<patch_key>/ossfuzz_apply_patch_and_test_build_output.log`: per-hunk build logs.
+
 List tools:
 ```bash
 python3 script/react_agent/agent_langgraph.py --list-tools

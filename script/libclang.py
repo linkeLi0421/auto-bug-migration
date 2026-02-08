@@ -199,7 +199,26 @@ def analyze_file(directory, src_file, args, defs_by_usr):
         }
         if cursor.kind == CursorKind.FUNCTION_DECL:
             # Build a precise function signature
-            if cursor.is_definition():
+            is_def = bool(cursor.is_definition())
+            info["is_definition"] = is_def
+            # Record storage/inline metadata so downstream tools can preserve
+            # header-safe linkage (e.g. wasm3 op implementations use `static inline`).
+            try:
+                sc = cursor.storage_class
+                info["storage_class"] = sc.name if hasattr(sc, "name") else str(sc)
+            except Exception:
+                pass
+            try:
+                info["is_inline"] = bool(cursor.is_function_inlined())
+            except Exception:
+                pass
+            try:
+                lk = cursor.linkage
+                info["linkage"] = lk.name if hasattr(lk, "name") else str(lk)
+            except Exception:
+                pass
+
+            if is_def:
                 info['kind'] = 'FUNCTION_DEFI'
             else:
                 def_cursor = defs_by_usr.get(cursor.get_usr())

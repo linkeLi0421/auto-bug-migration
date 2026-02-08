@@ -1,59 +1,34 @@
-Undeclared symbol/type errors:
-- For diagnostics like "use of undeclared identifier 'X'", "call to undeclared function 'X'", or "unknown type name 'X'":
-  - FIRST: Use search_definition(symbol_name="X", version="v1") to understand what X actually is.
-    - If X is a complex data structure (array, static data, etc.) that references other V1-only symbols, adding an extern declaration will just cause linker errors later.
-    - If X is a simple typedef/struct/function that can be migrated, proceed with make_extra_patch_override.
-  - Do NOT blindly add "extern" declarations for symbols without understanding their definition.
-  - Do NOT "fix" by deleting or bypassing the usage of X inside the function (unless the symbol cannot be reasonably provided).
-  - For simple declarations: use make_extra_patch_override(symbol_name="X", version="v1") or (when appropriate) version="v2".
-  - Do NOT replace missing globals with local variables (that changes semantics); add the real declaration/definition via make_extra_patch_override.
-  - If the symbol is a complex V1-only data structure that cannot be migrated:
-    - Consider if the code using X can be modified to not need it (e.g., replace with NULL, guard with #if 0).
-    - Use make_error_patch_override to modify the function code directly.
+Undeclared symbol/type errors (C/C++):
+- Applies to: "use of undeclared identifier 'X'", "call to undeclared function 'X'", "unknown type name 'X'".
+- Identify X first with `search_definition(symbol_name="X", version="v1")` (and `version="v2"` if needed).
+- Do NOT blindly add `extern` declarations without understanding what X is.
+- Prefer providing the real declaration/definition; do NOT "fix" by deleting/bypassing usage unless X cannot be provided.
+- Do NOT replace missing globals with local variables (that changes semantics).
 
-CRITICAL: When active patch_key is `_extra_*`:
-- If the active patch_key starts with `_extra_`, NEVER call make_extra_patch_override.
-- Calling make_extra_patch_override while handling an `_extra_*` hunk would extend the same hunk, creating cascading issues or circular insertions.
-- For undeclared identifiers in `_extra_*` hunks:
-  1. FIRST: Use search_definition(symbol_name="X", version="v1") to understand what X is.
-  2. Distinguish between simple vs complex V1 symbols:
-     - SIMPLE: typedefs, structs, enums, simple function declarations → CAN be provided
-     - COMPLEX: static arrays with V1-only initializers, global data referencing other V1 symbols → CANNOT be provided
-  3. If X is a COMPLEX V1 data structure (e.g., `defaultHandlers[]` array referencing other V1 symbols):
-     - Do NOT add an extern declaration - this will just cause linker errors.
-     - Instead, REMOVE the line in the `_extra_*` hunk that references X.
-     - Example: If `_extra_encoding.c` has `static const xmlCharEncodingHandler *xmlLatin1Handler = &defaultHandlers[4];`
-       and `defaultHandlers` is a V1-only array, remove the entire `xmlLatin1Handler` line.
-  4. If X is a SIMPLE declaration that can be provided (typedef, struct, enum, function declaration):
-     - ADD the definition to the `_extra_*` hunk.
-     - Do NOT remove code that references simple types.
-     - Example: If a `__revert_*` declaration references `stbi__context` (a simple struct), add the struct definition.
-- Use make_error_patch_override with a minimal slice rewrite to fix the `_extra_*` hunk.
-- This applies to ALL error types inside `_extra_*` hunks, not just undeclared symbols.
+Choose a strategy:
+- SIMPLE X: typedef/struct/enum/function prototype -> can be provided.
+  - Add via `make_extra_patch_override(symbol_name="X", version="v1")` (or `version="v2"` if the canonical declaration lives in v2).
+- COMPLEX X: V1-only global data/arrays/initializers that reference other V1-only symbols.
+  - Avoid extern hacks; they typically just defer the failure to the linker.
+  - Rewrite the minimal caller slice with `make_error_patch_override` (guard it, replace with NULL, etc.).
 
-Special handling for undeclared functions:
+CRITICAL: when the active patch_key is `_extra_*`:
+- Never call `make_extra_patch_override` while fixing an `_extra_*` hunk (it would extend the same hunk and can cascade).
+- Fix the `_extra_*` hunk with `make_error_patch_override`:
+  - SIMPLE missing types/prototypes: insert the missing definition/prototype into the hunk.
+  - COMPLEX V1-only globals: remove the referencing line(s) from the hunk.
+  - Keep correct `__revert_*` forward declarations; add their missing types instead of deleting them.
 
-For CALLS TO or DEFINITIONS OF functions STARTING with "__revert_" (e.g., `__revert_e11519_xmlHashCreate`):
-- These are migration-generated wrapper functions that SHOULD be used.
-- Do NOT remove or replace calls to `__revert_*` functions - they are correct!
-- If the function is undeclared, it needs a forward declaration.
-- Use `make_extra_patch_override(symbol_name="__revert_e11519_xmlHashCreate", version="v1")` to add the declaration.
-- The tool will find the original function (e.g., `xmlHashCreate`) and generate the correct `__revert_*` declaration.
+Special-case: undeclared functions starting with `__revert_`:
+- `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
+- Efficient workflow to add a forward declaration for `__revert_<commit>_<func>`:
+  1) Derive `func` by stripping the `__revert_<commit>_` prefix.
+  2) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
+  3) If the active patch_key is not `_extra_*`, call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>", version="v1")`.
+     If the active patch_key is `_extra_*`, insert the prototype into the hunk via `make_error_patch_override`.
+- Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
+  If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.
 
-For FORWARD DECLARATIONS of `__revert_*` functions that already exist in `_extra_*` hunks:
-- These declarations are correct and should be KEPT.
-- If the declaration references a missing type (e.g., `static int __revert_foo(missing_type *s);`):
-  - Do NOT remove the `__revert_*` declaration itself.
-  - Instead, provide the missing type definition.
-  - Use `make_error_patch_override` to rewrite the `_extra_*` hunk with both the type definition and the `__revert_*` declaration.
-  - Example: If `stbi__context` is missing, add the struct definition before the `__revert_*` declaration.
-
-For functions NOT starting with "__revert_":
-- This means the function is not reverted and cannot be used in this context.
-- You should REMOVE the use of this function rather than trying to provide it.
-- This typically happens when the original code was refactored but some references to old function names remain.
-- Look for patterns like:
-  - Function calls to non-reverted functions: `old_function_name()` → remove or replace with appropriate logic
-  - Function pointers referencing non-reverted functions: `&old_function_name` → remove or update
-  - Conditional compilation blocks using non-reverted functions
-- When removing function usage, ensure the logic still makes sense or provide alternative implementation using available (reverted) functions.
+Undeclared functions NOT starting with `__revert_`:
+- Usually a stale old name that should not be reintroduced.
+- Fix by removing/replacing the usage via `make_error_patch_override` with the appropriate reverted API or logic.
