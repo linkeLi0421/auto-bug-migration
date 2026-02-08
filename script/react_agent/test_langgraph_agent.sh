@@ -448,7 +448,7 @@ st_undeclared = AgentState(
     snippet="",
 )
 p_undeclared = build_system_prompt(st_undeclared, tool_specs=TOOL_SPECS)
-assert "Undeclared symbol/type errors:" in p_undeclared, p_undeclared
+assert "Undeclared symbol/type errors (C/C++):" in p_undeclared, p_undeclared
 
 st_tail = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
 st_tail.active_old_signature = "int f(int x)"

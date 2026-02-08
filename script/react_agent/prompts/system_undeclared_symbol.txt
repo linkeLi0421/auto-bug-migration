@@ -1,34 +1,25 @@
 Undeclared symbol/type errors (C/C++):
 - Applies to: "use of undeclared identifier 'X'", "call to undeclared function 'X'", "unknown type name 'X'".
-- Identify X first with `search_definition(symbol_name="X", version="v1")` (and `version="v2"` if needed).
-- Do NOT blindly add `extern` declarations without understanding what X is.
-- Prefer providing the real declaration/definition; do NOT "fix" by deleting/bypassing usage unless X cannot be provided.
-- Do NOT replace missing globals with local variables (that changes semantics).
 
-Choose a strategy:
-- SIMPLE X: typedef/struct/enum/function prototype -> can be provided.
-  - Add via `make_extra_patch_override(symbol_name="X", version="v1")` (or `version="v2"` if the canonical declaration lives in v2).
-- COMPLEX X: V1-only global data/arrays/initializers that reference other V1-only symbols.
-  - Avoid extern hacks; they typically just defer the failure to the linker.
-  - Rewrite the minimal caller slice with `make_error_patch_override` (guard it, replace with NULL, etc.).
+Rule: only `__revert_*` functions get declarations; everything else gets REMOVED.
+
+1) Undeclared functions starting with `__revert_`:
+   - `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
+   - Workflow to add a forward declaration for `__revert_<commit>_<func>`:
+     a) Derive `func` by stripping the `__revert_<commit>_` prefix.
+     b) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
+     c) If the active patch_key is NOT `_extra_*`: call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>", version="v1")`.
+        If the active patch_key IS `_extra_*`: insert the prototype into the hunk via `make_error_patch_override`.
+   - Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
+     If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.
+
+2) Undeclared functions NOT starting with `__revert_`:
+   - These are V1-only helpers removed in V2. They have NO definition in V2.
+   - Do NOT use `make_extra_patch_override` — adding a forward declaration only defers the failure to a linker error.
+   - Do NOT insert a prototype or extern declaration.
+   - Use `make_error_patch_override` to rewrite the caller slice and REMOVE the call to the function.
 
 CRITICAL: when the active patch_key is `_extra_*`:
 - Never call `make_extra_patch_override` while fixing an `_extra_*` hunk (it would extend the same hunk and can cascade).
-- Fix the `_extra_*` hunk with `make_error_patch_override`:
-  - SIMPLE missing types/prototypes: insert the missing definition/prototype into the hunk.
-  - COMPLEX V1-only globals: remove the referencing line(s) from the hunk.
-  - Keep correct `__revert_*` forward declarations; add their missing types instead of deleting them.
-
-Special-case: undeclared functions starting with `__revert_`:
-- `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
-- Efficient workflow to add a forward declaration for `__revert_<commit>_<func>`:
-  1) Derive `func` by stripping the `__revert_<commit>_` prefix.
-  2) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
-  3) If the active patch_key is not `_extra_*`, call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>", version="v1")`.
-     If the active patch_key is `_extra_*`, insert the prototype into the hunk via `make_error_patch_override`.
-- Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
-  If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.
-
-Undeclared functions NOT starting with `__revert_`:
-- Usually a stale old name that should not be reintroduced.
-- Fix by removing/replacing the usage via `make_error_patch_override` with the appropriate reverted API or logic.
+- Fix the `_extra_*` hunk with `make_error_patch_override`.
+- Keep correct `__revert_*` forward declarations; add their missing types instead of deleting them.
