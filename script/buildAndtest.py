@@ -99,19 +99,22 @@ def get_latest_images_before_year(year: int) -> tuple:
 def get_base_builder_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-builder image digest for a given commit timestamp.
-    Returns the latest image that was available before or on the commit date.
+    Returns the latest image published within ~6 months after the commit date,
+    so that the builder is recent enough to compile the code at that commit.
+    Falls back to the latest available image if none is found within the window.
     """
     commit_date = datetime.fromtimestamp(commit_timestamp).date()
+    target_date = commit_date + timedelta(days=180)
 
     best_image = None
     for date_str, digest, _ in BASE_BUILDER_IMAGES:
         image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        if image_date <= commit_date:
+        if image_date <= target_date:
             best_image = digest
         else:
             break
 
-    # If no image found before commit date, use the earliest available
+    # If no image found within window, use the latest available
     if best_image is None:
         best_image = BASE_BUILDER_IMAGES[0][1]
 
@@ -121,19 +124,22 @@ def get_base_builder_for_date(commit_timestamp: int) -> str:
 def get_base_runner_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-runner image digest for a given commit timestamp.
-    Returns the latest image that was available before or on the commit date.
+    Returns the latest image published within ~6 months after the commit date,
+    so that the runner is recent enough for binaries built at that commit.
+    Falls back to the latest available image if none is found within the window.
     """
     commit_date = datetime.fromtimestamp(commit_timestamp).date()
+    target_date = commit_date + timedelta(days=180)
 
     best_image = None
     for date_str, digest, _ in BASE_RUNNER_IMAGES:
         image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        if image_date <= commit_date:
+        if image_date <= target_date:
             best_image = digest
         else:
             break
 
-    # If no image found before commit date, use the earliest available
+    # If no image found within window, use the latest available
     if best_image is None:
         best_image = BASE_RUNNER_IMAGES[0][1]
 
