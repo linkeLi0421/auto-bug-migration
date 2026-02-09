@@ -2681,6 +2681,8 @@ def revert_patch_test(args):
     parsed_data = parse_csv_file(csv_file_path)
     target = args.target
     target_repo_path = os.path.join(repo_path, target)
+    min_patch_file_path = os.path.join(data_path, 'min_patch', f'{target}.json')
+    os.makedirs(os.path.dirname(min_patch_file_path), exist_ok=True)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
 
     # Handle fixed image selection if --fixed-image is specified
@@ -2730,7 +2732,21 @@ def revert_patch_test(args):
             for key in patches_without_contexts.keys()
         )
         if bug_already_cached:
-            logger.info(f"Bug {bug_id} (commit {commit['commit_id']}, fuzzer {fuzzer}) already cached, skipping...")
+            logger.info(f"Bug {bug_id} (commit {commit['commit_id']}, fuzzer {fuzzer}) already cached, skipping patch generation...")
+            # Reconstruct get_patched_traces from existing patch files so
+            # the local bug test section below can still run.
+            patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+            prefix = f"{bug_id}_{next_commit['commit_id']}_patches"
+            existing_patches = sorted(
+                p for p in os.listdir(patch_folder)
+                if p.startswith(prefix) and p.endswith('.diff')
+            )
+            if existing_patches:
+                get_patched_traces[bug_id] = [
+                    os.path.join(patch_folder, p) for p in existing_patches
+                ]
+                logger.info(f"Found {len(existing_patches)} existing patch files for local bug test")
+            # Skip expensive patch generation / build / minimize
             continue
 
         sanitizer = bug_info['reproduce']['sanitizer'].split(' ')[0]
@@ -3050,9 +3066,6 @@ def revert_patch_test(args):
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
 
-        min_patch_file_path = os.path.join(data_path, 'min_patch', f'{target}.json')
-        if not os.path.exists(os.path.dirname(min_patch_file_path)):
-            os.makedirs(os.path.dirname(min_patch_file_path))
         if os.path.exists(min_patch_file_path):
             with open(min_patch_file_path, 'r') as f:
                 cached_patches = json.load(f)
@@ -3119,64 +3132,92 @@ def revert_patch_test(args):
         with open(os.path.join(data_path, 'signature_change_list', f"{bug_id}_{next_commit['commit_id']}.json"), 'w') as f:
             json.dump(signature_change_list, f, indent=4)
 
-        get_patched_traces, transitions, signature_change_list = mutable_args
-        # test if the local bugs is still there using crash stack comparison
-        patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+    # --- Local bug test loop (runs for all bugs with patches, including cached) ---
+    patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+    # Pre-collect crash logs for all local bugs so that get_crash_stack()
+    # inside the test loop never triggers a rebuild that would override
+    # the patched build produced by test_fuzzer(need_build=True).
+    for bug_id_trigger in bug_ids_trigger:
+        trigger_info = bug_info_dataset[bug_id_trigger]
+        trigger_fuzzer = trigger_info['reproduce']['fuzz_target']
+        trigger_sanitizer = trigger_info['reproduce']['sanitizer'].split(' ')[0]
+        trigger_job_type = trigger_info['reproduce']['job_type']
+        trigger_arch = trigger_job_type.split('_')[2] if len(trigger_job_type.split('_')) > 3 else 'x86_64'
+        trigger_input = select_crash_test_input(bug_id_trigger, testcases_env)
+        for commit, next_commit, bug_id in transitions:
+            get_crash_stack(
+                bug_id=bug_id_trigger,
+                commit_id=next_commit['commit_id'],
+                crash_test_input=trigger_input,
+                sanitizer=trigger_sanitizer,
+                build_csv=args.build_csv,
+                arch=trigger_arch,
+                testcases_env=testcases_env,
+                target=target,
+                fuzzer=trigger_fuzzer,
+                target_repo_path=target_repo_path,
+                fixed_builder_digest=fixed_builder_digest,
+                auto_select_images=args.auto_select_images,
+            )
+            break  # all transitions share the same next_commit for a given target
+
+    for commit, next_commit, bug_id in transitions:
+        if args.bug_id and bug_id != args.bug_id:
+            continue
         if bug_id not in get_patched_traces:
             continue
         logger.info('-' * 20)
         # Only test the final patch (last entry in the list), not all intermediate variants
         i = len(get_patched_traces[bug_id]) - 1
-        if True:  # Keep indentation for minimal diff
-            patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
-            need_build = True
-            count = 0
-            for bug_id_trigger in bug_ids_trigger:
-                result, crash_output = test_fuzzer(
-                    args,
-                    bug_id_trigger,
-                    target,
-                    next_commit['commit_id'],
-                    patch_file_path,
-                    need_build=need_build,
-                )
-                need_build = False  # only build once for multiple local bug tests
-                if result == 'not trigger':
-                    logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
-                    continue
+        patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
+        need_build = True
+        count = 0
+        for bug_id_trigger in bug_ids_trigger:
+            result, crash_output = test_fuzzer(
+                args,
+                bug_id_trigger,
+                target,
+                next_commit['commit_id'],
+                patch_file_path,
+                need_build=need_build,
+            )
+            need_build = False  # only build once for multiple local bug tests
+            if result == 'not trigger':
+                logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
+                continue
 
-                trigger_info = bug_info_dataset[bug_id_trigger]
-                trigger_fuzzer = trigger_info['reproduce']['fuzz_target']
-                trigger_sanitizer = trigger_info['reproduce']['sanitizer'].split(' ')[0]
-                trigger_job_type = trigger_info['reproduce']['job_type']
-                trigger_arch = trigger_job_type.split('_')[2] if len(trigger_job_type.split('_')) > 3 else 'x86_64'
-                trigger_input = select_crash_test_input(bug_id_trigger, testcases_env)
-                baseline_crash_path = get_crash_stack(
-                    bug_id=bug_id_trigger,
-                    commit_id=next_commit['commit_id'],
-                    crash_test_input=trigger_input,
-                    sanitizer=trigger_sanitizer,
-                    build_csv=args.build_csv,
-                    arch=trigger_arch,
-                    testcases_env=testcases_env,
-                    target=target,
-                    fuzzer=trigger_fuzzer,
-                    target_repo_path=target_repo_path,
-                    fixed_builder_digest=fixed_builder_digest,
-                    auto_select_images=args.auto_select_images,
-                )
-                signature_file_trigger = os.path.join(
-                    data_path,
-                    'signature_change_list',
-                    f'{bug_id}_{next_commit["commit_id"]}.json',
-                )
-                if crashes_match(crash_output, baseline_crash_path, signature_file_trigger):
-                    logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} (stack match)\n')
-                    count += 1
-                    test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
-                else:
-                    logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
-            logger.info(f'\t{bug_id} total local bugs triggered: {count}\n')
+            trigger_info = bug_info_dataset[bug_id_trigger]
+            trigger_fuzzer = trigger_info['reproduce']['fuzz_target']
+            trigger_sanitizer = trigger_info['reproduce']['sanitizer'].split(' ')[0]
+            trigger_job_type = trigger_info['reproduce']['job_type']
+            trigger_arch = trigger_job_type.split('_')[2] if len(trigger_job_type.split('_')) > 3 else 'x86_64'
+            trigger_input = select_crash_test_input(bug_id_trigger, testcases_env)
+            baseline_crash_path = get_crash_stack(
+                bug_id=bug_id_trigger,
+                commit_id=next_commit['commit_id'],
+                crash_test_input=trigger_input,
+                sanitizer=trigger_sanitizer,
+                build_csv=args.build_csv,
+                arch=trigger_arch,
+                testcases_env=testcases_env,
+                target=target,
+                fuzzer=trigger_fuzzer,
+                target_repo_path=target_repo_path,
+                fixed_builder_digest=fixed_builder_digest,
+                auto_select_images=args.auto_select_images,
+            )
+            signature_file_trigger = os.path.join(
+                data_path,
+                'signature_change_list',
+                f'{bug_id}_{next_commit["commit_id"]}.json',
+            )
+            if crashes_match(crash_output, baseline_crash_path, signature_file_trigger):
+                logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} (stack match)\n')
+                count += 1
+                test_local_bug_after_patch.setdefault(bug_id_trigger, set()).add(bug_id)
+            else:
+                logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
+        logger.info(f'\t{bug_id} total local bugs triggered: {count}\n')
 
     with open(min_patch_file_path, 'w') as f:
         json.dump(min_path_dict, f, indent=4)
