@@ -21,54 +21,64 @@ Build and test fuzzing targets across commit ranges:
 python script/buildAndtest.py --help
 ```
 
-### run_fuzz_test.py
-Run fuzzing tests with trace collection for a set of bugs. It reads bug configurations from JSON files, builds the target project at the specified commits, retrieves fuzzer dictionaries, and runs `fuzz_helper.py fuzz_one` for each bug entry.
+### fuzz_helper.py get_dict
+Retrieve the fuzzer dictionary for a project. This must be run before `get_poc_for_new_version`.
+
+```bash
+sudo python3 script/fuzz_helper.py get_dict <project> \
+  --commit <base_commit> \
+  --build_csv <builds_csv>
+```
+
+**Example:**
+```bash
+sudo python3 script/fuzz_helper.py get_dict wasm3 \
+  --commit bc32ee \
+  --build_csv ~/log/wasm3_builds.csv
+```
+
+### fuzz_helper.py get_poc_for_new_version
+Generate a PoC for a new version given an old version PoC. Builds the target at `--target_commit` with the revert `--patch` applied, collects execution traces and an allowlist from the buggy commit, then fuzzes with coverage guidance to find a crash matching the original bug signature.
 
 **Arguments:**
 | Argument | Required | Description |
 |---|---|---|
-| `--target_bugs` | Yes | JSON config file mapping test IDs to commit and bug info (keys: `id`, `base`, `buggy` or `buggy1`/`buggy2`) |
-| `--bug_info` | Yes | JSON file with full bug details including `reproduce.project`, `reproduce.fuzz_target`, and `reproduce.sanitizer` |
-| `--build_csv` | Yes | CSV file mapping project commits to OSS-Fuzz build commit IDs |
-
-**Environment variables:**
-| Variable | Description |
-|---|---|
-| `TESTCASES` | **(Required)** Path to the directory containing testcase files (named `testcase-<bug_id>`) |
-| `PYTHON_PATH` | Python interpreter path (default: `python3`). Set via `script/setenv.sh` |
+| `project` | Yes | Project name |
+| `fuzzer_name` | Yes | Name of the fuzzer |
+| `--buggy_commit` | Yes | Commit hash where the bug originally exists |
+| `--target_commit` | Yes | Commit hash to generate the PoC for |
+| `--testcases` | Yes | Path to directory containing seed testcases |
+| `--test_input` | Yes | Testcase filename (e.g., `testcase-OSV-2021-660`) |
+| `--build_csv` | Yes | CSV mapping project commits to OSS-Fuzz commit IDs |
+| `--patch` | No | Revert patch to apply at target commit |
+| `--signature_changes` | No | JSON file mapping old function names to new ones |
+| `--sanitizer` | No | Sanitizer to use (default: `address`) |
 
 **Example:**
 ```bash
-source script/setenv.sh
+# 1. Generate the dictionary first
+sudo python3 script/fuzz_helper.py get_dict wasm3 \
+  --commit bc32ee \
+  --build_csv ~/log/wasm3_builds.csv
 
-python3 script/run_fuzz_test.py \
-  --target_bugs config/my_bugs.json \
-  --bug_info osv_testcases_summary.json \
-  --build_csv log/opensc_builds.csv
+# 2. Run PoC generation with fuzzing
+sudo python3 script/fuzz_helper.py get_poc_for_new_version \
+  --buggy_commit 715a8d \
+  --target_commit bc32ee \
+  --testcases ~/oss-fuzz-for-select/pocs/tmp \
+  --test_input testcase-OSV-2021-660 \
+  --build_csv ~/log/wasm3_builds.csv \
+  --patch patch/OSV-2021-660_bc32ee_patches.diff \
+  --sanitizer address \
+  -e ASAN_OPTIONS=detect_leaks=0 \
+  wasm3 fuzzer
 ```
-
-**target_bugs JSON format:**
-```json
-{
-  "test_1": {
-    "id": "OSV-2020-525",
-    "base": "a3ee8c",
-    "buggy": "8963c3"
-  },
-  "test_2": {
-    "id": "OSV-2021-100",
-    "base": "abc123",
-    "buggy1": "def456",
-    "buggy2": "ghi789"
-  }
-}
-```
-Each entry can use single-bug mode (`buggy`) or two-bug mode (`buggy1`/`buggy2`).
 
 **What it does:**
-1. Checks out the latest OSS-Fuzz commit and patches Dockerfiles (removes `--depth 1` for full git history)
-2. Retrieves the fuzzer dictionary via `fuzz_helper.py get_dict`
-3. Runs `fuzz_helper.py fuzz_one` with the appropriate sanitizer, commits, and testcase
+1. Collects the crash log at the buggy commit using the seed testcase
+2. Collects an execution trace at the buggy commit and generates a coverage allowlist
+3. Collects a trace at the target commit with the revert patch applied
+4. Fuzzes at the target commit with the allowlist-filtered coverage to find a matching crash
 
 ### revert_patch_test.py
 End-to-end pipeline for selective code migration. Given a target project and a set of bug-introducing commits, it generates revert patches, fixes build errors using the LLM-based multi-agent (`multi_agent.py`), and verifies that the patched code still triggers the original bug.

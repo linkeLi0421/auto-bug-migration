@@ -248,8 +248,6 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
     result = get_dict(args)
   elif args.command == 'build_version':
     result = build_version(args)
-  elif args.command == 'fuzz_one':
-    result = fuzz_one(args)
   elif args.command == 'get_poc_for_new_version':
     result = get_poc_for_new_version(args)
   elif args.command == 'collect_trace':
@@ -672,39 +670,6 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   _add_sanitizer_args(build_version_parser)
   _add_environment_args(build_version_parser)
   _add_external_project_args(build_version_parser)
-
-  fuzz_one_parser = subparsers.add_parser(
-      'fuzz_one', help='Fuzz for a specific task.')
-  fuzz_one_parser.add_argument('project',
-                            help='name of the project or path (external)')
-  fuzz_one_parser.add_argument('source_path',
-                            help='path of local source',
-                            nargs='?')
-  fuzz_one_parser.add_argument('fuzzer_name',
-                            help='name of the fuzzer')
-  fuzz_one_parser.add_argument('--buggy_commit1',
-                            help='commit hash 1 to collect bug trace')
-  fuzz_one_parser.add_argument('--buggy_commit2',
-                            help='commit hash 2 to collect bug trace')
-  fuzz_one_parser.add_argument('--base_commit',
-                            help='commit hash to migrate bug')
-  fuzz_one_parser.add_argument('--testcases',
-                            help='path to store testcases')
-  fuzz_one_parser.add_argument('--test_input',
-                            help='test_input name')
-  fuzz_one_parser.add_argument('--two_bug_mode',
-                            action='store_true',
-                            help='Specify if there are two buggy commits to analyze. False means buggy_commit2==base_commit and is not buggy')
-  fuzz_one_parser.add_argument('--build_csv',
-                            help='this file contains a target project commit id and corresponding commit id')
-  fuzz_one_parser.add_argument('--patch',
-                            help='a patch apply in base commit')
-  
-  _add_architecture_args(fuzz_one_parser)
-  _add_engine_args(fuzz_one_parser)
-  _add_sanitizer_args(fuzz_one_parser)
-  _add_environment_args(fuzz_one_parser)
-  _add_external_project_args(fuzz_one_parser)
 
   get_poc_for_new_version_parser = subparsers.add_parser(
       'get_poc_for_new_version', help='Get poc for a new version given old version poc.')
@@ -1821,8 +1786,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
     # Full image URL provided
     reproduce_image = runner_image
   else:
-    # Use default 2020 base-runner:testing image for library compatibility (OpenSSL 1.0.0)
-    reproduce_image = 'gcr.io/oss-fuzz-base/base-runner@sha256:88ceb7b782d6e1e4a126bce5d751c7698493616f006b4b4f5a492f6e0ed0da3e'
+    reproduce_image = BASE_RUNNER_IMAGE
 
   run_args = _env_to_docker_args(env) + [
       '-v',
@@ -2379,6 +2343,11 @@ def get_poc_for_new_version(args):
   if not build_image_impl(args.project):
     return False
 
+  dict_path = os.path.join(HOME_DIR, 'data', 'fuzz.dict')
+  if not os.path.exists(dict_path):
+    logger.error('Dictionary file %s does not exist. Run "get_dict" first.', dict_path)
+    return False
+
   env = [
       'FUZZING_ENGINE=' + args.engine,
       'SANITIZER=' + args.sanitizer,
@@ -2530,6 +2499,7 @@ def get_poc_for_new_version(args):
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
     python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
+    /bin/bash;
     '''
     return bash_fuzz
 
@@ -2549,185 +2519,6 @@ def get_poc_for_new_version(args):
   ])
   clean(args, out_dir)
   docker_run(run_fuzzer_args, architecture=args.architecture)
-  
-  return True
-
-
-def fuzz_one(args):
-  """collect execution trace"""
-  if not build_image_impl(args.project):
-    return False
-
-  env = [
-      'FUZZING_ENGINE=' + args.engine,
-      'SANITIZER=' + args.sanitizer,
-      'ARCHITECTURE=' + args.architecture,
-      'HELPER=True',
-  ]
-
-  if args.project.name != 'base-runner-debug':
-    env.append('FUZZING_LANGUAGE=' + args.project.language)
-
-  if args.e:
-    env += args.e
-
-  if is_base_image(args.project.name):
-    image_project = 'oss-fuzz-base'
-    out_dir = _get_out_dir()
-  else:
-    image_project = 'oss-fuzz'
-    out_dir = args.project.out
-    
-  run_args = _env_to_docker_args(env)
-  if args.source_path:
-    workdir = _workdir_from_dockerfile(args.project)
-    run_args.extend([
-        '-v',
-        '%s:%s' % (_get_absolute_path(args.source_path), workdir),
-    ])
-
-  testcases_path = _get_absolute_path(args.testcases)
-  if os.path.exists(testcases_path):
-    run_args.extend([
-        '-v',
-        '%s:/corpus' % testcases_path,
-    ])
-  else:
-    logger.error('Testcase path %s does not exist.', args.testcases)
-    return False
-  
-  script_folder = os.path.join(HOME_DIR, 'script')
-  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
-  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
-  result_dir = os.path.join(HOME_DIR, 'data')
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-      
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-        
-        if args.buggy_commit1 in target_commit or target_commit in args.buggy_commit1:
-          logger.info('Found matching commit for buggy_commit1 in CSV: %s -> %s', 
-          args.buggy_commit1, oss_fuzz_commit)
-          oss_fuzz_commit1 = oss_fuzz_commit
-          
-        if args.buggy_commit2 in target_commit or target_commit in args.buggy_commit2:
-          logger.info('Found matching commit for buggy_commit2 in CSV: %s -> %s', 
-          args.buggy_commit2, oss_fuzz_commit)
-          oss_fuzz_commit2 = oss_fuzz_commit
-          
-        if args.base_commit in target_commit or target_commit in args.base_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
-          args.base_commit, oss_fuzz_commit)
-          oss_fuzz_commit_base = oss_fuzz_commit
-  
-  if not os.path.exists(result_dir):
-    os.makedirs(result_dir)
-  
-  if not os.path.exists(LLVM_PROJECT):
-    os.makedirs(LLVM_PROJECT)
-    
-    llvm_builder = run_args.copy()
-    # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
-    llvm_builder.extend([
-      '-v', f'{out_dir}:/out', 
-      '-v', f'{args.project.work}:/work', 
-      '-v', f'{script_folder}:/script', 
-      '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROJECT}:/llvm',
-      '-v', f'{result_dir}:/data',
-      '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', build_llvm_from_source()
-    ])
-    
-    docker_run(llvm_builder, architecture=args.architecture)
-  run_fuzzer_args = run_args.copy()
-
-  # Prepare part. 
-  # Use the formatted script, run_args will do preparation work, get crash log, allowlist.txt;
-  run_args.extend([
-      '-v', f'{out_dir}:/out', 
-      '-v', f'{args.project.work}:/work', 
-      '-v', f'{script_folder}:/script', 
-      '-v', f'{Function_instrument}:/Function_instrument', 
-      '-v', f'{LLVM_PROJECT}:/llvm',
-      '-v', f'{result_dir}:/data',
-      '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c'
-  ])
-  if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit1[:6]}-{args.test_input}.txt'):
-    run_args.extend([get_crash_log_bash(args.buggy_commit1, args)])
-    clean(args, out_dir)
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit1, args.project.name, None)
-    docker_run(run_args, architecture=args.architecture)
-    run_args.pop()
-
-  if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit1[:6]}-{args.test_input}.txt'):
-    run_args.extend([get_trace_log_bash(args.buggy_commit1, args, apply_patch = False)])
-    clean(args, out_dir)
-    docker_run(run_args, architecture=args.architecture)
-    run_args.pop()
-
-  if not os.path.exists(f"{result_dir}/target_trace-{args.base_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt") and \
-    args.base_commit != args.buggy_commit2:
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name, None)
-    run_args.extend([get_trace_log_bash(args.base_commit, args, apply_patch = True)])
-    clean(args, out_dir)
-    docker_run(run_args, architecture=args.architecture)
-    run_args.pop()
-
-  if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit2[:6]}-{args.test_input}.txt') or \
-    not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-full-{args.test_input}.txt') or \
-    not os.path.exists(f'/data/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'):
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit2, args.project.name, None)
-    run_args.extend([get_trace_log_bash(args.buggy_commit2, args, apply_patch = False) + get_allowlist_bash(args)])
-    clean(args, out_dir)
-    docker_run(run_args, architecture=args.architecture)
-    run_args.pop()
-
-  # Fuzzing part
-  if args.patch:
-    run_fuzzer_args.extend([
-        '-v',
-        '%s:/patch' % args.patch,
-    ])
-  run_fuzzer_args.extend([
-      '-v', f'{out_dir}:/out', 
-      '-v', f'{args.project.work}:/work', 
-      '-v', f'{script_folder}:/script', 
-      '-v', f'{Function_instrument}:/Function_instrument',
-      '-v', f'{result_dir}:/data',
-      '-t', f'gcr.io/{image_project}/{args.project.name}', 
-      '/bin/bash', '-c', get_runfuzzer_bash(args, 'diff')
-  ])
-  clean(args, out_dir)
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_base, args.project.name, None)
-  allowlist_path = f'{result_dir}/allowlist/allowlist-{args.buggy_commit1[:6]}-{args.buggy_commit2[:6]}-{args.test_input}.txt'
-  # Check if allowlist only contains "src:*"
-  with open(allowlist_path, 'r') as f:
-    content = f.read().strip()
-    # if 'fun:' in content:
-      # docker_run(run_fuzzer_args, architecture=args.architecture)
-  
-  run_fuzzer_args.pop()
-  run_fuzzer_args.extend([get_runfuzzer_bash(args, 'full')])
-  clean(args, out_dir)
-  allowlist_path = f'{result_dir}/allowlist/allowlist-{args.buggy_commit1[:6]}-full-{args.test_input}.txt'
-  # Check if allowlist only contains "src:*"
-  with open(allowlist_path, 'r') as f:
-    content = f.read().strip()
-    if 'fun:' in content:
-      docker_run(run_fuzzer_args, architecture=args.architecture)
-  
-  run_fuzzer_args.pop()
-  run_fuzzer_args.extend([get_runfuzzer_bash(args, 'noselect')])
-  clean(args, out_dir)
-  # docker_run(run_fuzzer_args, architecture=args.architecture)
   
   return True
 
