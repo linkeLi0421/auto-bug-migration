@@ -6,11 +6,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <elf.h>
 
 static int trace_fd = -1;
 static volatile int in_trace = 0;
 static volatile int ready = 0;
-static uintptr_t base_addr = 0;
+static uintptr_t runtime_base = 0;   /* from /proc/self/maps */
+static uintptr_t elf_load_vaddr = 0; /* from ELF PT_LOAD */
 
 /* Parse hex string into uintptr_t. */
 __attribute__((no_instrument_function))
@@ -26,15 +28,16 @@ static uintptr_t parse_hex(const char *s, int len) {
     return val;
 }
 
-/* Write an unsigned long in decimal to buf; return number of chars written. */
+/* Write a uintptr_t as lowercase hex to buf; return number of chars written. */
 __attribute__((no_instrument_function))
-static int ulong_to_str(unsigned long val, char *buf) {
-    char tmp[24];
+static int uptr_to_hex(uintptr_t val, char *buf) {
+    static const char hex[] = "0123456789abcdef";
+    char tmp[20];
     int len = 0;
     if (val == 0) { buf[0] = '0'; return 1; }
     while (val > 0) {
-        tmp[len++] = '0' + (val % 10);
-        val /= 10;
+        tmp[len++] = hex[val & 0xf];
+        val >>= 4;
     }
     for (int i = 0; i < len; i++)
         buf[i] = tmp[len - 1 - i];
@@ -42,13 +45,54 @@ static int ulong_to_str(unsigned long val, char *buf) {
 }
 
 /*
- * Read the main executable's base address from /proc/self/maps.
- * The first line's start address is the load base of the main binary.
- * All instrumented functions live in the main binary (shared libs like
- * libc aren't compiled with -finstrument-functions).
+ * Read the first PT_LOAD segment's p_vaddr from /proc/self/exe.
+ * - Non-PIE (ET_EXEC): p_vaddr = 0x400000 (x86_64 default)
+ * - PIE     (ET_DYN):  p_vaddr = 0x0 (or small)
+ */
+__attribute__((no_instrument_function))
+static uintptr_t read_elf_load_vaddr(void) {
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return 0;
+
+    Elf64_Ehdr ehdr;
+    if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+        close(fd);
+        return 0;
+    }
+
+    /* Seek to program header table */
+    if (lseek(fd, ehdr.e_phoff, SEEK_SET) < 0) {
+        close(fd);
+        return 0;
+    }
+
+    for (int i = 0; i < ehdr.e_phnum; i++) {
+        Elf64_Phdr phdr;
+        if (read(fd, &phdr, sizeof(phdr)) != sizeof(phdr)) break;
+        if (phdr.p_type == PT_LOAD) {
+            close(fd);
+            return (uintptr_t)phdr.p_vaddr;
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+
+/*
+ * Read runtime base address from /proc/self/maps (first line).
+ * Read ELF load vaddr from /proc/self/exe (first PT_LOAD).
+ *
+ * For any func pointer at runtime:
+ *   elf_vaddr = func - runtime_base + elf_load_vaddr
+ *
+ * This gives the correct virtual address for llvm-symbolizer:
+ *   Non-PIE: func - 0x400000 + 0x400000 = func  (raw address)
+ *   PIE:     func - random_base + 0     = offset (ELF offset)
  */
 __attribute__((constructor, no_instrument_function))
 static void trace_init(void) {
+    /* Read runtime base from /proc/self/maps */
     int fd = open("/proc/self/maps", O_RDONLY);
     if (fd >= 0) {
         char buf[128];
@@ -56,12 +100,15 @@ static void trace_init(void) {
         close(fd);
         if (n > 0) {
             buf[n] = '\0';
-            /* First line: "55a3c000-55a4d000 r--p ..." — parse up to '-' */
             int end = 0;
             while (end < n && buf[end] != '-') end++;
-            base_addr = parse_hex(buf, end);
+            runtime_base = parse_hex(buf, end);
         }
     }
+
+    /* Read ELF load vaddr */
+    elf_load_vaddr = read_elf_load_vaddr();
+
     ready = 1;
 }
 
@@ -79,13 +126,13 @@ void __cyg_profile_func_enter(void *func, void *caller) {
     char line[128];
     int pos = 0;
 
-    unsigned long offset = (unsigned long)((uintptr_t)func - base_addr);
-    unsigned long caller_offset = (unsigned long)((uintptr_t)caller - base_addr);
+    uintptr_t offset = (uintptr_t)func - runtime_base + elf_load_vaddr;
+    uintptr_t caller_off = (uintptr_t)caller - runtime_base + elf_load_vaddr;
 
     memcpy(line + pos, "offset: ", 8); pos += 8;
-    pos += ulong_to_str(offset, line + pos);
+    pos += uptr_to_hex(offset, line + pos);
     memcpy(line + pos, " called by: ", 12); pos += 12;
-    pos += ulong_to_str(caller_offset, line + pos);
+    pos += uptr_to_hex(caller_off, line + pos);
     line[pos++] = '\n';
 
     write(trace_fd, line, pos);

@@ -19,36 +19,51 @@ def symbolize_funcs(all_offsets, binary_path):
     # Prepare input for llvm-symbolizer
     offset_to_symbol = {}
 
-    # Batch process all offsets in a single call
-    # llvm-symbolizer expects hex addresses with 0x prefix
-    cmd_input = '\n'.join(["{} {}".format(binary_path, offset) for offset in all_offsets])
     if not os.path.exists('/out/llvm-symbolizer'):
         llvm_symbolizer_path = shutil.which('llvm-symbolizer')
     else:
         llvm_symbolizer_path = '/out/llvm-symbolizer'
-    
-    proc = subprocess.Popen([llvm_symbolizer_path], 
+
+    # Use 0x prefix so llvm-symbolizer reliably parses each address as hex
+    cmd_input = '\n'.join(["{} 0x{}".format(binary_path, offset) for offset in all_offsets])
+
+    proc = subprocess.Popen([llvm_symbolizer_path],
                           stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE,
                           universal_newlines=True)
     output, error = proc.communicate(input=cmd_input, timeout=30)
-    
+
     if error:
         print("Symbolizer error: {}".format(error), file=sys.stderr)
-    
-    # Process output - each symbol/location pair takes two lines
-    output_lines = output.strip().split('\n\n')
-    for i in range(len(output_lines)):
-        output_line = output_lines[i]
-        offset = all_offsets[i]
-        lines = output_line.split('\n')
-        if len(lines) < 2:
-            continue
-        symbol = lines[0].strip()
-        location = lines[1].strip()
-        offset_to_symbol[offset] = (symbol, location)
-    
+
+    # llvm-symbolizer outputs one block per query, blocks separated by blank lines.
+    # Parse by consuming lines sequentially rather than splitting on '\n\n'
+    # which breaks when a block contains extra blank lines.
+    lines = output.split('\n')
+    idx = 0       # current position in lines
+    query = 0     # current query index
+
+    while query < len(all_offsets) and idx < len(lines):
+        # Skip blank lines between blocks
+        while idx < len(lines) and lines[idx].strip() == '':
+            idx += 1
+        if idx >= len(lines):
+            break
+
+        # Read the symbol line
+        symbol = lines[idx].strip()
+        idx += 1
+
+        # Read the location line (may be absent if symbolizer fails)
+        location = '??:0:0'
+        if idx < len(lines) and lines[idx].strip() != '':
+            location = lines[idx].strip()
+            idx += 1
+
+        offset_to_symbol[all_offsets[query]] = (symbol, location)
+        query += 1
+
     return offset_to_symbol
 
 
@@ -108,11 +123,11 @@ def main():
     
     # Process caller relationships
     call_relation_lines = ['Call Relation Summary:', '-----------------------', '']
+    unknown = ('??', '??:0:0')
     for caller_offset, callee_offsets in caller_to_callees.items():
-        call_relation_lines.append("Caller: {} {}".format(offset_to_symbol[caller_offset], caller_offset))
+        call_relation_lines.append("Caller: {} {}".format(offset_to_symbol.get(caller_offset, unknown), caller_offset))
         for callee_offset in callee_offsets:
-            if callee_offset in offset_to_symbol:
-                call_relation_lines.append("  -> Callee: {} {}".format(offset_to_symbol[callee_offset], callee_offset))
+            call_relation_lines.append("  -> Callee: {} {}".format(offset_to_symbol.get(callee_offset, unknown), callee_offset))
 
                 
     for trace_offset in trace_offset_list:
@@ -125,7 +140,7 @@ def main():
     output_lines.append("Found {} function entries.".format(len(trace_offset_list)))
     output_lines.append("")
     for trace_offset in trace_offset_list:
-        symbol, location = offset_to_symbol[trace_offset]
+        symbol, location = offset_to_symbol.get(trace_offset, unknown)
         if args.source_path:
             # Get relative path
             location = location.replace(args.source_path, "")
