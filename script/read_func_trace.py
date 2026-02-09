@@ -84,7 +84,7 @@ def read_func_trace(file_path):
         with open(file_path, 'r') as f:
             for line in f:
                 if "Entering function:" in line:
-                    function_name = line.split("Entering function:")[1].strip()
+                    function_name = line.split("Entering function:")[1].strip().split(' ')[0]
                     function_names.add(function_name)
         
     except FileNotFoundError:

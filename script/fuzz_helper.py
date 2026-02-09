@@ -2499,7 +2499,6 @@ def get_poc_for_new_version(args):
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
     python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
-    /bin/bash;
     '''
     return bash_fuzz
 
@@ -2518,8 +2517,9 @@ def get_poc_for_new_version(args):
       '/bin/bash', '-c', get_target_fuzzing_bash(args)
   ])
   clean(args, out_dir)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, None)
   docker_run(run_fuzzer_args, architecture=args.architecture)
-  
+
   return True
 
 
