@@ -218,9 +218,14 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                 extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
                 end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
                 end_ln = int(end.get("line", 0) or 0)
-                if end_ln > 0:
-                    # Insert after the declaration line
-                    return end_ln + 1
+                if end_ln <= 0:
+                    continue
+                # Verify the extent belongs to the target file, not a header.
+                end_file = str(end.get("file") or "").strip()
+                if end_file and Path(end_file).name != base:
+                    continue
+                # Insert after the declaration line
+                return end_ln + 1
 
     def in_file(node: dict) -> bool:
         extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
@@ -283,12 +288,18 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
     fall back to inserting after the last #include statement in the initial header section.
     """
     in_block_comment = False
+    in_macro_continuation = False
     pp_nesting = 0
     last_include_idx = -1
     header_section_ended = False  # Track if we've left the initial header/preprocessor section
 
     for idx, raw in enumerate(lines):
         stripped = str(raw or "").lstrip()
+        # Track multi-line #define macros (lines ending with backslash).
+        if in_macro_continuation:
+            if not str(raw or "").rstrip().endswith("\\"):
+                in_macro_continuation = False
+            continue
         if in_block_comment:
             if "*/" in stripped:
                 in_block_comment = False
@@ -311,6 +322,9 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
                 pp_nesting += 1
             elif _PP_ENDIF_RE.match(stripped):
                 pp_nesting = max(pp_nesting - 1, 0)
+            # Check if this preprocessor line continues (multi-line macro).
+            if str(raw or "").rstrip().endswith("\\"):
+                in_macro_continuation = True
             continue
         if pp_nesting > 0:
             continue
@@ -327,6 +341,22 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
     if last_include_idx >= 0:
         return last_include_idx + 1
     return 0
+
+
+def _skip_past_macro_continuation(lines: List[str], idx: int) -> int:
+    """If `idx` falls inside a multi-line #define (backslash-continued), advance past it."""
+    if idx <= 0 or idx >= len(lines):
+        return idx
+    # Check if the immediately preceding line ends with backslash (we are inside a macro body).
+    if not str(lines[idx - 1] or "").rstrip().endswith("\\"):
+        return idx
+    # Advance past all remaining backslash-continued lines.
+    while idx < len(lines) and str(lines[idx] or "").rstrip().endswith("\\"):
+        idx += 1
+    # Skip one more (the final line of the macro which doesn't end with \).
+    if idx < len(lines):
+        idx += 1
+    return min(idx, len(lines))
 
 
 def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3, symbol_name: str = "") -> str:
@@ -377,6 +407,11 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     # Ensure insert_at is after all #include statements in the header section
     if last_include_idx >= 0 and insert_at <= last_include_idx:
         insert_at = last_include_idx + 1
+
+    # Safety: if insert_at lands inside a multi-line #define macro (backslash-continued lines),
+    # advance past the macro to avoid splitting it.
+    insert_at = _skip_past_macro_continuation(lines, insert_at)
+
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
     if not ctx:
