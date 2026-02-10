@@ -2467,7 +2467,7 @@ def get_poc_for_new_version(args):
     return bash_allowlist
 
   # Get the function trace in the buggy commit
-  if not os.path.exists(f'{result_dir}/target_trace-{args.buggy_commit[:6]}-{args.test_input}.txt'):
+  if not os.path.exists(f'{result_dir}/allowlist/allowlist-{args.buggy_commit}-{args.test_input}.txt'):
     run_args.extend([get_trace_log_bash(args.buggy_commit, args, apply_patch = False) + get_allowlist_one_trace_bash(args)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)

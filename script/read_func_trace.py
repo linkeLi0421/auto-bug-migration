@@ -55,7 +55,7 @@ def apply_signature_changes(functions, signature_map):
     additions = 0
     
     for func in functions:
-        clean_func = func.split(' ')[0]  # Remove any additional info after function name
+        clean_func = func.split(' ')[0].split('(')[0]  # Remove params and extra info
         updated_functions.add(clean_func)
         
         for new_func in signature_map.get(clean_func, []):
@@ -84,7 +84,7 @@ def read_func_trace(file_path):
         with open(file_path, 'r') as f:
             for line in f:
                 if "Entering function:" in line:
-                    function_name = line.split("Entering function:")[1].strip().split(' ')[0]
+                    function_name = line.split("Entering function:")[1].strip().split(' ')[0].split('(')[0]
                     function_names.add(function_name)
         
     except FileNotFoundError:
