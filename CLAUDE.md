@@ -131,7 +131,10 @@ Patch bundles (`*.patch2`) are pickled dictionaries keyed by `patch_key`. In pat
 ### Error Types and Hunk Status
 - **Compiler errors**: `file:line:col: error:` patterns. Determine hunk "fixed" status.
 - **Linker errors**: `undefined reference to` patterns. Grouped by patch_key alongside compiler errors.
-- **Hunk fixed**: All **compiler errors** in the active patch_key are resolved.
+- **Hunk fixed**: All **original** compiler errors (matching `target_errors` messages) in the active patch_key are resolved. New errors at the same lines but with different messages are tracked separately (`new_errors_in_active_patch_key`) and do not block the "fixed" verdict.
+
+### Pre-Build Batch Fix
+Before forcing `ossfuzz_apply_patch_and_test`, the agent checks `grouped_errors` for all undeclared identifier errors (matching `_UNDECLARED_SYMBOL_RE`) not yet handled by `make_extra_patch_override`. It forces `make_extra_patch_override` for each unfixed symbol before building. This allows fixing multiple undeclared identifiers in a single build pass, even with `ossfuzz-loop-max=1`.
 
 ### Environment Setup
 `source script/setenv.sh` sets paths used by `revert_patch_test.py`:
