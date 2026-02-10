@@ -96,6 +96,33 @@ def get_latest_images_before_year(year: int) -> tuple:
     return builder, runner
 
 
+def get_ossfuzz_commit_before_year(oss_fuzz_path: str, year: int) -> str:
+    """
+    Get the latest oss-fuzz commit before a given year.
+
+    Args:
+        oss_fuzz_path: Path to the oss-fuzz repository
+        year: The year cutoff (will find latest commit before Jan 1 of this year)
+
+    Returns:
+        The commit hash of the latest oss-fuzz commit before the given year.
+    """
+    repo = git.Repo(oss_fuzz_path)
+    cutoff_date = datetime(year, 1, 1)
+
+    # Get all commits in reverse chronological order
+    commits = list(repo.iter_commits('--all'))
+
+    # Find the latest commit before the cutoff date
+    for commit in commits:
+        commit_time = commit.committed_datetime.replace(tzinfo=None)
+        if commit_time < cutoff_date:
+            return commit.hexsha
+
+    # If no commit found before cutoff, return the oldest commit
+    return commits[-1].hexsha if commits else None
+
+
 def get_base_builder_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-builder image digest for a given commit timestamp.
@@ -254,11 +281,14 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
 
 
 def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer,
-                  fixed_builder=None, fixed_runner=None):
+                  fixed_builder=None, fixed_runner=None, fixed_ossfuzz_commit=None):
     '''
     Run helper.py build_image and build_fuzzers
-    ''' 
-    oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id, month)
+    '''
+    if fixed_ossfuzz_commit:
+        oss_fuzz_commit = fixed_ossfuzz_commit
+    else:
+        oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id, month)
     if not oss_fuzz_commit:
         # commit timestamp add month is newer than Head in oss-fuzz, so we can't find a version of oss-fuzz to build
         return "No appropriate version os oss-fuzz, stop try newer. Try build next version of target project"
@@ -704,16 +734,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     target = args.target
 
-    # Resolve fixed image digests if requested
-    fixed_builder = None
-    fixed_runner = None
-    if args.fixed_image:
-        fixed_builder, fixed_runner = get_latest_images_before_year(args.fixed_image)
-        logger.info(f"Using fixed images (latest before {args.fixed_image}):")
-        logger.info(f"  base-builder: {fixed_builder}")
-        logger.info(f"  base-runner:  {fixed_runner}")
     current_file_path = os.path.dirname(os.path.abspath(__file__))
     oss_fuzz_path = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
+
+    # Resolve fixed image digests and oss-fuzz commit if requested
+    fixed_builder = None
+    fixed_runner = None
+    fixed_ossfuzz_commit = None
+    if args.fixed_image:
+        fixed_builder, fixed_runner = get_latest_images_before_year(args.fixed_image)
+        fixed_ossfuzz_commit = get_ossfuzz_commit_before_year(oss_fuzz_path, args.fixed_image)
+        logger.info(f"Using fixed images and oss-fuzz (latest before {args.fixed_image}):")
+        logger.info(f"  base-builder: {fixed_builder}")
+        logger.info(f"  base-runner:  {fixed_runner}")
+        logger.info(f"  oss-fuzz:     {fixed_ossfuzz_commit}")
     log_path = os.getenv('LOG_PATH')
     if not log_path:
         logger.error("Environment variable 'LOG_PATH' is not set. Run source setenv.sh first. Exiting.")
@@ -769,7 +803,8 @@ if __name__ == "__main__":
             build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
             for commit in commits:  # from latest to old
                 do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer,
-                             fixed_builder=fixed_builder, fixed_runner=fixed_runner)
+                             fixed_builder=fixed_builder, fixed_runner=fixed_runner,
+                             fixed_ossfuzz_commit=fixed_ossfuzz_commit)
         
     
     if args.mode in ["test", "both"]:
