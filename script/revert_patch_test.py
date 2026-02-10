@@ -1300,7 +1300,7 @@ def _run_single_multi_agent_round(
 
     logger.info(f"Calling react multi-agent: {' '.join(cmd)}")
     start_time = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
     try:
         output = json.loads(result.stdout) if result.stdout.strip() else {}
@@ -1370,7 +1370,7 @@ def call_react_agent(
     max_steps: int = 100,
     jobs: int = int(os.environ.get("REACT_AGENT_JOBS", "4")),
     max_groups: int = 100,
-    ossfuzz_loop_max: int = 100,
+    ossfuzz_loop_max: int = 1,
     max_restarts_per_hunk: int = 3,
     openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
