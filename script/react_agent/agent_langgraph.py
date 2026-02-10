@@ -1751,11 +1751,30 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
     # Only count compiler errors for remaining_in_active_patch_key. Linker errors are handled by
     # multi-agent --auto-continue-on-link-errors, not counted against individual hunk status.
     compiler_in_active = [e for e in in_active if e.get("kind") != "linker"]
+
+    # Filter: only count errors matching original target messages as "remaining".
+    # New errors at same lines but with different messages represent progress (original error fixed,
+    # new one revealed), not a failure to fix the assigned error.
+    targets = list(state.target_errors or [])
+    if not targets:
+        targets = _extract_target_errors(
+            error_line=state.error_line, grouped_errors=state.grouped_errors, patch_key=state.patch_key,
+        )
+    target_msgs = {str(t.get("msg", "")).strip() for t in targets if str(t.get("msg", "")).strip()}
+    if target_msgs:
+        original_remaining = [e for e in compiler_in_active if str(e.get("msg", "") or "").strip() in target_msgs]
+        new_errors = [e for e in compiler_in_active if str(e.get("msg", "") or "").strip() not in target_msgs]
+    else:
+        original_remaining = compiler_in_active
+        new_errors = []
+
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     return {
         "status": "ok",
         "active_patch_key": active_key,
-        "remaining_in_active_patch_key": len(compiler_in_active),
+        "remaining_in_active_patch_key": len(original_remaining),
+        "new_errors_in_active_patch_key": len(new_errors),
+        "new_errors": new_errors[:5],
         "errors": in_active[:10],
         "function_groups": func_groups,
         "function_groups_total": func_total,
@@ -3720,6 +3739,32 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
     return ""
 
 
+def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tuple]:
+    """Return [(symbol_name, file_path), ...] for undeclared symbols in grouped_errors not yet fixed."""
+    result: List[tuple] = []
+    seen: set = set()
+    for e in state.grouped_errors or []:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if not raw:
+            continue
+        m = _UNDECLARED_SYMBOL_RE.search(raw)
+        if not m:
+            continue
+        sym = str(m.group("symbol") or "").strip()
+        if not sym or not _C_IDENT_RE.match(sym):
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        if _has_make_extra_patch_override_for_symbol(state, sym):
+            continue
+        fp = str(e.get("file", "") or "").strip()
+        result.append((sym, fp))
+    return result
+
+
 def _missing_struct_member_summary_for_error_line(error_line: str) -> List[Dict[str, Any]]:
     """Return the missing-member summary for the ACTIVE error line only.
 
@@ -4625,6 +4670,26 @@ def _run_langgraph(
                         "error": _error_payload(st),
                     },
                 }
+
+            # Before forcing the build, fix any remaining undeclared symbols from grouped_errors.
+            # This allows batch-fixing all undeclared identifiers in one pass (one build).
+            unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
+            if unfixed:
+                sym, fp = unfixed[0]
+                file_for_override = Path(fp).name if fp else ""
+                forced_extra: Decision = {
+                    "type": "tool",
+                    "thought": f"Additional undeclared symbol in grouped errors: {sym}. Add forward declaration before building.",
+                    "tool": "make_extra_patch_override",
+                    "args": {
+                        "patch_path": st.patch_path,
+                        "file_path": file_for_override,
+                        "symbol_name": sym,
+                        "version": "v1",
+                    },
+                }
+                _validate_tool_decision(forced_extra)
+                return {"state": st, "pending": forced_extra}
 
             decision = {
                 "type": "tool",
