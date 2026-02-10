@@ -1401,6 +1401,7 @@ def call_react_agent(
     current_patch = patch_path
     rounds = []
     final_result = None
+    agent_succeeded = False  # True only when the final build actually passed
 
     for round_num in range(1, max_multi_agent_rounds + 1):
         logger.info(f"=== Multi-agent round {round_num}/{max_multi_agent_rounds} ===")
@@ -1446,6 +1447,7 @@ def call_react_agent(
         # If final build succeeded, we're done
         if final_status == "ok":
             logger.info(f"Round {round_num}: Build succeeded!")
+            agent_succeeded = True
             break
 
         # Check if build log has sanitizer errors (means build succeeded, runtime issue)
@@ -1455,7 +1457,7 @@ def call_react_agent(
                 final_build_log_text = f.read()
             if _has_sanitizer_error(final_build_log_text):
                 logger.info(f"Round {round_num}: Sanitizer error detected (build succeeded), stopping")
-                final_result["success"] = True  # Treat as success
+                agent_succeeded = True
                 break
 
         # Check if we have output for next round
@@ -1486,10 +1488,11 @@ def call_react_agent(
         }
 
     return {
-        "success": final_result.get("success", False),
+        "success": agent_succeeded,
         "output": final_result.get("output", {}),
         "returncode": final_result.get("returncode", 1),
         "merged_diff_path": final_result.get("merged_diff_path", ""),
+        "merged_patch_bundle_path": final_result.get("merged_patch_bundle_path", ""),
         "artifacts_dir": final_result.get("artifacts_dir", ""),
         "rounds": rounds,
         "total_rounds": len(rounds),
@@ -2522,6 +2525,11 @@ def apply_and_test_patches(
             sanitizer=sanitizer,
             arch=arch,
         )
+
+        # If the agent failed to fix all errors, skip copy and verification build
+        if not agent_result.get("success", False):
+            logger.info("React multi-agent failed to fix all errors, skipping verification build")
+            break
 
         # Use the merged diff from the agent directly
         merged_diff = agent_result.get("merged_diff_path", "")
