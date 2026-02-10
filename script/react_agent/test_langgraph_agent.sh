@@ -4241,6 +4241,121 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# Patch-key status: new error at same line (different message) should NOT count as remaining.
+# Only errors matching the original target_errors messages count as "remaining".
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, ToolObservation, _summarize_active_patch_key_status  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+
+def fake_gepb(bundle, *, patch_path, file_path, line_number, **_kw):
+    return {"patch_key": "p", "old_signature": "int f(void)"}
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    import migration_tools.tools as mt  # noqa: E402
+
+    mt._get_error_patch_from_bundle = fake_gepb
+
+    bundle_path = root / "bundle.pkl"
+    bundle_path.write_bytes(
+        pickle.dumps(
+            {
+                "p": PatchInfo(
+                    file_path_old="a.c",
+                    file_path_new="a.c",
+                    patch_text="diff --git a/a.c b/a.c\n--- a/a.c\n+++ b/a.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+                    file_type="source",
+                    old_start_line=1,
+                    old_end_line=1,
+                    new_start_line=1,
+                    new_end_line=1,
+                )
+            }
+        )
+    )
+
+    # Build log has a NEW error (bar) at the same line — the ORIGINAL error (foo) was fixed.
+    build_log = root / "build.log"
+    build_log.write_text(
+        "/src/a.c:10:1: error: use of undeclared identifier 'bar'\n",
+        encoding="utf-8",
+    )
+
+    st = AgentState(build_log_path="-", patch_path=str(bundle_path), error_scope="patch", error_line="old", snippet="")
+    st.patch_key = "p"
+    st.active_patch_key = "p"
+    # Original target error had message about 'foo', not 'bar'
+    st.target_errors = [{"file": "/src/a.c", "msg": "use of undeclared identifier 'foo'", "patch_key": "p"}]
+    st.last_observation = ToolObservation(
+        ok=True,
+        tool="ossfuzz_apply_patch_and_test",
+        args={},
+        output={"build_output": {"artifact_path": str(build_log)}},
+        error=None,
+    )
+
+    pkv = _summarize_active_patch_key_status(st)
+    assert pkv.get("status") == "ok", pkv
+    # Original error is gone → remaining should be 0
+    assert pkv.get("remaining_in_active_patch_key") == 0, f"expected 0 remaining, got {pkv}"
+    # New error is tracked separately
+    assert pkv.get("new_errors_in_active_patch_key") == 1, f"expected 1 new error, got {pkv}"
+
+print("OK")
+PY
+
+# _iter_unfixed_undeclared_symbols_from_grouped: returns symbols from grouped_errors not yet overridden.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _iter_unfixed_undeclared_symbols_from_grouped  # noqa: E402
+
+st = AgentState(build_log_path="-", error_line="old", snippet="")
+st.grouped_errors = [
+    {"raw": "/src/a.h:10:8: error: use of undeclared identifier '__revert_foo'", "file": "/src/a.h", "line": 10},
+    {"raw": "/src/a.h:10:40: error: use of undeclared identifier '__revert_bar'", "file": "/src/a.h", "line": 10},
+]
+
+unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
+assert len(unfixed) == 2, f"expected 2 unfixed, got {unfixed}"
+assert unfixed[0] == ("__revert_foo", "/src/a.h"), unfixed[0]
+assert unfixed[1] == ("__revert_bar", "/src/a.h"), unfixed[1]
+
+# Simulate fixing the first symbol
+st.step_history = [
+    {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_foo"}}},
+]
+unfixed2 = _iter_unfixed_undeclared_symbols_from_grouped(st)
+assert len(unfixed2) == 1, f"expected 1 unfixed after fixing foo, got {unfixed2}"
+assert unfixed2[0] == ("__revert_bar", "/src/a.h"), unfixed2[0]
+
+# Simulate fixing both
+st.step_history.append(
+    {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_bar"}}},
+)
+unfixed3 = _iter_unfixed_undeclared_symbols_from_grouped(st)
+assert len(unfixed3) == 0, f"expected 0 unfixed after fixing both, got {unfixed3}"
+
+print("OK")
+PY
+
 # After stopping post-OSS-Fuzz (auto-loop disabled or loop-max hit), refresh the final error snapshot from
 # the latest OSS-Fuzz logs so "Build error" matches "Current function groups".
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
