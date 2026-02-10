@@ -166,6 +166,23 @@ then inspect the returned struct body (fields, nesting, `#if` guards) to infer t
 - `bash script/react_agent/test_langgraph_agent.sh`
 - `bash script/migration_tools/test_migration_tools.sh`
 
+## Pre-Build Batch Fix of Undeclared Symbols
+
+When the agent generates an override via `make_extra_patch_override` and `patch_generated` becomes `True`, the mandatory
+`ossfuzz_apply_patch_and_test` routing in `llm_node` first checks `grouped_errors` for other undeclared identifier errors
+(`_UNDECLARED_SYMBOL_RE` matches) not yet handled. For each unfixed symbol, it forces another `make_extra_patch_override`
+before proceeding to the build. This batch-fixes all undeclared identifiers in one pass.
+
+Key function: `_iter_unfixed_undeclared_symbols_from_grouped(state)` — scans `grouped_errors`, filters by
+`_has_make_extra_patch_override_for_symbol`, returns `[(symbol_name, file_path), ...]`.
+
+## Hunk Fixed Status: Target Error Filtering
+
+`_summarize_active_patch_key_status` filters `remaining_in_active_patch_key` against `state.target_errors` messages.
+Only errors whose `msg` matches an original target error count as "remaining". New errors at the same lines but with
+different messages (progress, not regression) are tracked in `new_errors_in_active_patch_key` and `new_errors` fields
+but do not block the "fixed" verdict.
+
 ## Multi-agent (multi-hunk) notes
 
 - `script/react_agent/multi_agent.py` writes per-hunk artifacts under `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` and a top-level `summary.json`.

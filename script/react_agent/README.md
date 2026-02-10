@@ -115,6 +115,7 @@ Notes:
 - Limit fan-out: `--max-groups 10`
 - Run only specific hunks: `--only-patch-keys p1,p2,p3`
 - Retry a failing hunk from a clean slate: `--max-restarts-per-hunk 1`
+- Pre-build batch fix: when the build log contains multiple undeclared identifiers, the agent automatically calls `make_extra_patch_override` for each one before running a single `ossfuzz_apply_patch_and_test`, avoiding repeated builds.
 - Run one final OSS-Fuzz build/check_build with *all* hunks' overrides:
   - `--final-ossfuzz-test always` (default): run regardless of per-hunk status (still requires `--tools real`)
   - `--final-ossfuzz-test auto`: only when all hunks are `fixed` and `--tools real`
@@ -170,6 +171,8 @@ shape is:
   - `agent_stdout_path`: path to `agent_stdout.json` (per-hunk agent I/O)
   - `artifacts_dir`: per-hunk artifact directory
 - `not_fixed`: list of errors that the patch-scope agent could not resolve
+- `remaining_in_active_patch_key`: count of original target errors still present (new errors with different messages are excluded)
+- `new_errors_in_active_patch_key`: count of new errors introduced at the same hunk (different message from original targets)
 
 Related files:
 
