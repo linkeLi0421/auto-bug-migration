@@ -853,6 +853,12 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             logger.debug(f'diff is too short, skipping: {diff}')
             # Skip if the diff is too short to contain valid information, like binary files or empty diffs
             continue
+
+        # Check for binary files and skip them
+        if any('Binary files' in line for line in diff_lines):
+            logger.debug(f'Skipping binary file diff')
+            continue
+
         path_a = None
         path_b = None
         for diff_line in diff_lines:
@@ -862,7 +868,13 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 path_b = diff_line.split(' ')[-1]
             if path_a and path_b:
                 break
-        path = path_b if 'dev/null' not in path_b else path_a
+
+        # Skip if we couldn't parse paths (e.g., malformed diffs)
+        if not path_a and not path_b:
+            logger.debug(f'Could not parse file paths from diff, skipping')
+            continue
+
+        path = path_b if (path_b and 'dev/null' not in path_b) else path_a
         # Derive file extension/type from path:
         ext  = path.rsplit('.', 1)[-1] if '.' in path else ''
         if ext not in ['c', 'h', 'cc', 'cpp', 'cxx', 'hh', 'hpp', 'hxx']:
