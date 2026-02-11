@@ -47,6 +47,7 @@ from utils import (
 from fuzzer_correct_test import test_fuzzer_build
 from gumtree import get_corresponding_lines, get_delete_lines
 from migration_tools.types import FunctionLocation, PatchInfo
+from migration_tools.tools import is_rename_only_hunk
 
 HERE = os.path.dirname(__file__)               # script/
 OPENAI_DIR = os.path.join(HERE, "openai")     # script/openai
@@ -1252,6 +1253,82 @@ def _has_sanitizer_error(build_log_text: str) -> bool:
     import re
     # Sanitizer errors like "ERROR: AddressSanitizer", "ERROR: MemorySanitizer", etc.
     return bool(re.search(r"ERROR:\s*\w*Sanitizer", build_log_text))
+
+
+_ARG_COUNT_ERROR_RE = re.compile(r"too (?:few|many) arguments to function call", re.IGNORECASE)
+_REVERT_NAME_RE = re.compile(r"__revert_[A-Za-z0-9]+_[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _extract_revert_names_from_arg_errors(error_log: str) -> set[str]:
+    """Extract ``__revert_*`` function names associated with arg-count errors.
+
+    Scans the build log for "too few/many arguments" error lines and collects
+    any ``__revert_*`` function name that appears in the error line itself or in
+    the 10 lines that follow (source snippets / ``note:`` lines).
+    """
+    lines = error_log.splitlines()
+    names: set[str] = set()
+    i = 0
+    while i < len(lines):
+        if _ARG_COUNT_ERROR_RE.search(lines[i]):
+            # Scan this line + up to 10 following lines for __revert_* names
+            for j in range(i, min(i + 11, len(lines))):
+                for m in _REVERT_NAME_RE.finditer(lines[j]):
+                    names.add(m.group(0))
+            i += 11  # skip past the window we just scanned
+        else:
+            i += 1
+    return names
+
+
+def _remove_rename_only_hunks(
+    patches: dict,
+    error_log: str,
+    patch_file_path: str,
+    patch_file_binary: str,
+) -> bool:
+    """Detect rename-only hunks that cause argument-count errors and remove them.
+
+    Strategy: extract ``__revert_*`` function names from arg-count error contexts
+    in the build log, then remove any rename-only hunk whose patch text references
+    one of those functions.
+
+    Modifies *patches* in-place, rewrites *patch_file_path* (.diff) and
+    *patch_file_binary* (.patch2).  Returns True if any hunks were removed.
+    """
+    error_func_names = _extract_revert_names_from_arg_errors(error_log)
+    if not error_func_names:
+        return False
+
+    # Find rename-only hunks that reference the problematic functions.
+    removed: list[str] = []
+    for key in list(patches.keys()):
+        patch = patches[key]
+        if not is_rename_only_hunk(patch.patch_text):
+            continue
+        # Check if this hunk renames calls to any of the error functions.
+        if any(fn in patch.patch_text for fn in error_func_names):
+            removed.append(key)
+            del patches[key]
+
+    if not removed:
+        return False
+
+    logger.info(f"Removed {len(removed)} rename-only hunk(s) with argument mismatch: {removed}")
+
+    # Rewrite the .diff and .patch2 files without the removed hunks.
+    remaining_keys = sorted(
+        patches.keys(),
+        key=lambda k: getattr(patches[k], "new_start_line", 0),
+        reverse=True,
+    )
+    with open(patch_file_path, "w") as f:
+        for key in remaining_keys:
+            f.write(patches[key].patch_text)
+            f.write("\n\n")
+    save_patches_pickle(patches, patch_file_binary)
+
+    return True
 
 
 def _run_single_multi_agent_round(
@@ -2491,6 +2568,15 @@ def apply_and_test_patches(
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
         if build_success:
             break
+
+        # Pre-process: remove rename-only hunks that cause argument-count errors.
+        # This modifies current_patches, patch_file_path, and patch_file_binary in place.
+        if _remove_rename_only_hunks(current_patches, error_log, patch_file_path, patch_file_binary):
+            # Rebuild with the cleaned patch to get an updated error log.
+            build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+            if build_success:
+                break
+
         # Write build log to temp file for agent
         build_log_temp = os.path.join(data_path, "tmp_patch", f"{target}_build.log")
         with open(build_log_temp, 'w') as f:
@@ -2702,7 +2788,6 @@ def revert_patch_test(args):
     target = args.target
     target_repo_path = os.path.join(repo_path, target)
     min_patch_file_path = os.path.join(data_path, 'min_patch', f'{target}.json')
-    os.makedirs(os.path.dirname(min_patch_file_path), exist_ok=True)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
 
     # Handle fixed image selection if --fixed-image is specified
@@ -3239,6 +3324,7 @@ def revert_patch_test(args):
                 logger.info(f'\t{bug_id} trigger local bug {bug_id_trigger} but stack mismatch\n')
         logger.info(f'\t{bug_id} total local bugs triggered: {count}\n')
 
+    os.makedirs(os.path.dirname(min_patch_file_path), exist_ok=True)
     with open(min_patch_file_path, 'w') as f:
         json.dump(min_path_dict, f, indent=4)
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")

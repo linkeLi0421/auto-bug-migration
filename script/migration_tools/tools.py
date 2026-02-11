@@ -25,6 +25,36 @@ def _strip_revert_prefix(name: str) -> str:
     return raw
 
 
+_REVERT_CALL_RE = re.compile(r"(?<!\w)(__revert_[A-Za-z0-9]+_)([A-Za-z_][A-Za-z0-9_]*)(?=\s*\()")
+
+
+def is_rename_only_hunk(patch_text: str) -> bool:
+    """Return True if every ``-``/``+`` pair in *patch_text* differs only by a ``__revert_*`` rename.
+
+    A rename-only hunk is one where the patch just substitutes
+    ``original_func`` with ``__revert_<commit>_original_func`` (or vice-versa)
+    at call sites, with no other changes.  These hunks should be made empty
+    (no-op) when the ``__revert_*`` callee has a different parameter count.
+    """
+    hunks = _iter_hunks(patch_text)
+    if not hunks:
+        return False
+
+    for hunk in hunks:
+        minus_lines = [line[1:] for line in hunk["lines"] if line.startswith("-")]
+        plus_lines = [line[1:] for line in hunk["lines"] if line.startswith("+")]
+
+        if not minus_lines or not plus_lines or len(minus_lines) != len(plus_lines):
+            return False
+
+        for minus, plus in zip(minus_lines, plus_lines):
+            # Strip the __revert_*_ prefix from the minus line and compare
+            stripped = _REVERT_CALL_RE.sub(r"\2", minus)
+            if stripped != plus:
+                return False
+    return True
+
+
 def _func_name_from_sig(signature: Optional[str]) -> str:
     sig = str(signature or "").strip()
     if not sig:
