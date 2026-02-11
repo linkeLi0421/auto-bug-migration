@@ -156,6 +156,66 @@ sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
 6. Verifies the patched build still triggers the original bug (crash reproduction)
 7. Caches results incrementally to `data/patches/<target>_patches.pkl.gz` for resumability
 
+### patch_merge.py
+Merge compatible patches from multiple bugs into a single unified patch. Loads patch sets produced by `revert_patch_test`, builds a compatibility graph, detects fully compatible groups (cliques), and optionally refreshes stale patches and verifies the merged result.
+
+**Arguments:**
+| Argument | Required | Description |
+|---|---|---|
+| `cache_file` | Yes (positional) | Pickled patch dictionary (`*.pkl.gz`) from `revert_patch_test` |
+| `--bug_distribution_csv` | Yes | CSV describing bug trigger status per commit (same format as `revert_patch_test`) |
+| `--graphviz_output` | No | DOT file path for visualizing the compatibility graph |
+| `--fuzz_target` | No | Fuzzer target name for post-merge build and verification |
+| `--target_commit` | No | Commit hash used as the base when restoring context to merged patches |
+| `--revert_bug_info` | No | JSON file with bug details (forwarded to `revert_patch_test` for patch refresh) |
+| `--revert_build_csv` | No | Build CSV (forwarded to `revert_patch_test`) |
+| `--revert_target` | No | Target project name (forwarded to `revert_patch_test`) |
+| `--revert_output_dir` | No | Directory to capture `revert_patch_test` stdout/stderr logs |
+
+**Environment variables:** Same as `revert_patch_test.py` (`REPO_PATH`, `TESTCASES`, etc.) when using automatic patch refresh.
+
+**Example:**
+```bash
+source script/setenv.sh
+
+# Basic compatibility analysis with graph output
+sudo -E python3 script/patch_merge.py \
+  --bug_distribution_csv ~/log/opensc.csv \
+  data/patches/opensc_patches.pkl.gz \
+  --graphviz_output ~/log/patch_compatibility.dot
+
+# Full merge with automatic patch refresh and fuzzer verification
+sudo -E python3 script/patch_merge.py \
+  --bug_distribution_csv ~/log/opensc.csv \
+  data/patches/opensc_patches.pkl.gz \
+  --graphviz_output ~/log/patch_compatibility.dot \
+  --revert_bug_info osv_testcases_summary.json \
+  --revert_build_csv ~/log/opensc_builds.csv \
+  --revert_target opensc \
+  --revert_output_dir ~/log/revert_patch/ \
+  --target_commit 2192a2 \
+  --fuzz_target fuzz_pkcs15init
+```
+
+**What it does:**
+1. Loads patch sets from the pickle cache and the bug distribution CSV
+2. Builds a compatibility graph: patches touching disjoint functions are automatically compatible; overlapping patches are compatible only if both bugs are triggered at a shared commit
+3. When overlapping patches exist at different commits, records them as needing refresh
+4. If `--revert_*` flags are provided, triggers `revert_patch_test` to regenerate stale patches and re-analyzes until stable
+5. Detects fully compatible groups (maximal cliques) using Bron-Kerbosch
+6. For the largest group, restores context lines at `--target_commit` and writes a merged diff to `patch/group_<commit>_final.diff`
+7. If `--fuzz_target` is provided, builds the fuzzer with the merged patch and runs stack verification against each bug
+
+**Compatibility logic:**
+- Patches touching **different functions** are always compatible
+- Patches touching **the same functions** require a shared commit where both bugs are triggered. If the patch commits differ from the shared commit, a refresh is needed
+- Local bugs (from `data/local_compatibility/<target>.json`) are attached as synthetic nodes in the graph (shown as red in Graphviz output)
+
+**Output files:**
+- `patch/group_<commit>_final.diff` — merged unified diff for the largest compatible group
+- `data/signature_change_list/merged_<commit>.json` — combined signature mappings for stack verification
+- Graphviz DOT file (if `--graphviz_output` specified) — visual compatibility graph
+
 ## Contributing
 Pull requests and bug reports are welcome.  Please ensure that all scripts pass basic syntax checks before submitting changes.
 
