@@ -3227,7 +3227,7 @@ def revert_patch_test(args):
             min_path_dict[bug_id] = minimal_fast
             patches_without_contexts[
                 (bug_id, commit['commit_id'], fuzzer,
-                tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
+                tuple(diff_results[key].old_function_name for keys in minimal_fast for key in keys))
             ] = patches_without_context
 
             # Save cache incrementally after each bug completes
@@ -3359,6 +3359,33 @@ if __name__ == "__main__":
     # Note: Cache loading/saving is now handled incrementally inside revert_patch_test()
     # The function loads existing cache at start and saves after each bug completes
     patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
+
+    # Save local bug compatibility for patch_merge.py
+    # test_local_bug_after_patch is {local_bug: set(remote_bugs)}
+    # patch_merge.py expects {remote_bug: [local_bugs]}
+    if test_local_bug_after_patch:
+        local_compat_dir = os.path.join(data_path, 'local_compatibility')
+        os.makedirs(local_compat_dir, exist_ok=True)
+        local_compat_file = os.path.join(local_compat_dir, f'{args.target}.json')
+        # Merge with existing file so single-bug runs don't lose other data
+        existing = {}
+        if os.path.exists(local_compat_file):
+            try:
+                with open(local_compat_file, 'r') as f:
+                    existing = json.load(f)
+            except Exception:
+                pass
+        # Invert: local_bug -> {remote_bugs} becomes remote_bug -> [local_bugs]
+        for local_bug, remote_bugs in test_local_bug_after_patch.items():
+            for remote_bug in remote_bugs:
+                existing.setdefault(remote_bug, [])
+                if local_bug not in existing[remote_bug]:
+                    existing[remote_bug].append(local_bug)
+        for key in existing:
+            existing[key] = sorted(existing[key])
+        with open(local_compat_file, 'w') as f:
+            json.dump(existing, f, indent=4)
+        logger.info(f"Saved local bug compatibility to {local_compat_file}")
 
     # Log compatibility results
     for bug_id, affected_bugs in test_local_bug_after_patch.items():
