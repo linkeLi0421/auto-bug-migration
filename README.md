@@ -51,7 +51,7 @@ Generate a PoC for a new version given an old version PoC. Builds the target at 
 | `--test_input` | Yes | Testcase filename (e.g., `testcase-OSV-2021-660`) |
 | `--build_csv` | Yes | CSV mapping project commits to OSS-Fuzz commit IDs |
 | `--patch` | No | Revert patch to apply at target commit |
-| `--signature_changes` | No | JSON file mapping old function names to new ones |
+| `--signature_changes` | Yes (for transplant bugs) | Filename of the JSON signature mapping in `data/signature_change_list/` (e.g., `OSV-2021-1787_e14064.json`). Required when the bug is transplanted to a different commit, so that renamed functions in the crash stack can be matched. |
 | `--sanitizer` | No | Sanitizer to use (default: `address`) |
 
 **Example:**
@@ -69,9 +69,23 @@ sudo python3 script/fuzz_helper.py get_poc_for_new_version \
   --test_input testcase-OSV-2021-660 \
   --build_csv ~/log/wasm3_builds.csv \
   --patch patch/OSV-2021-660_bc32ee_patches.diff \
+  --signature_changes OSV-2021-660_bc32ee.json \
   --sanitizer address \
   -e ASAN_OPTIONS=detect_leaks=0 \
   wasm3 fuzzer
+
+# Example for stb project
+sudo python3 script/fuzz_helper.py get_poc_for_new_version \
+  --buggy_commit b1826c \
+  --target_commit e14064 \
+  --testcases ~/oss-fuzz-for-select/pocs/tmp \
+  --test_input testcase-OSV-2021-1787 \
+  --build_csv ~/log/stb_builds.csv \
+  --patch patch/OSV-2021-1787_e14064_patches.diff \
+  --signature_changes OSV-2021-1787_e14064.json \
+  --sanitizer address \
+  -e ASAN_OPTIONS=detect_leaks=0 \
+  stb stbi_read_fuzzer
 ```
 
 **What it does:**
