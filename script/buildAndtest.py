@@ -396,8 +396,12 @@ def is_ancestor(repo_path, commit_id, ancestor_id):
     '''
     repo = git.Repo(repo_path)
     # Get commit objects
-    start_commit = repo.commit(commit_id)
-    end_commit = repo.commit(ancestor_id)
+    try:
+        start_commit = repo.commit(commit_id)
+        end_commit = repo.commit(ancestor_id)
+    except (ValueError, BadName):
+        logger.warning(f"Could not resolve commits for ancestry check: {commit_id} / {ancestor_id}")
+        return False
     common_ancestor = repo.git.merge_base(start_commit, end_commit)
     if common_ancestor == end_commit.hexsha:
         return True
@@ -683,6 +687,24 @@ def find_matching_commit(repo1_path: str,
     return False
 
 
+def fetch_missing_commits(repo_path, bug_ids, bug_infos):
+    """Fetch any introduced/fixed commits missing from the local repo."""
+    repo = git.Repo(repo_path)
+    for bug_id in bug_ids:
+        bug_info = bug_infos.get(bug_id, {})
+        for sha in [bug_info.get("introduced"), bug_info.get("fixed")]:
+            if not sha:
+                continue
+            try:
+                repo.commit(sha)
+            except (ValueError, BadName):
+                logger.info(f"Fetching missing commit {sha[:12]} for {bug_id}...")
+                try:
+                    repo.remotes.origin.fetch(sha)
+                except GitCommandError:
+                    logger.warning(f"Could not fetch {sha[:12]} for {bug_id}, skipping.")
+
+
 def get_commits_for_bug_windows(repo_path, bug_ids, bug_infos):
     """
     Collect all commits that lie between each bug's introduced and fixed commits.
@@ -784,7 +806,8 @@ if __name__ == "__main__":
     
     checkout_latest_commit(repo_path)
     checkout_latest_commit(oss_fuzz_path)
-    
+    fetch_missing_commits(repo_path, filter_bug_ids, bug_infos)
+
     commits = get_commits_for_bug_windows(repo_path, filter_bug_ids, bug_infos)
     if not commits:
         logger.error("No commits found between introduced and fixed for the selected bugs.")
