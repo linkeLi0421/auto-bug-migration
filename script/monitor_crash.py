@@ -388,7 +388,6 @@ if __name__ == "__main__":
     parser.add_argument('--signature-changes', dest='signature_changes', help='Path to JSON file that maps old function names to new ones')
     args = parser.parse_args()
 
-    global SIGNATURE_OVERRIDE
     SIGNATURE_OVERRIDE = args.signature_changes
 
     bug_match = re.search(r"(OSV-\d+-\d+)", args.stack_file)
