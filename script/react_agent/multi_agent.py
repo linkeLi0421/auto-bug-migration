@@ -484,6 +484,45 @@ def _error_type_priority(err: Dict[str, Any]) -> int:
     return 3
 
 
+_ARG_COUNT_RE = re.compile(r"too (?:few|many) arguments to function call", re.IGNORECASE)
+
+
+def _remove_rename_only_hunks_with_arg_errors(
+    groups: Dict[str, List[Dict[str, Any]]],
+    patch_path: str,
+) -> List[str]:
+    """Remove patch_keys whose errors are all argument-count mismatches on rename-only hunks.
+
+    Returns the list of removed patch_keys (for logging).
+    """
+    bundle, _ = _load_bundle(patch_path)
+    removed: List[str] = []
+    keys_to_remove: List[str] = []
+
+    for key, errs in groups.items():
+        # All errors for this key must be "too few/many arguments"
+        if not errs or not all(_ARG_COUNT_RE.search(str(e.get("msg", ""))) for e in errs):
+            continue
+        patch = bundle.patches.get(key)
+        if patch is None:
+            continue
+
+        # Lazy import to avoid circular dependency at module level
+        script_dir = Path(__file__).resolve().parents[1]
+        if str(script_dir) not in sys.path:
+            sys.path.insert(0, str(script_dir))
+        from migration_tools.tools import is_rename_only_hunk  # type: ignore
+
+        if is_rename_only_hunk(patch.patch_text):
+            keys_to_remove.append(key)
+
+    for key in keys_to_remove:
+        del groups[key]
+        removed.append(key)
+
+    return removed
+
+
 def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[str, List[Dict[str, Any]]]:
     bundle, get_error_patch_fn = _load_bundle(patch_path)
     groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -772,6 +811,12 @@ def main(argv: List[str]) -> int:
 
     build_log_text = load_build_log(str(args.build_log))
     groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=patch_path)
+
+    # Pre-filter: remove rename-only hunks whose only errors are argument-count mismatches.
+    removed_rename_only = _remove_rename_only_hunks_with_arg_errors(groups, patch_path)
+    if removed_rename_only:
+        print(f"[multi_agent] Removed {len(removed_rename_only)} rename-only hunk(s) with argument mismatch: {removed_rename_only}", file=sys.stderr)
+
     ranked_all = _rank_patch_keys(groups)
     patch_key_groups_found = len(ranked_all)
 
