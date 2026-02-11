@@ -2767,6 +2767,15 @@ def revert_patch_test(args):
 
     revert_and_trigger_fail_set = set()
     min_path_dict = dict()
+    # Pre-load existing min_patch file so single-bug runs don't lose other bugs' data
+    min_patch_file_path = os.path.join(data_path, 'min_patch', f'{args.target}.json')
+    if os.path.exists(min_patch_file_path):
+        try:
+            with open(min_patch_file_path, 'r') as f:
+                min_path_dict = json.load(f)
+            logger.info(f"Loaded {len(min_path_dict)} existing entries from {min_patch_file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load existing min_patch file: {e}")
     # Get repo path from environment variable
     repo_path = os.getenv('REPO_PATH')
     if not repo_path:
@@ -2787,7 +2796,7 @@ def revert_patch_test(args):
     parsed_data = parse_csv_file(csv_file_path)
     target = args.target
     target_repo_path = os.path.join(repo_path, target)
-    min_patch_file_path = os.path.join(data_path, 'min_patch', f'{target}.json')
+    os.makedirs(os.path.dirname(min_patch_file_path), exist_ok=True)
     target_dockerfile_path = f'{ossfuzz_path}/projects/{target}/Dockerfile'
 
     # Handle fixed image selection if --fixed-image is specified
@@ -2959,7 +2968,8 @@ def revert_patch_test(args):
                     )
                     logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
 
-            min_path_dict[bug_id] = minimal_fast
+            if result in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+                min_path_dict[bug_id] = minimal_fast
             logger.info(f"Debug mode: minimization complete, result: {minimal_fast}")
             continue  # Skip the rest of this iteration
 
@@ -3212,10 +3222,9 @@ def revert_patch_test(args):
                 )
                 logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
 
-        min_path_dict[bug_id] = minimal_fast
-
         # Only cache bugs that were triggered correctly
         if result in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
+            min_path_dict[bug_id] = minimal_fast
             patches_without_contexts[
                 (bug_id, commit['commit_id'], fuzzer,
                 tuple(diff_results[key].old_function_name for keys in patch_pair_list for key in keys))
