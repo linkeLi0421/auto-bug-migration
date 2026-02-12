@@ -739,7 +739,7 @@ def prepare_transplant(data, repo_path):
                 else:
                     bugs_need_transplant[bug_id] = row
     for bug_id in bug_ids_other:
-        if bug_id not in bugs_need_transplant:
+        if bug_id not in bugs_need_transplant and bug_id != 'poc count':
             bugs_cant_use.add(bug_id)
     logger.info(f'all bugs count: {len(max_poc_row["osv_statuses"])}')
     logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)} {bug_ids_trigger}')
@@ -2907,6 +2907,16 @@ def revert_patch_test(args):
                     os.path.join(patch_folder, p) for p in existing_patches
                 ]
                 logger.info(f"Found {len(existing_patches)} existing patch files for local bug test")
+                # Run self-trigger test so cached bugs appear in the summary
+                last_patch = get_patched_traces[bug_id][-1]
+                result, _ = test_fuzzer(args, bug_id, target, next_commit['commit_id'], last_patch, need_build=True)
+                if 'trigger' in result and 'not trigger' not in result:
+                    revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                    logger.info(f"Cached bug {bug_id} self-trigger test passed")
+                else:
+                    revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                    build_success_no_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                    logger.info(f"Cached bug {bug_id} self-trigger test: {result}")
             # Skip expensive patch generation / build / minimize
             continue
 
