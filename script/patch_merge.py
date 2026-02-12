@@ -70,7 +70,7 @@ def _integrate_refreshed_patches(bug_id: str, new_patches: Optional[Dict[PatchSe
     )
 current_file_path = os.path.dirname(os.path.abspath(__file__))
 ossfuzz_path = os.path.abspath(os.path.join(current_file_path, '..', 'oss-fuzz'))
-data_path = os.path.abspath(os.path.join(current_file_path, '..', 'data'))
+data_path = os.environ.get('DATA_PATH') or os.path.abspath(os.path.join(current_file_path, '..', 'data'))
 patch_path = os.path.join(os.path.join(current_file_path, '..', 'patch'))
 
 
