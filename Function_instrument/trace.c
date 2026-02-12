@@ -10,11 +10,11 @@
 
 /*
  * Two compile-time paths:
- *   Clang >= 15 (PIE default): use dladdr() per-call to subtract dli_fbase
- *   Clang <  15 (non-PIE):     use /proc/self/maps + ELF PT_LOAD at init time
+ *   Clang >  15 (PIE default): use dladdr() per-call to subtract dli_fbase
+ *   Clang <= 15 (non-PIE):     use /proc/self/maps + ELF PT_LOAD at init time
  */
 
-#if !defined(__clang__) || __clang_major__ < 15
+#if !defined(__clang__) || __clang_major__ <= 15
 #include <elf.h>
 #endif
 
@@ -38,9 +38,9 @@ static int uptr_to_hex(uintptr_t val, char *buf) {
 }
 
 /* ================================================================
- * Clang < 15 path: /proc/self/maps + ELF PT_LOAD (non-PIE default)
+ * Clang <= 15 path: /proc/self/maps + ELF PT_LOAD (non-PIE default)
  * ================================================================ */
-#if !defined(__clang__) || __clang_major__ < 15
+#if !defined(__clang__) || __clang_major__ <= 15
 
 static volatile int ready = 0;
 static uintptr_t runtime_base = 0;
@@ -130,7 +130,7 @@ void __cyg_profile_func_enter(void *func, void *caller) {
 }
 
 /* ================================================================
- * Clang >= 15 path: dladdr() per-call (PIE default)
+ * Clang > 15 path: dladdr() per-call (PIE default)
  * ================================================================ */
 #else
 
