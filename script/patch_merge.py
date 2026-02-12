@@ -776,6 +776,7 @@ def finalize_patch_group(
     patches: Optional[Dict[PatchSetKey, PatchSet]],
     target_repo_path: Optional[str],
     target_commit: Optional[str],
+    group_index: int = 0,
 ) -> Optional[str]:
     """Restore context lines for the selected group's patches by invoking add_context."""
 
@@ -841,9 +842,10 @@ def finalize_patch_group(
     except Exception:
         logger.exception("Failed to add context for commit %s.", target_commit)
 
+    suffix = f"_{group_index}" if group_index else ""
     final_path = os.path.join(
         patch_path,
-        f"group_{target_commit[:6]}_final.diff",
+        f"group_{target_commit[:6]}{suffix}_final.diff",
     )
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     with open(final_path, "w", encoding="utf-8") as handle:
@@ -997,6 +999,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target_commit",
         help="Commit hash to use as the base when re-adding context to merged patches.",
+    )
+    parser.add_argument(
+        "--top-groups",
+        type=int,
+        default=1,
+        help="Number of top compatible groups to build and verify (default: 1).",
     )
     return parser.parse_args()
 
@@ -1180,7 +1188,6 @@ def main() -> None:
         graph = merge_patches(CURRENT_PATCHES or {}, bug_distribution)
         log_patch_function_table(graph)
         groups = report_compatible_groups(graph)
-        group_one = groups[0] if groups else None
         for idx, candidate in enumerate(groups):
             if len(groups[0]) == len(candidate):
                 report_pending_patch_refreshes(candidate, idx+1)
@@ -1193,101 +1200,141 @@ def main() -> None:
             write_graphviz(graph, args.graphviz_output)
         break
 
-    # Merge and finalize patches for Group 1
+    # Merge and finalize patches for top N groups
     repo_base = os.getenv("REPO_PATH")
     target_repo_path = (
         os.path.join(repo_base, args.revert_target) if repo_base and args.revert_target else None
     )
-    patch_file_path = finalize_patch_group(group_one, CURRENT_PATCHES, target_repo_path, args.target_commit)
-    build_success = False
-    error_log = ""
-    if patch_file_path and args.revert_target and args.target_commit and args.revert_build_csv and args.fuzz_target:
-        build_success, error_log = build_fuzzer(
-            args.revert_target,
-            args.target_commit,
-            "address",
-            "",
-            str(patch_file_path),
-            args.fuzz_target,
-            str(args.revert_build_csv),
-            "x86_64",
-        )
-        if build_success:
-            logger.info("Successfully built fuzzer with merged patches applied.")
-        else:
-            logger.error("Failed to build fuzzer with merged patches. See log:\n%s", error_log)
-    else:
-        logger.info(
-            "Skipping post-merge build step due to missing patch path or required arguments "
-            "(requires --revert_target, --target_commit, --revert_build_csv, and --fuzz_target)."
-        )
-
-    if build_success and patch_file_path:
-        if not group_one:
-            logger.info("No compatible group to fuzz test after build.")
-        elif not (args.revert_bug_info and args.revert_target and args.target_commit):
-            logger.info(
-                "Missing --revert_bug_info/--revert_target/--target_commit; "
-                "skipping stack verification."
+    top_n = min(args.top_groups, len(groups)) if groups else 0
+    # (group_num, triggered, total, migration_count, local_count, built, patch_path)
+    group_summaries: List[Tuple[int, int, int, int, int, bool, Optional[str]]] = []
+    for gi, group in enumerate(groups[:top_n]):
+        local_count = sum(1 for ident in group if _is_local_bug_identifier(ident))
+        migration_count = len(group) - local_count
+        logger.info("=" * 60)
+        logger.info("Testing Group %d/%d (%d bugs: %d migration + %d local)", gi + 1, top_n, len(group), migration_count, local_count)
+        logger.info("=" * 60)
+        patch_file_path = finalize_patch_group(group, CURRENT_PATCHES, target_repo_path, args.target_commit, group_index=gi)
+        build_success = False
+        error_log = ""
+        if patch_file_path and args.revert_target and args.target_commit and args.revert_build_csv and args.fuzz_target:
+            build_success, error_log = build_fuzzer(
+                args.revert_target,
+                args.target_commit,
+                "address",
+                "",
+                str(patch_file_path),
+                args.fuzz_target,
+                str(args.revert_build_csv),
+                "x86_64",
             )
-        elif not bug_info_dataset:
-            logger.info("Bug info unavailable; skipping stack verification.")
-        else:
-            bug_ids_for_signatures: Set[str] = set()
-            for identifier in group_one:
-                if _is_local_bug_identifier(identifier):
-                    continue
-                if isinstance(identifier, tuple) and identifier and isinstance(identifier[0], str):
-                    bug_ids_for_signatures.add(identifier[0])
-            merged_signature_file = build_merged_signature_change_list(bug_ids_for_signatures, args.target_commit)
-
-            verification_results: List[Tuple[str, str, bool]] = []
-            for identifier in group_one:
-                if not isinstance(identifier, tuple) or not identifier:
-                    continue
-                if _is_local_bug_identifier(identifier):
-                    bug_id = identifier[1]
-                    buggy_commit = args.target_commit
-                else:
-                    bug_id = identifier[0]
-                    buggy_commit = identifier[1]
-                if not isinstance(bug_id, str):
-                    continue
-                signature_file = merged_signature_file
-                if signature_file is None:
-                    candidate = os.path.join(
-                        data_path,
-                        "signature_change_list",
-                        f"{bug_id}_{args.target_commit}.json",
-                    )
-                    signature_file = candidate if os.path.exists(candidate) else None
-                try:
-                    result = _stack_verification_for_bug(
-                        bug_id,
-                        buggy_commit,
-                        bug_info_dataset,
-                        args.revert_target,
-                        args.target_commit,
-                        signature_file=signature_file,
-                    )
-                    logger.info("Stack verification result for %s: %s", bug_id, result)
-                    success = result == "triggered (stack matches)"
-                    verification_results.append((bug_id, result, success))
-                except Exception:
-                    logger.exception("Stack verification failed for %s.", bug_id)
-                    verification_results.append((bug_id, "verification failed", False))
-
-            if verification_results:
-                headers = ["Bug", "Post-merge status", "Success"]
-                rows = [[bug, status, "True" if success else "False"] for bug, status, success in verification_results]
-                table = _render_table(headers, rows)
-                logger.info("Post-merge trigger summary:")
-                for line in table.splitlines():
-                    logger.info(line)
-                if not _tabulate:
-                    logger.info("  (Install 'tabulate' for enhanced table formatting.)")
+            if build_success:
+                logger.info("Group %d: Successfully built fuzzer with merged patches applied.", gi + 1)
             else:
-                logger.info("No stack verification results collected.")
+                logger.error("Group %d: Failed to build fuzzer with merged patches. See log:\n%s", gi + 1, error_log)
+        else:
+            logger.info(
+                "Skipping post-merge build step due to missing patch path or required arguments "
+                "(requires --revert_target, --target_commit, --revert_build_csv, and --fuzz_target)."
+            )
+
+        triggered_count = 0
+        total_bugs = len(group)
+        if build_success and patch_file_path:
+            if not group:
+                logger.info("No compatible group to fuzz test after build.")
+            elif not (args.revert_bug_info and args.revert_target and args.target_commit):
+                logger.info(
+                    "Missing --revert_bug_info/--revert_target/--target_commit; "
+                    "skipping stack verification."
+                )
+            elif not bug_info_dataset:
+                logger.info("Bug info unavailable; skipping stack verification.")
+            else:
+                bug_ids_for_signatures: Set[str] = set()
+                for identifier in group:
+                    if _is_local_bug_identifier(identifier):
+                        continue
+                    if isinstance(identifier, tuple) and identifier and isinstance(identifier[0], str):
+                        bug_ids_for_signatures.add(identifier[0])
+                merged_signature_file = build_merged_signature_change_list(bug_ids_for_signatures, args.target_commit)
+
+                verification_results: List[Tuple[str, str, bool]] = []
+                for identifier in group:
+                    if not isinstance(identifier, tuple) or not identifier:
+                        continue
+                    if _is_local_bug_identifier(identifier):
+                        bug_id = identifier[1]
+                        buggy_commit = args.target_commit
+                    else:
+                        bug_id = identifier[0]
+                        buggy_commit = identifier[1]
+                    if not isinstance(bug_id, str):
+                        continue
+                    signature_file = merged_signature_file
+                    if signature_file is None:
+                        candidate = os.path.join(
+                            data_path,
+                            "signature_change_list",
+                            f"{bug_id}_{args.target_commit}.json",
+                        )
+                        signature_file = candidate if os.path.exists(candidate) else None
+                    try:
+                        result = _stack_verification_for_bug(
+                            bug_id,
+                            buggy_commit,
+                            bug_info_dataset,
+                            args.revert_target,
+                            args.target_commit,
+                            signature_file=signature_file,
+                        )
+                        logger.info("Stack verification result for %s: %s", bug_id, result)
+                        success = result == "triggered (stack matches)"
+                        verification_results.append((bug_id, result, success))
+                    except Exception:
+                        logger.exception("Stack verification failed for %s.", bug_id)
+                        verification_results.append((bug_id, "verification failed", False))
+
+                if verification_results:
+                    triggered_count = sum(1 for _, _, s in verification_results if s)
+                    headers = ["Bug", "Post-merge status", "Success"]
+                    rows = [[bug, status, "True" if success else "False"] for bug, status, success in verification_results]
+                    table = _render_table(headers, rows)
+                    logger.info("Group %d post-merge trigger summary:", gi + 1)
+                    for line in table.splitlines():
+                        logger.info(line)
+                    if not _tabulate:
+                        logger.info("  (Install 'tabulate' for enhanced table formatting.)")
+                else:
+                    logger.info("No stack verification results collected.")
+        group_summaries.append((gi + 1, triggered_count, total_bugs, migration_count, local_count, build_success, patch_file_path))
+
+    # Print final cross-group summary
+    if len(group_summaries) > 1:
+        logger.info("=" * 60)
+        logger.info("Final Summary: %d groups tested", len(group_summaries))
+        logger.info("=" * 60)
+        best_group = max(group_summaries, key=lambda x: (x[1], -x[0]))
+        headers = ["Group", "Triggered", "Total", "Migration", "Local", "Build"]
+        rows = []
+        for gnum, triggered, total, n_mig, n_loc, built, ppath in group_summaries:
+            marker = " *" if gnum == best_group[0] else ""
+            rows.append([
+                f"{gnum}{marker}",
+                str(triggered),
+                str(total),
+                str(n_mig),
+                str(n_loc),
+                "OK" if built else "FAIL",
+            ])
+        table = _render_table(headers, rows)
+        for line in table.splitlines():
+            logger.info(line)
+        logger.info(
+            "Best: Group %d -- %d/%d bugs triggered (%d migration + %d local), patch: %s",
+            best_group[0], best_group[1], best_group[2], best_group[3], best_group[4],
+            best_group[6] or "(none)",
+        )
 
 if __name__ == "__main__":
     main()

@@ -165,9 +165,13 @@ def _resolve_signature_file(stack_file_path):
 
     return candidates[0]
 
+_REVERT_PREFIX_RE = re.compile(r'^__revert_[A-Fa-f0-9]+_')
+
 def _clean_function_name(func):
     """Normalize function names found in stack traces."""
-    return func.split('(')[0].split('+')[0].strip()
+    name = func.split('(')[0].split('+')[0].strip()
+    name = _REVERT_PREFIX_RE.sub('', name)
+    return name
 
 
 def _apply_signature_mapping(stack, signature_map):
