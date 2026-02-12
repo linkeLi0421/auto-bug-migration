@@ -1159,15 +1159,16 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     sanitizer_error_seen = bool(re.search(pattern, stdout))
     fuzzer_exists = os.path.exists(fuzzer_path)
     has_build_error = any(p in stdout for p in build_error_patterns)
+    patch_label = os.path.basename(patch_file_path)
     if ((not sanitizer_error_seen and not fuzzer_exists) or has_build_error or
             result.returncode != 0):
         if sanitizer_error_seen:
-            logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
+            logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
             return True, ''
-        logger.info(f"Build failed after patch reversion for bug {bug_id}\n")
+        logger.info(f"Build failed after patch reversion for {patch_label}\n")
         return False, stdout
 
-    logger.info(f"Successfully built fuzzer after reverting patch for bug {bug_id}")
+    logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
     return True, ''
 
 
@@ -2766,6 +2767,8 @@ def revert_patch_test(args):
             patches_without_contexts = dict()
 
     revert_and_trigger_fail_set = set()
+    build_success_no_trigger_set = set()
+    patch_build_fail_set = set()
     min_path_dict = dict()
     # Pre-load existing min_patch file so single-bug runs don't lose other bugs' data
     min_patch_file_path = os.path.join(data_path, 'min_patch', f'{args.target}.json')
@@ -2941,6 +2944,25 @@ def revert_patch_test(args):
             result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
             if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
                 revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                if result == 'not_trigger' or result == 'crash_mismatch':
+                    build_success_no_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                    # Save patch file for later fuzzing (get_poc_for_new_version)
+                    get_patched_traces_ref = mutable_args[0]
+                    suffix = len(get_patched_traces_ref[bug_id]) if bug_id in get_patched_traces_ref else ''
+                    src_patch = os.path.join(
+                        os.path.abspath(os.path.join(current_file_path, '..', 'patch')),
+                        f"{bug_id}_{next_commit['commit_id']}_patches{suffix}.diff"
+                    )
+                    if os.path.exists(src_patch):
+                        save_dir = os.path.join(data_path, 'build_success_patches')
+                        os.makedirs(save_dir, exist_ok=True)
+                        dst_patch = os.path.join(save_dir, f'{bug_id}.diff')
+                        shutil.copy(src_patch, dst_patch)
+                        logger.info(f"Saved patch for untriggered bug {bug_id} to {dst_patch}")
+                    else:
+                        logger.warning(f"Patch file {src_patch} not found for bug {bug_id}")
+                else:
+                    patch_build_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
                 minimal_fast = patch_pair_list  # Use original if initial build fails
                 logger.info(f"Initial build failed, using original patch set")
             else:
@@ -3192,6 +3214,25 @@ def revert_patch_test(args):
         result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
         if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
+            if result == 'not_trigger' or result == 'crash_mismatch':
+                build_success_no_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
+                # Save patch file for later fuzzing (get_poc_for_new_version)
+                get_patched_traces_ref = mutable_args[0]
+                suffix = len(get_patched_traces_ref[bug_id]) if bug_id in get_patched_traces_ref else ''
+                src_patch = os.path.join(
+                    os.path.abspath(os.path.join(current_file_path, '..', 'patch')),
+                    f"{bug_id}_{next_commit['commit_id']}_patches{suffix}.diff"
+                )
+                if os.path.exists(src_patch):
+                    save_dir = os.path.join(data_path, 'build_success_patches')
+                    os.makedirs(save_dir, exist_ok=True)
+                    dst_patch = os.path.join(save_dir, f'{bug_id}.diff')
+                    shutil.copy(src_patch, dst_patch)
+                    logger.info(f"Saved patch for untriggered bug {bug_id} to {dst_patch}")
+                else:
+                    logger.warning(f"Patch file {src_patch} not found for bug {bug_id}")
+            else:
+                patch_build_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
             minimal_fast = patch_pair_list  # Use original if initial build fails
         else:
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
@@ -3338,6 +3379,8 @@ def revert_patch_test(args):
         json.dump(min_path_dict, f, indent=4)
     logger.info(f"Revert and trigger set: {len(revert_and_trigger_set)} {revert_and_trigger_set}")
     logger.info(f"Revert and trigger fail set: {len(revert_and_trigger_fail_set)} {revert_and_trigger_fail_set}")
+    logger.info(f"  - Build success but bug not triggered: {len(build_success_no_trigger_set)} {build_success_no_trigger_set}")
+    logger.info(f"  - Patch build failed: {len(patch_build_fail_set)} {patch_build_fail_set}")
     
     return patches_without_contexts, test_local_bug_after_patch
 
