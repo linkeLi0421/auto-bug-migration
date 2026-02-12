@@ -812,10 +812,8 @@ def main(argv: List[str]) -> int:
     build_log_text = load_build_log(str(args.build_log))
     groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=patch_path)
 
-    # Pre-filter: remove rename-only hunks whose only errors are argument-count mismatches.
-    removed_rename_only = _remove_rename_only_hunks_with_arg_errors(groups, patch_path)
-    if removed_rename_only:
-        print(f"[multi_agent] Removed {len(removed_rename_only)} rename-only hunk(s) with argument mismatch: {removed_rename_only}", file=sys.stderr)
+    # NOTE: rename-only hunks with argument-count mismatches are no longer removed.
+    # The agent will attempt to fix them using the existing patch override tools.
 
     ranked_all = _rank_patch_keys(groups)
     patch_key_groups_found = len(ranked_all)

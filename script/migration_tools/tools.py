@@ -1387,6 +1387,17 @@ def make_error_patch_override(
     new_minus_lines = [f"-{line}" for line in new_func_lines]
     new_len = len(new_func_lines)
 
+    # Guardrail for rename-only (call-site) hunks: the agent must rewrite only the
+    # existing call lines, not invent new structure (e.g. wrapper functions).
+    # Enforce that new_func_code has the same line count as the old '-' lines.
+    old_minus_count = len(old_func_lines)
+    if old_minus_count > 0 and is_rename_only_hunk(patch.patch_text) and new_len != old_minus_count:
+        raise ValueError(
+            f"This is a call-site rename hunk with {old_minus_count} '-' line(s). "
+            f"new_func_code must have exactly {old_minus_count} line(s) (got {new_len}). "
+            f"Only modify the function call arguments; do not add or remove lines."
+        )
+
     rewritten_slice: List[str] = []
     inserted = False
     for line in slice_lines:

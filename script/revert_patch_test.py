@@ -2166,11 +2166,28 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         # Skip the function head
                         continue
                     if re.search(r'(?<![\w.])' + re.escape(recreated_fname) + r'(?!\w)', line) is not None:
-                        # If the function is recreated, add a call to it
-                        start_line = old_line_begin  + i
-                        end_line = start_line + 1
-                        patch_text = rename_func(f'-{line}', recreated_fname, commit)[0] + '\n+' + line[:-1]
-                        patch_text = patch_header + f"@@ -{start_line},{1} +{start_line},{1} @@\n" + patch_text
+                        # If the function is recreated, add a call to it.
+                        # Detect multi-line calls by counting parentheses.
+                        call_lines = [line]
+                        paren_depth = line.count('(') - line.count(')')
+                        j = i + 1
+                        while paren_depth > 0 and j < len(function_lines):
+                            call_lines.append(function_lines[j])
+                            paren_depth += function_lines[j].count('(') - function_lines[j].count(')')
+                            j += 1
+                        num_call_lines = len(call_lines)
+                        start_line = old_line_begin + i
+                        end_line = start_line + num_call_lines
+
+                        # Build -/+ pairs for all lines of the call
+                        minus_lines = []
+                        plus_lines = []
+                        for cl in call_lines:
+                            minus_lines.append(rename_func(f'-{cl}', recreated_fname, commit)[0])
+                            plus_lines.append('+' + cl.rstrip('\n'))
+                        patch_body = '\n'.join(minus_lines + plus_lines)
+                        patch_text = patch_header + f"@@ -{start_line},{num_call_lines} +{start_line},{num_call_lines} @@\n" + patch_body
+
                         patch = PatchInfo(
                             file_path_old=file_path,
                             file_path_new=file_path,
@@ -2187,8 +2204,8 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                             new_function_start_line=old_line_begin,
                             new_function_end_line=old_line_end,
                         )
-                        new_key = f'{file_path}{file_path}-{start_line},{1}+{start_line},{1}'
-                        
+                        new_key = f'{file_path}{file_path}-{start_line},{num_call_lines}+{start_line},{num_call_lines}'
+
                         diff_results[new_key] = patch
                         new_patch_to_apply.add(new_key)
 
@@ -2271,37 +2288,69 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                 new_start_line = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
                 if new_start_line <= node['location']['line'] < new_start_line + new_offset:
-                    # This call in within a patch, we need to update the patch
+                    # This call is within a patch, we need to update the patch.
+                    # For multi-line calls, also convert continuation context lines to -/+ pairs.
                     Inpatch_flag = True
-                    for i, line in enumerate(lines):
-                        if line[0] not in {'-', '+'} and re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
-                            # If the function is called in this patch, we need to update the call
+                    i = 0
+                    while i < len(lines):
+                        line = lines[i]
+                        if line and line[0] not in {'-', '+', '@', 'd'} and re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
+                            # Found the function name on a context line — convert it and continuations
                             rm_line = rename_func(f'-{line[1:]}', node['spelling'], commit)[0]
                             add_line = f'+{line[1:]}'
                             new_lines.append(rm_line)
                             new_lines.append(add_line)
+                            # Use paren counting to find how many continuation lines belong
+                            # to this call (AST extent may only cover the function name).
+                            paren_depth = line.count('(') - line.count(')')
+                            k = 1
+                            while paren_depth > 0 and i + k < len(lines):
+                                next_line = lines[i + k]
+                                if not next_line or next_line[0] != ' ':
+                                    break
+                                new_lines.append(f'-{next_line[1:]}')
+                                new_lines.append(f'+{next_line[1:]}')
+                                paren_depth += next_line.count('(') - next_line.count(')')
+                                k += 1
+                            i += k
                         else:
                             new_lines.append(line)
+                            i += 1
                     patch.patch_text = '\n'.join(new_lines)
             
             # Step 3b: Create new patch for calls not covered by existing patches
             if not Inpatch_flag:
                 # This call is not in any patch, we need to create a new patch
-                new_start_line = node['location']['line']
-                new_offset = 1
-                
-                # Read the actual function call line from source file
+                call_start = node['location']['line']
+
+                # Skip if add_patch_for_trace_funcs already created a patch for this call
+                if any(k.startswith(f'{fuzzer_file_path}{fuzzer_file_path}-{call_start},') for k in diff_results):
+                    continue
+
+                # Read the call from source and use paren counting to find the full
+                # multi-line span (AST extent may only cover the function name).
                 with open(os.path.join(target_repo_path, fuzzer_file_path), 'r', encoding="latin-1") as f:
                     content = f.readlines()
-                    function_line = content[node['location']['line']-1]
-                    assert(node['extent']['start']['line'] == node['extent']['end']['line']), f'Function call should be in one line, but got {node["extent"]["start"]["line"]} - {node["extent"]["end"]["line"]}'
+                first_line = content[call_start - 1]
+                call_lines = [first_line]
+                paren_depth = first_line.count('(') - first_line.count(')')
+                j = call_start  # 0-based index of next line
+                while paren_depth > 0 and j < len(content):
+                    call_lines.append(content[j])
+                    paren_depth += content[j].count('(') - content[j].count(')')
+                    j += 1
+                num_lines = len(call_lines)
 
-                # Create patch lines for reverting __revert_commit_ functions back to original names
-                rm_line = rename_func(f'-{function_line}', node['spelling'], commit)[0]
-                add_line = f"+{function_line.replace(chr(10), '')}"
-                
+                # Create -/+ pairs for each line of the call
+                minus_lines = []
+                plus_lines = []
+                for cl in call_lines:
+                    minus_lines.append(rename_func(f'-{cl}', node['spelling'], commit)[0])
+                    plus_lines.append('+' + cl.rstrip('\n'))
+                patch_body = '\n'.join(minus_lines + plus_lines)
+
                 # Construct complete patch text
-                patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{new_start_line},{new_offset} +{new_start_line},{new_offset} @@\n{rm_line}\n{add_line}'
+                patch_text = f'diff --git a/{fuzzer_file_path} b/{fuzzer_file_path}\n--- a/{fuzzer_file_path}\n+++ b/{fuzzer_file_path}\n@@ -{call_start},{num_lines} +{call_start},{num_lines} @@\n{patch_body}'
                 # Create new patch entry
                 patch = PatchInfo(
                     file_path_old=fuzzer_file_path,
@@ -2312,16 +2361,16 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     new_signature=fuzzer_new_signature,
                     patch_type={'Function body change'},
                     dependent_func=set(),
-                    new_start_line=new_start_line,
-                    new_end_line=new_start_line + new_offset,
-                    old_start_line=new_start_line,
-                    old_end_line=new_start_line + new_offset,
+                    new_start_line=call_start,
+                    new_end_line=call_start + num_lines,
+                    old_start_line=call_start,
+                    old_end_line=call_start + num_lines,
                     old_function_start_line=fuzzer_start_line,
                     old_function_end_line=fuzzer_end_line,
                 )
-                
+
                 # Add new patch to diff_results and patch_to_apply list
-                new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{new_start_line},{new_offset}+{new_start_line},{new_offset}'
+                new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{call_start},{num_lines}+{call_start},{num_lines}'
                 diff_results[new_key] = patch
                 patch_to_apply.append(new_key)
 
@@ -2570,13 +2619,8 @@ def apply_and_test_patches(
         if build_success:
             break
 
-        # Pre-process: remove rename-only hunks that cause argument-count errors.
-        # This modifies current_patches, patch_file_path, and patch_file_binary in place.
-        if _remove_rename_only_hunks(current_patches, error_log, patch_file_path, patch_file_binary):
-            # Rebuild with the cleaned patch to get an updated error log.
-            build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
-            if build_success:
-                break
+        # NOTE: rename-only hunks with argument-count mismatches are no longer removed.
+        # The agent will attempt to fix them using the existing patch override tools.
 
         # Write build log to temp file for agent
         build_log_temp = os.path.join(data_path, "tmp_patch", f"{target}_build.log")
