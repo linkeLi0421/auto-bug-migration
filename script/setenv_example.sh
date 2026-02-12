@@ -4,6 +4,7 @@ export LOG_PATH="/home/user/log"
 export STORAGE_PATH="/mnt/nas/linke"
 export TESTCASES="/home/user/oss-fuzz-for-select/pocs/tmp"
 export REPO_PATH="/home/user/tasks-git"
+export DATA_PATH="/home/user/data"
 # Separate repo paths for V1 (old commit) and V2 (new commit) source trees
 # These are used by the react agent to read source code from both versions
 export V1_REPO_PATH="/home/user/tasks-git-v1"
