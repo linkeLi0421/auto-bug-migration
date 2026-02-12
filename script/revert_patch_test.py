@@ -3203,11 +3203,13 @@ def revert_patch_test(args):
                 patch_by_func.setdefault(diff_results[key].old_signature, []).append(key)
         patch_pair_list = [tuple(v) for v in patch_by_func.values()]
 
+        used_min_patch_cache = False
         if os.path.exists(min_patch_file_path):
             with open(min_patch_file_path, 'r') as f:
                 cached_patches = json.load(f)
                 if bug_id in cached_patches:
                     patch_pair_list = cached_patches[bug_id]
+                    used_min_patch_cache = True
 
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
@@ -3238,30 +3240,18 @@ def revert_patch_test(args):
             revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             logger.info(f'Initial revert patch set: {len(patch_pair_list)} {patch_pair_list}')
 
-            # Use greedy minimization
-            tmp = copy.deepcopy(inmutable_args)
-            minimal_fast = minimize_greedy(
-                patch_pair_list, apply_and_test_patches, patches_without_context,
-                mutable_args, tmp
-            )
-
-            logger.info(f'Minimal patch set after greedy minimization: {len(minimal_fast)}')
-
-            # Apply greedy one-by-one minimization to further reduce the patch set
-            # TODO: Consider hybrid two-phase minimization for better performance:
-            #   1. Phase 1: Binary search - Try removing half patches at once (O(log N) calls)
-            #   2. Phase 2: One-by-one - Fall back when binary search can't remove more (O(M) calls)
-            #   Expected: 58 patches → ~6 binary + ~5 one-by-one = ~11 calls vs ~58
-            if len(minimal_fast) > 1:
-                logger.info(f'Starting greedy minimization on {len(minimal_fast)} patches')
+            if used_min_patch_cache:
+                # Skip minimization — patch_pair_list is already minimized from cache
+                minimal_fast = patch_pair_list
+                logger.info(f'Skipping minimization, using cached min_patch: {len(minimal_fast)}')
+            else:
+                # Use greedy minimization
+                tmp = copy.deepcopy(inmutable_args)
                 minimal_fast = minimize_greedy(
-                    minimal_fast,
-                    apply_and_test_patches,
-                    patches_without_context,
-                    mutable_args,
-                    inmutable_args
+                    patch_pair_list, apply_and_test_patches, patches_without_context,
+                    mutable_args, tmp
                 )
-                logger.info(f'Minimal revert patch set after greedy: {len(minimal_fast)} {minimal_fast}')
+                logger.info(f'Minimal patch set after greedy minimization: {len(minimal_fast)}')
 
         # Only cache bugs that were triggered correctly
         if result in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
