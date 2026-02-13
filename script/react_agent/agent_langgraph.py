@@ -4702,6 +4702,15 @@ def _run_langgraph(
     def llm_node(gs: GraphState) -> GraphState:
         st = gs["state"]
         if st.patch_generated and not st.ossfuzz_test_attempted:
+            # If we've already exhausted ossfuzz_loop_max builds, skip forcing another build
+            # and let the auto-loop / verdict path handle it.
+            _loop_max = max(int(cfg.ossfuzz_loop_max or 0), 1)
+            if st.ossfuzz_runs_attempted >= _loop_max:
+                st.ossfuzz_test_attempted = True  # fall through to the verdict path below
+            else:
+                pass  # continue with the forced build below
+
+        if st.patch_generated and not st.ossfuzz_test_attempted:
             # Mandatory: test the generated override patch in OSS-Fuzz before allowing final.
             if not st.patch_path:
                 return {
@@ -5892,7 +5901,6 @@ def _run_langgraph(
         if obs.ok and obs.tool == "make_extra_patch_override":
             st.patch_result = obs.output if isinstance(obs.output, dict) else None
             st.pending_patch = None
-            st.ossfuzz_test_attempted = False
 
             patch_text = ""
             patch_text_path = ""
@@ -5912,7 +5920,11 @@ def _run_langgraph(
                     patch_text = pt
 
             has_patch = bool(patch_text.strip()) or bool(patch_text_path)
-            st.patch_generated = bool(has_patch)
+            # Only update patch state when the extra patch actually produced content;
+            # a no-op extra patch (empty patch_text) shouldn't undo prior make_error_patch_override work.
+            if has_patch:
+                st.patch_generated = True
+                st.ossfuzz_test_attempted = False
 
             if patch_text.strip() and extra_patch_key:
                 override_path, override_err = _persist_override_diff(
