@@ -233,6 +233,15 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
         _is_undeclared_func_warning(m.group(0)) for _, level, m in starts if level == "warning"
     )
 
+    # Check if there are any visibility warnings (struct/union/enum used before declared).
+    # If so, we filter out "conflicting types" errors because they're a downstream symptom:
+    # the forward declaration creates a local tag type, causing a type mismatch with the
+    # real definition later. Fixing the visibility warning (adding a forward tag declaration)
+    # resolves the conflicting types error.
+    has_visibility_warning = any(
+        "will not be visible" in m.group(0) for _, level, m in starts if level == "warning"
+    )
+
     for i, (idx, level, m) in enumerate(starts):
         file_path = str(m.group("file"))
         line_no = int(m.group("line"))
@@ -246,6 +255,7 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
                 "undeclared function" not in msg
                 and "implicit declaration of function" not in msg
                 and "no previous prototype for function" not in msg
+                and "will not be visible" not in msg
             ):
                 continue
 
@@ -253,6 +263,11 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
         # undeclared function warnings. The undeclared function causes an implicit non-static
         # declaration; fixing it (by adding proper declaration) resolves this error.
         if has_undeclared_func_warning and "static declaration" in msg and "follows non-static" in msg:
+            continue
+
+        # Skip "conflicting types" errors when visibility warnings exist.
+        # The visibility warning is the root cause; fixing it resolves the type conflict.
+        if has_visibility_warning and "conflicting types" in msg:
             continue
 
         key = (file_path, line_no, col_no, msg)

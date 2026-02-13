@@ -2613,6 +2613,7 @@ def apply_and_test_patches(
         or 'too few arguments to function call' in error_log
         or 'member named' in error_log
         or 'unknown type name' in error_log
+        or 'will not be visible' in error_log
     ):
         count += 1
         build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
