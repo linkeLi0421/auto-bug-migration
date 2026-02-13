@@ -5161,7 +5161,7 @@ def _run_langgraph(
                         return {"state": st, "pending": forced_extra}
 
                 # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
-                if last_tool != "read_artifact":
+                if not _has_tool_call(st, "read_artifact"):
                     if remaining < 3:
                         return {
                             "state": st,
