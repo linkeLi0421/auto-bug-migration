@@ -1768,11 +1768,16 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
         original_remaining = compiler_in_active
         new_errors = []
 
+    # Count distinct remaining target messages (not instances) so partial-fix detection
+    # works correctly when one error message has multiple instances (e.g. same warning on
+    # two lines).  target_errors_total counts distinct messages, so remaining must too.
+    remaining_target_msgs = {str(e.get("msg", "") or "").strip() for e in original_remaining if str(e.get("msg", "") or "").strip()}
+
     func_groups, func_total, func_trunc = _summarize_function_groups(in_active)
     return {
         "status": "ok",
         "active_patch_key": active_key,
-        "remaining_in_active_patch_key": len(original_remaining),
+        "remaining_in_active_patch_key": len(remaining_target_msgs),
         "target_errors_total": len(target_msgs),
         "new_errors_in_active_patch_key": len(new_errors),
         "new_errors": new_errors[:5],
@@ -3797,7 +3802,12 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
 
 
 def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tuple]:
-    """Return [(symbol_name, file_path), ...] for undeclared symbols in grouped_errors not yet fixed."""
+    """Return [(symbol_name, file_path), ...] for undeclared __revert_* symbols in grouped_errors not yet fixed.
+
+    Only ``__revert_*`` symbols are eligible for ``make_extra_patch_override`` (forward declarations).
+    Non-``__revert_*`` symbols are V1-only helpers removed in V2 and should be REMOVED from the
+    function body via ``make_error_patch_override`` instead.
+    """
     result: List[tuple] = []
     seen: set = set()
     for e in state.grouped_errors or []:
@@ -3811,6 +3821,10 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
             continue
         sym = str(m.group("symbol") or "").strip()
         if not sym or not _C_IDENT_RE.match(sym):
+            continue
+        # Only __revert_* symbols get forward declarations; everything else should be removed
+        # from the function body by the LLM via make_error_patch_override.
+        if not sym.startswith("__revert_"):
             continue
         if sym in seen:
             continue
