@@ -1357,7 +1357,7 @@ def make_error_patch_override(
             continue
         if "(" in line:
             old_func_name = _func_name_from_sig(line)
-        break
+            break
 
     if old_func_name:
         new_func_name = ""
@@ -1367,7 +1367,7 @@ def make_error_patch_override(
                 continue
             if "(" in line:
                 new_func_name = _func_name_from_sig(line)
-            break
+                break
         if new_func_name and new_func_name != old_func_name:
             raise ValueError(
                 f"new_func_code changes the function name from '{old_func_name}' to '{new_func_name}'. "
@@ -1397,6 +1397,10 @@ def make_error_patch_override(
             f"new_func_code must have exactly {old_minus_count} line(s) (got {new_len}). "
             f"Only modify the function call arguments; do not add or remove lines."
         )
+
+    old_func_code_text, old_func_code_truncated, _, _ = _truncate_text(
+        text=old_func_code_full, max_lines=200, max_chars=12000,
+    )
 
     rewritten_slice: List[str] = []
     inserted = False
@@ -1503,8 +1507,8 @@ def make_error_patch_override(
     out: Dict[str, Any] = {
         **mapping,
         "file_path_patch": rel_file,
-        "old_func_code": new_func_code_text,
-        "old_func_code_truncated": new_truncated,
+        "old_func_code": old_func_code_text,
+        "old_func_code_truncated": old_func_code_truncated,
         "new_func_code_lines": new_len,
         "patch_text": patch_text,
         "patch_text_truncated": patch_truncated,
@@ -1616,7 +1620,7 @@ def make_link_error_patch_override(
             continue
         if "(" in line:
             old_func_name = _func_name_from_sig(line)
-        break
+            break
 
     if old_func_name:
         new_func_name = ""
@@ -1626,7 +1630,7 @@ def make_link_error_patch_override(
                 continue
             if "(" in line:
                 new_func_name = _func_name_from_sig(line)
-            break
+                break
         if new_func_name and new_func_name != old_func_name:
             raise ValueError(
                 f"new_func_code changes the function name from '{old_func_name}' to '{new_func_name}'. "
@@ -1645,6 +1649,10 @@ def make_link_error_patch_override(
         raise ValueError("new_func_code must contain at least one non-empty line")
     new_minus_lines = [f"-{line}" for line in new_func_lines]
     new_len = len(new_func_lines)
+
+    old_func_code_text, old_func_code_truncated, _, _ = _truncate_text(
+        text=old_func_code_full, max_lines=200, max_chars=12000,
+    )
 
     rewritten_slice: List[str] = []
     inserted = False
@@ -1745,8 +1753,8 @@ def make_link_error_patch_override(
     out: Dict[str, Any] = {
         **mapping,
         "file_path_patch": rel_file,
-        "old_func_code": new_func_code_text,
-        "old_func_code_truncated": new_truncated,
+        "old_func_code": old_func_code_text,
+        "old_func_code_truncated": old_func_code_truncated,
         "new_func_code_lines": new_len,
         "patch_text": patch_text,
         "patch_text_truncated": patch_truncated,

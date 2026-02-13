@@ -1018,7 +1018,15 @@ def main(argv: List[str]) -> int:
                     rem = patch_key_verdict.get("remaining_in_active_patch_key")
                     if isinstance(rem, int):
                         remaining_in_active_patch_key = rem
-                        hunk_fixed = rem == 0
+                        # Consider the hunk "fixed" if the agent resolved at least one
+                        # target error.  With ossfuzz-loop-max=1 the agent only gets a
+                        # single build cycle, so partial progress is still valuable --
+                        # remaining errors will be picked up in subsequent rounds.
+                        total = patch_key_verdict.get("target_errors_total")
+                        if isinstance(total, int) and total > 0:
+                            hunk_fixed = rem < total
+                        else:
+                            hunk_fixed = rem == 0
 
             target_fixed: Optional[bool] = None
             if isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "ok":

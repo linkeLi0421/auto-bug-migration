@@ -1615,6 +1615,15 @@ def make_extra_patch_override(
 
     inserted_lines: List[str] = []
     insert_kind = ""
+
+    # 0) Forward tag declaration: symbol_name like "struct X" or "union Y" or "enum Z".
+    #    Just emit a forward declaration (e.g. "struct X;") — the full definition exists
+    #    later in the file, so we only need the tag visible for prototypes that precede it.
+    _tag_fwd_match = re.match(r"^(struct|union|enum)\s+(\w+)$", symbol)
+    if _tag_fwd_match:
+        inserted_lines = [f"{_tag_fwd_match.group(1)} {_tag_fwd_match.group(2)};"]
+        insert_kind = "forward_tag_declaration"
+
     kind, underlying = _symbol_underlying_name(symbol)
 
     # 1) Best-effort: for generated __revert_* functions, extract the prototype from the bundle itself.

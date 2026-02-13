@@ -1773,6 +1773,7 @@ def _summarize_active_patch_key_status(state: AgentState) -> Dict[str, Any]:
         "status": "ok",
         "active_patch_key": active_key,
         "remaining_in_active_patch_key": len(original_remaining),
+        "target_errors_total": len(target_msgs),
         "new_errors_in_active_patch_key": len(new_errors),
         "new_errors": new_errors[:5],
         "errors": in_active[:10],
@@ -3551,6 +3552,59 @@ def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decisi
     }
 
 
+def _visibility_decl_extra_patch_guardrail(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Handle -Wvisibility warnings by inserting a forward struct/union/enum declaration via `_extra_*`.
+
+    When a function declaration uses `struct X` in a parameter before `struct X` is defined,
+    the compiler emits: "declaration of 'struct X' will not be visible outside of this function".
+    Fix by adding `struct X;` as a forward declaration.
+    """
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+    if _next_patch_prereq_tool(state) is not None:
+        return None
+
+    # Scan error context for visibility warnings
+    candidates: List[str] = []
+    for e in state.grouped_errors or []:
+        if isinstance(e, dict):
+            raw = str(e.get("raw", "") or "").strip()
+            if raw:
+                candidates.append(raw)
+    if str(state.error_line or "").strip():
+        candidates.append(str(state.error_line))
+
+    tag = ""
+    for text in candidates:
+        m = _VISIBILITY_DECL_RE.search(text)
+        if m:
+            tag = str(m.group("tag") or "").strip()
+            if tag:
+                break
+    if not tag:
+        return None
+    if _has_make_extra_patch_override_for_symbol(state, tag):
+        return None
+
+    file_path, _ = _first_error_location(state)
+    if not file_path:
+        return None
+
+    return {
+        "type": "tool",
+        "thought": (
+            f"Visibility warning: '{tag}' used in a function declaration before it is defined. "
+            f"Adding forward declaration '{tag};' via the file's _extra_* hunk."
+        ),
+        "tool": "make_extra_patch_override",
+        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": tag, "version": "v1"},
+    }
+
+
 def _macro_lookup_pick_token(state: AgentState) -> str:
     """Pick the most relevant missing macro token for the current macro-expansion snippet."""
     snippet = str(state.snippet or "")
@@ -3703,6 +3757,9 @@ _INCOMPLETE_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<symbol>[^']+)'", re.IGNORECASE)
+_VISIBILITY_DECL_RE = re.compile(
+    r"declaration of '(?P<tag>(?:struct|union|enum)\s+\w+)' will not be visible"
+)
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
 _LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
@@ -5577,6 +5634,12 @@ def _run_langgraph(
             _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_missing_proto)
             _validate_tool_decision(forced_missing_proto)
             return {"state": st, "pending": forced_missing_proto}
+
+        forced_visibility = _visibility_decl_extra_patch_guardrail(st, decision)
+        if forced_visibility:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_visibility)
+            _validate_tool_decision(forced_visibility)
+            return {"state": st, "pending": forced_visibility}
 
         forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
         if forced_undeclared:
