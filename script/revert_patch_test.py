@@ -2153,10 +2153,14 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             with open(os.path.join(target_repo_path, file_path), 'r', encoding="latin-1") as f:
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
-            for func_info in recreated_functions:
-                if func_info.is_static() and func_info.file_path_old != file_path:
-                    # Static functions are used in the same file
-                    continue                    
+            # Build list of recreated functions visible to this file
+            visible_recreated = [fi for fi in recreated_functions
+                                 if not (fi.is_static() and fi.file_path_old != file_path)]
+            # Track absolute line numbers already covered by a call-site patch
+            # to avoid creating overlapping patches when multiple recreated
+            # functions appear in the same multi-line call.
+            covered_lines = set()
+            for func_info in visible_recreated:
                 recreated_fname = func_info.name
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
@@ -2164,6 +2168,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         function_head_flag = True
                     if not function_head_flag:
                         # Skip the function head
+                        continue
+                    abs_line = old_line_begin + i
+                    if abs_line in covered_lines:
                         continue
                     if re.search(r'(?<![\w.])' + re.escape(recreated_fname) + r'(?!\w)', line) is not None:
                         # If the function is recreated, add a call to it.
@@ -2179,11 +2186,21 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         start_line = old_line_begin + i
                         end_line = start_line + num_call_lines
 
-                        # Build -/+ pairs for all lines of the call
+                        # Mark these lines as covered
+                        for l in range(start_line, end_line):
+                            covered_lines.add(l)
+
+                        # Build -/+ pairs for all lines of the call,
+                        # renaming ALL visible recreated functions (not just
+                        # the triggering one) to avoid overlapping patches.
                         minus_lines = []
                         plus_lines = []
                         for cl in call_lines:
-                            minus_lines.append(rename_func(f'-{cl}', recreated_fname, commit)[0])
+                            ml = '-' + cl.rstrip('\n')
+                            for rf in visible_recreated:
+                                if re.search(r'(?<![\w.])' + re.escape(rf.name) + r'(?!\w)', cl):
+                                    ml = rename_func(ml, rf.name, commit)[0]
+                            minus_lines.append(ml)
                             plus_lines.append('+' + cl.rstrip('\n'))
                         patch_body = '\n'.join(minus_lines + plus_lines)
                         patch_text = patch_header + f"@@ -{start_line},{num_call_lines} +{start_line},{num_call_lines} @@\n" + patch_body
