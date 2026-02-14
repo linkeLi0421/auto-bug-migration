@@ -4934,7 +4934,16 @@ def _run_langgraph(
 
         # Macro-expansion preflight: do not invent #defines inside the function body. Prefer adding
         # the missing macro at file scope via the file's `_extra_*` hunk.
-        if st.macro_tokens_not_defined_in_slice and "expanded from macro" in str(st.snippet or ""):
+        # Only fire when the active error is actually about an undeclared/unknown symbol —
+        # not for structural errors (e.g. "too many arguments") where a macro merely appears
+        # in compiler diagnostics.
+        _macro_pf_error = str(st.error_line or "")
+        _macro_pf_is_undeclared = bool(_UNDECLARED_SYMBOL_RE.search(_macro_pf_error))
+        if (
+            _macro_pf_is_undeclared
+            and st.macro_tokens_not_defined_in_slice
+            and "expanded from macro" in str(st.snippet or "")
+        ):
             file_path, _ = _first_error_location(st)
             if file_path:
                 tokens = _macro_lookup_pick_tokens(st, max_tokens=3)
