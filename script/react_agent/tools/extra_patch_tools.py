@@ -1522,6 +1522,14 @@ def make_extra_patch_override(
     symbol = str(symbol_name or "").strip()
     if not symbol:
         raise ValueError("symbol_name must be non-empty")
+    # Detect when the LLM accidentally passes a full prototype or declaration
+    # instead of a bare symbol name (e.g. "void foo(int x);" instead of "foo").
+    if '(' in symbol or symbol.endswith(';'):
+        raise ValueError(
+            f"symbol_name looks like a prototype or declaration, not a bare "
+            f"symbol name. Pass only the identifier (e.g. "
+            f"'__revert_<commit>_<func>'), not a full signature. Got: {symbol!r}"
+        )
 
     bundle = load_patch_bundle(patch_path_s, allowed_roots=_allowed_patch_roots_from_env())
     extra_key = _infer_extra_patch_key(bundle=bundle, file_path=file_path_s)

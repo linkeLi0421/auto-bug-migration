@@ -2016,8 +2016,10 @@ def build_version(args):
       'HELPER=True',
 
       # ↓↓↓ make/ninja/cmake parallelism & output
-      'MAKEFLAGS=--output-sync=line -j1',   # one job; flush by line
-      'CMAKE_BUILD_PARALLEL_LEVEL=1',       # cmake-driven builds
+      # Use -j1 for compile_commands/preprocess (needs deterministic ordering);
+      # otherwise -j16 (build lock ensures one build at a time).
+      'MAKEFLAGS=--output-sync=line -j1' if (getattr(args, 'compile_commands', False) or getattr(args, 'preprocess', False)) else 'MAKEFLAGS=--output-sync=line -j30',
+      'CMAKE_BUILD_PARALLEL_LEVEL=1' if (getattr(args, 'compile_commands', False) or getattr(args, 'preprocess', False)) else 'CMAKE_BUILD_PARALLEL_LEVEL=30',
       'NINJA_STATUS=',                      # silence progress bar
       # color off to avoid ANSI control sequences
       'TERM=dumb',

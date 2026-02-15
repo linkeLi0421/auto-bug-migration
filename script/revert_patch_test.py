@@ -1462,7 +1462,7 @@ def call_react_agent(
     max_groups: int = 100,
     ossfuzz_loop_max: int = 1,
     max_restarts_per_hunk: int = 3,
-    openai_model: str = "gpt-5-mini",
+    openai_model: str = "gpt-5.2",
     openai_max_tokens: int = 64000,
     max_multi_agent_rounds: int = 20,
 ) -> dict:
@@ -2185,6 +2185,32 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         num_call_lines = len(call_lines)
                         start_line = old_line_begin + i
                         end_line = start_line + num_call_lines
+
+                        # Check if any line in the collected call range
+                        # is already covered by a previous call-site patch.
+                        new_range = set(range(start_line, end_line))
+                        overlap = new_range & covered_lines
+                        if overlap:
+                            if not (new_range - covered_lines):
+                                # New patch is entirely within already-covered
+                                # lines (a smaller/equal duplicate); skip it.
+                                continue
+                            # The new patch covers uncovered lines too, so it
+                            # is a broader multi-line call that subsumes the
+                            # previous smaller patch(es).  Remove the old
+                            # overlapping patches and fall through to create
+                            # the replacement.
+                            keys_to_remove = []
+                            for key in list(new_patch_to_apply):
+                                p = diff_results[key]
+                                if p.file_path_old == file_path:
+                                    old_range = set(range(p.old_start_line, p.old_end_line))
+                                    if old_range & new_range:
+                                        keys_to_remove.append(key)
+                                        covered_lines -= old_range
+                            for key in keys_to_remove:
+                                new_patch_to_apply.discard(key)
+                                del diff_results[key]
 
                         # Mark these lines as covered
                         for l in range(start_line, end_line):
