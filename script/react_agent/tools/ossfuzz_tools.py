@@ -13,6 +13,11 @@ from build_log import iter_linker_errors
 
 
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_DIFF_GIT_RE = re.compile(r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$")
+_HUNK_HEADER_RE = re.compile(
+    r"^@@\s+-(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@(?P<suffix>.*)$"
+)
+_MAX_OVERLAP_MERGE_SPAN = 12
 _PATCH_APPLY_ERROR_PATTERNS = [
     re.compile(r"^error:\s+corrupt patch(?:\s+at\s+line\s+\d+)?\s*$", re.IGNORECASE),
     re.compile(r"^error:\s+patch failed:\s+.*$", re.IGNORECASE),
@@ -233,6 +238,372 @@ def _infer_primary_patch_key_from_path(path: Path, patch_keys: set[str]) -> str:
             if not original.startswith("_extra_"):
                 return original
     return ""
+
+
+def _strip_diff_path_prefix(path: str) -> str:
+    out = str(path or "").strip()
+    if out.startswith("a/") or out.startswith("b/"):
+        return out[2:]
+    return out
+
+
+def _parse_diff_block(block_lines: list[str]) -> Optional[Dict[str, Any]]:
+    """Parse one `diff --git ...` block with unified hunks."""
+    if not block_lines:
+        return None
+    first = str(block_lines[0] or "").strip()
+    m0 = _DIFF_GIT_RE.match(first)
+    old_path = str(m0.group("old") or "") if m0 else ""
+    new_path = str(m0.group("new") or "") if m0 else ""
+
+    header_lines: list[str] = []
+    hunks: list[Dict[str, Any]] = []
+    i = 0
+    while i < len(block_lines):
+        line = block_lines[i]
+        if line.startswith("@@"):
+            mh = _HUNK_HEADER_RE.match(line.strip())
+            if not mh:
+                return None
+            old_start = int(mh.group("old_start"))
+            old_len = int(mh.group("old_len") or 1)
+            new_start = int(mh.group("new_start"))
+            new_len = int(mh.group("new_len") or 1)
+            suffix = str(mh.group("suffix") or "")
+            body: list[str] = []
+            i += 1
+            while i < len(block_lines) and not block_lines[i].startswith("@@"):
+                if block_lines[i] == "":
+                    i += 1
+                    continue
+                body.append(block_lines[i])
+                i += 1
+            hunks.append(
+                {
+                    "old_start": old_start,
+                    "old_len": old_len,
+                    "new_start": new_start,
+                    "new_len": new_len,
+                    "suffix": suffix,
+                    "body": body,
+                }
+            )
+            continue
+        header_lines.append(line)
+        stripped = line.strip()
+        if stripped.startswith("--- "):
+            old_path = _strip_diff_path_prefix(stripped[len("--- ") :].strip())
+        elif stripped.startswith("+++ "):
+            new_path = _strip_diff_path_prefix(stripped[len("+++ ") :].strip())
+        i += 1
+
+    if not hunks:
+        return None
+
+    old_path = _strip_diff_path_prefix(old_path)
+    new_path = _strip_diff_path_prefix(new_path)
+    file_key = new_path if new_path and new_path != "/dev/null" else old_path
+    if not file_key:
+        return None
+
+    return {
+        "file_key": file_key,
+        "old_path": old_path,
+        "new_path": new_path,
+        "header_lines": header_lines,
+        "hunks": hunks,
+    }
+
+
+def _merge_overlapping_hunk_cluster(cluster: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Merge a cluster of overlapping/adjacent hunks anchored to old-file line numbers."""
+    if not cluster:
+        return None
+    if len(cluster) == 1:
+        return cluster[0]
+
+    deltas = {int(h["new_start"]) - int(h["old_start"]) for h in cluster}
+    if len(deltas) != 1:
+        return None
+    delta = next(iter(deltas))
+
+    old_begin = min(int(h["old_start"]) for h in cluster)
+    old_end = max(int(h["old_start"]) + int(h["old_len"]) for h in cluster)
+    if (old_end - old_begin) > _MAX_OVERLAP_MERGE_SPAN:
+        return None
+
+    old_line_scores: Dict[int, Dict[str, int]] = {}
+    for h in cluster:
+        pos = int(h["old_start"])
+        for raw in list(h.get("body") or []):
+            if not raw:
+                prefix = " "
+                text = ""
+            else:
+                prefix = raw[0]
+                text = raw[1:]
+            if prefix in {" ", "-"}:
+                score = 10 if prefix == "-" else 1
+                scores = old_line_scores.setdefault(pos, {})
+                scores[text] = int(scores.get(text, 0)) + score
+                pos += 1
+            elif prefix in {"+", "\\"}:
+                continue
+            else:
+                scores = old_line_scores.setdefault(pos, {})
+                scores[raw] = int(scores.get(raw, 0)) + 1
+                pos += 1
+
+    base_old_lines: Dict[int, str] = {}
+    if old_end > old_begin:
+        for pos in range(old_begin, old_end):
+            choices = old_line_scores.get(pos, {})
+            if not choices:
+                return None
+            best = max(choices.values())
+            winners = [line for line, score in choices.items() if score == best]
+            if len(winners) != 1:
+                return None
+            base_old_lines[pos] = winners[0]
+
+    insert_before: Dict[int, list[str]] = {}
+    delete_pos: set[int] = set()
+    for h in sorted(cluster, key=lambda it: int(it.get("_order", 0))):
+        pos = int(h["old_start"])
+        for raw in list(h.get("body") or []):
+            if not raw:
+                prefix = " "
+                text = ""
+            else:
+                prefix = raw[0]
+                text = raw[1:]
+            if prefix == "+":
+                insert_before.setdefault(pos, []).append(text)
+            elif prefix == "-":
+                delete_pos.add(pos)
+                pos += 1
+            elif prefix == " ":
+                pos += 1
+            elif prefix == "\\":
+                continue
+            else:
+                pos += 1
+
+    merged_body: list[str] = []
+    if old_end == old_begin:
+        for text in insert_before.get(old_begin, []):
+            merged_body.append("+" + text if text else "+")
+    else:
+        for pos in range(old_begin, old_end):
+            for text in insert_before.get(pos, []):
+                merged_body.append("+" + text if text else "+")
+            old_line = base_old_lines[pos]
+            if pos in delete_pos:
+                merged_body.append("-" + old_line if old_line else "-")
+            else:
+                merged_body.append(" " + old_line if old_line else " ")
+        for text in insert_before.get(old_end, []):
+            merged_body.append("+" + text if text else "+")
+
+    if not merged_body:
+        return None
+
+    old_len = sum(1 for line in merged_body if line and line[0] not in {"+", "\\"})
+    new_len = sum(1 for line in merged_body if line and line[0] not in {"-", "\\"})
+    suffix = next((str(h.get("suffix") or "") for h in cluster if str(h.get("suffix") or "").strip()), "")
+
+    return {
+        "old_start": old_begin,
+        "old_len": old_len,
+        "new_start": old_begin + delta,
+        "new_len": new_len,
+        "suffix": suffix,
+        "body": merged_body,
+        "_order": min(int(h.get("_order", 0)) for h in cluster),
+    }
+
+
+def _flip_hunk_direction(hunk: Dict[str, Any]) -> Dict[str, Any]:
+    """Swap old/new sides of a unified-diff hunk."""
+    flipped_body: list[str] = []
+    for raw in list(hunk.get("body") or []):
+        if not raw:
+            flipped_body.append(raw)
+            continue
+        prefix = raw[0]
+        rest = raw[1:]
+        if prefix == "+":
+            flipped_body.append("-" + rest)
+        elif prefix == "-":
+            flipped_body.append("+" + rest)
+        else:
+            flipped_body.append(raw)
+    return {
+        "old_start": int(hunk["new_start"]),
+        "old_len": int(hunk["new_len"]),
+        "new_start": int(hunk["old_start"]),
+        "new_len": int(hunk["old_len"]),
+        "suffix": str(hunk.get("suffix") or ""),
+        "body": flipped_body,
+        "_order": int(hunk.get("_order", 0)),
+    }
+
+
+def _merge_overlapping_hunk_cluster_via_reverse(cluster: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Fallback merge: merge in reverse-apply space, then flip back."""
+    reversed_cluster = [_flip_hunk_direction(h) for h in cluster]
+    merged_reversed = _merge_overlapping_hunk_cluster(reversed_cluster)
+    if merged_reversed is None:
+        return None
+    merged = _flip_hunk_direction(merged_reversed)
+    merged["_order"] = min(int(h.get("_order", 0)) for h in cluster)
+    return merged
+
+
+def _coalesce_overlapping_file_hunks(hunks: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    if len(hunks) <= 1:
+        return hunks
+
+    indexed: list[Dict[str, Any]] = []
+    for idx, h in enumerate(hunks):
+        h2 = dict(h)
+        h2["_order"] = idx
+        indexed.append(h2)
+
+    indexed.sort(
+        key=lambda h: (
+            int(h["old_start"]),
+            int(h["old_start"]) + int(h["old_len"]),
+            int(h.get("_order", 0)),
+        )
+    )
+
+    merged: list[Dict[str, Any]] = []
+    cluster: list[Dict[str, Any]] = []
+    cluster_end = 0
+
+    def _flush_cluster() -> None:
+        nonlocal cluster
+        if not cluster:
+            return
+        if len(cluster) == 1:
+            merged.append(cluster[0])
+        else:
+            merged_hunk = _merge_overlapping_hunk_cluster(cluster)
+            if merged_hunk is None:
+                merged_hunk = _merge_overlapping_hunk_cluster_via_reverse(cluster)
+            if merged_hunk is None:
+                merged.extend(cluster)
+            else:
+                merged.append(merged_hunk)
+        cluster = []
+
+    for h in indexed:
+        start = int(h["old_start"])
+        end = int(h["old_start"]) + int(h["old_len"])
+        if not cluster:
+            cluster = [h]
+            cluster_end = end
+            continue
+        if start <= cluster_end:
+            cluster.append(h)
+            if end > cluster_end:
+                cluster_end = end
+            continue
+        _flush_cluster()
+        cluster = [h]
+        cluster_end = end
+    _flush_cluster()
+
+    merged.sort(
+        key=lambda h: (
+            int(h["old_start"]),
+            int(h["old_start"]) + int(h["old_len"]),
+            int(h.get("_order", 0)),
+        )
+    )
+    return merged
+
+
+def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
+    """Merge only overlapping same-file hunks; otherwise keep original block layout."""
+    raw = str(patch_text or "").rstrip("\n")
+    if not raw.strip():
+        return ""
+
+    lines = raw.splitlines()
+    blocks: list[list[str]] = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("diff --git "):
+            if lines[i].strip():
+                return raw + "\n"
+            i += 1
+            continue
+        start = i
+        i += 1
+        while i < len(lines) and not lines[i].startswith("diff --git "):
+            i += 1
+        block = list(lines[start:i])
+        while block and block[-1] == "":
+            block.pop()
+        if block:
+            blocks.append(block)
+
+    if not blocks:
+        return raw + "\n"
+
+    parsed_blocks: list[Dict[str, Any]] = []
+    file_to_block_indices: Dict[str, list[int]] = {}
+    for idx, block in enumerate(blocks):
+        parsed = _parse_diff_block(block)
+        if parsed is None:
+            return raw + "\n"
+        key = str(parsed["file_key"] or "")
+        parsed_blocks.append({"raw_lines": block, "parsed": parsed, "file_key": key})
+        file_to_block_indices.setdefault(key, []).append(idx)
+
+    replacement_blocks: Dict[int, list[str]] = {}
+    skip_block_indices: set[int] = set()
+    for key, idxs in file_to_block_indices.items():
+        if not idxs:
+            continue
+        all_hunks: list[Dict[str, Any]] = []
+        for bi in idxs:
+            all_hunks.extend(list(parsed_blocks[bi]["parsed"].get("hunks") or []))
+        if not all_hunks:
+            continue
+        merged_hunks = _coalesce_overlapping_file_hunks(all_hunks)
+        # Preserve original layout when no overlap was actually merged.
+        if len(merged_hunks) >= len(all_hunks):
+            continue
+
+        first_idx = idxs[0]
+        header_lines = list(parsed_blocks[first_idx]["parsed"].get("header_lines") or [])
+        new_block_lines: list[str] = []
+        new_block_lines.extend(header_lines)
+        for h in merged_hunks:
+            suffix = str(h.get("suffix") or "")
+            new_block_lines.append(
+                f"@@ -{int(h['old_start'])},{int(h['old_len'])} +{int(h['new_start'])},{int(h['new_len'])} @@{suffix}".rstrip()
+            )
+            new_block_lines.extend(list(h.get("body") or []))
+        replacement_blocks[first_idx] = new_block_lines
+        for bi in idxs[1:]:
+            skip_block_indices.add(bi)
+
+    if not replacement_blocks:
+        return raw + "\n"
+
+    out_lines: list[str] = []
+    for idx, entry in enumerate(parsed_blocks):
+        if idx in skip_block_indices:
+            continue
+        block_lines = replacement_blocks.get(idx, list(entry.get("raw_lines") or []))
+        out_lines.extend(block_lines)
+        out_lines.append("")
+
+    return "\n".join(out_lines).rstrip("\n") + "\n"
 
 
 def _extra_hunk_minus_lines(patch_text: str) -> list[str]:
@@ -771,6 +1142,8 @@ def merge_patch_bundle_with_overrides(
             parts.append(patch_text)
 
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
+    if merged_text:
+        merged_text = _consolidate_same_file_diff_blocks(merged_text)
 
 
     out_name = _safe_filename(str(output_name or "ossfuzz_merged.diff"))
