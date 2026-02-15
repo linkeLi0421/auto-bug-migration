@@ -654,40 +654,74 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         reverse_allowed = resolve_aliases(current_frame)
         return base_frame in reverse_allowed
 
+    # Filter out sanitizer-internal frames for matching purposes.
+    # These frames are runtime infrastructure (ASAN, LSAN, TSAN, MSAN,
+    # UBSAN) whose names vary across compiler/sanitizer versions and are
+    # not part of the actual bug signature.
+    _SANITIZER_FRAME_RE = re.compile(
+        r'^(__asan::|__lsan::|__tsan::|__msan::|__ubsan::|__sanitizer::'
+        r'|__interception::'
+        r'|Atomically\w*Allocated'
+        r'|atomic_compare_exchange_strong<__sanitizer::)'
+    )
+
+    def _is_sanitizer_frame(frame: str) -> bool:
+        return bool(_SANITIZER_FRAME_RE.match(frame))
+
+    baseline_app = [f for f in baseline_clean if not _is_sanitizer_frame(f)]
+    current_app = [f for f in current_clean if not _is_sanitizer_frame(f)]
+
     logger.debug(f'signature_map: {signature_map}')
-    top_match = frames_match(baseline_clean[0], current_clean[0])
+
+    # Top-frame check on application frames (fall back to full stack if
+    # all frames were sanitizer-internal).
+    top_baseline = baseline_app[0] if baseline_app else baseline_clean[0]
+    top_current = current_app[0] if current_app else current_clean[0]
+    top_match = frames_match(top_baseline, top_current)
     if not top_match:
         logger.info(
             "Crash stack top frame mismatch: baseline '%s' vs current '%s'.\nBaseline: %s\nCurrent: %s",
-            baseline_clean[0],
-            current_clean[0],
+            top_baseline,
+            top_current,
             baseline_stack,
             current_stack,
         )
         return False
 
-    matches = 0
-    current_idx = 0
-    for base_frame in baseline_clean:
-        while current_idx < len(current_clean) and not frames_match(base_frame, current_clean[current_idx]):
-            current_idx += 1
-        if current_idx == len(current_clean):
-            continue
-        matches += 1
-        current_idx += 1
+    # Use DP-based LCS (longest common subsequence) on application frames.
+    # The old greedy forward scan could cascade-fail: one unmatched frame
+    # (e.g. __interceptor_free vs free) would exhaust the scan pointer and
+    # lose all subsequent matches.
+    def _lcs_length(seq_a: List[str], seq_b: List[str]) -> int:
+        n, m = len(seq_a), len(seq_b)
+        if n == 0 or m == 0:
+            return 0
+        prev = [0] * (m + 1)
+        for i in range(1, n + 1):
+            curr = [0] * (m + 1)
+            for j in range(1, m + 1):
+                if frames_match(seq_a[i - 1], seq_b[j - 1]):
+                    curr[j] = prev[j - 1] + 1
+                else:
+                    curr[j] = max(prev[j], curr[j - 1])
+            prev = curr
+        return prev[m]
 
-    baseline_len = max(len(baseline_clean), 1)
-    match_ratio = matches / baseline_len
+    lcs_len = _lcs_length(baseline_app, current_app)
+    denom = max(len(baseline_app), len(current_app), 1)
+    match_ratio = lcs_len / denom
     STACK_MATCH_THRESHOLD = 0.6
     if match_ratio >= STACK_MATCH_THRESHOLD:
         return True
 
     logger.info(
-        "Crash stack mismatch (ratio %.2f < %.2f).\nBaseline: %s\nCurrent: %s",
+        "Crash stack mismatch (ratio %.2f < %.2f).\nBaseline: %s\nCurrent: %s\nApp frames baseline: %s\nApp frames current: %s",
         match_ratio,
         STACK_MATCH_THRESHOLD,
         baseline_stack,
         current_stack,
+        baseline_app,
+        current_app,
     )
     return False
 

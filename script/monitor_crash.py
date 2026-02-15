@@ -166,11 +166,13 @@ def _resolve_signature_file(stack_file_path):
     return candidates[0]
 
 _REVERT_PREFIX_RE = re.compile(r'^__revert_[A-Fa-f0-9]+_')
+_INTERCEPTOR_PREFIX_RE = re.compile(r'^__interceptor_')
 
 def _clean_function_name(func):
     """Normalize function names found in stack traces."""
     name = func.split('(')[0].split('+')[0].strip()
     name = _REVERT_PREFIX_RE.sub('', name)
+    name = _INTERCEPTOR_PREFIX_RE.sub('', name)
     return name
 
 
