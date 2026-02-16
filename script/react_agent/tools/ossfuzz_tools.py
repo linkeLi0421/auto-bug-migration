@@ -526,7 +526,7 @@ def _coalesce_overlapping_file_hunks(hunks: list[Dict[str, Any]]) -> list[Dict[s
 
 
 def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
-    """Merge only overlapping same-file hunks; otherwise keep original block layout."""
+    """Merge only overlapping single-hunk pairs from consecutive same-file occurrences."""
     raw = str(patch_text or "").rstrip("\n")
     if not raw.strip():
         return ""
@@ -554,53 +554,100 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
         return raw + "\n"
 
     parsed_blocks: list[Dict[str, Any]] = []
-    file_to_block_indices: Dict[str, list[int]] = {}
-    for idx, block in enumerate(blocks):
+    for block in blocks:
         parsed = _parse_diff_block(block)
         if parsed is None:
             return raw + "\n"
-        key = str(parsed["file_key"] or "")
-        parsed_blocks.append({"raw_lines": block, "parsed": parsed, "file_key": key})
-        file_to_block_indices.setdefault(key, []).append(idx)
+        parsed_blocks.append({"raw_lines": block, "parsed": parsed, "file_key": str(parsed.get("file_key") or "")})
 
-    replacement_blocks: Dict[int, list[str]] = {}
-    skip_block_indices: set[int] = set()
-    for key, idxs in file_to_block_indices.items():
-        if not idxs:
-            continue
-        all_hunks: list[Dict[str, Any]] = []
-        for bi in idxs:
-            all_hunks.extend(list(parsed_blocks[bi]["parsed"].get("hunks") or []))
-        if not all_hunks:
-            continue
-        merged_hunks = _coalesce_overlapping_file_hunks(all_hunks)
-        # Preserve original layout when no overlap was actually merged.
-        if len(merged_hunks) >= len(all_hunks):
-            continue
+    def _old_span(h: Dict[str, Any]) -> tuple[int, int]:
+        start = int(h.get("old_start", 0) or 0)
+        end = start + int(h.get("old_len", 0) or 0)
+        return start, end
 
-        first_idx = idxs[0]
-        header_lines = list(parsed_blocks[first_idx]["parsed"].get("header_lines") or [])
-        new_block_lines: list[str] = []
-        new_block_lines.extend(header_lines)
-        for h in merged_hunks:
-            suffix = str(h.get("suffix") or "")
-            new_block_lines.append(
-                f"@@ -{int(h['old_start'])},{int(h['old_len'])} +{int(h['new_start'])},{int(h['new_len'])} @@{suffix}".rstrip()
+    def _old_ranges_overlap(h1: Dict[str, Any], h2: Dict[str, Any]) -> bool:
+        s1, e1 = _old_span(h1)
+        s2, e2 = _old_span(h2)
+        if e1 <= s1 or e2 <= s2:
+            return False
+        return max(s1, s2) < min(e1, e2)
+
+    file_to_indices: Dict[str, list[int]] = {}
+    for idx, entry in enumerate(parsed_blocks):
+        key = str(entry.get("file_key") or "")
+        if not key:
+            continue
+        file_to_indices.setdefault(key, []).append(idx)
+
+    replaced_blocks: Dict[int, Dict[str, Any]] = {}
+    removed_indices: set[int] = set()
+    changed = False
+
+    for key, idxs in file_to_indices.items():
+        if len(idxs) < 2:
+            continue
+        j = 0
+        while j < len(idxs) - 1:
+            i1 = idxs[j]
+            i2 = idxs[j + 1]
+            if i1 in removed_indices or i2 in removed_indices:
+                j += 1
+                continue
+            cur = replaced_blocks.get(i1, parsed_blocks[i1])
+            nxt = replaced_blocks.get(i2, parsed_blocks[i2])
+            cur_hunks = list(cur["parsed"].get("hunks") or [])
+            nxt_hunks = list(nxt["parsed"].get("hunks") or [])
+            if len(cur_hunks) != 1 or len(nxt_hunks) != 1:
+                j += 1
+                continue
+
+            h1 = dict(cur_hunks[0])
+            h2 = dict(nxt_hunks[0])
+            if not _old_ranges_overlap(h1, h2):
+                j += 1
+                continue
+
+            h1["_order"] = 0
+            h2["_order"] = 1
+            merged = _merge_overlapping_hunk_cluster([h1, h2])
+            if merged is None:
+                merged = _merge_overlapping_hunk_cluster_via_reverse([h1, h2])
+            if merged is None:
+                j += 1
+                continue
+
+            header_lines = list(cur["parsed"].get("header_lines") or [])
+            merged_lines: list[str] = []
+            merged_lines.extend(header_lines)
+            suffix = str(merged.get("suffix") or "")
+            merged_lines.append(
+                f"@@ -{int(merged['old_start'])},{int(merged['old_len'])} +{int(merged['new_start'])},{int(merged['new_len'])} @@{suffix}".rstrip()
             )
-            new_block_lines.extend(list(h.get("body") or []))
-        replacement_blocks[first_idx] = new_block_lines
-        for bi in idxs[1:]:
-            skip_block_indices.add(bi)
+            merged_lines.extend(list(merged.get("body") or []))
+            reparsed = _parse_diff_block(merged_lines)
+            if reparsed is None:
+                j += 1
+                continue
 
-    if not replacement_blocks:
+            replaced_blocks[i1] = {
+                "raw_lines": merged_lines,
+                "parsed": reparsed,
+                "file_key": str(reparsed.get("file_key") or key),
+            }
+            removed_indices.add(i2)
+            changed = True
+            # Keep i1 as the current anchor; it may overlap with the next same-file block.
+            continue
+
+    if not changed:
         return raw + "\n"
 
     out_lines: list[str] = []
     for idx, entry in enumerate(parsed_blocks):
-        if idx in skip_block_indices:
+        if idx in removed_indices:
             continue
-        block_lines = replacement_blocks.get(idx, list(entry.get("raw_lines") or []))
-        out_lines.extend(block_lines)
+        block = replaced_blocks.get(idx, entry)
+        out_lines.extend(list(block.get("raw_lines") or []))
         out_lines.append("")
 
     return "\n".join(out_lines).rstrip("\n") + "\n"
