@@ -598,8 +598,13 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
 
     old_start = selected_hunk[0] if selected_hunk else int(patch.old_start_line or 0)
     index_old_infun = 0
+    # Track both:
+    # - old-line progress (index_old_infun), used to match the target old-side line
+    # - body index (hit_body_index), used for hiden_func_dict offsets (which are body indices)
+    scan_start = max(0, int(front_context_num))
+    hit_body_index: Optional[int] = None
     patch_flag = False
-    for line in patch_lines[body_start + front_context_num :]:
+    for rel_idx, line in enumerate(patch_lines[body_start + scan_start :], start=scan_start):
         if line.startswith("-"):
             index_old_infun += 1
             if not patch_flag:
@@ -610,18 +615,25 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
         else:
             index_old_infun += 1
         if ln + add_num == old_start + index_old_infun:
+            hit_body_index = rel_idx
             break
+    if hit_body_index is None:
+        # Fallback: project old-line progress into body-index space as best effort.
+        if body:
+            hit_body_index = max(0, min(scan_start + max(index_old_infun, 0), len(body) - 1))
+        else:
+            hit_body_index = 0
 
     hiden_func_items = sorted((patch.hiden_func_dict or {}).items(), key=lambda x: x[1])
-    func_start_index = front_context_num
+    func_start_index = scan_start
     func_end_index = last_minus_end_index()
 
     if {"Merged functions", "Tail function"} & (patch.patch_type or set()):
-        last_offset = front_context_num
+        last_offset = scan_start
         last_func_sig = hiden_func_items[0][0] if hiden_func_items else old_function_signature
         chosen = False
         for func_sig, offset in hiden_func_items:
-            if offset > index_old_infun:
+            if offset > hit_body_index:
                 func_start_index = last_offset
                 func_end_index = offset
                 old_function_signature = last_func_sig
