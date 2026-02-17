@@ -390,6 +390,112 @@ assert "-#define EMPTY_ICONV" in patch_text_out and "-#define EMPTY_UCONV" in pa
 print("OK")
 PY
 
+# Recreated+merged hunk mapping: hiden_func_dict offsets are body indices.
+# Ensure get_error_patch_context picks the correct merged function slice (not the first call-site block).
+bundle_path="$tmp_dir/_fixture_recreated_merged_offsets.patch2"
+
+"$PYTHON" - "$bundle_path" <<'PY'
+import json
+import pickle
+import sys
+from pathlib import Path
+
+bundle_path = Path(sys.argv[1])
+allowed_roots = [str(bundle_path.parent)]
+
+repo_root = bundle_path.parents[4]
+script_dir = repo_root / "script"
+sys.path.insert(0, str(script_dir))
+
+from migration_tools.patch_bundle import load_patch_bundle
+from migration_tools.tools import get_error_patch, get_error_patch_context
+from migration_tools.types import PatchInfo
+
+patch_text = "\n".join(
+    [
+        "diff --git a/src/lib/protocols/http.c b/src/lib/protocols/http.c",
+        "--- a/src/lib/protocols/http.c",
+        "+++ b/src/lib/protocols/http.c",
+        "@@ -10,20 +10,8 @@",
+        " context1",
+        " context2",
+        "-  __revert_f25dee_ndpi_set_bitmask_protocol_detection(\"HTTP\", ndpi_struct, detection_bitmask, *id,",
+        "-    NDPI_PROTOCOL_HTTP,",
+        "-    ndpi_search_http_tcp,",
+        "-    NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD,",
+        "-    SAVE_DETECTION_BITMASK_AS_UNKNOWN,",
+        "-    ADD_TO_DETECTION_BITMASK);",
+        "+  ndpi_set_bitmask_protocol_detection(\"HTTP\", ndpi_struct, detection_bitmask, *id,",
+        "+    NDPI_PROTOCOL_HTTP,",
+        "+    ndpi_search_http_tcp,",
+        "+    NDPI_SELECTION_BITMASK_PROTOCOL_V4_V6_TCP_WITH_PAYLOAD,",
+        "+    SAVE_DETECTION_BITMASK_AS_UNKNOWN,",
+        "+    ADD_TO_DETECTION_BITMASK);",
+        " context3",
+        " context4",
+        "-static void __revert_f25dee_ndpi_check_http_header(struct ndpi_detection_module_struct *ndpi_struct, struct ndpi_flow_struct *flow) {",
+        "-  int i;",
+        "-  struct ndpi_packet_struct *packet = &ndpi_struct->packet;",
+        "-  if(packet) return;",
+        "-}",
+        "-static int __revert_f25dee_is_a_suspicious_header(void){",
+        "-  return 0;",
+        "-}",
+    ]
+)
+
+data = {
+    "p1": PatchInfo(
+        file_path_old="src/lib/protocols/http.c",
+        file_path_new="src/lib/protocols/http.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=10,
+        old_end_line=30,
+        new_start_line=10,
+        new_end_line=18,
+        patch_type=set(["Function removed", "Function body change", "Merged functions", "Recreated function"]),
+        old_signature="no change trace function ndpi_set_bitmask_protocol_detection",
+        new_signature="no change trace function ndpi_set_bitmask_protocol_detection",
+        hiden_func_dict={
+            "no change trace function ndpi_set_bitmask_protocol_detection": 2,
+            "void ndpi_check_http_header(struct ndpi_detection_module_struct * ndpi_struct, struct ndpi_flow_struct * flow)": 16,
+            "int is_a_suspicious_header(void)": 21,
+        },
+    )
+}
+
+bundle_path.write_bytes(pickle.dumps(data))
+
+bundle = load_patch_bundle(bundle_path, allowed_roots=allowed_roots)
+assert list(bundle.patches.keys()) == ["p1"], list(bundle.patches.keys())
+
+# old line 22 is inside ndpi_check_http_header in this hunk.
+err = get_error_patch(
+    patch_path=str(bundle_path),
+    file_path="/src/ndpi/src/lib/protocols/http.c",
+    line_number=22,
+    allowed_roots=allowed_roots,
+)
+json.dumps(err)
+assert err["patch_key"] == "p1", err
+assert err["func_start_index"] == 16 and err["func_end_index"] == 21, err
+assert "ndpi_check_http_header" in str(err.get("old_signature") or ""), err
+
+ctx = get_error_patch_context(
+    patch_path=str(bundle_path),
+    file_path="/src/ndpi/src/lib/protocols/http.c",
+    line_number=22,
+    allowed_roots=allowed_roots,
+)
+json.dumps(ctx)
+func_code = str(ctx.get("error_func_code") or "")
+assert "__revert_f25dee_ndpi_check_http_header" in func_code, func_code
+assert "ndpi_struct->packet" in func_code, func_code
+
+print("OK")
+PY
+
 # Multi-hunk header rewrite: later hunks must get +new_start adjusted when the first hunk delta changes.
 fixture_b64="$SCRIPT_DIR/fixtures/multi_hunk.patch2.b64"
 bundle_path="$tmp_dir/_fixture_multi_hunk.patch2"
