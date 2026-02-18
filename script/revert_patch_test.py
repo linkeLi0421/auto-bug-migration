@@ -1494,11 +1494,11 @@ def call_react_agent(
     max_steps: int = 100,
     jobs: int = int(os.environ.get("REACT_AGENT_JOBS", "4")),
     max_groups: int = 100,
-    ossfuzz_loop_max: int = 1,
+    ossfuzz_loop_max: int = 20,
     max_restarts_per_hunk: int = 3,
-    openai_model: str = "gpt-5.2",
+    openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
-    max_multi_agent_rounds: int = 20,
+    max_multi_agent_rounds: int = 100,
 ) -> dict:
     """Call the multi-agent to fix build errors with iterative rounds.
 
