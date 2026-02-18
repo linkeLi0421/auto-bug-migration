@@ -1670,7 +1670,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 # Need a Artificial patch, to create the old function
 
                 func_code, func_length, start_line = get_function_code_from_old_commit(target_repo_path, commit, data_path, patch.file_path_old, patch.old_signature)
-                func_code = '\n'.join([f'-{line}' for line in func_code.split('\n')][:-1]) + '\n'  # Add a \n at the end to avoid patch fail
+                func_code = '\n'.join([f'-{line}' for line in func_code.splitlines()]) + '\n'  # Add a \n at the end to avoid patch fail
                 func_loc = FunctionLocation(file_path=patch.file_path_old, start_line=start_line, end_line=start_line + func_length - 1)
 
                 artificial_patch_insert_point = get_patch_insert_line_number(target_repo_path, next_commit, data_path, patch.file_path_new, patch.new_signature)
