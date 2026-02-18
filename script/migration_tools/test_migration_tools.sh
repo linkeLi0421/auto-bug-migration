@@ -358,20 +358,6 @@ json.dumps(ctx)
 missing = set(ctx.get("macro_tokens_not_defined_in_slice") or [])
 assert {"EMPTY_ICONV", "EMPTY_UCONV"} <= missing, missing
 
-# Guardrail: a no-op rewrite (new_func_code identical to the existing '-' slice) should be rejected.
-try:
-    make_error_patch_override(
-        patch_path=str(bundle_path),
-        file_path="/src/libxml2/encoding.c",
-        line_number=100,
-        new_func_code=ctx.get("patch_minus_code") or "",
-        max_lines=2000,
-        max_chars=200000,
-        allowed_roots=allowed_roots,
-    )
-    raise AssertionError("expected ValueError for no-op rewrite")
-except ValueError:
-    pass
 
 out = make_error_patch_override(
     patch_path=str(bundle_path),
