@@ -168,8 +168,8 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
     Strategy: insert before a selected function definition start line (start.line).
-    - For __revert_* functions: insert AFTER the corresponding V2 function declaration (extent.end.line + 1).
-      This ensures types referenced by the function are already defined.
+    - For __revert_* functions: fall through to the default "before first function" logic.
+      Forward declarations must appear before call sites, not after the V2 function body.
     - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
     - Otherwise, insert before the first function definition in the file (smallest start line).
     """
@@ -196,36 +196,11 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     if not isinstance(nodes, list) or not nodes:
         return no_anchor()
 
-    # Special handling for __revert_* functions: insert after the V2 declaration of the underlying function.
-    # This ensures types used by the function are already defined.
-    symbol = str(symbol_name or "").strip()
-    if symbol.startswith("__revert_"):
-        # Extract underlying function name (e.g., "__revert_b1826c_stbi__jpeg_test" -> "stbi__jpeg_test")
-        kind, underlying = _symbol_underlying_name(symbol)
-        if kind == "revert_function" and underlying:
-            # Find the V2 declaration/definition of the underlying function
-            for n in nodes:
-                if not isinstance(n, dict):
-                    continue
-                spelling = str(n.get("spelling", "") or "").strip()
-                if spelling != underlying:
-                    continue
-                # Check if it's a function declaration or definition
-                node_kind = str(n.get("kind", "") or "").strip()
-                if node_kind not in _FUNC_DEF_KINDS and "FUNCTION" not in node_kind:
-                    continue
-                # Get the extent end line and insert after it
-                extent = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
-                end = extent.get("end", {}) if isinstance(extent.get("end"), dict) else {}
-                end_ln = int(end.get("line", 0) or 0)
-                if end_ln <= 0:
-                    continue
-                # Verify the extent belongs to the target file, not a header.
-                end_file = str(end.get("file") or "").strip()
-                if end_file and Path(end_file).name != base:
-                    continue
-                # Insert after the declaration line
-                return end_ln + 1
+    # NOTE: For __revert_* functions (kind == "revert_function"), we intentionally
+    # fall through to the default "before first function definition" logic below.
+    # Forward declarations must appear before call sites; anchoring after the V2
+    # function body (extent.end.line + 1) placed them too late, causing
+    # "conflicting types" errors when the call site preceded the V2 function end.
 
     def in_file(node: dict) -> bool:
         extent = node.get("extent", {}) if isinstance(node.get("extent"), dict) else {}
