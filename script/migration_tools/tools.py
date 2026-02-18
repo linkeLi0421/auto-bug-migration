@@ -366,6 +366,10 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
 
     # Replicate revert_patch_test.get_error_patch ordering: patch_key_list sorted by new_start_line desc,
     # then scanned in reverse while adjusting offsets.
+    # De-duplicate equivalent hunks for the same file: _extra_* entries can mirror a normal patch hunk and
+    # would otherwise double-apply add_num shifts.
+    file_entries: List[Tuple[str, PatchInfo, Tuple[int, int, int, int]]] = []
+    non_extra_hunks: set[Tuple[int, int, int, int]] = set()
     for key in reversed(bundle.keys_sorted):
         patch = bundle.patches[key]
         if not _file_matches(patch.file_path_new, file_path):
@@ -376,6 +380,17 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
             int(patch.new_start_line or 0),
             max(int((patch.new_end_line or 0) - (patch.new_start_line or 0)), 0),
         )
+        file_entries.append((key, patch, hunk))
+        if "Extra" not in (patch.patch_type or set()):
+            non_extra_hunks.add(hunk)
+
+    seen_hunks: set[Tuple[int, int, int, int]] = set()
+    for key, patch, hunk in file_entries:
+        if "Extra" in (patch.patch_type or set()) and hunk in non_extra_hunks:
+            continue
+        if hunk in seen_hunks:
+            continue
+        seen_hunks.add(hunk)
         old_start, old_len, new_start, new_len = hunk
         if old_len <= 0:
             add_num += new_len - old_len
