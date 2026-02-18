@@ -1498,6 +1498,76 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override tool: for __revert_* functions, anchor the skeleton BEFORE the first
+# function definition (not after the V2 function body), so forward declarations appear
+# before call sites and avoid "conflicting types" errors.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from tools.extra_patch_tools import _ast_insert_line_number_for_extra_skeleton  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ.pop("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", None)
+
+    kb_v1 = td / "kb_v1"; kb_v1.mkdir()
+    kb_v2 = td / "kb_v2"; kb_v2.mkdir()
+
+    # V2 has two functions: early_func at lines 10-20, underlying_func at lines 100-200.
+    # The __revert_* prototype must anchor at line 10 (first func), not line 201.
+    early_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "early_func",
+        "location": {"file": "test.c", "line": 10, "column": 1},
+        "extent": {
+            "start": {"file": "test.c", "line": 10, "column": 1},
+            "end": {"file": "test.c", "line": 20, "column": 1},
+        },
+    }
+    underlying_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "myfunc",
+        "location": {"file": "test.c", "line": 100, "column": 1},
+        "extent": {
+            "start": {"file": "test.c", "line": 100, "column": 1},
+            "end": {"file": "test.c", "line": 200, "column": 1},
+        },
+    }
+    (kb_v2 / "test.c_analysis.json").write_text(
+        json.dumps([early_func, underlying_func]), encoding="utf-8"
+    )
+
+    kb = KbIndex(str(kb_v1), str(kb_v2))
+    tools = AgentTools(kb, SourceManager(str(td / "v1"), str(td / "v2")))
+
+    # __revert_* function: must get line 10 (first func), NOT 201 (underlying end + 1)
+    result = _ast_insert_line_number_for_extra_skeleton(
+        tools, file_path="test.c", version="v2",
+        symbol_name="__revert_deadbeef_myfunc",
+    )
+    assert result == 10, f"Expected 10 (first func start), got {result}"
+
+    # Non-__revert_* symbol: should also get line 10 (default behavior unchanged)
+    result2 = _ast_insert_line_number_for_extra_skeleton(
+        tools, file_path="test.c", version="v2",
+        symbol_name="some_other_symbol",
+    )
+    assert result2 == 10, f"Expected 10, got {result2}"
+
+print("OK")
+PY
+
 # Extra patch override tool: don't treat a type name mentioned only in prototypes as "already present",
 # and prepend inserted typedefs before existing prototype blocks in `_extra_*`.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
