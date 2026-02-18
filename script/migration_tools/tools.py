@@ -1401,13 +1401,8 @@ def make_error_patch_override(
                 f"The function name must be preserved exactly (including any __revert_* prefix)."
             )
 
-    def _norm_for_compare(text: str) -> str:
-        return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
-
     new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
 
-    if _norm_for_compare(old_func_code_full) == _norm_for_compare(new_code_norm):
-        raise ValueError("new_func_code is identical to the existing mapped '-' slice (no-op rewrite)")
     new_func_lines = new_code_norm.splitlines()
     if not any(line.strip() for line in new_func_lines):
         raise ValueError("new_func_code must contain at least one non-empty line")
@@ -1664,13 +1659,8 @@ def make_link_error_patch_override(
                 f"The function name must be preserved exactly (including any __revert_* prefix)."
             )
 
-    def _norm_for_compare(text: str) -> str:
-        return "\n".join(line.rstrip() for line in str(text or "").splitlines()).strip()
-
     new_code_norm = str(new_code).replace("\r\n", "\n").replace("\r", "\n")
 
-    if _norm_for_compare(old_func_code_full) == _norm_for_compare(new_code_norm):
-        raise ValueError("new_func_code is identical to the existing mapped '-' slice (no-op rewrite)")
     new_func_lines = new_code_norm.splitlines()
     if not any(line.strip() for line in new_func_lines):
         raise ValueError("new_func_code must contain at least one non-empty line")
