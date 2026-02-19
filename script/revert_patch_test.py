@@ -2845,11 +2845,18 @@ def test_fuzzer(args, bug_id, target, commit_id, patch_path, need_build = True):
         py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', target, fuzzer, testcase_path, '-e', 'ASAN_OPTIONS=detect_leaks=0'
     ]
     logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
-    test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
-    combined_output = (test_result.stderr or '') + (test_result.stdout or '')
+    test_result = subprocess.run(reproduce_cmd, capture_output=True)
+    combined_output = (
+        (test_result.stderr or b'').decode('utf-8', errors='replace')
+        + (test_result.stdout or b'').decode('utf-8', errors='replace')
+    )
     lowered = combined_output.lower()
     sanitizer_lower = sanitizer.lower()
-    if 'sanitizer' in lowered and sanitizer_lower in lowered:
+    # Detect sanitizer-reported crashes (e.g. AddressSanitizer, MemorySanitizer)
+    sanitizer_triggered = 'sanitizer' in lowered and sanitizer_lower in lowered
+    # Also detect libFuzzer-reported errors (out-of-memory, timeout, deadly signal)
+    libfuzzer_triggered = 'summary: libfuzzer:' in lowered
+    if sanitizer_triggered or libfuzzer_triggered:
         # trigger the bug
         confidence_level = '0.5'
         if crash_type.lower() in lowered:
@@ -2977,8 +2984,9 @@ def revert_patch_test(args):
             patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
             prefix = f"{bug_id}_{next_commit['commit_id']}_patches"
             existing_patches = sorted(
-                p for p in os.listdir(patch_folder)
-                if p.startswith(prefix) and p.endswith('.diff')
+                (p for p in os.listdir(patch_folder)
+                 if p.startswith(prefix) and p.endswith('.diff')),
+                key=lambda p: int(p[len(prefix):].split('.')[0]) if p[len(prefix):].split('.')[0].isdigit() else 0,
             )
             if existing_patches:
                 get_patched_traces[bug_id] = [
@@ -3447,9 +3455,12 @@ def revert_patch_test(args):
         # Only test the final patch (last entry in the list), not all intermediate variants
         i = len(get_patched_traces[bug_id]) - 1
         patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
-        need_build = True
+        last_sanitizer = None
         count = 0
         for bug_id_trigger in bug_ids_trigger:
+            trigger_san = bug_info_dataset[bug_id_trigger]['reproduce']['sanitizer'].split(' ')[0]
+            need_build = (trigger_san != last_sanitizer)
+            last_sanitizer = trigger_san
             result, crash_output = test_fuzzer(
                 args,
                 bug_id_trigger,
@@ -3458,7 +3469,6 @@ def revert_patch_test(args):
                 patch_file_path,
                 need_build=need_build,
             )
-            need_build = False  # only build once for multiple local bug tests
             if result == 'not trigger':
                 logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')
                 continue

@@ -214,7 +214,7 @@ def extract_function_stack(file_path, signature_file=None, apply_signatures=True
     stack_pattern = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+([^\s]+)", re.IGNORECASE)
 
     try:
-        with open(normalized_path, 'r') as f:
+        with open(normalized_path, 'r', errors='replace') as f:
             for line in f:
                 match = stack_pattern.search(line)
                 if match:
