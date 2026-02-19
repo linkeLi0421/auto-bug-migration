@@ -915,6 +915,39 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# _is_valid_function_prototype must reject bare call sites that lack a return type prefix.
+# A bare `funcname(args);` at column 0 is a call site, not a prototype.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _is_valid_function_prototype  # noqa: E402
+
+# Call site: no return type before function name → reject
+assert not _is_valid_function_prototype(
+    ['__revert_3ac8a0_hfile_add_scheme_handler("s3", &handler);'],
+    symbol_name="__revert_3ac8a0_hfile_add_scheme_handler",
+), "Bare call site should NOT be accepted as a valid prototype"
+
+# Real single-line prototype with return type → accept
+assert _is_valid_function_prototype(
+    ["void __revert_3ac8a0_hfile_add_scheme_handler(const char *scheme, const struct hFILE_scheme_handler *handler);"],
+    symbol_name="__revert_3ac8a0_hfile_add_scheme_handler",
+), "Real prototype with return type should be valid"
+
+# Multi-line prototype (return type on separate line) → accept
+assert _is_valid_function_prototype(
+    ["static inline void", "__revert_3ac8a0_hfile_add_scheme_handler(const char *scheme);"],
+    symbol_name="__revert_3ac8a0_hfile_add_scheme_handler",
+), "Multi-line prototype with return type should be valid"
+
+print("OK")
+PY
+
 # Extra patch override tool: for non-generated symbols that only appear as DECL_REF_EXPR,
 # use type_ref.typedef_extent to insert a VAR_DECL (not a statement) into the `_extra_*` hunk.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
