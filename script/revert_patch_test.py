@@ -126,8 +126,8 @@ def rename_func(patch_text, fname, commit, replacement_string=None):
         replacement_string = f"__revert_{commit}_{fname}"
 
     for line in patch_text.splitlines():
-        if line.startswith('-'):
-            # Only modify lines that represent removed code
+        if line.startswith('-') and not line.startswith('--- ') and not line.startswith('diff --git '):
+            # Only modify lines that represent removed code, not diff headers
             modified_line = re.sub(regex, replacement_string, line)
             modified_lines.append(modified_line)
         else:
