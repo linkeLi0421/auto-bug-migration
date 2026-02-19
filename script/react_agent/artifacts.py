@@ -14,13 +14,10 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _PATCH_TOOL_FIELDS: dict[str, dict[str, str]] = {
     "get_error_patch_context": {
         "excerpt": ".diff",
-        # Unified-diff derived helpers for merged/tail hunks.
-        "patch_minus_code": ".c",
         "error_func_code": ".c",
     },
     "get_link_error_patch_context": {
         "excerpt": ".diff",
-        "patch_minus_code": ".c",
         "error_func_code": ".c",
     },
     "get_patch": {"patch_text": ".diff"},
@@ -187,15 +184,18 @@ def offload_patch_output(
         if terms and tool == "get_error_patch_context":
             snippet = _focus_snippet(val, terms)
             if snippet:
-                if key == "excerpt":
-                    updated.setdefault("focus_excerpt", snippet)
-                elif key == "error_func_code":
+                if key == "error_func_code":
                     updated.setdefault("focus_error_func_snippet", snippet)
-                elif key == "patch_minus_code":
-                    updated.setdefault("focus_patch_minus_snippet", snippet)
         ref = store.write_text(name=_artifact_name(tool=tool, field=key, args=args), text=val, ext=ext)
         updated[key] = ref.to_dict()
         changed = True
+
+    # Strip fields that should not appear in model messages (even as inline text).
+    for drop_key in ("patch_minus_code", "patch_minus_code_lines_total"):
+        if drop_key in updated:
+            updated.pop(drop_key)
+            changed = True
+
     return updated if changed else output
 
 
