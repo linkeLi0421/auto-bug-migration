@@ -120,7 +120,7 @@ def get_defs(directory, src_file, args):
     return defs_by_usr
 
 
-def analyze_file(directory, src_file, args, defs_by_usr):
+def analyze_file(directory, src_file, args, defs_by_usr, file_to_project=None):
     path = os.path.join(directory, src_file)
     include_paths = extract_include_paths()
     args = [f"-I{os.path.abspath(os.path.join(directory, arg[2:]))}" if arg.startswith("-I") and not os.path.isabs(arg[2:]) else arg for arg in args]
@@ -163,7 +163,20 @@ def analyze_file(directory, src_file, args, defs_by_usr):
                 return set()
     
     dir_path, file_name = os.path.split(path)
-    dir_path = os.path.join('/data/', dir_path[5:])  # ensure output is in /data/
+    # Handle files outside /src/ (e.g., oss-fuzz harness files like /src/matio_fuzzer.cc)
+    # by mapping them into the appropriate project subdirectory
+    if dir_path == '/src' or dir_path.startswith('/src/'):
+        rel_path = dir_path[5:]  # Remove '/src' or '/src/' prefix
+        if not rel_path:
+            # File is directly in /src/, check if we have a pre-computed mapping
+            if file_to_project and path in file_to_project:
+                dir_path = os.path.join('/data/', file_to_project[path])
+            else:
+                dir_path = os.path.join('/data/', 'src')  # fallback to 'src' subdirectory
+        else:
+            dir_path = os.path.join('/data/', rel_path.split('/')[0])
+    else:
+        dir_path = os.path.join('/data/', dir_path[5:] if dir_path.startswith('/src') else dir_path.lstrip('/'))  # ensure output is in /data/
     out_path_set = set()
     
     if not tu or not tu.cursor:
@@ -437,8 +450,60 @@ def load_compile_commands(path="compile_commands.json"):
     return commands
 
 
+def get_project_dir_mappings(compile_db):
+    """
+    Pre-analyze compile commands to determine which files should map to which project directories.
+    This handles cases like oss-fuzz harness files that are outside the project source directory.
+    """
+    # First pass: identify all project directories that will be created
+    project_dirs = set()
+    file_to_project = {}
+    
+    for src_file in compile_db:
+        directory, args = compile_db[src_file]
+        path = os.path.join(directory, src_file)
+        dir_path, file_name = os.path.split(path)
+        
+        # Check if path is under /src/ (including exactly /src)
+        if dir_path == '/src' or dir_path.startswith('/src/'):
+            rel_path = dir_path[5:]  # Remove '/src' or '/src/' prefix
+            if rel_path and '/' in rel_path:
+                project_name = rel_path.split('/')[0]
+                project_dirs.add(project_name)
+                file_to_project[path] = project_name
+    
+    # Second pass: map files directly in /src/ to appropriate projects
+    for src_file in compile_db:
+        directory, args = compile_db[src_file]
+        path = os.path.join(directory, src_file)
+        dir_path, file_name = os.path.split(path)
+        
+        # Check if file is directly in /src/ (not in a subdirectory)
+        if dir_path == '/src':
+            # File is directly in /src/, try to find matching project
+            matched_project = None
+            for proj in project_dirs:
+                if file_name.lower().startswith(proj.lower()):
+                    matched_project = proj
+                    break
+                # Also check with underscore replacement
+                file_base = file_name.lower().replace('_', '').replace('-', '')
+                proj_normalized = proj.lower().replace('_', '').replace('-', '')
+                if file_base.startswith(proj_normalized):
+                    matched_project = proj
+                    break
+            if matched_project:
+                file_to_project[path] = matched_project
+    
+    return file_to_project
+
+
 def main():
     compile_db = load_compile_commands()
+    
+    # Pre-compute project mappings for files directly in /src/
+    file_to_project = get_project_dir_mappings(compile_db)
+    
     out_path_set = set()
     defs_by_usr = dict()
     for src_file in compile_db:
@@ -458,7 +523,7 @@ def main():
             idx = args.index("-o")
             if idx + 1 < len(args):
                 args[idx + 1] = "/dev/null"
-        out_path_set.update(analyze_file(directory, src_file, args, defs_by_usr))
+        out_path_set.update(analyze_file(directory, src_file, args, defs_by_usr, file_to_project))
 
     for out_path in out_path_set:
         with open(out_path, "r+") as f:
