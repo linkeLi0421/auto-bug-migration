@@ -269,7 +269,9 @@ def _find_file_scope_insertion_index(lines: List[str]) -> int:
     header_section_ended = False  # Track if we've left the initial header/preprocessor section
 
     for idx, raw in enumerate(lines):
-        stripped = str(raw or "").lstrip()
+        # Strip BOM (U+FEFF) so that BOM-prefixed comment/preprocessor lines
+        # (e.g. '\ufeff/** @file ...') are recognised correctly.
+        stripped = str(raw or "").lstrip().lstrip("\ufeff")
         # Track multi-line #define macros (lines ending with backslash).
         if in_macro_continuation:
             if not str(raw or "").rstrip().endswith("\\"):
@@ -341,10 +343,16 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         return ""
 
     resolved = None
-    try:
-        resolved = sm._resolve_path(str(file_path or "").strip(), "v2")  # type: ignore[attr-defined]
-    except Exception:
-        resolved = None
+    version_used = "v2"
+    # Try V2 first, then fall back to V1 (for fuzzer harness files that may not exist in V2)
+    for ver in ("v2", "v1"):
+        try:
+            resolved = sm._resolve_path(str(file_path or "").strip(), ver)  # type: ignore[attr-defined]
+        except Exception:
+            resolved = None
+        if resolved is not None and resolved.exists():
+            version_used = ver
+            break
     if resolved is None or not resolved.exists():
         return ""
     text = resolved.read_text(encoding="utf-8", errors="replace")
@@ -354,7 +362,7 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
 
     insert_at = -1
     insert_line = _ast_insert_line_number_for_extra_skeleton(
-        agent_tools, file_path=str(file_path or "").strip(), version="v2", symbol_name=str(symbol_name or "").strip()
+        agent_tools, file_path=str(file_path or "").strip(), version=version_used, symbol_name=str(symbol_name or "").strip()
     )
     if insert_line > 0:
         # We insert before the context line at insert_line; index is 0-based.
@@ -393,7 +401,7 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         ctx = [lines[0]]
         start_line = 1
 
-    rel = _normalize_repo_rel_path(agent_tools, file_path=str(file_path or "").strip(), version="v2")
+    rel = _normalize_repo_rel_path(agent_tools, file_path=str(file_path or "").strip(), version=version_used)
     if not rel:
         rel = _normalize_file_basename(file_path)
     if not rel:
@@ -942,7 +950,7 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
                 continue
             if _looks_like_statement(code):
                 continue
-            # Walk backward to include leading decl/attribute lines (but stop at '}' / blank / headers).
+            # Walk backward to include leading decl/attribute lines (but stop at '}' / blank / headers / comments).
             start = idx
             for j in range(idx - 1, max(-1, idx - 12), -1):
                 prev = lines[j]
@@ -954,6 +962,12 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
                 if "{" in prev_code:
                     break
                 if prev_code.strip() in {"}", "};"} or prev_code.strip().endswith("}"):
+                    break
+                # Stop at comment lines — avoid capturing file-header or
+                # doc-comment blocks as part of the prototype.
+                stripped_prev = prev_code.strip()
+                if (stripped_prev.endswith("*/") or stripped_prev.startswith("/*")
+                        or stripped_prev.startswith("*") or stripped_prev.startswith("//")):
                     break
                 start = j
 
@@ -1065,6 +1079,59 @@ def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[s
     updated[insert_at:insert_at] = block
     updated = _recompute_hunk_headers(updated)
     return "\n".join(updated).rstrip("\n") + "\n"
+
+
+def _strip_comment_minus_lines(patch_text: str) -> str:
+    """Remove leading comment-only '-' lines from an _extra_* hunk.
+
+    These appear when a skeleton is incorrectly created at the beginning of a
+    BOM-prefixed file, causing file-header comment lines (/** @file ... */) to
+    be captured as '-' content.  They duplicate the context lines and produce
+    broken diffs when applied.
+    """
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return raw
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return raw
+
+    # Identify the contiguous block of leading '-' lines in the first hunk body.
+    # If ALL of them are comment lines (or blank), strip them entirely.
+    start = first_hunk + 1
+    end = start
+    has_non_comment = False
+    for i in range(start, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            break
+        if not (lines[i].startswith("-") and not lines[i].startswith("---")):
+            break
+        code = lines[i][1:].strip()  # strip the '-' prefix
+        if not code:
+            end = i + 1
+            continue
+        if (code.startswith("/*") or code.startswith("*") or code.startswith("//")
+                or code.endswith("*/")):
+            end = i + 1
+            continue
+        # Found a non-comment '-' line → stop; only strip the leading comment block.
+        has_non_comment = True
+        break
+
+    if end > start and not has_non_comment:
+        # All '-' lines are comments — strip them all.
+        updated = lines[:start] + lines[end:]
+        updated = _recompute_hunk_headers(updated)
+        return "\n".join(updated).rstrip("\n") + "\n"
+
+    if end > start and has_non_comment:
+        # Leading comment block followed by real declarations — strip just the comments.
+        updated = lines[:start] + lines[end:]
+        updated = _recompute_hunk_headers(updated)
+        return "\n".join(updated).rstrip("\n") + "\n"
+
+    return raw
 
 
 def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: List[str]) -> bool:
@@ -1569,6 +1636,21 @@ def make_extra_patch_override(
             }
     else:
         existing = str(getattr(patch, "patch_text", "") or "")
+
+    # Clean up corrupted _extra_* hunks that have file-header comment '-' lines
+    # (caused by BOM-prefixed files where the skeleton started at line 0).
+    existing = _strip_comment_minus_lines(existing)
+
+    # If cleanup left a pure context-only skeleton (no '-' lines), the anchor
+    # may be at the wrong position (e.g. line 1 of a BOM file).  Regenerate
+    # the skeleton so the insertion point is after includes/comments.
+    if existing.strip() and agent_tools is not None:
+        ex_lines = existing.splitlines()
+        has_minus = any(l.startswith("-") and not l.startswith("---") for l in ex_lines)
+        if not has_minus:
+            refreshed = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol)
+            if refreshed.strip():
+                existing = refreshed
 
     if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
         # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.

@@ -686,7 +686,9 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
             baseline_stack,
             current_stack,
         )
-        return False
+        # Fall through to LCS check instead of rejecting immediately.
+        # Inlining, partial inlining, and version-specific refactors can
+        # shift the top frame while the rest of the stack is identical.
 
     # Use DP-based LCS (longest common subsequence) on application frames.
     # The old greedy forward scan could cascade-fail: one unmatched frame
@@ -712,6 +714,12 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
     match_ratio = lcs_len / denom
     STACK_MATCH_THRESHOLD = 0.6
     if match_ratio >= STACK_MATCH_THRESHOLD:
+        if not top_match:
+            logger.info(
+                "Top frame mismatch overridden by LCS ratio %.2f (>= %.2f).",
+                match_ratio,
+                STACK_MATCH_THRESHOLD,
+            )
         return True
 
     logger.info(
