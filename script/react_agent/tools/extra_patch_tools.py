@@ -1698,6 +1698,27 @@ def make_extra_patch_override(
     if inserted_lines and kind == "revert_function":
         inserted_lines = _strip_attribute_macros_from_prototype(inserted_lines, func_name=symbol)
 
+    # For revert functions being inserted into header files, wrap in extern "C"
+    # to ensure C++ code can link against the C-defined functions.
+    if inserted_lines and kind == "revert_function":
+        target_file = str(file_path_s or "").strip()
+        if target_file.endswith(".h") or target_file.endswith(".hpp"):
+            # Check if already wrapped
+            text_to_insert = "\n".join(inserted_lines)
+            if 'extern "C"' not in text_to_insert:
+                # Wrap the function declaration in extern "C"
+                # Handle multi-line prototypes
+                if len(inserted_lines) == 1:
+                    # Single line prototype - wrap directly
+                    inserted_lines = [
+                        'extern "C" {',
+                        inserted_lines[0],
+                        '}'
+                    ]
+                else:
+                    # Multi-line prototype
+                    inserted_lines = ['extern "C" {'] + inserted_lines + ['}']
+
     if not inserted_lines:
         note = "Failed to locate a definition/decl for the symbol (bundle+KB)."
         if agent_tools is not None:
