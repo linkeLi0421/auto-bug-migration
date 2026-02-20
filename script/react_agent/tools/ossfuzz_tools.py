@@ -1250,12 +1250,9 @@ def merge_patch_bundle_with_overrides(
                     primary_from_paths.add(k)
             if len(primary_from_paths) == 1:
                 inferred_key = next(iter(primary_from_paths))
-    if inferred_key and str(allow_root.name) != str(inferred_key):
-        # Use safe directory name to avoid nested directories from patch_keys with slashes
-        safe_key_dir = _safe_filename(inferred_key)
-        out_dir = (allow_root / safe_key_dir).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = _unique_path((out_dir / out_name).resolve())
+    # NOTE: Always write merged patch to the root artifact directory (not in subdirectories)
+    # to make it easier to find and use the merged patch file.
+    out_path = _unique_path((allow_root / out_name).resolve())
     _validate_under_root(out_path, allow_root)
     out_path.write_text(merged_text, encoding="utf-8", errors="replace")
 
