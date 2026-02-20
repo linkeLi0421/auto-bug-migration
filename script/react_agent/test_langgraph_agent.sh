@@ -948,6 +948,38 @@ assert _is_valid_function_prototype(
 print("OK")
 PY
 
+# _strip_attribute_macros_from_prototype: strip ALL_CAPS attribute macros from prototypes.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+from tools.extra_patch_tools import _strip_attribute_macros_from_prototype
+
+# HTS_OPT3 on a separate line before the function name should be stripped.
+lines = ["static inline void HTS_OPT3", "__revert_9e1ffd_add33(uint8_t *a, const uint8_t *b, int32_t len);"]
+result = _strip_attribute_macros_from_prototype(lines, func_name="__revert_9e1ffd_add33")
+joined = " ".join(l.strip() for l in result)
+assert "HTS_OPT3" not in joined, f"HTS_OPT3 should be stripped: {result}"
+assert "__revert_9e1ffd_add33(uint8_t *a" in joined, f"function name should remain: {result}"
+assert "static inline void" in joined, f"return type should remain: {result}"
+
+# ALL_CAPS types in parameter list should NOT be stripped.
+lines2 = ["void NOINLINE __revert_foo(BOOL x, DWORD y);"]
+result2 = _strip_attribute_macros_from_prototype(lines2, func_name="__revert_foo")
+joined2 = " ".join(l.strip() for l in result2)
+assert "NOINLINE" not in joined2, f"NOINLINE should be stripped: {result2}"
+assert "BOOL" in joined2, f"BOOL param type should remain: {result2}"
+assert "DWORD" in joined2, f"DWORD param type should remain: {result2}"
+
+# No ALL_CAPS tokens: should be unchanged.
+lines3 = ["static int __revert_bar(int x);"]
+result3 = _strip_attribute_macros_from_prototype(lines3, func_name="__revert_bar")
+assert result3 == lines3, f"No-op expected: {result3}"
+
+print("OK")
+PY
+
 # Extra patch override tool: for non-generated symbols that only appear as DECL_REF_EXPR,
 # use type_ref.typedef_extent to insert a VAR_DECL (not a statement) into the `_extra_*` hunk.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

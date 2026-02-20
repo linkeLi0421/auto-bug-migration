@@ -770,6 +770,36 @@ def _rewrite_existing_opaque_var_decl_in_extra_hunk(agent_tools: Any, *, patch_t
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
+_ALL_CAPS_ATTR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
+
+
+def _strip_attribute_macros_from_prototype(lines: List[str], *, func_name: str) -> List[str]:
+    """Strip unknown ALL_CAPS attribute macros from the return-type portion of a C prototype.
+
+    Tokens like ``HTS_OPT3``, ``ATTRIBUTE_HIDDEN``, ``NOINLINE`` are V1-only
+    attribute macros that cause parse errors when inserted into V2 code.
+    We only strip tokens that appear *before* the function name so that
+    ALL_CAPS types in parameter lists (``BOOL``, ``DWORD``, ``FILE``) are kept.
+    """
+    if not lines or not func_name:
+        return lines
+    joined = "\n".join(lines)
+    # Find the function name in the joined text.
+    fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(func_name)}\s*\(")
+    m = fn_pat.search(joined)
+    if m is None:
+        return lines
+    prefix = joined[: m.start()]
+    suffix = joined[m.start() :]
+    # Strip ALL_CAPS tokens from the prefix (return-type / attribute area).
+    cleaned = _ALL_CAPS_ATTR_RE.sub("", prefix)
+    # Collapse whitespace.
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n ", "\n", cleaned)
+    result = (cleaned + suffix).strip()
+    return [l.rstrip() for l in result.splitlines() if l.strip()]
+
+
 def _extract_c_declaration_from_function_code(code: str) -> List[str]:
     """Best-effort extraction of a function declaration/prototype from a C function body."""
     text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -1661,6 +1691,12 @@ def make_extra_patch_override(
             inserted_lines = decl_lines
             insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
             break
+
+    # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) that would cause
+    # parse errors in V2 code.  Only the return-type area before the function
+    # name is touched; parameter-list types are preserved.
+    if inserted_lines and kind == "revert_function":
+        inserted_lines = _strip_attribute_macros_from_prototype(inserted_lines, func_name=symbol)
 
     if not inserted_lines:
         note = "Failed to locate a definition/decl for the symbol (bundle+KB)."
