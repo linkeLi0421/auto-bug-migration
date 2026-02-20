@@ -5,6 +5,8 @@ Rule: only `__revert_*` functions get declarations; everything else gets REMOVED
 
 1) Undeclared functions starting with `__revert_`:
    - `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
+   - **PRIORITY**: When the error is an undeclared `__revert_*` function, ALWAYS use `make_extra_patch_override` to add the forward declaration, even if `editable_hunk` is present.
+     Do NOT use `revise_patch_hunk` to revert the call back to the original function - this defeats the purpose of the revert wrapper.
    - Workflow to add a forward declaration for `__revert_<commit>_<func>`:
      a) Derive `func` by stripping the `__revert_<commit>_` prefix.
      b) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
