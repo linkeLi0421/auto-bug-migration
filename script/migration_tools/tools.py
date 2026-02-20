@@ -612,11 +612,14 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
     # Best-effort port of the original logic for recreated-function patches.
 
     old_start = selected_hunk[0] if selected_hunk else int(patch.old_start_line or 0)
-    index_old_infun = 0
     # Track both:
     # - old-line progress (index_old_infun), used to match the target old-side line
     # - body index (hit_body_index), used for hiden_func_dict offsets (which are body indices)
     scan_start = max(0, int(front_context_num))
+    # Start index_old_infun at scan_start: the skipped leading context lines are old-side
+    # lines that contribute to old-line numbering.  Without this, hit_body_index lands
+    # scan_start positions too late and hiden_func_dict picks the wrong merged function.
+    index_old_infun = scan_start
     hit_body_index: Optional[int] = None
     patch_flag = False
     for rel_idx, line in enumerate(patch_lines[body_start + scan_start :], start=scan_start):
@@ -629,7 +632,7 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
                 patch_flag = True
         else:
             index_old_infun += 1
-        if ln + add_num == old_start + index_old_infun:
+        if ln + add_num == old_start + index_old_infun - 1:
             hit_body_index = rel_idx
             break
     if hit_body_index is None:
