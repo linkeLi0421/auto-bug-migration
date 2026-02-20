@@ -850,21 +850,21 @@ with tempfile.TemporaryDirectory() as td_raw:
     extra_key = "_extra_dict.c"
     main_key = "tail-dict.c-f1_"
     extra_patch_text = (
-        "diff --git a/dict.c b/dict.c\\n"
-        "--- a/dict.c\\n"
-        "+++ b/dict.c\\n"
-        "@@ -1,1 +1,0 @@\\n"
-        "-/* extra decls */\\n"
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -1,1 +1,0 @@\n"
+        "-/* extra decls */\n"
     )
     main_patch_text = (
-        "diff --git a/dict.c b/dict.c\\n"
-        "--- a/dict.c\\n"
-        "+++ b/dict.c\\n"
-        "@@ -10,5 +10,0 @@\\n"
-        "-static int caller(void) {\\n"
-        "-_   (__revert_deadbeef_myfunc(123));\\n"
-        "-  return 0;\\n"
-        "-}\\n"
+        "diff --git a/dict.c b/dict.c\n"
+        "--- a/dict.c\n"
+        "+++ b/dict.c\n"
+        "@@ -10,5 +10,0 @@\n"
+        "-static int caller(void) {\n"
+        "-_   (__revert_deadbeef_myfunc(123));\n"
+        "-  return 0;\n"
+        "-}\n"
     )
     extra_patch = PatchInfo(
         file_path_old="dict.c",
@@ -3296,7 +3296,7 @@ tool = (steps[1].get("decision") or {}).get("tool")
 assert tool == "get_error_patch_context", tool
 
 obs = (steps[1].get("observation") or {}).get("output") or {}
-for field in ("excerpt", "patch_minus_code", "error_func_code"):
+for field in ("excerpt", "error_func_code"):
     val = obs.get(field)
     assert isinstance(val, dict) and val.get("artifact_path"), (field, val)
     ap = Path(val["artifact_path"]).resolve()
@@ -3306,12 +3306,9 @@ for field in ("excerpt", "patch_minus_code", "error_func_code"):
     snippet = read_artifact(artifact_path=str(ap), start_line=1, max_lines=20)
     assert snippet.get("text"), (field, snippet)
 
-pm = obs.get("patch_minus_code") or {}
 ef = obs.get("error_func_code") or {}
-pm_text = read_artifact(artifact_path=str(pm.get("artifact_path")), start_line=1, max_lines=0, max_chars=0).get("text") or ""
 ef_text = read_artifact(artifact_path=str(ef.get("artifact_path")), start_line=1, max_lines=0, max_chars=0).get("text") or ""
 assert ef_text.strip(), ef_text
-assert ef_text.strip() in pm_text, (ef_text[:200], pm_text[:200])
 
 try:
     read_artifact(artifact_path=str(Path("/etc/hosts")), max_lines=5)
@@ -4430,7 +4427,7 @@ sys.path.insert(0, str(script_dir))
 
 from agent_langgraph import AgentState, _iter_unfixed_undeclared_symbols_from_grouped  # noqa: E402
 
-st = AgentState(build_log_path="-", error_line="old", snippet="")
+st = AgentState(build_log_path="-", patch_path="", error_scope="first", error_line="old", snippet="")
 st.grouped_errors = [
     {"raw": "/src/a.h:10:8: error: use of undeclared identifier '__revert_foo'", "file": "/src/a.h", "line": 10},
     {"raw": "/src/a.h:10:40: error: use of undeclared identifier '__revert_bar'", "file": "/src/a.h", "line": 10},

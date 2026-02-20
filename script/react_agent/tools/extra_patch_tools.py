@@ -1615,12 +1615,14 @@ def make_extra_patch_override(
 
     kind, underlying = _symbol_underlying_name(symbol)
 
-    # # 1) Best-effort: for generated __revert_* functions, extract the prototype from the bundle itself.
-    # if kind == "revert_function":
-    #     proto = _extract_function_prototype_from_bundle(bundle, symbol_name=symbol)
-    #     if proto:
-    #         inserted_lines = proto
-    #         insert_kind = "function_prototype_from_bundle"
+    # 1) Best-effort: for generated __revert_* functions, extract the prototype from the bundle itself.
+    #    _extract_function_prototype_from_bundle uses _is_valid_function_prototype which rejects bare
+    #    call sites (e.g., `funcname(args);` without a return type prefix).
+    if kind == "revert_function":
+        proto = _extract_function_prototype_from_bundle(bundle, symbol_name=symbol)
+        if proto:
+            inserted_lines = proto
+            insert_kind = "function_prototype_from_bundle"
 
     # 2) Fallback to KB/JSON: locate underlying symbol code and synthesize a declaration.
     if not inserted_lines and agent_tools is not None:
