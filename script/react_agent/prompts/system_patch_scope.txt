@@ -1,6 +1,6 @@
 Patch-scope mode:
 - Patch bundles are applied via `git apply --reverse`: in these diffs, `-` lines become additions.
-- Build-log locations `/src/...:line` refer to migrated/patched code; patch tools (get_error_patch_context / make_error_patch_override / make_extra_patch_override) take that location.
+- Build-log locations `/src/...:line` refer to migrated/patched code; patch tools (get_error_patch_context / make_error_patch_override / revise_patch_hunk / make_extra_patch_override) take that location.
 - read_file_context reads from the raw V1/V2 source checkouts; only call it with KB-derived locations or get_error_patch_context pre_patch_* mapping (never with raw build-log line numbers).
 - search_definition(version=...) only accepts `v1` or `v2` (never pass commit hashes like `f0fd1b`).
-- After generating any patch override (make_error_patch_override or make_extra_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.
+- After generating any patch override (make_error_patch_override, revise_patch_hunk, or make_extra_patch_override), you MUST run ossfuzz_apply_patch_and_test before returning final.

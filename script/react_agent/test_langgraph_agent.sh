@@ -980,6 +980,164 @@ assert result3 == lines3, f"No-op expected: {result3}"
 print("OK")
 PY
 
+# revise_patch_hunk: editable_hunk field and round-trip sign flip for mixed -/+ hunks.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parent))
+
+from migration_tools.tools import get_error_patch_context, revise_patch_hunk
+from migration_tools.types import PatchInfo
+
+# Build a mixed hunk: LLVMFuzzerTestOneInput with both - and + lines.
+patch_text = (
+    "diff --git a/harness.c b/harness.c\n"
+    "--- a/harness.c\n"
+    "+++ b/harness.c\n"
+    "@@ -10,6 +10,4 @@\n"
+    " int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+    "-    view_vcf(data, size, \"w\");\n"
+    "-    view_vcf(data, size, \"wb\");\n"
+    "+    view_vcf(ht_file);\n"
+    "     return 0;\n"
+    " }\n"
+)
+patch = PatchInfo(
+    file_path_old="harness.c",
+    file_path_new="harness.c",
+    old_start_line="10",
+    old_end_line="16",
+    new_start_line="10",
+    new_end_line="14",
+    file_type="c",
+    patch_text=patch_text,
+    old_signature="int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)",
+    new_signature="int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)",
+)
+bundle = {"harness.charness.c-10,6+10,4": patch}
+
+with tempfile.TemporaryDirectory() as td:
+    bp = os.path.join(td, "test.patch2")
+    with open(bp, "wb") as f:
+        pickle.dump(bundle, f)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = td
+
+    # 1) get_error_patch_context returns editable_hunk with flipped signs.
+    ctx = get_error_patch_context(
+        patch_path=bp,
+        file_path="/src/project/harness.c",
+        line_number=11,
+        error_text="too many arguments",
+        allowed_roots=[td],
+    )
+    eh = ctx.get("editable_hunk", "")
+    assert eh, f"editable_hunk should be non-empty for mixed hunk: {ctx}"
+    eh_lines = eh.strip().split("\n")
+    # '+' lines in editable_hunk = V1 code (originally '-' in patch)
+    plus_lines = [l for l in eh_lines if l.startswith("+")]
+    minus_lines = [l for l in eh_lines if l.startswith("-")]
+    assert len(plus_lines) == 2, f"Expected 2 '+' lines (V1 calls): {plus_lines}"
+    assert len(minus_lines) == 1, f"Expected 1 '-' line (V2 call): {minus_lines}"
+    assert 'view_vcf(data, size, "w")' in plus_lines[0], plus_lines[0]
+    assert "view_vcf(ht_file)" in minus_lines[0], minus_lines[0]
+
+    # 2) revise_patch_hunk: edit the '+' lines (fix V1 code), keep '-' lines unchanged.
+    revised = (
+        "-    view_vcf(ht_file);\n"
+        "+    view_vcf(ht_file);\n"
+        "+    view_vcf(ht_file);\n"
+    )
+    result = revise_patch_hunk(
+        patch_path=bp,
+        file_path="/src/project/harness.c",
+        line_number=11,
+        revised_hunk=revised,
+        allowed_roots=[td],
+    )
+    pt = result.get("patch_text", "")
+    assert pt, f"patch_text should be non-empty: {result}"
+    # After flipping back: '+' in revised → '-' in patch, '-' in revised → '+' in patch.
+    pt_lines = pt.strip().split("\n")
+    new_minus = [l for l in pt_lines if l.startswith("-") and not l.startswith("---")]
+    new_plus = [l for l in pt_lines if l.startswith("+") and not l.startswith("+++")]
+    # Two '-' lines: the fixed V1 code
+    assert len(new_minus) == 2, f"Expected 2 '-' lines in output: {new_minus}"
+    assert all("view_vcf(ht_file)" in l for l in new_minus), new_minus
+    # One '+' line: V2 code preserved
+    assert len(new_plus) == 1, f"Expected 1 '+' line in output: {new_plus}"
+    assert "view_vcf(ht_file)" in new_plus[0], new_plus[0]
+
+    # 3) revise_patch_hunk: changing V2 lines raises ValueError.
+    bad_revised = (
+        "-    MODIFIED_view_vcf(ht_file);\n"
+        "+    view_vcf(ht_file);\n"
+    )
+    try:
+        revise_patch_hunk(
+            patch_path=bp,
+            file_path="/src/project/harness.c",
+            line_number=11,
+            revised_hunk=bad_revised,
+            allowed_roots=[td],
+        )
+        assert False, "Should have raised ValueError for modified V2 lines"
+    except ValueError as e:
+        assert "V2 code" in str(e), str(e)
+
+    # 4) Pure minus hunk: editable_hunk should be empty.
+    pure_minus_text = (
+        "diff --git a/pure.c b/pure.c\n"
+        "--- a/pure.c\n"
+        "+++ b/pure.c\n"
+        "@@ -5,3 +5,0 @@\n"
+        "-void removed_func(void) {\n"
+        "-    return;\n"
+        "-}\n"
+    )
+    pure_patch = PatchInfo(
+        file_path_old="pure.c",
+        file_path_new="pure.c",
+        old_start_line="5",
+        old_end_line="8",
+        new_start_line="5",
+        new_end_line="5",
+        file_type="c",
+        patch_text=pure_minus_text,
+        old_signature="void removed_func(void)",
+    )
+    bundle2 = {"pure.cpure.c-5,3+5,0": pure_patch}
+    bp2 = os.path.join(td, "pure.patch2")
+    with open(bp2, "wb") as f:
+        pickle.dump(bundle2, f)
+    ctx2 = get_error_patch_context(
+        patch_path=bp2,
+        file_path="/src/project/pure.c",
+        line_number=5,
+        allowed_roots=[td],
+    )
+    assert not ctx2.get("editable_hunk", "").strip(), \
+        f"editable_hunk should be empty for pure minus hunk: {ctx2.get('editable_hunk')}"
+
+    # 5) revise_patch_hunk on pure minus hunk: returns note to use make_error_patch_override.
+    result2 = revise_patch_hunk(
+        patch_path=bp2,
+        file_path="/src/project/pure.c",
+        line_number=5,
+        revised_hunk="-void removed_func(void) {\n",
+        allowed_roots=[td],
+    )
+    note = result2.get("note", "")
+    assert "make_error_patch_override" in note, f"Expected redirect note: {note}"
+
+print("OK")
+PY
+
 # Extra patch override tool: for non-generated symbols that only appear as DECL_REF_EXPR,
 # use type_ref.typedef_extent to insert a VAR_DECL (not a statement) into the `_extra_*` hunk.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

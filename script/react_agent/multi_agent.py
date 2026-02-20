@@ -206,6 +206,8 @@ def _latest_make_error_patch_override_diff(artifacts_dir: Path) -> Optional[Path
     patterns = [
         "make_error_patch_override_patch_text_*.diff",
         "make_error_patch_override_patch_text*.diff",
+        "revise_patch_hunk_patch_text_*.diff",
+        "revise_patch_hunk_patch_text*.diff",
     ]
     candidates: List[Path] = []
     for pat in patterns:

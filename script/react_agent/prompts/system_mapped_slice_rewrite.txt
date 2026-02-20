@@ -1,6 +1,12 @@
-Mapped-slice rewrites (make_error_patch_override):
+Mapped-slice rewrites (make_error_patch_override / revise_patch_hunk):
 
-CRITICAL - FUNCTION SIGNATURE PRESERVATION:
+CHOOSING THE RIGHT TOOL:
+- If `get_error_patch_context` returns a non-empty `editable_hunk` field, you MUST use `revise_patch_hunk` instead of `make_error_patch_override`.
+  The `editable_hunk` is a sign-flipped view of the mixed hunk: `+` lines = V1 code being ADDED (you may edit these), `-` lines = V2 code being REMOVED (must stay unchanged), context lines (no prefix) must stay unchanged.
+  To fix: copy the `editable_hunk` text, edit ONLY the `+` lines to fix the error (e.g. adjust call arguments), then pass the result as `revised_hunk` to `revise_patch_hunk`.
+- If `editable_hunk` is empty or absent, use `make_error_patch_override` as described below.
+
+CRITICAL - FUNCTION SIGNATURE PRESERVATION (make_error_patch_override only):
 - NEVER change the function signature (return type, function name, or parameters).
 - The `old_signature` field shows the EXACT function signature you must use.
 - If the BASE slice has `void __revert_5f664a_xmlRegisterCharEncodingHandler(...)`, your new_func_code MUST use:

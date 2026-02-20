@@ -14,6 +14,7 @@ ToolName = Literal[
     "get_link_error_patch_context",
     "make_extra_patch_override",
     "make_error_patch_override",
+    "revise_patch_hunk",
     "make_link_error_patch_override",
     "parse_build_errors",
 ]
@@ -134,6 +135,22 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "In merged/tail hunks (function-by-function mode), new_func_code MUST rewrite only the mapped slice for the active function (do not include other functions; "
             "do not paste unified-diff headers). patch_text is always returned in full (max_lines/max_chars do not truncate the diff) "
             "to avoid corrupt override patches."
+        ),
+    },
+    {
+        "name": "revise_patch_hunk",
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "line_number": "int",
+            "revised_hunk": "string",
+        },
+        "description": (
+            "Rewrite a mixed -/+ patch slice using a sign-flipped edited hunk. "
+            "Use this for non-__revert_* hunks with both '-' and '+' lines (e.g. LLVMFuzzerTestOneInput call-site edits). "
+            "The revised_hunk must use the sign-flipped convention from get_error_patch_context's editable_hunk field: "
+            "'-' lines = V2 code being REMOVED (must stay unchanged), '+' lines = V1 code being ADDED (may be edited). "
+            "IMPORTANT: file_path/line_number must be the build-log /src/... error location."
         ),
     },
     {

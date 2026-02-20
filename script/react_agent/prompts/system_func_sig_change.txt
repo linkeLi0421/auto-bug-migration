@@ -12,15 +12,24 @@ FIX WORKFLOW - Follow these steps in order:
 1. GET CALLER CODE: Use `get_error_patch_context` with the error file_path and line_number.
    - This returns `error_func_code` containing the caller function that has the bad call site.
    - Note the `old_signature` field - this is the EXACT function signature you must preserve.
+   - IMPORTANT: Check if the response includes a non-empty `editable_hunk` field — this changes step 3.
 
 2. GET CALLEE SIGNATURE: Use `search_definition(callee_name, version="v2")` to find the NEW callee signature.
    - The callee name is the function being called at the error location.
    - V2 is the target version - this gives you the new expected signature.
 
-3. FIX THE CALLER: Use `make_error_patch_override` with a fixed version of the caller function.
-   - Start with the EXACT function signature from `old_signature` (including any __revert_* prefix).
-   - Keep the ENTIRE function body from `error_func_code`.
-   - Only modify the specific call site(s) to match the new callee signature.
+3. FIX THE CALLER:
+   A) If `editable_hunk` is non-empty (mixed hunk with both V1 and V2 code):
+      Use `revise_patch_hunk` instead of `make_error_patch_override`.
+      - Copy the `editable_hunk` text exactly.
+      - Edit ONLY the `+` lines (V1 code being added) to fix the call site arguments.
+      - Keep ALL `-` lines (V2 code) and context lines (no prefix) EXACTLY as they are.
+      - Pass the edited text as `revised_hunk` to `revise_patch_hunk`.
+   B) If `editable_hunk` is empty or absent (pure __revert_* function hunk):
+      Use `make_error_patch_override` with a fixed version of the caller function.
+      - Start with the EXACT function signature from `old_signature` (including any __revert_* prefix).
+      - Keep the ENTIRE function body from `error_func_code`.
+      - Only modify the specific call site(s) to match the new callee signature.
 
 RULES FOR FIXING CALL SITES:
 - If parameters were ADDED to callee: use existing local variables if available, otherwise NULL/0
@@ -29,7 +38,21 @@ RULES FOR FIXING CALL SITES:
 - Check the caller function for existing local variables that match the new parameter types
 - When in doubt, use NULL for pointers and 0 for integers
 
-EXAMPLE:
+EXAMPLE A (editable_hunk present — mixed hunk):
+Error: "too many arguments to function call, expected single argument 'in', have 3 arguments"
+get_error_patch_context returns editable_hunk:
+  +            view_vcf(data, size, "w");     // VCF
+  +            view_vcf(data, size, "wb");    // BCF
+  -            view_vcf(ht_file);
+search_definition("view_vcf", "v2") -> void view_vcf(htsFile *in)
+Fix: edit only the '+' lines to match V2 signature, keep '-' lines unchanged:
+  revised_hunk:
+  +            view_vcf(ht_file);             // VCF
+  +            view_vcf(ht_file);             // BCF
+  -            view_vcf(ht_file);
+Then call revise_patch_hunk(revised_hunk=...).
+
+EXAMPLE B (no editable_hunk — pure __revert_* hunk):
 Error: "too few arguments to function call 'xmlParseEndTag2'"
 old_signature: "__revert_5f664a_xmlParseTryOrFinish(xmlParserCtxtPtr ctxt, int terminate)"
 
