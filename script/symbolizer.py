@@ -142,8 +142,12 @@ def main():
     for trace_offset in trace_offset_list:
         symbol, location = offset_to_symbol.get(trace_offset, unknown)
         if args.source_path:
-            # Get relative path
-            location = location.replace(args.source_path, "")
+            # Get relative path - ensure we match the full directory path
+            # by checking for path separator after the source_path
+            if location.startswith(args.source_path + '/'):
+                location = location[len(args.source_path):]
+            elif location == args.source_path:
+                location = ""
         output_lines.append("Entering function: {} Location: {}".format(symbol, location))
     write_output = "\n".join(output_lines)
     with open(args.output, 'w') if args.output else sys.stdout as f:
