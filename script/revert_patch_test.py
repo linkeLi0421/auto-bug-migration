@@ -2289,7 +2289,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     final_patches.extend(list(new_patch_to_apply))
 
 
-def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path: str) -> str:
+def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path: str) -> Tuple[str, str]:
     """
     Find the analysis JSON file for a fuzzer, trying different extensions and paths.
     
@@ -2303,7 +2303,8 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
         fuzzer_file_path: File path from trace (e.g., 'src/matio_fuzzer.cc')
         
     Returns:
-        Full path to the analysis JSON file
+        Tuple of (analysis_file_path, actual_source_path) where actual_source_path
+        is the correct path to use for patch generation (from the analysis file content)
         
     Raises:
         FileNotFoundError: If no matching analysis file is found
@@ -2313,7 +2314,8 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
     # Try the exact path first
     exact_path = os.path.join(base_dir, f'{fuzzer_file_path}_analysis.json')
     if os.path.exists(exact_path):
-        return exact_path
+        actual_path = _get_actual_source_path_from_analysis(exact_path, fuzzer_file_path)
+        return exact_path, actual_path
     
     # Parse the fuzzer file path
     dir_name = os.path.dirname(fuzzer_file_path)  # e.g., 'src' or ''
@@ -2351,10 +2353,81 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
     for alt_path in alternatives:
         full_path = os.path.join(base_dir, f'{alt_path}_analysis.json')
         if os.path.exists(full_path):
-            return full_path
+            actual_path = _get_actual_source_path_from_analysis(full_path, fuzzer_file_path)
+            return full_path, actual_path
     
     # If nothing found, return the original path (which will fail with FileNotFoundError)
-    return exact_path
+    return exact_path, fuzzer_file_path
+
+
+def _get_actual_source_path_from_analysis(analysis_path: str, default_path: str) -> str:
+    """
+    Extract the actual source file path from the analysis file.
+    
+    The analysis file contains AST nodes with file paths that reflect the actual
+    source structure. We use this to get the correct path for patch generation.
+    
+    Args:
+        analysis_path: Path to the analysis JSON file
+        default_path: Fallback path if extraction fails
+        
+    Returns:
+        The actual source file path to use for patches
+    """
+    try:
+        with open(analysis_path, 'r') as f:
+            ast_nodes = json.load(f)
+        
+        # Look for LLVMFuzzerTestOneInput function to get the correct file path
+        for node in ast_nodes:
+            if node.get('kind') in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                if node.get('spelling') == 'LLVMFuzzerTestOneInput':
+                    # Get the file path from the extent or location
+                    extent = node.get('extent', {})
+                    location_file = extent.get('start', {}).get('file') if extent else None
+                    if not location_file:
+                        location_file = node.get('location', {}).get('file')
+                    
+                    if location_file and location_file != 'None':
+                        # Normalize the path (remove any absolute prefix)
+                        if location_file.startswith('/src/'):
+                            return location_file[5:]  # Remove /src/ prefix
+                        elif location_file.startswith('/'):
+                            # Try to find the relative path
+                            parts = location_file.split('/')
+                            if 'src' in parts:
+                                src_idx = parts.index('src')
+                                return '/'.join(parts[src_idx + 1:])
+                            else:
+                                return '/'.join(parts[1:])  # Remove leading empty part
+                        else:
+                            return location_file
+        
+        # If we didn't find LLVMFuzzerTestOneInput, try to infer from any node
+        for node in ast_nodes:
+            extent = node.get('extent', {})
+            location_file = extent.get('start', {}).get('file') if extent else None
+            if not location_file:
+                location_file = node.get('location', {}).get('file')
+            
+            if location_file and location_file != 'None' and not location_file.startswith('#include'):
+                # Normalize the path
+                if location_file.startswith('/src/'):
+                    return location_file[5:]
+                elif location_file.startswith('/'):
+                    parts = location_file.split('/')
+                    if 'src' in parts:
+                        src_idx = parts.index('src')
+                        return '/'.join(parts[src_idx + 1:])
+                    else:
+                        return '/'.join(parts[1:])
+                else:
+                    return location_file
+                
+    except Exception as e:
+        pass
+    
+    return default_path
 
 
 def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recreated_functions, target_repo_path, commit, next_commit, target, trace1):
@@ -2398,19 +2471,22 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_keys.add(key)
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
-    parsing_path = find_analysis_file(data_path, f'{target}-{next_commit}', fuzzer_file_path)
+    parsing_path, actual_fuzzer_path = find_analysis_file(data_path, f'{target}-{next_commit}', fuzzer_file_path)
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
         if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
             continue
-        if node['extent']['start']['file'] == fuzzer_file_path and node['spelling'] == 'LLVMFuzzerTestOneInput':
+        if node['spelling'] == 'LLVMFuzzerTestOneInput':
             # Found the function definition
             fuzzer_start_line = node['extent']['start']['line']
             fuzzer_end_line = node['extent']['end']['line']
             fuzzer_new_signature = node['signature']
             fuzzer_old_signature = node['signature']
             break
+    
+    # Use the actual source path from analysis for patch generation
+    fuzzer_file_path = actual_fuzzer_path
     
     # Step 3: Process all function calls within LLVMFuzzerTestOneInput that reference recreated functions
     for node in ast_nodes:
