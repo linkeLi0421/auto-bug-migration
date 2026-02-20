@@ -2315,7 +2315,8 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
     exact_path = os.path.join(base_dir, f'{fuzzer_file_path}_analysis.json')
     if os.path.exists(exact_path):
         actual_path = _get_actual_source_path_from_analysis(exact_path, fuzzer_file_path)
-        return exact_path, actual_path
+        if actual_path:
+            return exact_path, actual_path
     
     # Parse the fuzzer file path
     dir_name = os.path.dirname(fuzzer_file_path)  # e.g., 'src' or ''
@@ -2338,29 +2339,36 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
     # Different directories: try without 'src/', with 'ossfuzz/', or root
     if dir_name == 'src':
         for ext in ['.cc', '.cpp', '.c', '.cxx']:
-            alternatives.append(f'{name_without_ext}{ext}')  # root
             alternatives.append(f'ossfuzz/{name_without_ext}{ext}')
+            alternatives.append(f'{name_without_ext}{ext}')  # root
     elif dir_name == '':
         for ext in ['.cc', '.cpp', '.c', '.cxx']:
-            alternatives.append(f'src/{name_without_ext}{ext}')
             alternatives.append(f'ossfuzz/{name_without_ext}{ext}')
+            alternatives.append(f'src/{name_without_ext}{ext}')
     elif dir_name == 'ossfuzz':
         for ext in ['.cc', '.cpp', '.c', '.cxx']:
             alternatives.append(f'{name_without_ext}{ext}')  # root
             alternatives.append(f'src/{name_without_ext}{ext}')
     
-    # Try all alternatives
+    # Try all alternatives and find one that has LLVMFuzzerTestOneInput definition
     for alt_path in alternatives:
         full_path = os.path.join(base_dir, f'{alt_path}_analysis.json')
         if os.path.exists(full_path):
             actual_path = _get_actual_source_path_from_analysis(full_path, fuzzer_file_path)
-            return full_path, actual_path
+            if actual_path:  # Only return if we found the function definition
+                return full_path, actual_path
+    
+    # If nothing found with function definition, fall back to first existing file
+    for alt_path in alternatives:
+        full_path = os.path.join(base_dir, f'{alt_path}_analysis.json')
+        if os.path.exists(full_path):
+            return full_path, fuzzer_file_path
     
     # If nothing found, return the original path (which will fail with FileNotFoundError)
     return exact_path, fuzzer_file_path
 
 
-def _get_actual_source_path_from_analysis(analysis_path: str, default_path: str) -> str:
+def _get_actual_source_path_from_analysis(analysis_path: str, default_path: str = None) -> Optional[str]:
     """
     Extract the actual source file path from the analysis file.
     
@@ -2372,7 +2380,8 @@ def _get_actual_source_path_from_analysis(analysis_path: str, default_path: str)
         default_path: Fallback path if extraction fails
         
     Returns:
-        The actual source file path to use for patches
+        The actual source file path to use for patches, or None if
+        LLVMFuzzerTestOneInput function definition is not found in this file
     """
     try:
         with open(analysis_path, 'r') as f:
@@ -2403,31 +2412,12 @@ def _get_actual_source_path_from_analysis(analysis_path: str, default_path: str)
                         else:
                             return location_file
         
-        # If we didn't find LLVMFuzzerTestOneInput, try to infer from any node
-        for node in ast_nodes:
-            extent = node.get('extent', {})
-            location_file = extent.get('start', {}).get('file') if extent else None
-            if not location_file:
-                location_file = node.get('location', {}).get('file')
-            
-            if location_file and location_file != 'None' and not location_file.startswith('#include'):
-                # Normalize the path
-                if location_file.startswith('/src/'):
-                    return location_file[5:]
-                elif location_file.startswith('/'):
-                    parts = location_file.split('/')
-                    if 'src' in parts:
-                        src_idx = parts.index('src')
-                        return '/'.join(parts[src_idx + 1:])
-                    else:
-                        return '/'.join(parts[1:])
-                else:
-                    return location_file
+        # LLVMFuzzerTestOneInput not found in this file - return None to indicate
+        # caller should try another file
+        return None
                 
     except Exception as e:
-        pass
-    
-    return default_path
+        return None
 
 
 def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recreated_functions, target_repo_path, commit, next_commit, target, trace1):
