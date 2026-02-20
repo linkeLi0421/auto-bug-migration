@@ -20,6 +20,7 @@ from migration_tools.tools import (  # noqa: E402
     make_error_patch_override as _make_error_patch_override,
     make_link_error_patch_override as _make_link_error_patch_override,
     parse_build_errors_tool as _parse_build_errors_tool,
+    revise_patch_hunk as _revise_patch_hunk,
     search_patches as _search_patches,
 )
 
@@ -137,6 +138,22 @@ def make_error_patch_override(
         context_lines=context_lines,
         max_lines=max_lines,
         max_chars=max_chars,
+        allowed_roots=_allowed_roots_from_env(),
+    )
+
+
+def revise_patch_hunk(
+    *,
+    patch_path: str,
+    file_path: str,
+    line_number: int,
+    revised_hunk: str,
+) -> Dict[str, Any]:
+    return _revise_patch_hunk(
+        patch_path=patch_path,
+        file_path=file_path,
+        line_number=line_number,
+        revised_hunk=revised_hunk,
         allowed_roots=_allowed_roots_from_env(),
     )
 

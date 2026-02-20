@@ -107,6 +107,33 @@ def _iter_hunks(patch_text: str) -> List[Dict[str, Any]]:
     return hunks
 
 
+def _expand_to_mixed_block(body_lines: List[str], fs: int, fe: int) -> Tuple[int, int]:
+    """Expand a minus-only slice ``[fs, fe)`` to include adjacent ``+``/``-`` lines.
+
+    Returns ``(expanded_start, expanded_end)`` covering the full contiguous diff
+    region so that mixed ``-``/``+`` hunks (e.g. call-site edits inside
+    ``LLVMFuzzerTestOneInput``) are captured as one block.
+    """
+    if fs < 0 or fe <= fs or not body_lines:
+        return (fs, fe)
+    n = len(body_lines)
+    start = fs
+    while start > 0:
+        prev = body_lines[start - 1]
+        if prev.startswith("+") or (prev.startswith("-") and not prev.startswith("---")):
+            start -= 1
+        else:
+            break
+    end = fe
+    while end < n:
+        nxt = body_lines[end]
+        if nxt.startswith("+") or (nxt.startswith("-") and not nxt.startswith("---")):
+            end += 1
+        else:
+            break
+    return (start, end)
+
+
 def _infer_migrated_side(patch_text: str) -> str:
     """Best-effort heuristic: which side likely contains migration artifacts."""
     markers = ("__revert_", "__rervert_")
@@ -920,6 +947,8 @@ def get_error_patch_context(
             "patch_minus_code_lines_total": 0,
             "error_func_code": "",
             "error_func_code_lines_total": 0,
+            "editable_hunk": "",
+            "editable_hunk_lines_total": 0,
             "defined_macros": [],
             "referenced_macro_tokens": [],
             "macro_tokens_not_defined_in_slice": [],
@@ -984,6 +1013,33 @@ def get_error_patch_context(
             func_minus_lines = [line[1:] for line in slice_lines if line.startswith("-") and not line.startswith("---")]
             error_func_code = "\n".join(func_minus_lines).rstrip("\n")
             error_func_total_lines = len(func_minus_lines)
+
+    # Build editable_hunk for mixed -/+ slices.
+    # The sign-flipped view lets the model naturally edit '+' lines (V1 code
+    # being added) while seeing '-' lines (V2 code) as read-only reference.
+    editable_hunk = ""
+    editable_hunk_lines_total = 0
+    if isinstance(func_start, int) and isinstance(func_end, int) and func_start >= 0 and func_end > func_start:
+        body_len_eh = max(len(patch_lines) - body_start, 0)
+        fs_eh = max(0, min(int(func_start), body_len_eh))
+        fe_eh = max(0, min(int(func_end), body_len_eh))
+        if fe_eh > fs_eh:
+            body_lines_eh = patch_lines[body_start:]
+            exp_start, exp_end = _expand_to_mixed_block(body_lines_eh, fs_eh, fe_eh)
+            mixed_slice = body_lines_eh[exp_start:exp_end]
+            has_minus = any(l.startswith("-") and not l.startswith("---") for l in mixed_slice)
+            has_plus = any(l.startswith("+") for l in mixed_slice)
+            if has_minus and has_plus:
+                flipped: List[str] = []
+                for ln in mixed_slice:
+                    if ln.startswith("-") and not ln.startswith("---"):
+                        flipped.append("+" + ln[1:])
+                    elif ln.startswith("+"):
+                        flipped.append("-" + ln[1:])
+                    else:
+                        flipped.append(ln)
+                editable_hunk = "\n".join(flipped)
+                editable_hunk_lines_total = len(flipped)
 
     defined_macros: set[str] = set()
     for line in patch_minus_lines:
@@ -1073,6 +1129,8 @@ def get_error_patch_context(
         "patch_minus_code_lines_total": patch_minus_total_lines,
         "error_func_code": error_func_code + ("\n" if error_func_code and not error_func_code.endswith("\n") else ""),
         "error_func_code_lines_total": error_func_total_lines,
+        "editable_hunk": editable_hunk + ("\n" if editable_hunk and not editable_hunk.endswith("\n") else ""),
+        "editable_hunk_lines_total": editable_hunk_lines_total,
         "defined_macros": defined_macros_list,
         "referenced_macro_tokens": referenced_macro_tokens_list,
         "macro_tokens_not_defined_in_slice": missing_macro_tokens_list,
@@ -1110,6 +1168,8 @@ def get_link_error_patch_context(
             "patch_minus_code_lines_total": 0,
             "error_func_code": "",
             "error_func_code_lines_total": 0,
+            "editable_hunk": "",
+            "editable_hunk_lines_total": 0,
             "defined_macros": [],
             "referenced_macro_tokens": [],
             "macro_tokens_not_defined_in_slice": [],
@@ -1291,6 +1351,84 @@ def _truncate_text(*, text: str, max_lines: int, max_chars: int) -> Tuple[str, b
     return out, truncated, total_lines, len(returned)
 
 
+def _update_hiden_func_dict(
+    patch: "PatchInfo",
+    func_end_n: int,
+    delta: int,
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Adjust ``hiden_func_dict`` offsets after a slice rewrite.
+
+    Returns ``(updated_dict_or_None, note_string)``.
+    """
+    if not delta or not getattr(patch, "hiden_func_dict", None):
+        return None, ""
+    try:
+        new_hiden: Dict[str, int] = {}
+        for sig, off in (patch.hiden_func_dict or {}).items():
+            off_i = int(off)
+            new_hiden[str(sig)] = off_i + delta if off_i >= func_end_n else off_i
+        return new_hiden, f" Updated hiden_func_dict offsets by {delta} lines."
+    except Exception:
+        return None, ""
+
+
+def _recompute_hunk_headers(patch_lines: List[str]) -> None:
+    """Recompute ``@@`` hunk headers in *patch_lines* in-place.
+
+    Keeps ``-old_start`` stable and recomputes ``+new_start`` by accumulating
+    the per-hunk delta ``(new_len - old_len)`` from the rewritten hunk bodies.
+    """
+    new_shift = 0
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if line.startswith("diff --git "):
+            new_shift = 0
+            i += 1
+            continue
+        if not line.startswith("@@"):
+            i += 1
+            continue
+        m = _HUNK_RE.match(line.strip())
+        if not m:
+            i += 1
+            continue
+        old_start = int(m.group("old_start"))
+        old_len_hdr = int(m.group("old_len") or 1)
+        new_start_hdr = int(m.group("new_start"))
+        new_len_hdr = int(m.group("new_len") or 1)
+
+        old_len = 0
+        new_len_hunk = 0
+        j = i + 1
+        while j < len(patch_lines):
+            body_line = patch_lines[j]
+            if body_line.startswith("@@") or body_line.startswith("diff --git "):
+                break
+            if not body_line:
+                j += 1
+                continue
+            prefix = body_line[0]
+            if prefix == " ":
+                old_len += 1
+                new_len_hunk += 1
+            elif prefix == "-":
+                old_len += 1
+            elif prefix == "+":
+                new_len_hunk += 1
+            elif prefix == "\\":
+                pass
+            j += 1
+
+        is_file_add = old_start == 0 and old_len_hdr == 0
+        is_file_del = new_start_hdr == 0 and new_len_hdr == 0
+        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
+        patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
+
+        new_shift += new_len_hunk - old_len
+        i = j
+
+
 def make_error_patch_override(
     *,
     patch_path: str,
@@ -1449,75 +1587,8 @@ def make_error_patch_override(
     delta = len(rewritten_slice) - len(slice_lines)
     patch_lines[slice_start:slice_end] = rewritten_slice
 
-    # If the patch contains merged/tail functions, adjust offsets after the rewritten slice.
-    hiden_func_dict_updated: Optional[Dict[str, int]] = None
-    if delta and getattr(patch, "hiden_func_dict", None):
-        try:
-            new_hiden: Dict[str, int] = {}
-            for sig, off in (patch.hiden_func_dict or {}).items():
-                off_i = int(off)
-                new_hiden[str(sig)] = off_i + delta if off_i >= func_end_n else off_i
-            hiden_func_dict_updated = new_hiden
-            patch_hiden_note = f" Updated hiden_func_dict offsets by {delta} lines."
-        except Exception:
-            patch_hiden_note = ""
-    else:
-        patch_hiden_note = ""
-
-    # Recompute hunk header lengths and recompute +new_start offsets.
-    #
-    # We keep -old_start stable and recompute +new_start by accumulating the
-    # per-hunk delta (new_len - old_len) from the rewritten hunk bodies.
-    new_shift = 0
-    i = 0
-    while i < len(patch_lines):
-        line = patch_lines[i]
-        if line.startswith("diff --git "):
-            new_shift = 0
-            i += 1
-            continue
-        if not line.startswith("@@"):
-            i += 1
-            continue
-        m = _HUNK_RE.match(line.strip())
-        if not m:
-            i += 1
-            continue
-        old_start = int(m.group("old_start"))
-        old_len_hdr = int(m.group("old_len") or 1)
-        new_start_hdr = int(m.group("new_start"))
-        new_len_hdr = int(m.group("new_len") or 1)
-
-        old_len = 0
-        new_len_hunk = 0
-        j = i + 1
-        while j < len(patch_lines):
-            body_line = patch_lines[j]
-            if body_line.startswith("@@") or body_line.startswith("diff --git "):
-                break
-            if not body_line:
-                j += 1
-                continue
-            prefix = body_line[0]
-            if prefix == " ":
-                old_len += 1
-                new_len_hunk += 1
-            elif prefix == "-":
-                old_len += 1
-            elif prefix == "+":
-                new_len_hunk += 1
-            elif prefix == "\\":
-                # "\ No newline at end of file" marker
-                pass
-            j += 1
-
-        is_file_add = old_start == 0 and old_len_hdr == 0
-        is_file_del = new_start_hdr == 0 and new_len_hdr == 0
-        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
-        patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
-
-        new_shift += new_len_hunk - old_len
-        i = j
+    hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, func_end_n, delta)
+    _recompute_hunk_headers(patch_lines)
 
     patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
     patch_total_lines = len(patch_lines)
@@ -1543,6 +1614,157 @@ def make_error_patch_override(
             "Rewrote the patch bundle's mapped patch slice by replacing '-' lines with the provided code. "
             "Use the returned patch_text to update the patch bundle entry. "
             "Note: patch_text is always returned in full (max_lines/max_chars are ignored for patch_text) to avoid corrupt patches."
+            + patch_hiden_note
+        ),
+    }
+    if hiden_func_dict_updated is not None:
+        out["hiden_func_dict_updated"] = hiden_func_dict_updated
+    return out
+
+
+def revise_patch_hunk(
+    *,
+    patch_path: str,
+    file_path: str,
+    line_number: int,
+    revised_hunk: str,
+    allowed_roots: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Rewrite a mixed ``-``/``+`` patch slice using a sign-flipped edited hunk.
+
+    The caller provides *revised_hunk* using the sign-flipped convention from
+    ``get_error_patch_context``'s ``editable_hunk`` field:
+
+    * ``-`` lines = V2 code being REMOVED (must be unchanged from original)
+    * ``+`` lines = V1 code being ADDED (the fixed version)
+    * context lines = unchanged
+
+    This function validates that V2 lines are preserved, flips signs back,
+    replaces the slice in the patch, and recomputes hunk headers.
+    """
+    revised_text = _extract_first_code_fence(revised_hunk)
+    if not revised_text.strip():
+        raise ValueError("revised_hunk must be non-empty")
+
+    bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
+    mapping = _get_error_patch_from_bundle(
+        bundle, patch_path=patch_path, file_path=file_path, line_number=line_number,
+    )
+    patch_key = mapping.get("patch_key")
+
+    if not patch_key or str(patch_key) not in bundle.patches:
+        return {
+            **mapping,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No matching patch_key; cannot generate override.",
+        }
+
+    func_start = mapping.get("func_start_index")
+    func_end = mapping.get("func_end_index")
+    if not isinstance(func_start, int) or not isinstance(func_end, int) or func_start < 0 or func_end <= func_start:
+        return {
+            **mapping,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "No rewriteable slice found.",
+        }
+
+    patch = bundle.patches[str(patch_key)]
+    rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
+    rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
+    if not rel_file:
+        rel_file = _norm_path(file_path).lstrip("./").lstrip("/")
+
+    patch_lines = (patch.patch_text or "").splitlines()
+    if len(patch_lines) < 4:
+        return {
+            **mapping,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Patch text is too short.",
+        }
+
+    first_hunk_idx = next((i for i, l in enumerate(patch_lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+    body_len = len(patch_lines) - body_start
+    fs = max(0, min(int(func_start), body_len))
+    fe = max(0, min(int(func_end), body_len))
+    if fe <= fs:
+        return {
+            **mapping,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Empty slice.",
+        }
+
+    # Expand to the full mixed block (same expansion as get_error_patch_context).
+    body_lines = patch_lines[body_start:]
+    exp_start, exp_end = _expand_to_mixed_block(body_lines, fs, fe)
+    original_slice = body_lines[exp_start:exp_end]
+
+    orig_has_minus = any(l.startswith("-") and not l.startswith("---") for l in original_slice)
+    orig_has_plus = any(l.startswith("+") for l in original_slice)
+    if not (orig_has_minus and orig_has_plus):
+        return {
+            **mapping,
+            "patch_text": "",
+            "patch_text_truncated": False,
+            "note": "Slice is not a mixed -/+ hunk. Use make_error_patch_override instead.",
+        }
+
+    # Parse the revised hunk lines.
+    revised_lines = revised_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+
+    # Validate: '-' lines in revised (= V2 code = original '+' lines) must be unchanged.
+    orig_v2_lines = [l[1:] for l in original_slice if l.startswith("+")]
+    revised_v2_lines = [l[1:] for l in revised_lines if l.startswith("-")]
+    if revised_v2_lines != orig_v2_lines:
+        raise ValueError(
+            "revised_hunk modifies '-' lines (V2 code that must stay unchanged). "
+            "Only '+' lines (V1 code being added) may be edited."
+        )
+
+    # Validate: context lines must be unchanged.
+    orig_ctx = [l for l in original_slice if not l.startswith("-") and not l.startswith("+")]
+    revised_ctx = [l for l in revised_lines if not l.startswith("-") and not l.startswith("+")]
+    if revised_ctx != orig_ctx:
+        raise ValueError(
+            "revised_hunk modifies context lines. Only '+' lines may be edited."
+        )
+
+    # Flip back: '+' in revised → '-' in patch, '-' in revised → '+' in patch.
+    reconstructed: List[str] = []
+    for ln in revised_lines:
+        if ln.startswith("+"):
+            reconstructed.append("-" + ln[1:])
+        elif ln.startswith("-"):
+            reconstructed.append("+" + ln[1:])
+        else:
+            reconstructed.append(ln)
+
+    # Replace the expanded slice in patch_lines.
+    slice_start_abs = body_start + exp_start
+    slice_end_abs = body_start + exp_end
+    delta = len(reconstructed) - len(original_slice)
+    patch_lines[slice_start_abs:slice_end_abs] = reconstructed
+
+    hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, exp_end, delta)
+    _recompute_hunk_headers(patch_lines)
+
+    patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
+
+    out: Dict[str, Any] = {
+        **mapping,
+        "file_path_patch": rel_file,
+        "patch_text": patch_text_full,
+        "patch_text_truncated": False,
+        "patch_text_lines_total": len(patch_lines),
+        "patch_text_lines_returned": len(patch_lines),
+        "note": (
+            "Rewrote the mixed -/+ patch slice using the sign-flipped revised hunk. "
+            "V2 lines (removed code) were validated as unchanged. "
+            "V1 lines (added code) were updated per the revised hunk."
             + patch_hiden_note
         ),
     }
