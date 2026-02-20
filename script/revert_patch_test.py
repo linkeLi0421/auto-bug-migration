@@ -2289,6 +2289,74 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
     final_patches.extend(list(new_patch_to_apply))
 
 
+def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path: str) -> str:
+    """
+    Find the analysis JSON file for a fuzzer, trying different extensions and paths.
+    
+    The trace may report a different path/extension than the actual analysis file due to:
+    - File extension changes (.cc vs .cpp)
+    - Path changes (src/ vs ossfuzz/ vs root)
+    
+    Args:
+        data_path: Base data directory path
+        target_commit_dir: Directory name for target commit (e.g., 'matio-44c26a')
+        fuzzer_file_path: File path from trace (e.g., 'src/matio_fuzzer.cc')
+        
+    Returns:
+        Full path to the analysis JSON file
+        
+    Raises:
+        FileNotFoundError: If no matching analysis file is found
+    """
+    base_dir = os.path.join(data_path, target_commit_dir)
+    
+    # Try the exact path first
+    exact_path = os.path.join(base_dir, f'{fuzzer_file_path}_analysis.json')
+    if os.path.exists(exact_path):
+        return exact_path
+    
+    # Parse the fuzzer file path
+    dir_name = os.path.dirname(fuzzer_file_path)  # e.g., 'src' or ''
+    file_name = os.path.basename(fuzzer_file_path)  # e.g., 'matio_fuzzer.cc'
+    
+    # Try different extensions
+    name_without_ext = file_name
+    for ext in ['.cc', '.cpp', '.c', '.cxx']:
+        if file_name.endswith(ext):
+            name_without_ext = file_name[:-len(ext)]
+            break
+    
+    # List of alternative paths to try
+    alternatives = []
+    
+    # Same directory, different extensions
+    for ext in ['.cc', '.cpp', '.c', '.cxx']:
+        alternatives.append(os.path.join(dir_name, f'{name_without_ext}{ext}'))
+    
+    # Different directories: try without 'src/', with 'ossfuzz/', or root
+    if dir_name == 'src':
+        for ext in ['.cc', '.cpp', '.c', '.cxx']:
+            alternatives.append(f'{name_without_ext}{ext}')  # root
+            alternatives.append(f'ossfuzz/{name_without_ext}{ext}')
+    elif dir_name == '':
+        for ext in ['.cc', '.cpp', '.c', '.cxx']:
+            alternatives.append(f'src/{name_without_ext}{ext}')
+            alternatives.append(f'ossfuzz/{name_without_ext}{ext}')
+    elif dir_name == 'ossfuzz':
+        for ext in ['.cc', '.cpp', '.c', '.cxx']:
+            alternatives.append(f'{name_without_ext}{ext}')  # root
+            alternatives.append(f'src/{name_without_ext}{ext}')
+    
+    # Try all alternatives
+    for alt_path in alternatives:
+        full_path = os.path.join(base_dir, f'{alt_path}_analysis.json')
+        if os.path.exists(full_path):
+            return full_path
+    
+    # If nothing found, return the original path (which will fail with FileNotFoundError)
+    return exact_path
+
+
 def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recreated_functions, target_repo_path, commit, next_commit, target, trace1):
     """
     Updates patches within LLVMFuzzerTestOneInput function to handle function call replacements when reverting patches.
@@ -2330,7 +2398,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_keys.add(key)
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
-    parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{fuzzer_file_path}_analysis.json')
+    parsing_path = find_analysis_file(data_path, f'{target}-{next_commit}', fuzzer_file_path)
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
