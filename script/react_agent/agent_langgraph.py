@@ -6260,7 +6260,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--openai-max-tokens",
         type=int,
         default=int(os.environ.get("OPENAI_MAX_TOKENS", "0") or 0),
-        help="Max completion tokens for the OpenAI call (0=auto; recommended >=2000 for gpt-5-*).",
+        help="Max completion tokens for the OpenAI call (0=auto, default 16000 for gpt-5-*/o-*).",
     )
     parser.add_argument("--no-json-mode", action="store_true", help="Disable OpenAI JSON mode.")
 
@@ -6580,7 +6580,7 @@ def main(argv: List[str]) -> int:
             openai_model_name = str(args.openai_model).strip()
             max_tokens = int(getattr(args, "openai_max_tokens", 0) or 0)
             if max_tokens <= 0:
-                max_tokens = 4000 if openai_model_name.startswith(("gpt-5", "o")) else 800
+                max_tokens = 16000 if openai_model_name.startswith(("gpt-5", "o")) else 800
             model = OpenAIChatCompletionsModel(
                 api_key=api_key,
                 model=openai_model_name,
