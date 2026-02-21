@@ -756,7 +756,7 @@ def prepare_transplant(data, repo_path):
     for row in data:
         row['poc_count'] = 0
         for bug_id in row['osv_statuses'].keys():
-            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0'}:
+            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
                 row['poc_count'] += 1
         if row['poc_count'] >= max_poc_count:
             max_poc_count = row['poc_count']
@@ -766,7 +766,7 @@ def prepare_transplant(data, repo_path):
     bug_ids_other = set()
     
     for bug_id in max_poc_row['osv_statuses'].keys():
-        if max_poc_row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0'}:
+        if max_poc_row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
@@ -774,7 +774,7 @@ def prepare_transplant(data, repo_path):
     bugs_cant_use = set()
     for row in data:
         for bug_id in bug_ids_other:
-            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0'}:
+            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
                 if bug_id in bugs_need_transplant:
                     if is_ancestor(repo_path, bugs_need_transplant[bug_id], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
                         bugs_need_transplant[bug_id] = row
@@ -1640,6 +1640,9 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         
         if fname == 'LLVMFuzzerTestOneInput':
             # skip LLVMFuzzerTestOneInput, because it is a special function for fuzzing
+            if patch.file_path_new == '/dev/null':
+                # Fuzzer file was deleted between commits, skip entirely
+                continue
             patch_lines = patch.patch_text.split('\n')
             old_start = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
             old_offset = int(patch_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
