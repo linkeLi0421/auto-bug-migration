@@ -174,7 +174,12 @@ def analyze_file(directory, src_file, args, defs_by_usr, file_to_project=None):
             else:
                 dir_path = os.path.join('/data/', 'src')  # fallback to 'src' subdirectory
         else:
-            dir_path = os.path.join('/data/', rel_path.split('/')[0])
+            # Get first directory component and strip -src suffix if present
+            # e.g., 'php-src' -> 'php' so files go to /data/php/ not /data/php-src/
+            first_dir = rel_path.split('/')[0]
+            if first_dir.endswith('-src'):
+                first_dir = first_dir[:-4]  # Remove '-src' suffix
+            dir_path = os.path.join('/data/', first_dir)
     else:
         dir_path = os.path.join('/data/', dir_path[5:] if dir_path.startswith('/src') else dir_path.lstrip('/'))  # ensure output is in /data/
     out_path_set = set()
@@ -352,7 +357,12 @@ def analyze_file(directory, src_file, args, defs_by_usr, file_to_project=None):
             # in where it use.
             file_relative_path = file_path.split('/', 2)[-1]
             file_name = file_relative_path.split('/')[-1] + "_analysis.json"
-            folder = os.path.join('/data/', '/'.join(file_relative_path.split('/')[:-1]))
+            # Get the directory parts and strip -src suffix from first component if present
+            # e.g., 'php-src/Zend' -> 'php/Zend' so files go to /data/php/ not /data/php-src/
+            dir_parts = file_relative_path.split('/')[:-1]
+            if dir_parts and dir_parts[0].endswith('-src'):
+                dir_parts[0] = dir_parts[0][:-4]  # Remove '-src' suffix
+            folder = os.path.join('/data/', '/'.join(dir_parts))
             out_path = os.path.realpath(os.path.join(folder, file_name))
             if not os.path.exists(folder):
                 os.makedirs(folder)
