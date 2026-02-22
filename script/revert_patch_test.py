@@ -254,9 +254,11 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["git", "checkout", "-f", commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+    short_commit = commit[:6] if len(commit) > 6 else commit
     parsing_path = os.path.join(
         data_path,
-        f'{target_repo_path.split("/")[-1]}-{commit}',
+        f'{target_repo_path.split("/")[-1]}-{short_commit}',
         f'{file_path}_analysis.json'
     )
     with open(parsing_path, "r") as f:
@@ -337,9 +339,11 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
         with open(os.path.join(target_repo_path, file_path), 'r') as fsrc:
             file_content = fsrc.readlines()
             return len(file_content)+1
+    # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+    short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
     parsing_path = os.path.join(
         data_path,
-        f"{target_repo_path.split('/')[-1]}-{next_commit}",
+        f"{target_repo_path.split('/')[-1]}-{short_next_commit}",
         f"{file_path}_analysis.json",
     )
     with open(parsing_path, 'r') as f:
