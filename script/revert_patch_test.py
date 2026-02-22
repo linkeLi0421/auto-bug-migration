@@ -255,7 +255,7 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     subprocess.run(["git", "checkout", "-f", commit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-    short_commit = commit[:6] if len(commit) > 6 else commit
+    short_commit = commit[:8] if len(commit) > 8 else commit
     parsing_path = os.path.join(
         data_path,
         f'{target_repo_path.split("/")[-1]}-{short_commit}',
@@ -340,7 +340,7 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
             file_content = fsrc.readlines()
             return len(file_content)+1
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-    short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
+    short_next_commit = next_commit[:8] if len(next_commit) > 8 else next_commit
     parsing_path = os.path.join(
         data_path,
         f"{target_repo_path.split('/')[-1]}-{short_next_commit}",
@@ -519,7 +519,7 @@ def get_crash_stack(
     os.makedirs(crash_dir, exist_ok=True)
     crash_log_path = os.path.join(
         crash_dir,
-        f'target_crash-{commit_id[:6]}-{crash_test_input}.txt',
+        f'target_crash-{commit_id[:8]}-{crash_test_input}.txt',
     )
     if os.path.exists(crash_log_path):
         return crash_log_path
@@ -972,7 +972,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 
             file_path = os.path.join(target_repo_path, path_b)
             # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-            short_new_commit = new_commit[:6] if len(new_commit) > 6 else new_commit
+            short_new_commit = new_commit[:8] if len(new_commit) > 8 else new_commit
             parsing_path = os.path.join(data_path, f'{target}-{short_new_commit}', f'{path_b}_analysis.json')
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
@@ -1050,7 +1050,7 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
 
             file_path = os.path.join(target_repo_path, path_a)
             # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-            short_old_commit = old_commit[:6] if len(old_commit) > 6 else old_commit
+            short_old_commit = old_commit[:8] if len(old_commit) > 8 else old_commit
             parsing_path = os.path.join(data_path, f'{target}-{short_old_commit}', f'{path_a}_analysis.json')
 
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
@@ -1836,7 +1836,7 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         patch = diff_results[key]
         if 'Function body change' in patch.patch_type and patch.file_path_old:
             # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-            short_old_commit = old_commit[:6] if len(old_commit) > 6 else old_commit
+            short_old_commit = old_commit[:8] if len(old_commit) > 8 else old_commit
             parsing_path = os.path.join(data_path, f"{target_repo_path.split('/')[-1]}-{short_old_commit}", f'{patch.file_path_old}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
@@ -2188,7 +2188,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
         if flag:
             continue
         # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-        short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
+        short_next_commit = next_commit[:8] if len(next_commit) > 8 else next_commit
         parsing_path = os.path.join(data_path, f'{target}-{short_next_commit}', f'{file_path}_analysis.json')
         if os.path.exists(parsing_path):
             with open(parsing_path, 'r') as f:
@@ -2373,6 +2373,25 @@ def find_analysis_file(data_path: str, target_commit_dir: str, fuzzer_file_path:
         for ext in ['.cc', '.cpp', '.c', '.cxx']:
             alternatives.append(f'{name_without_ext}{ext}')  # root
             alternatives.append(f'src/{name_without_ext}{ext}')
+
+    # Handle src/<project-name>/... paths (e.g., src/php-src/sapi/fuzzer/file.c)
+    # In Docker, source is at /src/<project>/, but analysis files use project-relative paths
+    parts = fuzzer_file_path.split('/')
+    if len(parts) >= 3 and parts[0] == 'src':
+        # Strip src/<project>/ prefix to get project-relative path
+        stripped_path = '/'.join(parts[2:])
+        stripped_dir = os.path.dirname(stripped_path)
+        stripped_name = os.path.basename(stripped_path)
+        stripped_name_without_ext = stripped_name
+        for ext in ['.cc', '.cpp', '.c', '.cxx']:
+            if stripped_name.endswith(ext):
+                stripped_name_without_ext = stripped_name[:-len(ext)]
+                break
+        for ext in ['.cc', '.cpp', '.c', '.cxx']:
+            if stripped_dir:
+                alternatives.append(os.path.join(stripped_dir, f'{stripped_name_without_ext}{ext}'))
+            else:
+                alternatives.append(f'{stripped_name_without_ext}{ext}')
     
     # Try all alternatives and find one that has LLVMFuzzerTestOneInput definition
     for alt_path in alternatives:
@@ -2486,7 +2505,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-    short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
+    short_next_commit = next_commit[:8] if len(next_commit) > 8 else next_commit
     parsing_path, actual_fuzzer_path = find_analysis_file(data_path, f'{target}-{short_next_commit}', fuzzer_file_path)
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -2624,7 +2643,7 @@ def get_full_funsig(patch, target, commit, version:str):
     patch_start_line = getattr(patch, f'{version}_start_line')
     patch_end_line = getattr(patch, f'{version}_end_line')
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-    short_commit = commit[:6] if len(commit) > 6 else commit
+    short_commit = commit[:8] if len(commit) > 8 else commit
     parsing_path = os.path.join(data_path, f'{target}-{short_commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
@@ -2945,7 +2964,7 @@ def apply_and_test_patches(
     baseline_crash_path = os.path.join(
         data_path,
         'crash',
-        f'target_crash-{commit["commit_id"][:6]}-{crash_test_input}.txt',
+        f'target_crash-{commit["commit_id"][:8]}-{crash_test_input}.txt',
     )
     signature_file = os.path.join(
         data_path,
@@ -2974,7 +2993,7 @@ def apply_and_test_patches(
                 return 'crash_mismatch'
             # Reproduce passed (bug triggered) - this is the main success criterion
             # check_build is optional; just warn if it fails
-            short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            short_next = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
             if not test_fuzzer_build(target, sanitizer, arch):
                 logger.warning(f"check_build failed for bug {bug_id} on commit {short_next}, but reproduce passed - treating as success")
             else:
@@ -2982,11 +3001,11 @@ def apply_and_test_patches(
             get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
             return 'trigger_and_fuzzer_build'
         else:
-            short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            short_next = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
             logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {short_next}\n")
             return 'not_trigger'
     else:
-        short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        short_next = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
         logger.info(f"Build failed for bug {bug_id} on commit {short_next}\n")
         return 'build_fail'
 
@@ -3132,8 +3151,8 @@ def revert_patch_test(args):
         if args.buggy_commit:
             commit['commit_id'] = args.buggy_commit
         # Use short IDs for logging readability
-        short_commit = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
-        short_next_commit = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        short_commit = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+        short_next_commit = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
         logger.info(f'bug trigger commit: {short_commit}')
         logger.info(f'target commit id: {short_next_commit}')
         bug_info = bug_info_dataset[bug_id]
@@ -3186,19 +3205,19 @@ def revert_patch_test(args):
             arch = 'x86_64'
         crash_test_input = select_crash_test_input(bug_id, testcases_env)
         # Use short commit IDs (6 chars) for trace filenames to match get_trace_log_bash
-        short_commit_id = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
-        short_next_commit_id = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        short_commit_id = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+        short_next_commit_id = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
         trace_path1 = os.path.join(data_path, f"target_trace-{short_commit_id}-{crash_test_input}.txt")
         trace_path2 = os.path.join(data_path, f"target_trace-{short_next_commit_id}-{crash_test_input}.txt")
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
             trace_path2 = os.path.join(data_path, f"target_trace-{short_next_commit_id}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt")
-            short_c = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
-            short_n = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            short_c = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+            short_n = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
             logger.info(f"Processing transition for bug {bug_id} from commit {short_c} to {short_n} with patch {patch_path_list[-1]}")
         else:
-            short_c = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
-            short_n = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            short_c = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+            short_n = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
             logger.info(f"Processing transition for bug {bug_id} from commit {short_c} to {short_n}")
 
         # Debug mode: skip patch generation and use pre-generated patches
@@ -3702,7 +3721,7 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
     ]
     
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
-    short_commit_id = commit_id[:6] if len(commit_id) > 6 else commit_id
+    short_commit_id = commit_id[:8] if len(commit_id) > 8 else commit_id
     if not os.path.exists(os.path.join(data_path, f'{target}-{short_commit_id}')):
         logger.info(' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)

@@ -94,7 +94,7 @@ def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -
     if not REVERT_PATCH_CONFIG or not required_commit:
         return False
 
-    attempt_key = (bug_id, required_commit[:6])
+    attempt_key = (bug_id, required_commit[:8])
     if attempt_key in REFRESH_ATTEMPTS:
         return False
     REFRESH_ATTEMPTS.add(attempt_key)
@@ -113,7 +113,7 @@ def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -
     output_dir: Optional[Path] = config.get("output_dir")
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
-        log_path = output_dir / f"revert_{config['target']}_{bug_id}_{required_commit[:6]}.log"
+        log_path = output_dir / f"revert_{config['target']}_{bug_id}_{required_commit[:8]}.log"
 
     patches: Optional[Dict[str, Any]] = None
     local_tests: Optional[Dict[str, Any]] = None
@@ -122,7 +122,7 @@ def _trigger_revert_patch_for_bug(bug_id: str, required_commit: Optional[str]) -
             patches, local_tests = execute_revert_patch_test(args)
     else:
         patches, local_tests = execute_revert_patch_test(args)
-    logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:6])
+    logger.info("Triggered revert_patch_test for bug %s at commit %s", bug_id, required_commit[:8])
     return {"patches": patches, "local_tests": local_tests}
 
 
@@ -315,7 +315,7 @@ def request_new_patch_for_bug(
     target_name = (
         REVERT_PATCH_CONFIG.get("target") if REVERT_PATCH_CONFIG and "target" in REVERT_PATCH_CONFIG else "target"
     )
-    commit_fragment = (required_commit or "unknown")[:6]
+    commit_fragment = (required_commit or "unknown")[:8]
     cache_file = cache_dir / f"{target_name}_{bug_id}_{commit_fragment}_patches.pkl.gz"
     logger.info("Checking for cached refreshed patches for %s at %s", bug_id, cache_file)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -747,10 +747,10 @@ def report_pending_patch_refreshes(group: Optional[List[PatchSetKey]], idx: int)
         if not required_full:
             required_full = info.get("required_commit")
         current_full = info.get("current_commit")
-        required_fragment = (required_full or "unknown")[:6]
-        current_fragment = (current_full or "unknown")[:6]
+        required_fragment = (required_full or "unknown")[:8]
+        current_fragment = (current_full or "unknown")[:8]
         partner_text = ", ".join(
-            f"{detail['partner']}@{(detail['commit'] or 'unknown')[:6]}"
+            f"{detail['partner']}@{(detail['commit'] or 'unknown')[:8]}"
             if detail.get("commit")
             else detail["partner"]
             for detail in partner_details
@@ -835,7 +835,7 @@ def finalize_patch_group(
         add_context(merged_patches, sorted_keys, target_commit, target_repo_path)
         logger.info(
             "Restored context for commit %s using %d patches from %d identifiers.",
-            target_commit[:6],
+            target_commit[:8],
             len(sorted_keys),
             len(group),
         )
@@ -845,7 +845,7 @@ def finalize_patch_group(
     suffix = f"_{group_index}" if group_index else ""
     final_path = os.path.join(
         patch_path,
-        f"group_{target_commit[:6]}{suffix}_final.diff",
+        f"group_{target_commit[:8]}{suffix}_final.diff",
     )
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     with open(final_path, "w", encoding="utf-8") as handle:
@@ -1055,7 +1055,7 @@ def _stack_verification_for_bug(
     baseline_crash_path = os.path.join(
         data_path,
         "crash",
-        f"target_crash-{bug_commit[:6]}-{crash_input}.txt",
+        f"target_crash-{bug_commit[:8]}-{crash_input}.txt",
     )
     if crashes_match(combined_output, baseline_crash_path, signature_file):
         return "triggered (stack matches)"
