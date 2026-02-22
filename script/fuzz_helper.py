@@ -2082,8 +2082,8 @@ def build_version(args):
     pip install libclang==18.*;
     bear compile;
     python3 /script/preprocessor.py compile_commands.json;
-    mkdir /data/{args.project.name}-{args.commit[:6]};
-    python3 /script/mv.py ./ /data/{args.project.name}-{args.commit[:6]};
+    mkdir /data/{args.project.name}-{args.commit[:8]};
+    python3 /script/mv.py ./ /data/{args.project.name}-{args.commit[:8]};
     '''
   elif args.compile_commands:
     build_bash += f'''
@@ -2094,10 +2094,10 @@ def build_version(args):
     bear compile;
     python3 /script/libclang.py;
     # Remove existing output directory if it already exists
-    if [ -d "/data/{args.project.name}-{args.commit[:6]}" ]; then
-        rm -rf "/data/{args.project.name}-{args.commit[:6]}"
+    if [ -d "/data/{args.project.name}-{args.commit[:8]}" ]; then
+        rm -rf "/data/{args.project.name}-{args.commit[:8]}"
     fi
-    mv /data/{args.project.name} /data/{args.project.name}-{args.commit[:6]};
+    mv /data/{args.project.name} /data/{args.project.name}-{args.commit[:8]};
     '''
   else:
     build_bash += '''
@@ -2135,7 +2135,7 @@ def get_crash_log_bash(commit:str, args):
     mkdir -p /data/crash;
     
     compile &> /dev/null;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:6]}-{args.test_input}.txt;
+    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
   '''
   return bash_crash
 
@@ -2159,15 +2159,15 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     # Compile and collect trace
     compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input};
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt &> /dev/null; 
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt &> /dev/null; 
   '''
   return bash_trace
 
 
 def get_allowlist_bash(args):
   # Use short commit IDs (6 chars) for filenames to match trace file naming
-  short_bc1 = args.buggy_commit1[:6] if len(args.buggy_commit1) > 6 else args.buggy_commit1
-  short_bc2 = args.buggy_commit2[:6] if len(args.buggy_commit2) > 6 else args.buggy_commit2
+  short_bc1 = args.buggy_commit1[:8] if len(args.buggy_commit1) > 8 else args.buggy_commit1
+  short_bc2 = args.buggy_commit2[:8] if len(args.buggy_commit2) > 8 else args.buggy_commit2
   if args.two_bug_mode:
     bash_allowlist = f'''
     mkdir -p /data/allowlist;
@@ -2185,8 +2185,8 @@ def get_allowlist_bash(args):
 
 def get_runfuzzer_bash(args, allowlist_type):
   # Use short commit IDs (6 chars) for filenames to match allowlist file naming
-  short_bc1 = args.buggy_commit1[:6] if len(args.buggy_commit1) > 6 else args.buggy_commit1
-  short_bc2 = args.buggy_commit2[:6] if len(args.buggy_commit2) > 6 else args.buggy_commit2
+  short_bc1 = args.buggy_commit1[:8] if len(args.buggy_commit1) > 8 else args.buggy_commit1
+  short_bc2 = args.buggy_commit2[:8] if len(args.buggy_commit2) > 8 else args.buggy_commit2
   if allowlist_type == 'full':
     allowlist_cmd = f'cp /data/allowlist/allowlist-{short_bc1}-full-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'diff':
@@ -2210,7 +2210,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
-    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1[:6]}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1[:8]}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
   '''
   return bash_runfuzzer
 
@@ -2235,7 +2235,7 @@ def get_cfg_bash(args):
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     export LD_LIBRARY_PATH=/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
-      {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:6]}-{args.target_file.replace('/', '-')}.txt;
+      {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:8]}-{args.target_file.replace('/', '-')}.txt;
   '''
   return bash_cfg
 
@@ -2467,7 +2467,7 @@ def get_poc_for_new_version(args):
       '/bin/bash', '-c'
   ])
   # Get the bug crash log from sanitizers
-  if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt'):
+  if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt'):
     run_args.extend([get_crash_log_bash(args.buggy_commit, args)])
     clean(args, out_dir)
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_buggy, args.project.name, None)
@@ -2475,7 +2475,7 @@ def get_poc_for_new_version(args):
     run_args.pop()
     
   def get_allowlist_one_trace_bash(args):
-    short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
+    short_bc = args.buggy_commit[:8] if len(args.buggy_commit) > 8 else args.buggy_commit
     bash_allowlist = f'''
     mkdir -p /data/allowlist;
     python3 /script/read_func_trace.py  /data/target_trace-{short_bc}-{args.test_input}.txt --signature-changes /data/signature_change_list/{args.signature_changes} -o /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt;
@@ -2483,7 +2483,7 @@ def get_poc_for_new_version(args):
     return bash_allowlist
 
   # Get the function trace in the buggy commit
-  short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
+  short_bc = args.buggy_commit[:8] if len(args.buggy_commit) > 8 else args.buggy_commit
   if not os.path.exists(f'{result_dir}/allowlist/allowlist-{short_bc}-{args.test_input}.txt'):
     run_args.extend([get_trace_log_bash(args.buggy_commit, args, apply_patch = False) + get_allowlist_one_trace_bash(args)])
     clean(args, out_dir)
@@ -2491,7 +2491,7 @@ def get_poc_for_new_version(args):
     run_args.pop()
 
   # Get the function trace in the target commit with patch that reverts some patches
-  if not os.path.exists(f"{result_dir}/target_trace-{args.target_commit[:6]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt"):
+  if not os.path.exists(f"{result_dir}/target_trace-{args.target_commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt"):
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, None)
     run_args.extend([get_trace_log_bash(args.target_commit, args, apply_patch = True)])
     clean(args, out_dir)
@@ -2499,7 +2499,7 @@ def get_poc_for_new_version(args):
 
   # Fuzzing part
   def get_target_fuzzing_bash(args):
-    short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
+    short_bc = args.buggy_commit[:8] if len(args.buggy_commit) > 8 else args.buggy_commit
     bash_fuzz = f'''
     # Fuzz with target commit
     mkdir -p /tmpfolder; 
@@ -2516,7 +2516,7 @@ def get_poc_for_new_version(args):
 
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
-    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:6]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
     '''
     return bash_fuzz
 

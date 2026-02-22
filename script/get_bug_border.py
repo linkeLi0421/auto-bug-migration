@@ -45,23 +45,23 @@ def main():
                     if bug not in results:
                         results[bug] = []
                     results[bug].append({
-                        "base": df.loc[i, "commit"][:6],
-                        "buggy1": df.loc[i-1, "commit"][:6],
-                        "buggy2": df.loc[i+1, "commit"][:6]
+                        "base": df.loc[i, "commit"][:8],
+                        "buggy1": df.loc[i-1, "commit"][:8],
+                        "buggy2": df.loc[i+1, "commit"][:8]
                     })
                 else:
                     if bug not in results:
                         results[bug] = []
                     results[bug].append({
-                        "base": df.loc[i, "commit"][:6],
-                        "buggy": df.loc[i-1, "commit"][:6],
+                        "base": df.loc[i, "commit"][:8],
+                        "buggy": df.loc[i-1, "commit"][:8],
                     })
             elif prev_value == "0|1" and curr_value == "1|1" and prev_prev_value != "1|1":
                 if bug not in results:
                     results[bug] = []
                 results[bug].append({
-                    "base": df.loc[i-1, "commit"][:6],
-                    "buggy": df.loc[i, "commit"][:6],
+                    "base": df.loc[i-1, "commit"][:8],
+                    "buggy": df.loc[i, "commit"][:8],
                 })
     # Extract the base filename from the input file path
     input_filename = os.path.basename(args.file)
