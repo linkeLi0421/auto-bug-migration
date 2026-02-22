@@ -39,8 +39,61 @@ def get_folder_names(directory):
 
 def get_commit_timestamp(repo_path: str, commit_hash: str) -> int:
     repo = git.Repo(repo_path)
-    ts = repo.git.show("-s", "--format=%ct", commit_hash).strip()
+    # Resolve short/ambiguous commit to full hash first
+    full_hash = resolve_commit_hash(repo_path, commit_hash)
+    ts = repo.git.show("-s", "--format=%ct", full_hash).strip()
     return int(ts)
+
+
+def resolve_commit_hash(repo_path: str, commit_hash: str) -> str:
+    """
+    Resolve a short or potentially ambiguous commit hash to its full form.
+    
+    Args:
+        repo_path: Path to the git repository
+        commit_hash: Short or full commit hash
+        
+    Returns:
+        Full 40-character commit hash
+        
+    Raises:
+        ValueError: If the commit hash is ambiguous or not found
+    """
+    repo = git.Repo(repo_path)
+    try:
+        # Try to get the full commit hash using git rev-parse
+        full_hash = repo.git.rev_parse("--verify", f"{commit_hash}^{{commit}}")
+        return full_hash.strip()
+    except GitCommandError as e:
+        # If ambiguous or not found, provide a helpful error message
+        error_msg = str(e)
+        if "ambiguous" in error_msg.lower():
+            # Try to get candidates using git rev-list
+            try:
+                candidates = repo.git.rev_list("--all", "--abbrev-commit", 
+                                               f"--grep={commit_hash}", max_count=10)
+                if not candidates:
+                    # Try with git log on all refs
+                    result = subprocess.run(
+                        ["git", "-C", repo_path, "log", "--all", "--oneline", 
+                         "--no-walk", "--abbrev-commit"],
+                        capture_output=True, text=True
+                    )
+                    lines = result.stdout.strip().split('\n')
+                    matches = [l.split()[0] for l in lines if l.startswith(commit_hash)]
+                    if matches:
+                        raise ValueError(
+                            f"Commit hash '{commit_hash}' is ambiguous. "
+                            f"Candidates: {', '.join(matches)}. "
+                            f"Please use a longer prefix or the full hash."
+                        )
+            except Exception:
+                pass
+            raise ValueError(
+                f"Commit hash '{commit_hash}' is ambiguous. "
+                f"Please use a longer prefix (at least 8-12 characters) or the full 40-character hash."
+            )
+        raise ValueError(f"Commit hash '{commit_hash}' not found in repository: {error_msg}")
 
 
 # Base-builder images sorted by date (oldest first)

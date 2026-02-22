@@ -2152,11 +2152,9 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
-    cd /src/{args.project.name}; 
     # Checkout buggy commit and set up environment
     git checkout -f {commit};
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch and apply_patch else ''} 
-    cd -;
     
     # Compile and collect trace
     compile;
@@ -2167,26 +2165,32 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
 
 
 def get_allowlist_bash(args):
+  # Use short commit IDs (6 chars) for filenames to match trace file naming
+  short_bc1 = args.buggy_commit1[:6] if len(args.buggy_commit1) > 6 else args.buggy_commit1
+  short_bc2 = args.buggy_commit2[:6] if len(args.buggy_commit2) > 6 else args.buggy_commit2
   if args.two_bug_mode:
     bash_allowlist = f'''
     mkdir -p /data/allowlist;
-    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt --two_bug_mode > /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    python3 /script/read_func_trace.py /data/target_trace-{short_bc1}-{args.test_input}.txt > /data/allowlist/allowlist-{short_bc1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{short_bc1}-{args.test_input}.txt /data/target_trace-{short_bc2}-{args.test_input}.txt --two_bug_mode > /data/allowlist/allowlist-{short_bc1}-{short_bc2}-{args.test_input}.txt;
     '''
   else:
     bash_allowlist = f'''
     mkdir -p /data/allowlist;
-    python3 /script/read_func_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt;
-    python3 /script/compare_trace.py /data/target_trace-{args.buggy_commit1}-{args.test_input}.txt /data/target_trace-{args.buggy_commit2}-{args.test_input}.txt > /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt;
+    python3 /script/read_func_trace.py /data/target_trace-{short_bc1}-{args.test_input}.txt > /data/allowlist/allowlist-{short_bc1}-full-{args.test_input}.txt;
+    python3 /script/compare_trace.py /data/target_trace-{short_bc1}-{args.test_input}.txt /data/target_trace-{short_bc2}-{args.test_input}.txt > /data/allowlist/allowlist-{short_bc1}-{short_bc2}-{args.test_input}.txt;
     '''
   return bash_allowlist
 
 
 def get_runfuzzer_bash(args, allowlist_type):
+  # Use short commit IDs (6 chars) for filenames to match allowlist file naming
+  short_bc1 = args.buggy_commit1[:6] if len(args.buggy_commit1) > 6 else args.buggy_commit1
+  short_bc2 = args.buggy_commit2[:6] if len(args.buggy_commit2) > 6 else args.buggy_commit2
   if allowlist_type == 'full':
-    allowlist_cmd = f'cp /data/allowlist/allowlist-{args.buggy_commit1}-full-{args.test_input}.txt /allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist/allowlist-{short_bc1}-full-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'diff':
-    allowlist_cmd = f'cp /data/allowlist/allowlist-{args.buggy_commit1}-{args.buggy_commit2}-{args.test_input}.txt /allowlist.txt;'
+    allowlist_cmd = f'cp /data/allowlist/allowlist-{short_bc1}-{short_bc2}-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'noselect':
     allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > /allowlist.txt;'
   bash_runfuzzer = f'''
@@ -2198,7 +2202,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     git checkout -f {args.base_commit}; 
     cd -;
     {allowlist_cmd}
-    python3 /script/add_revert_entries.py --commit {args.buggy_commit1} /allowlist.txt -o /allowlist.txt;
+    python3 /script/add_revert_entries.py --commit {short_bc1} /allowlist.txt -o /allowlist.txt;
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
     
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
@@ -2206,7 +2210,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
-    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1[:6]}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
   '''
   return bash_runfuzzer
 
@@ -2318,8 +2322,17 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
   if builder_image_digest:
     if not builder_image_digest.startswith('sha256:'):
       builder_image_digest = f'sha256:{builder_image_digest}'
-    # Only pin if not already pinned to avoid double-pinning
-    if f'@{builder_image_digest}' not in updated_content:
+    # Check if base-builder is already pinned to any digest
+    already_pinned = re.search(
+      r'gcr\.io/oss-fuzz-base/base-builder@sha256:[a-f0-9]+',
+      updated_content
+    )
+    if already_pinned:
+      # Already pinned - preserve the existing pinned version
+      logger.info('Base-builder already pinned to %s, preserving it', 
+                  already_pinned.group(0))
+    else:
+      # Not pinned yet - pin it with the provided digest
       updated_content = updated_content.replace(
         'gcr.io/oss-fuzz-base/base-builder',
         f'gcr.io/oss-fuzz-base/base-builder@{builder_image_digest}'
@@ -2462,14 +2475,16 @@ def get_poc_for_new_version(args):
     run_args.pop()
     
   def get_allowlist_one_trace_bash(args):
+    short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
     bash_allowlist = f'''
     mkdir -p /data/allowlist;
-    python3 /script/read_func_trace.py  /data/target_trace-{args.buggy_commit}-{args.test_input}.txt --signature-changes /data/signature_change_list/{args.signature_changes} -o /data/allowlist/allowlist-{args.buggy_commit}-{args.test_input}.txt;
+    python3 /script/read_func_trace.py  /data/target_trace-{short_bc}-{args.test_input}.txt --signature-changes /data/signature_change_list/{args.signature_changes} -o /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt;
     '''
     return bash_allowlist
 
   # Get the function trace in the buggy commit
-  if not os.path.exists(f'{result_dir}/allowlist/allowlist-{args.buggy_commit}-{args.test_input}.txt'):
+  short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
+  if not os.path.exists(f'{result_dir}/allowlist/allowlist-{short_bc}-{args.test_input}.txt'):
     run_args.extend([get_trace_log_bash(args.buggy_commit, args, apply_patch = False) + get_allowlist_one_trace_bash(args)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
@@ -2484,6 +2499,7 @@ def get_poc_for_new_version(args):
 
   # Fuzzing part
   def get_target_fuzzing_bash(args):
+    short_bc = args.buggy_commit[:6] if len(args.buggy_commit) > 6 else args.buggy_commit
     bash_fuzz = f'''
     # Fuzz with target commit
     mkdir -p /tmpfolder; 
@@ -2492,7 +2508,7 @@ def get_poc_for_new_version(args):
     cd /src/{args.project.name};
     git checkout -f {args.target_commit}; 
     cd -;
-    cp /data/allowlist/allowlist-{args.buggy_commit}-{args.test_input}.txt /allowlist.txt;
+    cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
     {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
 
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";

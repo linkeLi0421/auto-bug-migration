@@ -22,6 +22,7 @@ from buildAndtest import (
     checkout_latest_commit,
     get_commit_timestamp,
     get_latest_images_before_year,
+    resolve_commit_hash,
 )
 from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls
@@ -2957,17 +2958,20 @@ def apply_and_test_patches(
                 return 'crash_mismatch'
             # Reproduce passed (bug triggered) - this is the main success criterion
             # check_build is optional; just warn if it fails
+            short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
             if not test_fuzzer_build(target, sanitizer, arch):
-                logger.warning(f"check_build failed for bug {bug_id} on commit {next_commit['commit_id']}, but reproduce passed - treating as success")
+                logger.warning(f"check_build failed for bug {bug_id} on commit {short_next}, but reproduce passed - treating as success")
             else:
-                logger.info(f"Fuzzer build check passed for bug {bug_id} on commit {next_commit['commit_id']}")
+                logger.info(f"Fuzzer build check passed for bug {bug_id} on commit {short_next}")
             get_patched_traces.setdefault(bug_id, []).append(patch_file_path)
             return 'trigger_and_fuzzer_build'
         else:
-            logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {next_commit['commit_id']}\n")
+            short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            logger.info(f"Bug {bug_id} not triggered with fuzzer {fuzzer} on commit {short_next}\n")
             return 'not_trigger'
     else:
-        logger.info(f"Build failed for bug {bug_id} on commit {next_commit['commit_id']}\n")
+        short_next = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        logger.info(f"Build failed for bug {bug_id} on commit {short_next}\n")
         return 'build_fail'
 
 
@@ -3098,8 +3102,10 @@ def revert_patch_test(args):
     for bug_id, row in bugs_need_transplant.items():
         commit = dict()
         next_commit = dict()
-        commit['commit_id'] = row['commit_id'][:6]  # use short commit id for trace file name
-        next_commit['commit_id'] = max_poc_row['commit_id'][:6]  # use short commit id for trace file name
+        # Store full commit IDs to avoid ambiguity in git commands
+        # Short IDs (for display/filenames) will be generated on-the-fly
+        commit['commit_id'] = row['commit_id']
+        next_commit['commit_id'] = max_poc_row['commit_id']
         transitions.append((commit, next_commit, bug_id))
     
     flag = False
@@ -3108,9 +3114,12 @@ def revert_patch_test(args):
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
-            commit['commit_id'] = args.buggy_commit[:6]
-        logger.info(f'bug trigger commit: {commit["commit_id"]}')
-        logger.info(f'target commit id: {next_commit["commit_id"]}')
+            commit['commit_id'] = args.buggy_commit
+        # Use short IDs for logging readability
+        short_commit = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
+        short_next_commit = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        logger.info(f'bug trigger commit: {short_commit}')
+        logger.info(f'target commit id: {short_next_commit}')
         bug_info = bug_info_dataset[bug_id]
         fuzzer = bug_info['reproduce']['fuzz_target']
 
@@ -3123,7 +3132,7 @@ def revert_patch_test(args):
             for key in patches_without_contexts.keys()
         )
         if bug_already_cached:
-            logger.info(f"Bug {bug_id} (commit {commit['commit_id']}, fuzzer {fuzzer}) already cached, skipping patch generation...")
+            logger.info(f"Bug {bug_id} (commit {short_commit}, fuzzer {fuzzer}) already cached, skipping patch generation...")
             # Reconstruct get_patched_traces from existing patch files so
             # the local bug test section below can still run.
             patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
@@ -3160,14 +3169,21 @@ def revert_patch_test(args):
         else:
             arch = 'x86_64'
         crash_test_input = select_crash_test_input(bug_id, testcases_env)
-        trace_path1 = os.path.join(data_path, f"target_trace-{commit['commit_id']}-{crash_test_input}.txt")
-        trace_path2 = os.path.join(data_path, f"target_trace-{next_commit['commit_id']}-{crash_test_input}.txt")
+        # Use short commit IDs (6 chars) for trace filenames to match get_trace_log_bash
+        short_commit_id = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
+        short_next_commit_id = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+        trace_path1 = os.path.join(data_path, f"target_trace-{short_commit_id}-{crash_test_input}.txt")
+        trace_path2 = os.path.join(data_path, f"target_trace-{short_next_commit_id}-{crash_test_input}.txt")
         if bug_id in get_patched_traces:
             patch_path_list = get_patched_traces[bug_id]
-            trace_path2 = os.path.join(data_path, f"target_trace-{next_commit['commit_id']}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt")
-            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']} with patch {patch_path_list[-1]}")
+            trace_path2 = os.path.join(data_path, f"target_trace-{short_next_commit_id}-{crash_test_input}{patch_path_list[-1].split('/')[-1].split('.diff')[0]}.txt")
+            short_c = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
+            short_n = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            logger.info(f"Processing transition for bug {bug_id} from commit {short_c} to {short_n} with patch {patch_path_list[-1]}")
         else:
-            logger.info(f"Processing transition for bug {bug_id} from commit {commit['commit_id']} to {next_commit['commit_id']}")
+            short_c = commit['commit_id'][:6] if len(commit['commit_id']) > 6 else commit['commit_id']
+            short_n = next_commit['commit_id'][:6] if len(next_commit['commit_id']) > 6 else next_commit['commit_id']
+            logger.info(f"Processing transition for bug {bug_id} from commit {short_c} to {short_n}")
 
         # Debug mode: skip patch generation and use pre-generated patches
         debug_artifact_dir = getattr(args, 'debug_artifact_dir', None)
