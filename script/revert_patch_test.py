@@ -967,7 +967,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                 continue
                 
             file_path = os.path.join(target_repo_path, path_b)
-            parsing_path = os.path.join(data_path, f'{target}-{new_commit}', f'{path_b}_analysis.json')
+            # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+            short_new_commit = new_commit[:6] if len(new_commit) > 6 else new_commit
+            parsing_path = os.path.join(data_path, f'{target}-{short_new_commit}', f'{path_b}_analysis.json')
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
                 continue
@@ -1043,7 +1045,9 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
             new_line_num = header.split('@@')[-2].strip().split('+')[1].strip()
 
             file_path = os.path.join(target_repo_path, path_a)
-            parsing_path = os.path.join(data_path, f'{target}-{old_commit}', f'{path_a}_analysis.json')
+            # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+            short_old_commit = old_commit[:6] if len(old_commit) > 6 else old_commit
+            parsing_path = os.path.join(data_path, f'{target}-{short_old_commit}', f'{path_a}_analysis.json')
 
             if not os.path.exists(file_path) or not os.path.exists(parsing_path):
                 logger.debug(f"File {file_path} or {parsing_path} does not exist, skipping parsing")
@@ -1827,7 +1831,9 @@ def build_dependency_graph(diff_results, patch_to_apply, target_repo_path, old_c
         )
         patch = diff_results[key]
         if 'Function body change' in patch.patch_type and patch.file_path_old:
-            parsing_path = os.path.join(data_path, f"{target_repo_path.split('/')[-1]}-{old_commit}", f'{patch.file_path_old}_analysis.json')
+            # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+            short_old_commit = old_commit[:6] if len(old_commit) > 6 else old_commit
+            parsing_path = os.path.join(data_path, f"{target_repo_path.split('/')[-1]}-{short_old_commit}", f'{patch.file_path_old}_analysis.json')
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
             # filter for call expressions (clang cursors for function calls)
@@ -2177,7 +2183,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                 break
         if flag:
             continue
-        parsing_path = os.path.join(data_path, f'{target}-{next_commit}', f'{file_path}_analysis.json')
+        # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+        short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
+        parsing_path = os.path.join(data_path, f'{target}-{short_next_commit}', f'{file_path}_analysis.json')
         if os.path.exists(parsing_path):
             with open(parsing_path, 'r') as f:
                 ast_nodes = json.load(f)
@@ -2473,7 +2481,9 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_keys.add(key)
 
     # Step 2: Load AST analysis and locate LLVMFuzzerTestOneInput function boundaries
-    parsing_path, actual_fuzzer_path = find_analysis_file(data_path, f'{target}-{next_commit}', fuzzer_file_path)
+    # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+    short_next_commit = next_commit[:6] if len(next_commit) > 6 else next_commit
+    parsing_path, actual_fuzzer_path = find_analysis_file(data_path, f'{target}-{short_next_commit}', fuzzer_file_path)
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
@@ -2609,7 +2619,9 @@ def get_full_funsig(patch, target, commit, version:str):
     patch_file_path = getattr(patch, f'file_path_{version}')
     patch_start_line = getattr(patch, f'{version}_start_line')
     patch_end_line = getattr(patch, f'{version}_end_line')
-    parsing_path = os.path.join(data_path, f'{target}-{commit}', f'{patch_file_path}_analysis.json')
+    # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+    short_commit = commit[:6] if len(commit) > 6 else commit
+    parsing_path = os.path.join(data_path, f'{target}-{short_commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     for node in ast_nodes:
@@ -3685,7 +3697,9 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
         '--build_csv', build_csv, '--compile_commands', '--architecture', arch , target
     ]
     
-    if not os.path.exists(os.path.join(data_path, f'{target}-{commit_id}')):
+    # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
+    short_commit_id = commit_id[:6] if len(commit_id) > 6 else commit_id
+    if not os.path.exists(os.path.join(data_path, f'{target}-{short_commit_id}')):
         logger.info(' '.join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
         
