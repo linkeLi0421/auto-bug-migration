@@ -5769,13 +5769,8 @@ def _run_langgraph(
         error_line = str(getattr(st, "error_line", "") or "").strip()
         error_file_path = _extract_file_path_from_error(error_line)
         step_context = {
-            "scope": str(st.error_scope),
-            "pinned_patch_key": str(getattr(st, "patch_key", "") or "").strip(),
-            "active_patch_key": str(getattr(st, "active_patch_key", "") or "").strip(),
-            "active_old_signature": str(getattr(st, "active_old_signature", "") or "").strip(),
             "error_line": error_line,
             "error_file_path": error_file_path,
-            "build_log_path": str(getattr(st, "build_log_path", "") or "").strip(),
         }
 
         # Patch-scope: always run patch tools against the current effective patch bundle.
