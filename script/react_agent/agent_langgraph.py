@@ -6059,6 +6059,40 @@ def _run_langgraph(
                 st.patch_override_by_key[extra_patch_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
 
+            # Apply enum rename overrides to regular hunks (from V1/V2 enum conflict detection)
+            _enum_overrides = (st.patch_result or {}).get("enum_rename_overrides") or []
+            for _ov in _enum_overrides:
+                _ov_key = str(_ov.get("patch_key", "") if isinstance(_ov, dict) else "").strip()
+                _ov_pt = ""
+                _ov_artifact = _ov.get("patch_text") if isinstance(_ov, dict) else None
+                if isinstance(_ov_artifact, dict):
+                    _ov_path = str(_ov_artifact.get("artifact_path", "")).strip()
+                    if _ov_path:
+                        try:
+                            _ov_pt = _read_text(_ov_path)
+                        except Exception:
+                            _ov_pt = ""
+                elif isinstance(_ov_artifact, str):
+                    _ov_pt = _ov_artifact
+                if _ov_pt.strip() and _ov_key:
+                    _ov_override_path, _ov_err = _persist_override_diff(
+                        st,
+                        patch_key=_ov_key,
+                        patch_text=_ov_pt,
+                        label=f"override_{_ov_key}_enum_rename",
+                    )
+                    if _ov_override_path and not _ov_err:
+                        st.patch_override_by_key[_ov_key] = _ov_override_path
+                    _ov_eff_path, _ov_eff_err = _write_effective_patch_bundle(
+                        st,
+                        patch_key=_ov_key,
+                        patch_text=_ov_pt,
+                    )
+                    if _ov_eff_path and not _ov_eff_err:
+                        st.patch_path = _ov_eff_path
+                    st.patch_override_paths = list(st.patch_override_by_key.values())
+                    sys.stderr.write(f"[make_extra_patch_override] enum_rename applied to {_ov_key}\n")
+
             sys.stderr.write("[make_extra_patch_override] artifacts:\n")
             if patch_text_path:
                 sys.stderr.write(f"  patch_text: {patch_text_path}\n")
