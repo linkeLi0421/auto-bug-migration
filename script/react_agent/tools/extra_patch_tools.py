@@ -1575,6 +1575,147 @@ def _upgrade_existing_forward_typedef_in_extra_hunk(
     return updated, "\n".join(inserted_lines).rstrip("\n") + "\n", insert_kind
 
 
+# ---------------------------------------------------------------------------
+# Enum conflict detection and renaming helpers
+# ---------------------------------------------------------------------------
+
+def _extract_enum_constant_names(code: str) -> List[str]:
+    """Extract enumerator names from C enum source code.
+
+    Handles patterns like ``NAME = VALUE,``, ``NAME,``, ``NAME = OTHER,``,
+    and multiple enumerators per line.  Skips comments and preprocessor directives.
+    """
+    names: List[str] = []
+    in_body = False
+    for line in str(code or "").splitlines():
+        stripped = line.strip()
+        # Skip comments and preprocessor lines
+        if stripped.startswith("//") or stripped.startswith("#"):
+            continue
+        if "{" in stripped:
+            in_body = True
+            stripped = stripped[stripped.index("{") + 1:]
+        if not in_body:
+            continue
+        tail = stripped
+        if "}" in tail:
+            tail = tail[:tail.index("}")]
+        # Extract NAME tokens before '=', ',', '}', or at end of line
+        for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=|,|}|$)", tail):
+            name = m.group(1)
+            if name not in ("enum", "typedef", "struct", "union"):
+                if name not in names:
+                    names.append(name)
+        if "}" in stripped:
+            break
+    return names
+
+
+def _check_v2_enum_conflict(kb_index: Any, enum_names: List[str]) -> set:
+    """Return enum constant names that also exist in V2 as ENUM_CONSTANT_DECL."""
+    conflicts: set = set()
+    if kb_index is None:
+        return conflicts
+    for name in enum_names:
+        try:
+            v2_nodes = (kb_index.query_all(name) or {}).get("v2", [])
+        except Exception:
+            v2_nodes = []
+        for n in v2_nodes:
+            if isinstance(n, dict) and n.get("kind") == "ENUM_CONSTANT_DECL":
+                conflicts.add(name)
+                break
+    return conflicts
+
+
+def _prefix_enum_source(code: str, enum_names: List[str], prefix: str) -> Tuple[str, Dict[str, str]]:
+    """Rename all enumerator names in enum source code with a prefix.
+
+    Returns (modified_code, rename_map) where rename_map maps old→new.
+    Processes longest names first to avoid partial replacements.
+    """
+    rename_map: Dict[str, str] = {}
+    result = str(code or "")
+    # Sort by length descending to avoid partial replacements (e.g. RANS before RANS0)
+    sorted_names = sorted(enum_names, key=len, reverse=True)
+    for name in sorted_names:
+        new_name = f"{prefix}{name}"
+        rename_map[name] = new_name
+    # Apply replacements using word-boundary regex, longest first
+    for old_name in sorted_names:
+        new_name = rename_map[old_name]
+        result = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(old_name)}(?![A-Za-z0-9_])",
+            new_name,
+            result,
+        )
+    return result, rename_map
+
+
+def _apply_rename_map_to_minus_lines(patch_text: str, rename_map: Dict[str, str]) -> str:
+    """In a unified diff's ``-`` lines, replace enum names with prefixed names.
+
+    Only modifies ``-`` prefixed lines (the transplanted code).  Context lines
+    and ``+`` lines are left untouched.
+    """
+    if not rename_map:
+        return patch_text
+    lines = str(patch_text or "").splitlines()
+    # Sort by length descending to avoid partial replacements
+    sorted_old = sorted(rename_map.keys(), key=len, reverse=True)
+    updated = list(lines)
+    changed = False
+    for i, line in enumerate(lines):
+        if not line.startswith("-") or line.startswith("---"):
+            continue
+        new_line = line
+        for old_name in sorted_old:
+            new_name = rename_map[old_name]
+            new_line = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(old_name)}(?![A-Za-z0-9_])",
+                new_name,
+                new_line,
+            )
+        if new_line != line:
+            updated[i] = new_line
+            changed = True
+    if not changed:
+        return patch_text
+    return "\n".join(updated)
+
+
+def _rename_enum_refs_in_bundle(
+    bundle: Any, file_path: str, rename_map: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Apply rename_map to ``-`` lines in all regular hunks for the same file.
+
+    Returns list of ``{"patch_key": key, "patch_text": modified_text}`` for
+    modified hunks.
+    """
+    if not rename_map:
+        return []
+    target_basename = Path(str(file_path or "")).name
+    if not target_basename:
+        return []
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return []
+    overrides: List[Dict[str, Any]] = []
+    for key, patch_info in patches.items():
+        key_s = str(key or "")
+        if key_s.startswith("_extra_"):
+            continue
+        pt = str(getattr(patch_info, "patch_text", "") or "")
+        if not pt.strip():
+            continue
+        if target_basename not in pt:
+            continue
+        modified = _apply_rename_map_to_minus_lines(pt, rename_map)
+        if modified != pt:
+            overrides.append({"patch_key": key_s, "patch_text": modified})
+    return overrides
+
+
 def make_extra_patch_override(
     agent_tools: Any,
     *,
@@ -1716,6 +1857,7 @@ def make_extra_patch_override(
 
     inserted_lines: List[str] = []
     insert_kind = ""
+    enum_rename_overrides: List[Dict[str, Any]] = []
 
     # 0) Forward tag declaration: symbol_name like "struct X" or "union Y" or "enum Z".
     #    Just emit a forward declaration (e.g. "struct X;") — the full definition exists
@@ -1770,6 +1912,33 @@ def make_extra_patch_override(
                     decl_lines = _rewrite_first_function_name(decl_lines, old=underlying, new=symbol)
                 elif kind in {"revert_var", "revert_const"}:
                     decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
+
+            # --- Enum conflict detection: if this is an ENUM_DECL, check for V2 ---
+            # enumerator name collisions and proactively prefix all names.
+            if chosen_kind == "ENUM_DECL" and agent_tools is not None:
+                kb_index = getattr(agent_tools, "kb_index", None)
+                if kb_index is not None:
+                    enum_code = "\n".join(decl_lines)
+                    enum_names = _extract_enum_constant_names(enum_code)
+                    if enum_names:
+                        conflicts = _check_v2_enum_conflict(kb_index, enum_names)
+                        if conflicts:
+                            # Prefix ALL enum names (not just conflicting ones)
+                            # to keep the enum self-consistent.
+                            _prefix = "__revert_enum_"
+                            code_prefixed, rename_map = _prefix_enum_source(
+                                enum_code, enum_names, _prefix
+                            )
+                            decl_lines = [
+                                l.rstrip()
+                                for l in code_prefixed.splitlines()
+                                if l.strip()
+                            ]
+                            # Rename references in regular hunks for the same file
+                            enum_rename_overrides = _rename_enum_refs_in_bundle(
+                                bundle, file_path_s, rename_map
+                            )
+
             inserted_lines = decl_lines
             insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
             break
@@ -1867,7 +2036,25 @@ def make_extra_patch_override(
         ext=".diff",
     )
 
-    return {
+    # Persist enum rename overrides for regular hunks as artifacts.
+    serialized_enum_overrides: List[Dict[str, Any]] = []
+    for ov in enum_rename_overrides:
+        ov_key = str(ov.get("patch_key", "")).strip()
+        ov_text = str(ov.get("patch_text", "")).strip()
+        if not ov_key or not ov_text:
+            continue
+        ov_store = ArtifactStore(_artifact_root() / ov_key, overwrite=False)
+        ov_ref = ov_store.write_text(
+            name=f"enum_rename_override_{_normalize_file_basename(file_path_s)}_{symbol}",
+            text=ov_text,
+            ext=".diff",
+        )
+        serialized_enum_overrides.append({
+            "patch_key": ov_key,
+            "patch_text": ov_ref.to_dict(),
+        })
+
+    result: Dict[str, Any] = {
         "patch_path": str(Path(patch_path_s).expanduser().resolve()),
         "file_path": file_path_s,
         "symbol_name": symbol,
@@ -1881,3 +2068,6 @@ def make_extra_patch_override(
         "patch_text_lines_total": len(updated_text.splitlines()),
         "note": "Inserted missing declaration into the file's _extra_* hunk and returned an override diff artifact.",
     }
+    if serialized_enum_overrides:
+        result["enum_rename_overrides"] = serialized_enum_overrides
+    return result

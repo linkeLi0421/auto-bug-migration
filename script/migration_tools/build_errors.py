@@ -218,6 +218,35 @@ def parse_build_errors(error_log: str) -> Dict[str, Any]:
             }
         )
 
+    # --- Redefinition of enumerator (V1/V2 enum name collision) ---
+    redefinition_enumerators: List[Dict[str, Any]] = []
+    pattern = r"(/src.+?):(\d+):(\d+):.*redefinition of enumerator '(\w+)'"
+    for filepath, line, column, enumerator in re.findall(pattern, text):
+        redefinition_enumerators.append(
+            {
+                "name": enumerator,
+                "file": filepath,
+                "line": int(line),
+                "column": int(column),
+                "location": _as_location(filepath, line, column),
+                "kind": "redefinition_of_enumerator",
+            }
+        )
+
+    # --- Duplicate case value ---
+    duplicate_case_values: List[Dict[str, Any]] = []
+    pattern = r"(/src.+?):(\d+):(\d+):.*duplicate case value"
+    for filepath, line, column in re.findall(pattern, text):
+        duplicate_case_values.append(
+            {
+                "file": filepath,
+                "line": int(line),
+                "column": int(column),
+                "location": _as_location(filepath, line, column),
+                "kind": "duplicate_case_value",
+            }
+        )
+
     # Deterministic ordering
     def _sort_key(obj: Dict[str, Any]) -> Tuple[Any, ...]:
         return (obj.get("file", ""), obj.get("line", 0), obj.get("column", 0), obj.get("name", ""))
@@ -227,6 +256,8 @@ def parse_build_errors(error_log: str) -> Dict[str, Any]:
     missing_struct_members.sort(key=lambda o: (o.get("file", ""), o.get("line", 0), o.get("member", "")))
     function_call_issues.sort(key=lambda o: (o.get("file", ""), (o.get("line_range") or [0, 0])[0], o.get("kind", "")))
     incomplete_types.sort(key=lambda o: (o.get("error_location", ""), o.get("type", "")))
+    redefinition_enumerators.sort(key=_sort_key)
+    duplicate_case_values.sort(key=lambda o: (o.get("file", ""), o.get("line", 0)))
 
     return {
         "undeclared_identifiers": undeclared_identifiers,
@@ -234,5 +265,7 @@ def parse_build_errors(error_log: str) -> Dict[str, Any]:
         "missing_struct_members": missing_struct_members,
         "function_call_issues": function_call_issues,
         "incomplete_types": incomplete_types,
+        "redefinition_enumerators": redefinition_enumerators,
+        "duplicate_case_values": duplicate_case_values,
     }
 

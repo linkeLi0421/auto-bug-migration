@@ -4926,4 +4926,414 @@ assert _error_type_priority(err_other) == 3, f"Expected 3, got {_error_type_prio
 print("OK")
 PY
 
+# ---------------------------------------------------------------------------
+# Enum conflict detection: _extract_enum_constant_names
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.extra_patch_tools import _extract_enum_constant_names
+
+# Basic enum
+code1 = """\
+enum cram_block_method_int {
+    BM_ERROR = -1,
+    RAW     = 0,
+    GZIP    = 1,
+    BZIP2   = 2,
+    LZMA    = 3,
+    RANS    = 4,
+    RANS0   = RANS,
+    FQZ     = 7,
+};
+"""
+names1 = _extract_enum_constant_names(code1)
+assert "BM_ERROR" in names1, names1
+assert "RAW" in names1, names1
+assert "GZIP" in names1, names1
+assert "RANS" in names1, names1
+assert "RANS0" in names1, names1
+assert "FQZ" in names1, names1
+assert "enum" not in names1, names1
+
+# Typedef enum
+code2 = "typedef enum { A, B = 1, C } my_enum;"
+names2 = _extract_enum_constant_names(code2)
+assert names2 == ["A", "B", "C"], names2
+
+# Empty enum
+code3 = "enum empty {};"
+names3 = _extract_enum_constant_names(code3)
+assert names3 == [], names3
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum conflict detection: _prefix_enum_source
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.extra_patch_tools import _prefix_enum_source
+
+code = """\
+enum test {
+    FOO = 0,
+    BAR = 1,
+    BAZ = FOO,
+};
+"""
+names = ["FOO", "BAR", "BAZ"]
+result, rename_map = _prefix_enum_source(code, names, "__revert_enum_")
+assert rename_map == {"FOO": "__revert_enum_FOO", "BAR": "__revert_enum_BAR", "BAZ": "__revert_enum_BAZ"}, rename_map
+assert "__revert_enum_FOO" in result, result
+assert "__revert_enum_BAR" in result, result
+assert "__revert_enum_BAZ = __revert_enum_FOO" in result, result
+# Original names should not appear (except inside the prefix)
+for line in result.splitlines():
+    stripped = line.strip()
+    if not stripped or stripped.startswith("enum") or stripped.startswith("}"):
+        continue
+    # After removing all __revert_enum_ prefixed names, original names shouldn't remain
+    import re
+    cleaned = re.sub(r"__revert_enum_\w+", "", stripped)
+    for n in names:
+        assert n not in cleaned, f"{n!r} found in cleaned line: {stripped!r}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum conflict detection: _apply_rename_map_to_minus_lines
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.extra_patch_tools import _apply_rename_map_to_minus_lines
+
+rename_map = {"FOO": "__revert_enum_FOO", "BAR": "__revert_enum_BAR"}
+patch_text = (
+    "diff --git a/test.c b/test.c\n"
+    "--- a/test.c\n"
+    "+++ b/test.c\n"
+    "@@ -10,5 +10,0 @@\n"
+    "-  if (x == FOO) {\n"
+    "-    return BAR;\n"
+    " /* context line with FOO */\n"
+    "+added line with FOO\n"
+)
+result = _apply_rename_map_to_minus_lines(patch_text, rename_map)
+lines = result.splitlines()
+# '-' lines should be renamed
+assert "-  if (x == __revert_enum_FOO) {" in lines, lines
+assert "-    return __revert_enum_BAR;" in lines, lines
+# context and '+' lines should NOT be renamed
+assert " /* context line with FOO */" in lines, lines
+assert "+added line with FOO" in lines, lines
+
+# Empty rename map should return original
+assert _apply_rename_map_to_minus_lines(patch_text, {}) == patch_text
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum conflict detection: _check_v2_enum_conflict with mock KB
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from tools.extra_patch_tools import _check_v2_enum_conflict
+
+class MockKb:
+    def __init__(self, v2_nodes):
+        self._v2 = v2_nodes
+    def query_all(self, name):
+        return {"v2": self._v2.get(name, [])}
+
+# V2 has BM_ERROR and RAW as ENUM_CONSTANT_DECL, but not FQZ
+kb = MockKb({
+    "BM_ERROR": [{"kind": "ENUM_CONSTANT_DECL"}],
+    "RAW": [{"kind": "ENUM_CONSTANT_DECL"}],
+    "GZIP": [{"kind": "VAR_DECL"}],  # Different kind, should not conflict
+})
+
+conflicts = _check_v2_enum_conflict(kb, ["BM_ERROR", "RAW", "GZIP", "FQZ"])
+assert "BM_ERROR" in conflicts, conflicts
+assert "RAW" in conflicts, conflicts
+assert "GZIP" not in conflicts, conflicts
+assert "FQZ" not in conflicts, conflicts
+
+# No KB should return empty
+assert _check_v2_enum_conflict(None, ["FOO"]) == set()
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum conflict detection: _rename_enum_refs_in_bundle
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys, pickle, os, tempfile
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.types import PatchInfo
+from tools.extra_patch_tools import _rename_enum_refs_in_bundle
+
+main_patch_text = (
+    "diff --git a/cram_io.c b/cram_io.c\n"
+    "--- a/cram_io.c\n"
+    "+++ b/cram_io.c\n"
+    "@@ -100,5 +100,0 @@\n"
+    "-  if (method == GZIP) {\n"
+    "-    return RAW;\n"
+    " /* context */\n"
+)
+extra_patch_text = (
+    "diff --git a/cram_io.c b/cram_io.c\n"
+    "--- a/cram_io.c\n"
+    "+++ b/cram_io.c\n"
+    "@@ -1,1 +1,0 @@\n"
+    "-/* extra */\n"
+)
+
+class FakeBundle:
+    def __init__(self, patches):
+        self.patches = patches
+
+main_patch = PatchInfo(
+    file_path_old="cram_io.c", file_path_new="cram_io.c",
+    patch_text=main_patch_text, file_type="c",
+    old_start_line=100, old_end_line=105,
+    new_start_line=100, new_end_line=100,
+    patch_type=set(), old_signature="",
+    dependent_func=set(), hiden_func_dict={},
+)
+extra_patch = PatchInfo(
+    file_path_old="cram_io.c", file_path_new="cram_io.c",
+    patch_text=extra_patch_text, file_type="c",
+    old_start_line=1, old_end_line=2,
+    new_start_line=1, new_end_line=1,
+    patch_type=set(), old_signature="",
+    dependent_func=set(), hiden_func_dict={},
+)
+
+bundle = FakeBundle({
+    "tail-cram_io.c-f1_": main_patch,
+    "_extra_cram_io.c": extra_patch,
+})
+
+rename_map = {"GZIP": "__revert_enum_GZIP", "RAW": "__revert_enum_RAW"}
+overrides = _rename_enum_refs_in_bundle(bundle, "cram_io.c", rename_map)
+
+# Should produce exactly one override for the main (non-extra) hunk
+assert len(overrides) == 1, overrides
+assert overrides[0]["patch_key"] == "tail-cram_io.c-f1_", overrides
+modified = overrides[0]["patch_text"]
+assert "__revert_enum_GZIP" in modified, modified
+assert "__revert_enum_RAW" in modified, modified
+# Context line should be untouched
+assert " /* context */" in modified, modified
+
+# Extra hunk should be skipped
+assert not any(o["patch_key"].startswith("_extra_") for o in overrides), overrides
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum conflict detection: end-to-end make_extra_patch_override with conflicting enum
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json, os, pickle, sys, tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex
+from core.source_manager import SourceManager
+from migration_tools.types import PatchInfo
+from tools.extra_patch_tools import make_extra_patch_override
+from tools.symbol_tools import AgentTools
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    # Set up KB and sources
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+    v1_src = td / "v1_src"
+    v2_src = td / "v2_src"
+    v1_src.mkdir()
+    v2_src.mkdir()
+
+    # V1 enum code
+    v1_enum_code = (
+        "enum cram_block_method_int {\n"
+        "    BM_ERROR = -1,\n"
+        "    RAW     = 0,\n"
+        "    GZIP    = 1,\n"
+        "    FQZ     = 7,\n"
+        "};\n"
+    )
+    (v1_src / "cram_io.c").write_text(v1_enum_code + "\nint dummy(void) { return 0; }\n", encoding="utf-8")
+    (v2_src / "cram_io.c").write_text("/* v2 */\nint dummy(void) { return 0; }\n", encoding="utf-8")
+
+    # V1 KB: ENUM_DECL for cram_block_method_int
+    v1_node = {
+        "kind": "ENUM_DECL",
+        "spelling": "cram_block_method_int",
+        "usr": "c:@E@cram_block_method_int",
+        "location": {"file": "cram_io.c", "line": 1, "column": 1},
+        "extent": {"start": {"file": "cram_io.c", "line": 1, "column": 1},
+                    "end": {"file": "cram_io.c", "line": 6, "column": 2}},
+    }
+    (kb_v1 / "cram_io_analysis.json").write_text(json.dumps([v1_node]), encoding="utf-8")
+
+    # V2 KB: ENUM_CONSTANT_DECL nodes for conflicting names
+    v2_nodes = [
+        {"kind": "ENUM_CONSTANT_DECL", "spelling": "BM_ERROR",
+         "usr": "c:@E@cram_block_method@BM_ERROR",
+         "location": {"file": "cram_io.c", "line": 5, "column": 5},
+         "extent": {"start": {"file": "cram_io.c", "line": 5, "column": 5},
+                    "end": {"file": "cram_io.c", "line": 5, "column": 15}}},
+        {"kind": "ENUM_CONSTANT_DECL", "spelling": "RAW",
+         "usr": "c:@E@cram_block_method@RAW",
+         "location": {"file": "cram_io.c", "line": 6, "column": 5},
+         "extent": {"start": {"file": "cram_io.c", "line": 6, "column": 5},
+                    "end": {"file": "cram_io.c", "line": 6, "column": 8}}},
+    ]
+    (kb_v2 / "cram_io_analysis.json").write_text(json.dumps(v2_nodes), encoding="utf-8")
+
+    # Build the KB and SourceManager
+    kb_index = KbIndex(str(kb_v1), str(kb_v2))
+    sm = SourceManager(str(v1_src), str(v2_src))
+    agent_tools = AgentTools(kb_index=kb_index, source_manager=sm)
+
+    # Create bundle with a main hunk that references the enum values
+    main_patch_text = (
+        "diff --git a/cram_io.c b/cram_io.c\n"
+        "--- a/cram_io.c\n"
+        "+++ b/cram_io.c\n"
+        "@@ -10,3 +10,0 @@\n"
+        "-  if (method == GZIP) {\n"
+        "-    return FQZ;\n"
+        "-  }\n"
+    )
+    extra_patch_text = (
+        "diff --git a/cram_io.c b/cram_io.c\n"
+        "--- a/cram_io.c\n"
+        "+++ b/cram_io.c\n"
+        "@@ -2,1 +2,1 @@\n"
+        " int dummy(void) { return 0; }\n"
+    )
+
+    main_patch = PatchInfo(
+        file_path_old="cram_io.c", file_path_new="cram_io.c",
+        patch_text=main_patch_text, file_type="c",
+        old_start_line=10, old_end_line=13,
+        new_start_line=10, new_end_line=10,
+        patch_type=set(), old_signature="",
+        dependent_func=set(), hiden_func_dict={},
+    )
+    extra_patch = PatchInfo(
+        file_path_old="cram_io.c", file_path_new="cram_io.c",
+        patch_text=extra_patch_text, file_type="c",
+        old_start_line=2, old_end_line=2,
+        new_start_line=2, new_end_line=2,
+        patch_type={"Extra"}, old_signature="",
+        dependent_func=set(), hiden_func_dict={},
+    )
+
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({
+        "tail-cram_io.c-f1_": main_patch,
+        "_extra_cram_io.c": extra_patch,
+    }, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        agent_tools,
+        patch_path=str(bundle_path),
+        file_path="/src/htslib/cram_io.c",
+        symbol_name="cram_block_method_int",
+        version="v1",
+    )
+
+    # Check that the extra hunk has prefixed enum names
+    ref = out.get("patch_text")
+    assert isinstance(ref, dict) and ref.get("artifact_path"), f"Missing patch_text artifact: {out}"
+    p = Path(str(ref.get("artifact_path"))).resolve()
+    text = p.read_text(encoding="utf-8", errors="replace")
+    assert "__revert_enum_BM_ERROR" in text, f"Expected prefixed BM_ERROR in extra hunk:\n{text}"
+    assert "__revert_enum_RAW" in text, f"Expected prefixed RAW in extra hunk:\n{text}"
+    assert "__revert_enum_GZIP" in text, f"Expected prefixed GZIP in extra hunk:\n{text}"
+    assert "__revert_enum_FQZ" in text, f"Expected prefixed FQZ in extra hunk:\n{text}"
+
+    # Check that enum_rename_overrides are present
+    overrides = out.get("enum_rename_overrides") or []
+    assert len(overrides) >= 1, f"Expected at least one enum_rename_override: {out}"
+    # The override for the main hunk should reference GZIP/FQZ with prefixed names
+    ov = overrides[0]
+    assert ov.get("patch_key") == "tail-cram_io.c-f1_", ov
+    ov_ref = ov.get("patch_text")
+    assert isinstance(ov_ref, dict) and ov_ref.get("artifact_path"), ov
+    ov_text = Path(str(ov_ref["artifact_path"])).read_text(encoding="utf-8", errors="replace")
+    assert "__revert_enum_GZIP" in ov_text, f"Expected prefixed GZIP in main hunk override:\n{ov_text}"
+    assert "__revert_enum_FQZ" in ov_text, f"Expected prefixed FQZ in main hunk override:\n{ov_text}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# build_errors.py: redefinition of enumerator pattern
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.build_errors import parse_build_errors
+
+log = """\
+/src/htslib/cram/cram_io.c:42:5: error: redefinition of enumerator 'BM_ERROR'
+/src/htslib/cram/cram_io.c:43:5: error: redefinition of enumerator 'RAW'
+/src/htslib/cram/cram_io.c:80:10: error: duplicate case value
+"""
+result = parse_build_errors(log)
+redefs = result.get("redefinition_enumerators", [])
+assert len(redefs) == 2, redefs
+assert redefs[0]["name"] == "BM_ERROR", redefs
+assert redefs[1]["name"] == "RAW", redefs
+
+dupes = result.get("duplicate_case_values", [])
+assert len(dupes) == 1, dupes
+assert dupes[0]["line"] == 80, dupes
+
+print("OK")
+PY
+
 echo "OK"
