@@ -23,6 +23,7 @@ class PromptContext:
     func_sig_change: bool  # "too few/many arguments to function call"
     conflicting_types: bool  # "conflicting types for 'func'"
     static_nonstatic_decl: bool  # "static declaration follows non-static declaration"
+    visibility_warning: bool  # "declaration of 'struct X' will not be visible" [-Wvisibility]
 
 
 _FRAGMENT_CACHE: Dict[str, str] = {}
@@ -94,6 +95,7 @@ def _context_from_state(state: Any) -> PromptContext:
     # Only handle static/non-static declaration mismatch when there are NO undeclared symbol errors.
     # The undeclared function causes an implicit (non-static) declaration; fixing it resolves this error.
     static_nonstatic_decl = ("static declaration" in err_lower and "follows non-static" in err_lower) and not undeclared_symbol
+    visibility_warning = "will not be visible" in err_lower and "-wvisibility" in err_lower
     return PromptContext(
         error_scope=error_scope,
         snippet=snippet,
@@ -110,6 +112,7 @@ def _context_from_state(state: Any) -> PromptContext:
         func_sig_change=func_sig_change,
         conflicting_types=conflicting_types,
         static_nonstatic_decl=static_nonstatic_decl,
+        visibility_warning=visibility_warning,
     )
 
 
@@ -193,6 +196,11 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
         if conflicting_types:
             parts.append(conflicting_types)
 
+    if ctx.visibility_warning:
+        visibility = _load_fragment("system_visibility.txt")
+        if visibility:
+            parts.append(visibility)
+
     prompt = "\n\n".join(p for p in parts if str(p or "").strip()).strip()
 
     # Optional debugging: include the assembled prompt section names.
@@ -220,6 +228,8 @@ def build_system_prompt(state: Any, *, tool_specs: List[Dict[str, Any]]) -> str:
             names.append("system_func_sig_change.txt")
         if ctx.conflicting_types:
             names.append("system_conflicting_types.txt")
+        if ctx.visibility_warning:
+            names.append("system_visibility.txt")
         prompt = f"[prompt_sections={','.join(names)}]\n\n{prompt}".strip()
 
     return prompt + "\n"

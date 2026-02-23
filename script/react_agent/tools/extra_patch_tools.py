@@ -1759,6 +1759,7 @@ def make_extra_patch_override(
     add a forward declaration (or macro/type) into the file's `_extra_<file>` hunk so the agent doesn't
     inline declarations into the active function body.
     """
+    import sys
     from migration_tools.patch_bundle import load_patch_bundle  # type: ignore
 
     patch_path_s = str(patch_path or "").strip()
@@ -1888,13 +1889,68 @@ def make_extra_patch_override(
     insert_kind = ""
     enum_rename_overrides: List[Dict[str, Any]] = []
 
-    # 0) Forward tag declaration: symbol_name like "struct X" or "union Y" or "enum Z".
-    #    Just emit a forward declaration (e.g. "struct X;") — the full definition exists
-    #    later in the file, so we only need the tag visible for prototypes that precede it.
+    # Helper to extract full type definition from KB for enums/structs/unions
+    def _extract_type_definition_from_kb(type_name: str, ver: str) -> Tuple[List[str], str]:
+        """Extract full enum/struct/union definition from KB.
+        
+        Returns (lines, insert_kind) or ([], "") if not found.
+        """
+        if agent_tools is None:
+            sys.stderr.write(f"[_extract_type_definition_from_kb] agent_tools is None\n")
+            return [], ""
+        kb_index = getattr(agent_tools, "kb_index", None)
+        source_manager = getattr(agent_tools, "source_manager", None)
+        sys.stderr.write(f"[_extract_type_definition_from_kb] type_name={type_name}, ver={ver}, kb_index={kb_index is not None}, source_manager={source_manager is not None}\n")
+        if kb_index is None or source_manager is None:
+            return [], ""
+        
+        # Try to find ENUM_DECL, STRUCT_DECL, or UNION_DECL for this type
+        for query_name in [type_name, f"enum {type_name}", f"struct {type_name}", f"union {type_name}"]:
+            nodes = (kb_index.query_all(query_name) or {}).get(ver, [])
+            sys.stderr.write(f"[_extract_type_definition_from_kb] query_name={query_name}, found {len(nodes)} nodes\n")
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                node_kind = str(node.get("kind", "") or "").strip()
+                if node_kind not in ("ENUM_DECL", "STRUCT_DECL", "UNION_DECL"):
+                    # Check related definitions
+                    for cand in kb_index.related_definition_candidates(node, ver, max_depth=2) or []:
+                        if isinstance(cand, dict) and str(cand.get("kind", "")).strip() in ("ENUM_DECL", "STRUCT_DECL", "UNION_DECL"):
+                            code = str(source_manager.get_function_code(cand, ver) or "").strip()
+                            if code and "{" in code:
+                                lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+                                lines = [l.rstrip() for l in lines if l is not None]
+                                if lines:
+                                    return lines, f"{node_kind.lower()}_definition_from_kb:{ver}"
+                else:
+                    # Direct ENUM_DECL/STRUCT_DECL/UNION_DECL
+                    code = str(source_manager.get_function_code(node, ver) or "").strip()
+                    if code and "{" in code:
+                        lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+                        lines = [l.rstrip() for l in lines if l is not None]
+                        if lines:
+                            return lines, f"{node_kind.lower()}_definition_from_kb:{ver}"
+        return [], ""
+
+    # 0) Handle type definitions: symbol_name like "struct X" or "union Y" or "enum Z".
+    #    Try to extract the full type definition from KB instead of just a forward declaration.
     _tag_fwd_match = re.match(r"^(struct|union|enum)\s+(\w+)$", symbol)
     if _tag_fwd_match:
-        inserted_lines = [f"{_tag_fwd_match.group(1)} {_tag_fwd_match.group(2)};"]
-        insert_kind = "forward_tag_declaration"
+        type_kind = _tag_fwd_match.group(1)  # struct/union/enum
+        type_name = _tag_fwd_match.group(2)  # the type name
+        # Try to get full definition from KB first
+        for ver in [str(version or "v1").strip().lower(), "v2" if str(version or "v1").strip().lower() == "v1" else "v1"]:
+            type_lines, type_insert_kind = _extract_type_definition_from_kb(type_name, ver)
+            if type_lines:
+                inserted_lines = type_lines
+                insert_kind = type_insert_kind
+                sys.stderr.write(f"[make_extra_patch_override] Found full {type_kind} definition for {type_name} from {ver}\n")
+                break
+        if not inserted_lines:
+            # Fallback to forward declaration
+            sys.stderr.write(f"[make_extra_patch_override] KB lookup failed for {type_kind} {type_name}; falling back to forward declaration\n")
+            inserted_lines = [f"{type_kind} {type_name};"]
+            insert_kind = "forward_tag_declaration"
 
     kind, underlying = _symbol_underlying_name(symbol)
 
@@ -1908,6 +1964,7 @@ def make_extra_patch_override(
             insert_kind = "function_prototype_from_bundle"
 
     # 2) Fallback to KB/JSON: locate underlying symbol code and synthesize a declaration.
+    sys.stderr.write(f"[make_extra_patch_override] Step 2: inserted_lines={bool(inserted_lines)}, agent_tools={agent_tools is not None}\n")
     if not inserted_lines and agent_tools is not None:
         requested = str(version or "v1").strip().lower()
         if requested not in {"v1", "v2"}:
@@ -1916,6 +1973,7 @@ def make_extra_patch_override(
         query = underlying or symbol
         for ver in versions_to_try:
             chosen = _kb_pick_insertable_node(agent_tools, symbol=query, version=ver)
+            sys.stderr.write(f"[make_extra_patch_override] _kb_pick_insertable_node for query={query}, ver={ver} returned {chosen is not None}\n")
             if chosen is None:
                 continue
             chosen_kind = str(chosen.get("kind", "") or "").strip()
@@ -1971,6 +2029,32 @@ def make_extra_patch_override(
             inserted_lines = decl_lines
             insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
             break
+
+    # If KB lookup failed for a type name, try harder to extract full enum/struct/union definition
+    # This handles cases where the type is defined in a different file (e.g., header file)
+    sys.stderr.write(f"[make_extra_patch_override] Checking fallback for type extraction. inserted_lines={bool(inserted_lines)}, agent_tools={agent_tools is not None}\n")
+    if not inserted_lines and agent_tools is not None:
+        requested = str(version or "v1").strip().lower()
+        if requested not in {"v1", "v2"}:
+            requested = "v1"
+        sys.stderr.write(f"[make_extra_patch_override] Trying type extraction fallback for symbol={symbol}, underlying={underlying}, requested={requested}\n")
+        # Try both versions
+        for ver in [requested, ("v2" if requested == "v1" else "v1")]:
+            type_lines, type_kind = _extract_type_definition_from_kb(symbol, ver)
+            sys.stderr.write(f"[make_extra_patch_override] Tried {ver} for symbol={symbol}, got {len(type_lines)} lines\n")
+            if type_lines:
+                inserted_lines = type_lines
+                insert_kind = type_kind
+                break
+        # Also try with underlying name for revert functions that use enum/struct parameters
+        if not inserted_lines and underlying:
+            for ver in [requested, ("v2" if requested == "v1" else "v1")]:
+                type_lines, type_kind = _extract_type_definition_from_kb(underlying, ver)
+                sys.stderr.write(f"[make_extra_patch_override] Tried {ver} for underlying={underlying}, got {len(type_lines)} lines\n")
+                if type_lines:
+                    inserted_lines = type_lines
+                    insert_kind = type_kind
+                    break
 
     # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) that would cause
     # parse errors in V2 code.  Only the return-type area before the function

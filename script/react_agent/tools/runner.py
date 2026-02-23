@@ -478,24 +478,17 @@ class ToolRunner:
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 symbol_name = str(args.get("symbol_name", "")).strip()
-                version_raw = str(args.get("version", "v1")).strip() or "v1"
-                version = version_raw
                 if not patch_path:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
                 if not file_path:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
                 if not symbol_name:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: symbol_name")
-                # Some model outputs confuse "version" with an OSS-Fuzz commit hash. Be tolerant and coerce to v1;
-                # the tool will fall back across versions when it can't find a definition in the requested one.
-                if version not in {"v1", "v2"}:
-                    version = "v1"
                 out = make_extra_patch_override_tool(
                     self._agent_tools,
                     patch_path=patch_path,
                     file_path=file_path,
                     symbol_name=symbol_name,
-                    version=version,
                 )
                 return ToolObservation(
                     True,
@@ -504,8 +497,6 @@ class ToolRunner:
                         "patch_path": patch_path,
                         "file_path": file_path,
                         "symbol_name": symbol_name,
-                        "version": version,
-                        **({"version_raw": version_raw} if version_raw != version else {}),
                     },
                     output=out,
                 )

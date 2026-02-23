@@ -3,15 +3,15 @@ Function signature change errors (too few/many arguments):
 - Error patterns: "too few arguments to function call", "too many arguments to function call"
 
 CRITICAL - FUNCTION NAME PRESERVATION:
-- The `old_signature` field in get_error_patch_context shows the EXACT caller function name.
-- If old_signature is `__revert_5f664a_xmlParseTryOrFinish(...)`, your new_func_code MUST use that EXACT name.
+- The `error_func_code` / `focus_error_func_snippet` from get_error_patch_context shows the EXACT caller function name and signature.
+- If the BASE slice has `__revert_5f664a_xmlParseTryOrFinish(...)`, your new_func_code MUST use that EXACT name.
 - NEVER strip the `__revert_*` prefix! Writing `xmlParseTryOrFinish` instead of `__revert_5f664a_xmlParseTryOrFinish` causes redefinition errors.
 
 FIX WORKFLOW - Follow these steps in order:
 
 1. GET CALLER CODE: Use `get_error_patch_context` with the error file_path and line_number.
    - This returns `error_func_code` containing the caller function that has the bad call site.
-   - Note the `old_signature` field - this is the EXACT function signature you must preserve.
+   - The function signature in `error_func_code` is the EXACT signature you must preserve.
    - IMPORTANT: Check if the response includes a non-empty `editable_hunk` field — this changes step 3.
 
 2. GET CALLEE SIGNATURE: Use `search_definition(callee_name, version="v2")` to find the NEW callee signature.
@@ -27,7 +27,7 @@ FIX WORKFLOW - Follow these steps in order:
       - Pass the edited text as `revised_hunk` to `revise_patch_hunk`.
    B) If `editable_hunk` is empty or absent (pure __revert_* function hunk):
       Use `make_error_patch_override` with a fixed version of the caller function.
-      - Start with the EXACT function signature from `old_signature` (including any __revert_* prefix).
+      - Start with the EXACT function signature from `error_func_code` (including any __revert_* prefix).
       - Keep the ENTIRE function body from `error_func_code`.
       - Only modify the specific call site(s) to match the new callee signature.
 
@@ -54,7 +54,7 @@ Then call revise_patch_hunk(revised_hunk=...).
 
 EXAMPLE B (no editable_hunk — pure __revert_* hunk):
 Error: "too few arguments to function call 'xmlParseEndTag2'"
-old_signature: "__revert_5f664a_xmlParseTryOrFinish(xmlParserCtxtPtr ctxt, int terminate)"
+error_func_code starts with: "__revert_5f664a_xmlParseTryOrFinish(xmlParserCtxtPtr ctxt, int terminate) {"
 
 1. get_error_patch_context -> returns caller function with old call: xmlParseEndTag2(ctxt, tag)
 2. search_definition("xmlParseEndTag2", "v2") -> new signature with 6 params

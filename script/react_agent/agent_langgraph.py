@@ -3324,7 +3324,7 @@ def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) 
         "type": "tool",
         "thought": f"Macro guardrail: add the real definition for {token} via the file's _extra_* hunk (do not invent #define values in the function body).",
         "tool": "make_extra_patch_override",
-        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": token, "version": "v1"},
+        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": token},
     }
 
 
@@ -3403,7 +3403,6 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
             "patch_path": state.patch_path,
             "file_path": file_path,
             "symbol_name": undeclared,
-            "version": "v1",
         },
     }
 
@@ -3510,7 +3509,6 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
                 "patch_path": state.patch_path,
                 "file_path": file_path,
                 "symbol_name": sym,
-                "version": "v1",
             },
         }
 
@@ -3553,61 +3551,9 @@ def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decisi
             "(deterministic extra patch strategy)."
         ),
         "tool": "make_extra_patch_override",
-        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": sym, "version": "v1"},
+        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": sym},
     }
 
-
-def _visibility_decl_extra_patch_guardrail(state: AgentState, decision: Decision) -> Optional[Decision]:
-    """Handle -Wvisibility warnings by inserting a forward struct/union/enum declaration via `_extra_*`.
-
-    When a function declaration uses `struct X` in a parameter before `struct X` is defined,
-    the compiler emits: "declaration of 'struct X' will not be visible outside of this function".
-    Fix by adding `struct X;` as a forward declaration.
-    """
-    if state.error_scope != "patch" or not state.patch_path:
-        return None
-    if str(decision.get("type", "")).strip() != "tool":
-        return None
-    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
-        return None
-    if _next_patch_prereq_tool(state) is not None:
-        return None
-
-    # Scan error context for visibility warnings
-    candidates: List[str] = []
-    for e in state.grouped_errors or []:
-        if isinstance(e, dict):
-            raw = str(e.get("raw", "") or "").strip()
-            if raw:
-                candidates.append(raw)
-    if str(state.error_line or "").strip():
-        candidates.append(str(state.error_line))
-
-    tag = ""
-    for text in candidates:
-        m = _VISIBILITY_DECL_RE.search(text)
-        if m:
-            tag = str(m.group("tag") or "").strip()
-            if tag:
-                break
-    if not tag:
-        return None
-    if _has_make_extra_patch_override_for_symbol(state, tag):
-        return None
-
-    file_path, _ = _first_error_location(state)
-    if not file_path:
-        return None
-
-    return {
-        "type": "tool",
-        "thought": (
-            f"Visibility warning: '{tag}' used in a function declaration before it is defined. "
-            f"Adding forward declaration '{tag};' via the file's _extra_* hunk."
-        ),
-        "tool": "make_extra_patch_override",
-        "args": {"patch_path": state.patch_path, "file_path": file_path, "symbol_name": tag, "version": "v1"},
-    }
 
 
 def _macro_lookup_pick_token(state: AgentState) -> str:
@@ -3681,6 +3627,11 @@ def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
     if isinstance(observation, dict):
         tool_name = str(observation.get("tool", "") or "").strip()
 
+    # Keys to strip from tool observations to avoid confusing the LLM.
+    # old_signature shows the original (non-__revert_*) function name; the LLM should
+    # rely on the actual function name in the BASE slice / error_func_code instead.
+    _STRIP_KEYS = {"old_signature", "new_signature"}
+
     def compact(value: Any, *, depth: int = 0, key_path: tuple[str, ...] = ()) -> Any:
         if depth > 4:
             return "[truncated]"
@@ -3693,6 +3644,8 @@ def _compact_observation_for_prompt(state: AgentState, observation: Any) -> Any:
         if isinstance(value, dict):
             out: Dict[str, Any] = {}
             for i, (k, v) in enumerate(value.items()):
+                if str(k) in _STRIP_KEYS:
+                    continue
                 if i >= 60:
                     out["...[truncated_keys]"] = f"{len(value) - i} more keys"
                     break
@@ -4555,7 +4508,7 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
 
         active_json: Dict[str, Any] = {}
         if isinstance(active, dict):
-            for k in ("raw", "file", "line", "col", "level", "msg", "patch_key", "old_signature", "func_start_index", "func_end_index"):
+            for k in ("raw", "file", "line", "col", "level", "msg", "patch_key", "func_start_index", "func_end_index"):
                 if k == "raw":
                     active_json[k] = raw_line
                     continue
@@ -4602,8 +4555,8 @@ def _build_messages(state: AgentState) -> List[Dict[str, str]]:
         )
     if state.artifacts_dir:
         header_lines.append(f"Artifacts dir: {state.artifacts_dir}")
-    if state.error_scope == "patch" and str(getattr(state, "active_old_signature", "") or "").strip():
-        header_lines.append(f"Active function (old_signature): {str(state.active_old_signature).strip()}")
+    # NOTE: old_signature intentionally omitted from user-facing messages — it shows the
+    # original (non-__revert_*) function name and confuses the LLM into using the wrong name.
     if state.ossfuzz_project and state.ossfuzz_commit:
         header_lines.append("OSS-Fuzz test config:")
         header_lines.append(f"  project: {state.ossfuzz_project}")
@@ -4765,11 +4718,44 @@ def _run_langgraph(
                         "patch_path": st.patch_path,
                         "file_path": file_for_override,
                         "symbol_name": sym,
-                        "version": "v1",
                     },
                 }
                 _validate_tool_decision(forced_extra)
                 return {"state": st, "pending": forced_extra}
+
+            # Also fix any -Wvisibility warnings (forward struct/union/enum declarations).
+            if not unfixed:
+                for e in st.grouped_errors or []:
+                    if not isinstance(e, dict):
+                        continue
+                    raw = str(e.get("raw", "") or "").strip()
+                    if not raw:
+                        continue
+                    m = _VISIBILITY_DECL_RE.search(raw)
+                    if not m:
+                        continue
+                    tag = str(m.group("tag") or "").strip()
+                    if not tag:
+                        continue
+                    if _has_make_extra_patch_override_for_symbol(st, tag):
+                        continue
+                    fp = str(e.get("file", "") or "").strip()
+                    file_for_override_vis = Path(fp).name if fp else ""
+                    forced_vis: Decision = {
+                        "type": "tool",
+                        "thought": (
+                            f"Visibility warning in grouped errors: '{tag}' used before defined. "
+                            f"Adding forward declaration '{tag};' via _extra_* hunk before building."
+                        ),
+                        "tool": "make_extra_patch_override",
+                        "args": {
+                            "patch_path": st.patch_path,
+                            "file_path": file_for_override_vis,
+                            "symbol_name": tag,
+                        },
+                    }
+                    _validate_tool_decision(forced_vis)
+                    return {"state": st, "pending": forced_vis}
 
             decision = {
                 "type": "tool",
@@ -4953,7 +4939,7 @@ def _run_langgraph(
                         "type": "tool",
                         "thought": f"Macro preflight: add the real definition for {token} via the file's _extra_* hunk (do not invent #define values).",
                         "tool": "make_extra_patch_override",
-                        "args": {"patch_path": st.patch_path, "file_path": file_path, "symbol_name": token, "version": "v1"},
+                        "args": {"patch_path": st.patch_path, "file_path": file_path, "symbol_name": token},
                     }
                     _validate_tool_decision(forced)
                     return {"state": st, "pending": forced}
@@ -5186,7 +5172,6 @@ def _run_langgraph(
                                 "patch_path": st.patch_path,
                                 "file_path": file_path,
                                 "symbol_name": undeclared_symbol,
-                                "version": "v1",
                             },
                         }
                         _validate_tool_decision(forced_extra)
@@ -5421,10 +5406,9 @@ def _run_langgraph(
                         messages,
                         decision,
                         (
-                            "In function-by-function mode (Active function (old_signature) is set), "
+                            "In function-by-function mode, "
                             "make_error_patch_override.new_func_code must rewrite ONLY the mapped slice "
                             "for the active function from this round.\n"
-                            f"active_old_signature: {str(getattr(st, 'active_old_signature', '') or '').strip()}\n"
                             f"{func_scope_err}\n\n"
                             "Fix: start from the BASE slice (read_artifact output) and apply minimal edits to ONLY that active slice. "
                             "Do NOT include other functions or unified-diff headers.\n"
@@ -5666,12 +5650,6 @@ def _run_langgraph(
             _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_missing_proto)
             _validate_tool_decision(forced_missing_proto)
             return {"state": st, "pending": forced_missing_proto}
-
-        forced_visibility = _visibility_decl_extra_patch_guardrail(st, decision)
-        if forced_visibility:
-            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_visibility)
-            _validate_tool_decision(forced_visibility)
-            return {"state": st, "pending": forced_visibility}
 
         forced_undeclared = _undeclared_symbol_extra_patch_guardrail_for_override(st, decision)
         if forced_undeclared:

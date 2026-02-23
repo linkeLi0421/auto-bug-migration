@@ -2910,8 +2910,10 @@ def apply_and_test_patches(
             f.write(error_log)
 
         # Call react multi-agent to fix build errors
-        v1_json_dir = os.path.join(data_path, f"{target}-{commit['commit_id']}")
-        v2_json_dir = os.path.join(data_path, f"{target}-{next_commit['commit_id']}")
+        _v1_sha = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+        _v2_sha = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
+        v1_json_dir = os.path.join(data_path, f"{target}-{_v1_sha}")
+        v2_json_dir = os.path.join(data_path, f"{target}-{_v2_sha}")
 
         # Prepare separate V1/V2 source trees checked out to correct commits
         v1_src_path, v2_src_path = prepare_v1_v2_repos(
