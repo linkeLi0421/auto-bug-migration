@@ -332,13 +332,36 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
 def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_path, func_sig):
     """Get patch insert line number from new commit for the Artificial patch"""
     if not func_sig:
-        # return the last line of that file
+        # Try to insert after the last function definition in V2
+        parsing_path = os.path.join(
+            data_path,
+            f"{target_repo_path.split('/')[-1]}-{next_commit}",
+            f"{file_path}_analysis.json",
+        )
+        last_func_end = -1
+        try:
+            with open(parsing_path, 'r') as f:
+                ast_nodes = json.load(f)
+            for ast_node in ast_nodes:
+                if ast_node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
+                    continue
+                if ast_node['extent']['start']['file'] == file_path:
+                    end_line = ast_node['extent']['end']['line']
+                    if end_line > last_func_end:
+                        last_func_end = end_line
+        except (FileNotFoundError, json.JSONDecodeError, KeyError):
+            pass
+
+        if last_func_end > 0:
+            return last_func_end + 1
+
+        # Fallback: end of file (no AST or no functions found)
         os.chdir(target_repo_path)
         subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(os.path.join(target_repo_path, file_path), 'r') as fsrc:
             file_content = fsrc.readlines()
-            return len(file_content)+1
+            return len(file_content) + 1
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
     short_next_commit = next_commit[:8] if len(next_commit) > 8 else next_commit
     parsing_path = os.path.join(
@@ -2980,10 +3003,12 @@ def apply_and_test_patches(
             py3, f'{current_file_path}/fuzz_helper.py', 'reproduce', target, fuzzer, testcase_path, '-e', 'ASAN_OPTIONS=detect_leaks=0'
         ]
         logger.info(f"Running reproduce command: {' '.join(reproduce_cmd)}")
-        test_result = subprocess.run(reproduce_cmd, capture_output=True, text=True)
-        if 'sanitizer' in test_result.stderr.lower()+test_result.stdout.lower() and sanitizer in test_result.stderr.lower()+test_result.stdout.lower():
+        test_result = subprocess.run(reproduce_cmd, capture_output=True)
+        test_stdout = (test_result.stdout or b'').decode('utf-8', errors='replace')
+        test_stderr = (test_result.stderr or b'').decode('utf-8', errors='replace')
+        if 'sanitizer' in test_stderr.lower()+test_stdout.lower() and sanitizer in test_stderr.lower()+test_stdout.lower():
             # trigger the bug
-            combined_output = (test_result.stderr or '') + (test_result.stdout or '')
+            combined_output = test_stderr + test_stdout
             if not crashes_match(combined_output, baseline_crash_path, signature_file):
                 logger.info(
                     "Crash for bug %s on commit %s does not match baseline stack; skipping.",
