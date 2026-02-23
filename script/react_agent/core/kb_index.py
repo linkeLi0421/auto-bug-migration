@@ -161,7 +161,32 @@ class KbIndex:
         self._load_dir(Path(v1_root_dir), "v1")
         self._load_dir(Path(v2_root_dir), "v2")
 
+    @staticmethod
+    def _resolve_dir(root: Path) -> Path:
+        """Resolve a KB directory, falling back to glob-based prefix matching.
+
+        The caller may pass a full commit hash (e.g. ``project-9e1ffd856614fcfc...``)
+        while the actual directory uses a truncated hash (``project-9e1ffd85``).
+        """
+        if root.is_dir():
+            return root
+        # Try prefix glob in the parent directory.
+        parent = root.parent
+        name = root.name
+        if parent.is_dir() and name:
+            # Try progressively shorter prefixes (min 8 chars) to find a matching dir.
+            for length in (len(name), max(len(name) // 2, 8), 8):
+                prefix = name[:length]
+                candidates = sorted(parent.glob(f"{prefix}*"))
+                dirs = [c for c in candidates if c.is_dir()]
+                if len(dirs) == 1:
+                    return dirs[0]
+        return root
+
     def _load_dir(self, root: Path, version: str) -> None:
+        root = self._resolve_dir(root)
+        if not root.is_dir():
+            return
         for json_path in sorted(root.rglob("*_analysis.json")):
             try:
                 with json_path.open(encoding="utf-8", errors="replace") as f:

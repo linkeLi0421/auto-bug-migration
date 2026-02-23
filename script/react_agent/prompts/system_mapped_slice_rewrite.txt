@@ -8,7 +8,7 @@ CHOOSING THE RIGHT TOOL:
 
 CRITICAL - FUNCTION SIGNATURE PRESERVATION (make_error_patch_override only):
 - NEVER change the function signature (return type, function name, or parameters).
-- The `old_signature` field shows the EXACT function signature you must use.
+- The `error_func_code` / `focus_error_func_snippet` from get_error_patch_context shows the EXACT function signature you must use.
 - If the BASE slice has `void __revert_5f664a_xmlRegisterCharEncodingHandler(...)`, your new_func_code MUST use:
   - SAME return type: `void` (not `int`, not anything else)
   - SAME function name: `__revert_5f664a_xmlRegisterCharEncodingHandler` (not stripped prefix)

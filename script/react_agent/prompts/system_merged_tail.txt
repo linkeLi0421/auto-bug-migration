@@ -1,2 +1,2 @@
 Merged/tail hunks (function-by-function):
-- If the header shows `Active function (old_signature): ...`, fix ONLY that function in this round.
+- Fix ONLY the active function (shown in error_func_code / focus_error_func_snippet) in this round.

@@ -175,7 +175,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
     },
     {
         "name": "make_extra_patch_override",
-        "args": {"patch_path": "string", "file_path": "string", "symbol_name": "string", "version": "v1|v2?"},
+        "args": {"patch_path": "string", "file_path": "string", "symbol_name": "string"},
         "description": (
             "Deterministically extend a file's `_extra_*` hunk to provide a missing declaration/define/typedef. "
             "Use for undeclared function/type/macro issues (including warning-level diagnostics like 'call to undeclared function ...'). "
