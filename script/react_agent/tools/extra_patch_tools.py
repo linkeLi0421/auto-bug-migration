@@ -808,6 +808,29 @@ def _strip_attribute_macros_from_prototype(lines: List[str], *, func_name: str) 
     return [l.rstrip() for l in result.splitlines() if l.strip()]
 
 
+def _strip_c_comments_from_line(line: str) -> str:
+    """Remove C-style /* */ and // comments from a single line.
+    
+    This is a best-effort sanitization for prototype extraction;
+    it handles simple cases but not nested comments or preprocessor directives.
+    """
+    text = str(line or "")
+    # Remove // comments first (everything after // to end of line)
+    if "//" in text:
+        text = text.split("//", 1)[0]
+    # Remove /* */ comments
+    while "/*" in text and "*/" in text:
+        start = text.find("/*")
+        end = text.find("*/", start + 2)
+        if end == -1:
+            break
+        text = text[:start] + text[end + 2:]
+    # If there's an unclosed /*, remove everything from /* onwards
+    if "/*" in text:
+        text = text[:text.find("/*")]
+    return text
+
+
 def _extract_c_declaration_from_function_code(code: str) -> List[str]:
     """Best-effort extraction of a function declaration/prototype from a C function body."""
     text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
@@ -827,6 +850,12 @@ def _extract_c_declaration_from_function_code(code: str) -> List[str]:
     head = joined.split("{", 1)[0].rstrip()
     if not head.endswith(")"):
         head = head.rstrip()
+    
+    # Strip C comments from the extracted prototype to avoid malformed
+    # declarations like "void foo() /*;" which would comment out subsequent code.
+    head = _strip_c_comments_from_line(head)
+    head = head.rstrip()
+    
     head_lines = head.splitlines()
     if not head_lines:
         return []
