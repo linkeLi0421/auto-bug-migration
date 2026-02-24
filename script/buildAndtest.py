@@ -28,6 +28,29 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 
 
+def _tail_text(text: str, max_lines: int = 80, max_chars: int = 12000) -> str:
+    """Return a bounded tail of command output for readable logs."""
+    if not text:
+        return ''
+
+    lines = text.splitlines()
+    truncated_lines = False
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        truncated_lines = True
+
+    joined = '\n'.join(lines)
+    truncated_chars = False
+    if len(joined) > max_chars:
+        joined = joined[-max_chars:]
+        truncated_chars = True
+
+    prefix = ''
+    if truncated_lines or truncated_chars:
+        prefix = '[output truncated to tail]\n'
+    return prefix + joined
+
+
 def get_folder_names(directory):
     folder_names = []
     for item in os.listdir(directory):
@@ -179,51 +202,51 @@ def get_ossfuzz_commit_before_year(oss_fuzz_path: str, year: int) -> str:
 def get_base_builder_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-builder image digest for a given commit timestamp.
-    Returns the latest image published within ~6 months after the commit date,
-    so that the builder is recent enough to compile the code at that commit.
-    Falls back to the latest available image if none is found within the window.
+    Prefer the closest image at or after the commit date (same-era toolchain),
+    and fall back to the latest image before the commit date when needed.
     """
     commit_date = datetime.fromtimestamp(commit_timestamp).date()
-    target_date = commit_date + timedelta(days=180)
+    latest_past = None
+    nearest_future = None
 
-    best_image = None
     for date_str, digest, _ in BASE_BUILDER_IMAGES:
         image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        if image_date <= target_date:
-            best_image = digest
-        else:
-            break
+        if image_date <= commit_date:
+            latest_past = digest
+            continue
+        nearest_future = digest
+        break
 
-    # If no image found within window, use the latest available
-    if best_image is None:
-        best_image = BASE_BUILDER_IMAGES[0][1]
-
-    return best_image
+    if nearest_future:
+        return nearest_future
+    if latest_past:
+        return latest_past
+    return BASE_BUILDER_IMAGES[0][1]
 
 
 def get_base_runner_for_date(commit_timestamp: int) -> str:
     """
     Get the appropriate base-runner image digest for a given commit timestamp.
-    Returns the latest image published within ~6 months after the commit date,
-    so that the runner is recent enough for binaries built at that commit.
-    Falls back to the latest available image if none is found within the window.
+    Prefer the closest image at or after the commit date (same-era runtime),
+    and fall back to the latest image before the commit date when needed.
     """
     commit_date = datetime.fromtimestamp(commit_timestamp).date()
-    target_date = commit_date + timedelta(days=180)
+    latest_past = None
+    nearest_future = None
 
-    best_image = None
     for date_str, digest, _ in BASE_RUNNER_IMAGES:
         image_date = datetime.strptime(date_str, '%Y-%m-%d').date()
-        if image_date <= target_date:
-            best_image = digest
-        else:
-            break
+        if image_date <= commit_date:
+            latest_past = digest
+            continue
+        nearest_future = digest
+        break
 
-    # If no image found within window, use the latest available
-    if best_image is None:
-        best_image = BASE_RUNNER_IMAGES[0][1]
-
-    return best_image
+    if nearest_future:
+        return nearest_future
+    if latest_past:
+        return latest_past
+    return BASE_RUNNER_IMAGES[0][1]
 
 
 def git_first_last_commit(target_bug_ids, bug_infos):
@@ -334,13 +357,17 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
 
 
 def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer,
-                  fixed_builder=None, fixed_runner=None, fixed_ossfuzz_commit=None):
+                  fixed_builder=None, fixed_runner=None, fixed_ossfuzz_commit=None,
+                  max_retry_months=7, retry_month_step=1):
     '''
     Run helper.py build_image and build_fuzzers
     '''
     if fixed_ossfuzz_commit:
         oss_fuzz_commit = fixed_ossfuzz_commit
     else:
+        if month > max_retry_months:
+            logger.info(f"Reached retry month limit ({max_retry_months}) for {target}-{commit_id}; stop trying newer oss-fuzz commits.")
+            return f"Reached retry month limit ({max_retry_months})"
         oss_fuzz_commit = find_matching_commit(target_path, oss_fuzz_path, commit_id, month)
     if not oss_fuzz_commit:
         # commit timestamp add month is newer than Head in oss-fuzz, so we can't find a version of oss-fuzz to build
@@ -357,6 +384,18 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
 
     # Remove --depth 1 from Dockerfile to ensure full git history
     target_dockerfile_path = f'{oss_fuzz_path}/projects/{target}/Dockerfile'
+    if not os.path.exists(target_dockerfile_path):
+        logger.error(f"Target Dockerfile not found: {target_dockerfile_path}")
+        if fixed_ossfuzz_commit:
+            return "Target Dockerfile missing in fixed oss-fuzz commit."
+        return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id,
+                            month + retry_month_step, build_writer,
+                            fixed_builder=fixed_builder,
+                            fixed_runner=fixed_runner,
+                            fixed_ossfuzz_commit=fixed_ossfuzz_commit,
+                            max_retry_months=max_retry_months,
+                            retry_month_step=retry_month_step)
+
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
     updated_content = dockerfile_content.replace('--depth 1', '')
@@ -423,7 +462,15 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 "failed with exit status"
             ]) or result.returncode != 0:
                 logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
-                # return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month+6, build_writer)
+                if fixed_ossfuzz_commit:
+                    return "Build failed with fixed oss-fuzz commit, no retry."
+                return do_bug_build(target_path, target_bug_ids, bug_infos, commit_id,
+                                    month + retry_month_step, build_writer,
+                                    fixed_builder=fixed_builder,
+                                    fixed_runner=fixed_runner,
+                                    fixed_ossfuzz_commit=fixed_ossfuzz_commit,
+                                    max_retry_months=max_retry_months,
+                                    retry_month_step=retry_month_step)
             else:
                 # build finish here
                 logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
@@ -804,9 +851,21 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["build", "test", "both"], default="both",
                        help="Specify the operation mode: 'build' for building only, 'test' for testing only, or 'both' for both operations")
     parser.add_argument("--fuzzer", help = "Harness to test")
+    parser.add_argument("--commit-step", type=int, default=1,
+                       help="Sample commits by stride. Example: --commit-step 10 tests every 10th commit.")
+    parser.add_argument("--max-retry-months", type=int, default=7,
+                       help="Maximum month offset to try for newer oss-fuzz commits after build failures.")
+    parser.add_argument("--retry-month-step", type=int, default=1,
+                       help="Month increment per retry when selecting newer oss-fuzz commits.")
     parser.add_argument("--fixed-image", type=int, metavar="YEAR", default=None,
                        help="Use fixed Docker images: latest base-builder/base-runner before YEAR (e.g., 2023)")
     args = parser.parse_args()
+    if args.commit_step <= 0:
+        parser.error("--commit-step must be >= 1")
+    if args.max_retry_months <= 0:
+        parser.error("--max-retry-months must be >= 1")
+    if args.retry_month_step <= 0:
+        parser.error("--retry-month-step must be >= 1")
     target = args.target
 
     current_file_path = os.path.dirname(os.path.abspath(__file__))
@@ -867,6 +926,13 @@ if __name__ == "__main__":
         sys.exit(1)
     logger.info(f'Collected {len(commits)} commits between introduced/fixed windows.')
     logger.info(f'Range preview: {commits[0]} -> {commits[-1]}')
+    if args.commit_step > 1:
+        sampled_commits = commits[::args.commit_step]
+        if commits[-1] not in sampled_commits:
+            sampled_commits.append(commits[-1])
+        logger.info(f'Sampling commits with step={args.commit_step}: {len(commits)} -> {len(sampled_commits)} commits.')
+        commits = sampled_commits
+        logger.info(f'Sampled range preview: {commits[0]} -> {commits[-1]}')
 
     if args.mode in ["build", "both"]:
         # Save build information to CSV
@@ -880,7 +946,9 @@ if __name__ == "__main__":
             for commit in commits:  # from latest to old
                 do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer,
                              fixed_builder=fixed_builder, fixed_runner=fixed_runner,
-                             fixed_ossfuzz_commit=fixed_ossfuzz_commit)
+                             fixed_ossfuzz_commit=fixed_ossfuzz_commit,
+                             max_retry_months=args.max_retry_months,
+                             retry_month_step=args.retry_month_step)
         
     
     if args.mode in ["test", "both"]:
