@@ -93,6 +93,11 @@ class SourceManager:
                     rel = ""
                 elif rel_norm.startswith(prefix):
                     rel = rel_norm[len(prefix) :]
+                # OSS-Fuzz convention: repo may have -src suffix (e.g., php-src, matio-src)
+                elif rel_norm.startswith(f"{repo_name}-src/"):
+                    rel = rel_norm[len(f"{repo_name}-src/") :]
+                elif rel_norm == f"{repo_name}-src":
+                    rel = ""
             return repo_root if not rel else (repo_root / rel)
         if json_path.lstrip().startswith("#include") or "#include" in json_path:
             after = json_path.split("#include", 1)[-1].strip()
