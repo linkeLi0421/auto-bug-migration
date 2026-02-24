@@ -321,25 +321,40 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
             found_any = True
 
         # Also collect the latest nested override for each `_extra_*` directory under this hunk.
+        # Some runs store overrides at:
+        #   <artifacts_dir>/<patch_key>/_extra_<file>/override_*.diff
+        # so we scan both direct children and one nested level.
         try:
+            roots: List[Path] = [artifacts_dir]
             for child in artifacts_dir.iterdir():
-                if not child.is_dir():
-                    continue
-                name = child.name
-                if not str(name).startswith("_extra_"):
-                    continue
-                latest_extra = _latest_override_diff(child)
-                if latest_extra is None:
-                    continue
-                candidates.append(
-                    {
-                        "patch_key": name,
-                        "override_diff": str(latest_extra.resolve()),
-                        "method": "glob_latest_nested_override",
-                        "origin_patch_key": patch_key,
-                    }
-                )
-                found_any = True
+                if child.is_dir():
+                    roots.append(child)
+
+            seen_extra_dirs: set[str] = set()
+            for root in roots:
+                for child in root.iterdir():
+                    if not child.is_dir():
+                        continue
+                    name = str(child.name or "").strip()
+                    if not name.startswith("_extra_"):
+                        continue
+                    key = str(child.resolve())
+                    if key in seen_extra_dirs:
+                        continue
+                    seen_extra_dirs.add(key)
+
+                    latest_extra = _latest_override_diff(child)
+                    if latest_extra is None:
+                        continue
+                    candidates.append(
+                        {
+                            "patch_key": name,
+                            "override_diff": str(latest_extra.resolve()),
+                            "method": "glob_latest_nested_override",
+                            "origin_patch_key": patch_key,
+                        }
+                    )
+                    found_any = True
         except Exception:
             pass
 
@@ -383,6 +398,36 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
         except Exception:
             return (0.0, 0, str(path))
 
+    def _path_contains_dir(path: str, dirname: str) -> bool:
+        want = str(dirname or "").strip()
+        if not want:
+            return False
+        try:
+            p = Path(path).expanduser().resolve()
+        except Exception:
+            p = Path(str(path))
+        for parent in [p.parent, *p.parents]:
+            if str(parent.name or "").strip() == want:
+                return True
+        return False
+
+    def _extra_origin_rank(path: str, *, extra_key: str, method: str) -> Tuple[int, int, float, int, str]:
+        """Ranking for `_extra_*` override candidates for one origin hunk.
+
+        Prefer paths physically scoped under the `_extra_*` directory so downstream
+        patch-key inference cannot mis-map them to the origin patch key.
+        """
+        scoped = 1 if _path_contains_dir(path, extra_key) else 0
+        m = str(method or "").strip()
+        if "nested_override" in m:
+            method_pri = 2
+        elif "steps:make_extra_patch_override" in m:
+            method_pri = 1
+        else:
+            method_pri = 0
+        mt, ver, rp = score(path)
+        return (scoped, method_pri, mt, ver, rp)
+
     for c in candidates:
         key = str(c.get("patch_key", "") or "").strip()
         path = str(c.get("override_diff", "") or "").strip()
@@ -395,7 +440,11 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
         if key.startswith("_extra_") and origin:
             extra_key = (key, origin)
             existing = by_extra_origin.get(extra_key)
-            if existing is None or score(rp) > score(str(existing.get("override_diff", "") or "")):
+            existing_path = str(existing.get("override_diff", "") or "") if isinstance(existing, dict) else ""
+            existing_method = str(existing.get("method", "") or "") if isinstance(existing, dict) else ""
+            cand_rank = _extra_origin_rank(rp, extra_key=key, method=method)
+            existing_rank = _extra_origin_rank(existing_path, extra_key=key, method=existing_method)
+            if existing is None or cand_rank > existing_rank:
                 by_extra_origin[extra_key] = {"patch_key": key, "override_diff": rp, "method": method, "origin_patch_key": origin}
             continue
 
