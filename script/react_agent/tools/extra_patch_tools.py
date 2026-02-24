@@ -104,6 +104,66 @@ _PP_ENDIF_RE = re.compile(r"^#\s*endif\b")
 _FUNC_DEF_KINDS = {"FUNCTION_DEFI", "CXX_METHOD", "FUNCTION_TEMPLATE"}
 
 
+def _find_include_guard_endif(lines: List[str]) -> int:
+    """Return the 0-based index of the closing ``#endif`` of an include guard, or -1.
+
+    An include guard is detected when the file starts with ``#ifndef`` / ``#define``
+    (possibly preceded by comments/blank lines) and ends with a matching ``#endif``
+    that brings the preprocessor nesting back to zero.  We return the index of that
+    final ``#endif`` so callers can clamp insertions to stay inside the guard.
+    """
+    if not lines:
+        return -1
+
+    # 1. Check if the file opens with an include guard pattern.
+    #    Skip leading blank lines, single-line comments, and multi-line /* ... */ blocks.
+    guard_open_idx = -1
+    in_block_comment = False
+    for i, raw in enumerate(lines):
+        stripped = str(raw or "").lstrip().lstrip("\ufeff")
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
+            continue
+        if re.match(r"^#\s*ifndef\b", stripped):
+            guard_open_idx = i
+        break  # first meaningful line must be #ifndef
+
+    if guard_open_idx < 0:
+        # Also accept #pragma once -- but there is no closing #endif to clamp to.
+        return -1
+
+    # 2. Walk the file tracking preprocessor nesting; record the last #endif that
+    #    brings nesting back to zero.
+    pp_nesting = 0
+    last_zero_endif = -1
+    for i, raw in enumerate(lines):
+        stripped = str(raw or "").lstrip()
+        if _PP_IF_RE.match(stripped):
+            pp_nesting += 1
+        elif _PP_ENDIF_RE.match(stripped):
+            pp_nesting -= 1
+            if pp_nesting == 0:
+                last_zero_endif = i
+
+    # 3. Only treat it as a guard #endif if nothing meaningful follows it.
+    if last_zero_endif < 0:
+        return -1
+    for i in range(last_zero_endif + 1, len(lines)):
+        stripped = str(lines[i] or "").strip()
+        if stripped and not stripped.startswith("//") and not stripped.startswith("/*"):
+            return -1  # there is real code after; not a simple include guard
+    return last_zero_endif
+
+
 def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
     """Normalize a C-like function signature into (return_type, name, arg_types).
 
@@ -394,6 +454,29 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     # Safety: if insert_at lands inside a multi-line #define macro (backslash-continued lines),
     # advance past the macro to avoid splitting it.
     insert_at = _skip_past_macro_continuation(lines, insert_at)
+
+    # For header files with include guards, clamp insert_at to stay inside the guard
+    # AND inside any trailing `extern "C" { ... }` block.
+    if _is_header_path(str(file_path or "")):
+        guard_endif_idx = _find_include_guard_endif(lines)
+        if guard_endif_idx >= 0:
+            # Walk backward from the guard #endif to skip trailing
+            # preprocessor / extern "C" closing blocks and blank lines.
+            ceiling = guard_endif_idx  # 0-based
+            for i in range(guard_endif_idx - 1, -1, -1):
+                stripped = lines[i].strip()
+                if not stripped:
+                    ceiling = i
+                    continue
+                if stripped in ("}", "#endif") or re.match(r"^#\s*(?:ifdef|ifndef|else|endif)\b", stripped):
+                    ceiling = i
+                    continue
+                if stripped.startswith("extern") and "{" in stripped:
+                    ceiling = i
+                    continue
+                break
+            if insert_at >= ceiling:
+                insert_at = ceiling
 
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]

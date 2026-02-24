@@ -329,6 +329,63 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     return None, 0, 0
 
 
+def _find_include_guard_endif_line(file_lines):
+    """Return the 1-based line number of the closing #endif of an include guard, or -1.
+
+    Detects ``#ifndef X / #define X / ... / #endif`` patterns with optional
+    leading comments (including multi-line ``/* ... */`` blocks).
+    """
+    if not file_lines:
+        return -1
+    _pp_if_re = re.compile(r"^#\s*(?:if|ifdef|ifndef)\b")
+    _pp_endif_re = re.compile(r"^#\s*endif\b")
+
+    # Check that the first meaningful line is #ifndef
+    in_block_comment = False
+    guard_found = False
+    for raw in file_lines:
+        stripped = raw.lstrip().lstrip("\ufeff")
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+            continue
+        if not stripped:
+            continue
+        if stripped.startswith("//"):
+            continue
+        if stripped.startswith("/*"):
+            if "*/" not in stripped:
+                in_block_comment = True
+            continue
+        if re.match(r"^#\s*ifndef\b", stripped):
+            guard_found = True
+        break
+
+    if not guard_found:
+        return -1
+
+    # Track preprocessor nesting; find last #endif that returns to level 0.
+    pp_nesting = 0
+    last_zero_endif = -1
+    for i, raw in enumerate(file_lines):
+        stripped = raw.lstrip()
+        if _pp_if_re.match(stripped):
+            pp_nesting += 1
+        elif _pp_endif_re.match(stripped):
+            pp_nesting -= 1
+            if pp_nesting == 0:
+                last_zero_endif = i
+
+    if last_zero_endif < 0:
+        return -1
+    # Only treat it as a guard if nothing meaningful follows.
+    for i in range(last_zero_endif + 1, len(file_lines)):
+        stripped = file_lines[i].strip()
+        if stripped and not stripped.startswith("//") and not stripped.startswith("/*"):
+            return -1
+    return last_zero_endif + 1  # 1-based
+
+
 def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_path, func_sig):
     """Get patch insert line number from new commit for the Artificial patch"""
     if not func_sig:
@@ -353,7 +410,12 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
             pass
 
         if last_func_end > 0:
-            return last_func_end + 1
+            insert_point = last_func_end + 1
+            # For header files, clamp inside the include guard.
+            insert_point = _clamp_insert_before_include_guard(
+                target_repo_path, next_commit, file_path, insert_point
+            )
+            return insert_point
 
         # Fallback: end of file (no AST or no functions found)
         os.chdir(target_repo_path)
@@ -361,7 +423,13 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
         subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         with open(os.path.join(target_repo_path, file_path), 'r') as fsrc:
             file_content = fsrc.readlines()
-            return len(file_content) + 1
+            insert_point = len(file_content) + 1
+            # For header files, clamp inside the include guard.
+            insert_point = _clamp_insert_before_include_guard(
+                target_repo_path, next_commit, file_path, insert_point,
+                file_lines=[l.rstrip('\n') for l in file_content],
+            )
+            return insert_point
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
     short_next_commit = next_commit[:8] if len(next_commit) > 8 else next_commit
     parsing_path = os.path.join(
@@ -378,7 +446,57 @@ def get_patch_insert_line_number(target_repo_path, next_commit, data_path, file_
         if ast_node['extent']['start']['file'] == file_path and compare_function_signatures(ast_node['signature'], func_sig, True):
             artificial_patch_insert_point = ast_node['extent']['end']['line'] + 1
             break
+    if artificial_patch_insert_point > 0:
+        artificial_patch_insert_point = _clamp_insert_before_include_guard(
+            target_repo_path, next_commit, file_path, artificial_patch_insert_point
+        )
     return artificial_patch_insert_point
+
+
+def _clamp_insert_before_include_guard(target_repo_path, next_commit, file_path, insert_point, file_lines=None):
+    """For header files, clamp insert_point to stay inside the include guard.
+
+    Also skips backward past trailing ``#ifdef __cplusplus / } / #endif``
+    blocks so the insertion stays inside extern "C" scopes.
+
+    The insert_point is a 1-based line number where the recreated function's
+    diff hunk will be anchored.  Because the hunk uses context lines *after*
+    the anchor, even an insert_point a few lines before ``#endif`` can cause
+    the function to land outside the guard.  We compute a safe ceiling and
+    clamp to it.
+    """
+    suffix = os.path.splitext(file_path)[1].lower()
+    if suffix not in {'.h', '.hh', '.hpp', '.hxx'}:
+        return insert_point
+    if file_lines is None:
+        try:
+            src_path = os.path.join(target_repo_path, file_path)
+            with open(src_path, 'r', encoding='utf-8', errors='replace') as f:
+                file_lines = [l.rstrip('\n') for l in f.readlines()]
+        except (FileNotFoundError, OSError):
+            return insert_point
+    guard_endif = _find_include_guard_endif_line(file_lines)
+    if guard_endif <= 0:
+        return insert_point
+    # Walk backward from the guard #endif to find the safe ceiling: skip
+    # trailing blank lines, preprocessor blocks (``#ifdef __cplusplus / } /
+    # #endif``), and the guard's own ``#endif``.
+    ceiling = guard_endif  # 1-based line of the guard #endif
+    for i in range(guard_endif - 2, -1, -1):  # 0-based index
+        stripped = file_lines[i].strip()
+        if not stripped:
+            ceiling = i + 1  # 1-based
+            continue
+        if stripped in ('}', '#endif') or re.match(r'^#\s*(?:ifdef|ifndef|else|endif)\b', stripped):
+            ceiling = i + 1
+            continue
+        if stripped.startswith('extern') and '{' in stripped:
+            ceiling = i + 1
+            continue
+        break
+    if insert_point >= ceiling:
+        return ceiling
+    return insert_point
 
 
 def get_diff_unified(repo_path, commit1, commit2, patch_path, context_lines=3):
