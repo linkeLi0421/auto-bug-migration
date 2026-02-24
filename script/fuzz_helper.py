@@ -1771,6 +1771,11 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
   if env_to_add:
     env += env_to_add
 
+  # Propagate ASAN_OPTIONS to the container unless caller already set it via -e.
+  asan_options = os.getenv('ASAN_OPTIONS')
+  if asan_options and not any(v.startswith('ASAN_OPTIONS=') for v in env):
+    env.append(f'ASAN_OPTIONS={asan_options}')
+
   # Determine base-runner image to use
   if runner_image == 'auto' and commit_date:
     # Import here to avoid circular dependency
@@ -1800,7 +1805,14 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
       '-runs=10',
   ] + fuzzer_args
   if fuzzer_path:
-    run_args[5] = f'{fuzzer_path}:/out'
+    out_mount = f'{fuzzer_path}:/out'
+    # Replace the existing /out bind mount without relying on fragile indexes.
+    for i in range(len(run_args) - 1):
+      if run_args[i] == '-v' and run_args[i + 1].endswith(':/out'):
+        run_args[i + 1] = out_mount
+        break
+    else:
+      run_args = ['-v', out_mount] + run_args
 
   return run_function(run_args, architecture=architecture)
 
