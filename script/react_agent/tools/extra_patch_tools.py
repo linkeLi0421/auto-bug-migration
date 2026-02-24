@@ -526,13 +526,27 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
     if not want:
         return False
 
-    want_re = re.escape(want)
-    fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){want_re}\s*\(")
-    declared_name_pat = re.compile(
-        rf"(?<![A-Za-z0-9_]){want_re}(?![A-Za-z0-9_])\s*(?:\[\s*|=|,|;|:|__attribute__\b|__declspec\b)"
-    )
-    typedef_fn_ptr_pat = re.compile(rf"^typedef\b.*\(\s*\*\s*{want_re}\s*\)")
-    tag_head_pat = re.compile(rf"^(?:typedef\s+)?(?:struct|union|enum)\s+{want_re}\b")
+    tag_match = re.match(r"^(struct|union|enum)\s+([A-Za-z_][A-Za-z0-9_]*)$", want)
+    want_is_tag_ref = bool(tag_match)
+    want_tag_kind = str(tag_match.group(1) if tag_match else "").strip()
+    want_id = str(tag_match.group(2) if tag_match else want).strip()
+    if not want_id:
+        return False
+
+    want_re = re.escape(want_id)
+    if want_is_tag_ref:
+        tag_kind_re = re.escape(want_tag_kind)
+        tag_head_pat = re.compile(rf"^(?:typedef\s+)?{tag_kind_re}\s+{want_re}\b")
+        fn_pat = re.compile(r"$^")  # unused for tag symbols
+        declared_name_pat = re.compile(r"$^")  # unused for tag symbols
+        typedef_fn_ptr_pat = re.compile(r"$^")  # unused for tag symbols
+    else:
+        tag_head_pat = re.compile(rf"^(?:typedef\s+)?(?:struct|union|enum)\s+{want_re}\b")
+        fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){want_re}\s*\(")
+        declared_name_pat = re.compile(
+            rf"(?<![A-Za-z0-9_]){want_re}(?![A-Za-z0-9_])\s*(?:\[\s*|=|,|;|:|__attribute__\b|__declspec\b)"
+        )
+        typedef_fn_ptr_pat = re.compile(rf"^typedef\b.*\(\s*\*\s*{want_re}\s*\)")
 
     in_block_comment = False
     raw_lines = str(patch_text or "").splitlines()
@@ -584,19 +598,19 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
                 break
 
         # Function prototypes/defs at file scope.
-        if not stripped.startswith("#"):
+        if not want_is_tag_ref and not stripped.startswith("#"):
             if fn_pat.search(stripped) and not _looks_like_statement(stripped):
                 if stripped.rstrip().endswith(";") or "{" in stripped:
                     return True
 
         # Typedefs for function pointers (common C style): `typedef <ret> (*NAME)(...);`
-        if stripped.startswith("typedef") and stripped.rstrip().endswith(";"):
+        if not want_is_tag_ref and stripped.startswith("typedef") and stripped.rstrip().endswith(";"):
             if typedef_fn_ptr_pat.match(stripped):
                 return True
 
         # Other file-scope declarations: treat as defined only if NAME appears in a declarator position,
         # not merely as a referenced type inside a prototype/param list.
-        if not stripped.startswith("#") and stripped.rstrip().endswith(";"):
+        if not want_is_tag_ref and not stripped.startswith("#") and stripped.rstrip().endswith(";"):
             # Avoid treating forward tag decls (`struct NAME;`) as a definition; tag bodies require `{`.
             if re.match(rf"^(?:struct|union|enum)\s+{want_re}\b", stripped):
                 continue
@@ -1243,6 +1257,10 @@ def _strip_comment_minus_lines(patch_text: str) -> str:
         if not code:
             end = i + 1
             continue
+        if code.startswith("#"):
+            # Preprocessor lines (for example `#if 0 /* ... */`) are code, not comments.
+            has_non_comment = True
+            break
         if (code.startswith("/*") or code.startswith("*") or code.startswith("//")
                 or code.endswith("*/")):
             end = i + 1
@@ -1264,6 +1282,204 @@ def _strip_comment_minus_lines(patch_text: str) -> str:
         return "\n".join(updated).rstrip("\n") + "\n"
 
     return raw
+
+
+_EXTRA_ENUM_HEAD_RE = re.compile(r"^\s*(?:typedef\s+)?enum\b.*\{")
+_EXTRA_REVERT_WRAPPER_RE = re.compile(r"__revert_[0-9a-f]{8,}_[A-Za-z_][A-Za-z0-9_]*")
+_EXTRA_ENUM_DISABLE_IF0_RE = re.compile(r"^\s*#\s*if\s+0\b.*enum duplicated", re.IGNORECASE)
+_EXTRA_ENUM_FWD_DECL_RE = re.compile(r"^enum\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$")
+
+
+def _brace_delta_ignoring_comments(code: str, in_block_comment: bool) -> Tuple[int, bool]:
+    """Return (brace_delta, in_block_comment_after) for a single C code line."""
+    delta = 0
+    i = 0
+    n = len(code)
+    while i < n:
+        if in_block_comment:
+            end = code.find("*/", i)
+            if end < 0:
+                return delta, True
+            i = end + 2
+            in_block_comment = False
+            continue
+
+        if code.startswith("//", i):
+            break
+        if code.startswith("/*", i):
+            in_block_comment = True
+            i += 2
+            continue
+
+        ch = code[i]
+        if ch == "{":
+            delta += 1
+        elif ch == "}":
+            delta -= 1
+        i += 1
+
+    return delta, in_block_comment
+
+
+def _repair_revert_decls_inserted_inside_enum(patch_text: str) -> str:
+    """Move misplaced `__revert_<sha>_*` declarations out of enum bodies.
+
+    Older runs could produce `_extra_*` hunks where multi-line enum blocks were
+    split by blank lines and then category-sorted, interleaving function
+    declarations into enum members. This repair pass is conservative: it only
+    moves declarations that contain `__revert_<hex>_...` and are currently
+    inside an enum block in the first hunk.
+    """
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return raw
+
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return raw
+
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+
+    body = lines[first_hunk + 1 : end]
+    out_body: List[str] = []
+    changed = False
+
+    # Stack entries: {"depth": int, "moved": List[List[str]]}
+    enum_stack: List[Dict[str, Any]] = []
+    brace_depth = 0
+    in_block_comment = False
+
+    i = 0
+    while i < len(body):
+        raw_line = body[i]
+        is_minus = raw_line.startswith("-") and not raw_line.startswith("---")
+
+        # Only move `__revert_<sha>_*` declarations when currently inside enum.
+        if is_minus and enum_stack:
+            code = raw_line[1:]
+            if _EXTRA_REVERT_WRAPPER_RE.search(code):
+                block: List[str] = []
+                while i < len(body):
+                    l = body[i]
+                    if not (l.startswith("-") and not l.startswith("---")):
+                        break
+                    c = l[1:]
+                    block.append(l)
+                    i += 1
+                    if c.strip().endswith(";"):
+                        while i < len(body) and body[i] == "-":
+                            block.append(body[i])
+                            i += 1
+                        break
+                enum_stack[-1]["moved"].append(block)
+                changed = True
+                continue
+
+        out_body.append(raw_line)
+
+        if is_minus:
+            code = raw_line[1:]
+            starts_enum = bool(_EXTRA_ENUM_HEAD_RE.match(code.strip()))
+
+            delta, in_block_comment = _brace_delta_ignoring_comments(code, in_block_comment)
+            brace_depth += delta
+            if brace_depth < 0:
+                brace_depth = 0
+
+            # Record enum depth *after* processing the opening '{' line.
+            if starts_enum and "{" in code:
+                enum_stack.append({"depth": brace_depth, "moved": []})
+
+            # If we closed the current enum, emit any moved declarations now.
+            while enum_stack and brace_depth < int(enum_stack[-1]["depth"]):
+                info = enum_stack.pop()
+                moved_blocks = info.get("moved") or []
+                if moved_blocks:
+                    if out_body and out_body[-1] != "-":
+                        out_body.append("-")
+                    for blk in moved_blocks:
+                        out_body.extend([str(x) for x in blk])
+
+        i += 1
+
+    if not changed:
+        return raw
+
+    updated = lines[: first_hunk + 1] + out_body + lines[end:]
+    # Moving declaration blocks can change old/new body line counts (e.g. when
+    # adding a separator '-' blank line), so refresh @@ header lengths.
+    updated = _recompute_hunk_headers(updated)
+    return "\n".join(updated).rstrip("\n") + "\n"
+
+
+def _repair_disabled_enum_if0_wrapper(patch_text: str) -> str:
+    """Remove `#if 0 /* enum duplicated ... */` wrappers around enum blocks.
+
+    Some model-generated overrides disable transplanted enums with a `#if 0`
+    wrapper and then leave only `enum NAME;` in scope, which causes incomplete
+    enum type errors.  This repair unwraps that disabled enum block and removes
+    the nearby forward declaration line.
+    """
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return raw
+
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return raw
+
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+
+    body = lines[first_hunk + 1 : end]
+    out_body: List[str] = []
+    changed = False
+    inside_disabled_enum = False
+    skip_following_enum_fwd_decl = False
+
+    for raw_line in body:
+        is_minus = raw_line.startswith("-") and not raw_line.startswith("---")
+        code = raw_line[1:].strip() if is_minus else ""
+
+        if is_minus and _EXTRA_ENUM_DISABLE_IF0_RE.match(code):
+            inside_disabled_enum = True
+            skip_following_enum_fwd_decl = True
+            changed = True
+            continue
+
+        if inside_disabled_enum and is_minus and re.match(r"^#\s*endif\b", code):
+            inside_disabled_enum = False
+            changed = True
+            continue
+
+        if skip_following_enum_fwd_decl and is_minus and not inside_disabled_enum:
+            if code and "forward-declare the enum" in code.lower():
+                changed = True
+                continue
+            if _EXTRA_ENUM_FWD_DECL_RE.match(code):
+                skip_following_enum_fwd_decl = False
+                changed = True
+                continue
+            if code and not code.startswith("//"):
+                skip_following_enum_fwd_decl = False
+
+        out_body.append(raw_line)
+
+    if not changed:
+        return raw
+
+    updated = lines[: first_hunk + 1] + out_body + lines[end:]
+    updated = _recompute_hunk_headers(updated)
+    return "\n".join(updated).rstrip("\n") + "\n"
 
 
 def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: List[str]) -> bool:
@@ -1711,6 +1927,9 @@ def _upgrade_existing_forward_typedef_in_extra_hunk(
 # Enum conflict detection and renaming helpers
 # ---------------------------------------------------------------------------
 
+_ENUM_RENAME_PREFIX = "_revert_"
+
+
 def _extract_enum_constant_names(code: str) -> List[str]:
     """Extract enumerator names from C enum source code.
 
@@ -1848,6 +2067,93 @@ def _rename_enum_refs_in_bundle(
     return overrides
 
 
+def _rename_conflicting_enum_constants_in_extra_hunk(
+    patch_text: str,
+    *,
+    kb_index: Any,
+    enum_tag: str,
+    prefix: str,
+) -> Tuple[str, Dict[str, str]]:
+    """Prefix conflicting enum constants inside the first `_extra_*` hunk enum block."""
+    raw = str(patch_text or "")
+    if not raw.strip() or kb_index is None:
+        return raw, {}
+
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return raw, {}
+
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+
+    body = lines[first_hunk + 1 : end]
+
+    tag_re = re.escape(str(enum_tag or "").strip())
+    if tag_re:
+        enum_head_re = re.compile(rf"^\s*(?:typedef\s+)?enum\s+{tag_re}\b.*\{{")
+    else:
+        enum_head_re = re.compile(r"^\s*(?:typedef\s+)?enum\b.*\{")
+
+    start_idx = -1
+    for i, raw_line in enumerate(body):
+        if not (raw_line.startswith("-") and not raw_line.startswith("---")):
+            continue
+        if enum_head_re.match(raw_line[1:].strip()):
+            start_idx = i
+            break
+    if start_idx < 0:
+        return raw, {}
+
+    block: List[str] = []
+    end_idx = -1
+    brace_depth = 0
+    in_block_comment = False
+    saw_open = False
+    for i in range(start_idx, len(body)):
+        raw_line = body[i]
+        if not (raw_line.startswith("-") and not raw_line.startswith("---")):
+            if block:
+                break
+            continue
+        code = raw_line[1:]
+        block.append(code)
+        if "{" in code:
+            saw_open = True
+        delta, in_block_comment = _brace_delta_ignoring_comments(code, in_block_comment)
+        brace_depth += delta
+        if saw_open and brace_depth <= 0 and "}" in code:
+            end_idx = i
+            break
+    if end_idx < start_idx or not block:
+        return raw, {}
+
+    enum_code = "\n".join(block)
+    enum_names = _extract_enum_constant_names(enum_code)
+    if not enum_names:
+        return raw, {}
+
+    conflicts = _check_v2_enum_conflict(kb_index, enum_names)
+    if not conflicts:
+        return raw, {}
+
+    prefixed_code, rename_map = _prefix_enum_source(enum_code, enum_names, prefix)
+    if not rename_map:
+        return raw, {}
+
+    replacement = [f"-{line.rstrip()}" for line in prefixed_code.splitlines()]
+    if not replacement:
+        return raw, {}
+
+    new_body = body[:start_idx] + replacement + body[end_idx + 1 :]
+    updated_lines = lines[: first_hunk + 1] + new_body + lines[end:]
+    updated_lines = _recompute_hunk_headers(updated_lines)
+    return "\n".join(updated_lines).rstrip("\n") + "\n", rename_map
+
+
 def make_extra_patch_override(
     agent_tools: Any,
     *,
@@ -1882,6 +2188,9 @@ def make_extra_patch_override(
             f"symbol name. Pass only the identifier (e.g. "
             f"'__revert_<commit>_<func>'), not a full signature. Got: {symbol!r}"
         )
+    tag_symbol_match = re.match(r"^(struct|union|enum)\s+(\w+)$", symbol)
+    tag_symbol_kind = str(tag_symbol_match.group(1) if tag_symbol_match else "").strip()
+    tag_symbol_name = str(tag_symbol_match.group(2) if tag_symbol_match else "").strip()
 
     bundle = load_patch_bundle(patch_path_s, allowed_roots=_allowed_patch_roots_from_env())
     extra_key = _infer_extra_patch_key(bundle=bundle, file_path=file_path_s)
@@ -1911,9 +2220,48 @@ def make_extra_patch_override(
     else:
         existing = str(getattr(patch, "patch_text", "") or "")
 
+    normalized_actions: List[str] = []
+    enum_rename_overrides: List[Dict[str, Any]] = []
+
+    def _serialize_enum_rename_overrides(overrides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        serialized: List[Dict[str, Any]] = []
+        for ov in overrides:
+            ov_key = str(ov.get("patch_key", "")).strip()
+            ov_text = str(ov.get("patch_text", "")).strip()
+            if not ov_key or not ov_text:
+                continue
+            ov_store = ArtifactStore(_artifact_root() / ov_key, overwrite=False)
+            ov_ref = ov_store.write_text(
+                name=f"enum_rename_override_{_normalize_file_basename(file_path_s)}_{symbol}",
+                text=ov_text,
+                ext=".diff",
+            )
+            serialized.append({
+                "patch_key": ov_key,
+                "patch_text": ov_ref.to_dict(),
+            })
+        return serialized
+
     # Clean up corrupted _extra_* hunks that have file-header comment '-' lines
     # (caused by BOM-prefixed files where the skeleton started at line 0).
+    _prev_existing = existing
     existing = _strip_comment_minus_lines(existing)
+    if existing != _prev_existing:
+        normalized_actions.append("strip_leading_comment_minus_lines")
+
+    # Self-heal inherited malformed hunks where __revert_* declarations were
+    # inserted into the middle of enum members by older block-splitting logic.
+    _prev_existing = existing
+    existing = _repair_revert_decls_inserted_inside_enum(existing)
+    if existing != _prev_existing:
+        normalized_actions.append("move_revert_decls_out_of_enum")
+
+    # Self-heal inherited malformed hunks that disabled transplanted enums via
+    # `#if 0 /* enum duplicated ... */ ... #endif`.
+    _prev_existing = existing
+    existing = _repair_disabled_enum_if0_wrapper(existing)
+    if existing != _prev_existing:
+        normalized_actions.append("unwrap_disabled_enum_if0")
 
     # If cleanup left a pure context-only skeleton (no '-' lines), the anchor
     # may be at the wrong position (e.g. line 1 of a BOM file).  Regenerate
@@ -1925,6 +2273,7 @@ def make_extra_patch_override(
             refreshed = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol)
             if refreshed.strip():
                 existing = refreshed
+                normalized_actions.append("regenerate_empty_extra_skeleton")
 
     if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
         # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.
@@ -1979,6 +2328,47 @@ def make_extra_patch_override(
                 "note": "Symbol already present as a forward typedef; inserted the tag body definition into the extra hunk.",
             }
 
+        # If this is an enum tag and the extra hunk already contains its definition,
+        # proactively prefix conflicting V1 constants to avoid V2 redefinition errors.
+        if tag_symbol_kind == "enum" and tag_symbol_name and agent_tools is not None:
+            kb_index = getattr(agent_tools, "kb_index", None)
+            if kb_index is not None:
+                renamed_existing, rename_map = _rename_conflicting_enum_constants_in_extra_hunk(
+                    existing,
+                    kb_index=kb_index,
+                    enum_tag=tag_symbol_name,
+                    prefix=_ENUM_RENAME_PREFIX,
+                )
+                if renamed_existing != existing and rename_map:
+                    existing = renamed_existing
+                    normalized_actions.append("prefix_conflicting_enum_constants")
+                    enum_rename_overrides = _rename_enum_refs_in_bundle(bundle, file_path_s, rename_map)
+
+        if normalized_actions or enum_rename_overrides:
+            store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
+            ref = store.write_text(
+                name=f"make_extra_patch_override_patch_text_{_normalize_file_basename(file_path_s)}_{symbol}",
+                text=existing,
+                ext=".diff",
+            )
+            payload: Dict[str, Any] = {
+                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
+                "file_path": file_path_s,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "insert_kind": "normalize_existing_extra_hunk",
+                "inserted_code": "",
+                "patch_text": ref.to_dict(),
+                "patch_text_truncated": False,
+                "patch_text_lines_total": len(existing.splitlines()),
+                "normalization_actions": list(normalized_actions),
+                "note": "Symbol already present; normalized malformed existing extra hunk.",
+            }
+            serialized_enum_overrides = _serialize_enum_rename_overrides(enum_rename_overrides)
+            if serialized_enum_overrides:
+                payload["enum_rename_overrides"] = serialized_enum_overrides
+            return payload
+
         return {
             "patch_path": str(Path(patch_path_s).expanduser().resolve()),
             "file_path": file_path_s,
@@ -1990,7 +2380,7 @@ def make_extra_patch_override(
 
     inserted_lines: List[str] = []
     insert_kind = ""
-    enum_rename_overrides: List[Dict[str, Any]] = []
+    enum_rename_overrides = []
 
     # Helper to extract full type definition from KB for enums/structs/unions
     def _extract_type_definition_from_kb(type_name: str, ver: str) -> Tuple[List[str], str]:
@@ -2037,10 +2427,9 @@ def make_extra_patch_override(
 
     # 0) Handle type definitions: symbol_name like "struct X" or "union Y" or "enum Z".
     #    Try to extract the full type definition from KB instead of just a forward declaration.
-    _tag_fwd_match = re.match(r"^(struct|union|enum)\s+(\w+)$", symbol)
-    if _tag_fwd_match:
-        type_kind = _tag_fwd_match.group(1)  # struct/union/enum
-        type_name = _tag_fwd_match.group(2)  # the type name
+    if tag_symbol_kind and tag_symbol_name:
+        type_kind = tag_symbol_kind  # struct/union/enum
+        type_name = tag_symbol_name  # the type name
         # Try to get full definition from KB first
         for ver in [str(version or "v1").strip().lower(), "v2" if str(version or "v1").strip().lower() == "v1" else "v1"]:
             type_lines, type_insert_kind = _extract_type_definition_from_kb(type_name, ver)
@@ -2103,32 +2492,6 @@ def make_extra_patch_override(
                 elif kind in {"revert_var", "revert_const"}:
                     decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
 
-            # --- Enum conflict detection: if this is an ENUM_DECL, check for V2 ---
-            # enumerator name collisions and proactively prefix all names.
-            if chosen_kind == "ENUM_DECL" and agent_tools is not None:
-                kb_index = getattr(agent_tools, "kb_index", None)
-                if kb_index is not None:
-                    enum_code = "\n".join(decl_lines)
-                    enum_names = _extract_enum_constant_names(enum_code)
-                    if enum_names:
-                        conflicts = _check_v2_enum_conflict(kb_index, enum_names)
-                        if conflicts:
-                            # Prefix ALL enum names (not just conflicting ones)
-                            # to keep the enum self-consistent.
-                            _prefix = "__revert_enum_"
-                            code_prefixed, rename_map = _prefix_enum_source(
-                                enum_code, enum_names, _prefix
-                            )
-                            decl_lines = [
-                                l.rstrip()
-                                for l in code_prefixed.splitlines()
-                                if l.strip()
-                            ]
-                            # Rename references in regular hunks for the same file
-                            enum_rename_overrides = _rename_enum_refs_in_bundle(
-                                bundle, file_path_s, rename_map
-                            )
-
             inserted_lines = decl_lines
             insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
             break
@@ -2158,6 +2521,36 @@ def make_extra_patch_override(
                     inserted_lines = type_lines
                     insert_kind = type_kind
                     break
+
+    # For inserted enum definitions, proactively prefix conflicting V1 constants
+    # so they do not collide with V2 enum constants in the same translation unit.
+    if inserted_lines and agent_tools is not None:
+        kb_index = getattr(agent_tools, "kb_index", None)
+        enum_code = "\n".join(inserted_lines)
+        if (
+            kb_index is not None
+            and re.search(r"^\s*(?:typedef\s+)?enum\b", enum_code, re.MULTILINE)
+            and "{" in enum_code
+            and "}" in enum_code
+        ):
+            enum_names = _extract_enum_constant_names(enum_code)
+            if enum_names:
+                conflicts = _check_v2_enum_conflict(kb_index, enum_names)
+                if conflicts:
+                    code_prefixed, rename_map = _prefix_enum_source(
+                        enum_code,
+                        enum_names,
+                        _ENUM_RENAME_PREFIX,
+                    )
+                    inserted_lines = [
+                        l.rstrip()
+                        for l in code_prefixed.splitlines()
+                        if l.strip()
+                    ]
+                    enum_rename_overrides = _rename_enum_refs_in_bundle(
+                        bundle, file_path_s, rename_map
+                    )
+                    insert_kind = (insert_kind + ":enum_values_prefixed").strip(":")
 
     # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) that would cause
     # parse errors in V2 code.  Only the return-type area before the function
@@ -2253,22 +2646,7 @@ def make_extra_patch_override(
     )
 
     # Persist enum rename overrides for regular hunks as artifacts.
-    serialized_enum_overrides: List[Dict[str, Any]] = []
-    for ov in enum_rename_overrides:
-        ov_key = str(ov.get("patch_key", "")).strip()
-        ov_text = str(ov.get("patch_text", "")).strip()
-        if not ov_key or not ov_text:
-            continue
-        ov_store = ArtifactStore(_artifact_root() / ov_key, overwrite=False)
-        ov_ref = ov_store.write_text(
-            name=f"enum_rename_override_{_normalize_file_basename(file_path_s)}_{symbol}",
-            text=ov_text,
-            ext=".diff",
-        )
-        serialized_enum_overrides.append({
-            "patch_key": ov_key,
-            "patch_text": ov_ref.to_dict(),
-        })
+    serialized_enum_overrides = _serialize_enum_rename_overrides(enum_rename_overrides)
 
     result: Dict[str, Any] = {
         "patch_path": str(Path(patch_path_s).expanduser().resolve()),

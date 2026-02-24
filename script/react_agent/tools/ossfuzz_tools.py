@@ -664,7 +664,13 @@ def _extra_hunk_minus_lines(patch_text: str) -> list[str]:
 
 
 def _extra_hunk_minus_blocks_first_hunk(patch_text: str) -> list[list[str]]:
-    """Return inserted blocks (raw code, no diff prefix) for the first hunk, split on blank '-' lines."""
+    """Return inserted blocks (raw code, no diff prefix) for the first hunk.
+
+    Blocks are split on blank '-' lines only at file scope (brace depth 0).
+    This keeps tag/type bodies (enum/struct/union) atomic even when they
+    contain internal blank lines, preventing merge-time reordering from
+    interleaving declarations into the middle of a type definition.
+    """
     raw = str(patch_text or "")
     if not raw.strip():
         return []
@@ -686,15 +692,55 @@ def _extra_hunk_minus_blocks_first_hunk(patch_text: str) -> list[list[str]]:
             continue
         minus.append("" if l == "-" else l[1:])
 
+    def _brace_delta_ignoring_comments(code: str, in_block_comment: bool) -> tuple[int, bool]:
+        delta = 0
+        i = 0
+        n = len(code)
+        while i < n:
+            if in_block_comment:
+                end = code.find("*/", i)
+                if end < 0:
+                    return delta, True
+                i = end + 2
+                in_block_comment = False
+                continue
+
+            if code.startswith("//", i):
+                break
+            if code.startswith("/*", i):
+                in_block_comment = True
+                i += 2
+                continue
+
+            ch = code[i]
+            if ch == "{":
+                delta += 1
+            elif ch == "}":
+                delta -= 1
+            i += 1
+
+        return delta, in_block_comment
+
     blocks: list[list[str]] = []
     cur: list[str] = []
+    brace_depth = 0
+    in_block_comment = False
     for line in minus:
         if line == "":
-            if cur:
-                blocks.append(cur)
-                cur = []
+            if brace_depth == 0:
+                if cur:
+                    blocks.append(cur)
+                    cur = []
+            elif cur:
+                # Preserve blank lines that are inside multi-line declarations.
+                cur.append("")
             continue
+
         cur.append(line)
+        delta, in_block_comment = _brace_delta_ignoring_comments(line, in_block_comment)
+        brace_depth += delta
+        if brace_depth < 0:
+            brace_depth = 0
     if cur:
         blocks.append(cur)
     return blocks
