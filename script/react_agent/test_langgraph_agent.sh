@@ -520,6 +520,7 @@ PY
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import os
 import pickle
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -984,6 +985,7 @@ PY
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import os
 import pickle
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -1886,6 +1888,196 @@ with tempfile.TemporaryDirectory() as td_raw:
     typedef_pos = text_out.find("typedef int xmlHashedString;")
     proto_pos = text_out.find("xmlParserNsPush(")
     assert typedef_pos != -1 and proto_pos != -1 and typedef_pos < proto_pos, text_out
+
+print("OK")
+PY
+
+# Extra patch override tool: normalize inherited malformed `_extra_*` hunks where
+# __revert_* declarations were inserted into the middle of enum members.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    bad_extra_patch = (
+        "diff --git a/cram/cram_io.c b/cram/cram_io.c\n"
+        "--- a/cram/cram_io.c\n"
+        "+++ b/cram/cram_io.c\n"
+        "@@ -1,9 +1,0 @@\n"
+        "-enum cram_block_method_int {\n"
+        "-    BM_ERROR = -1,\n"
+        "-\n"
+        "-void __revert_deadbeef_cram_update_curr_slice(cram_container *c, int version);\n"
+        "-\n"
+        "-    RAW = 0,\n"
+        "-};\n"
+        " int marker(void) { return 0; }\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="cram/cram_io.c",
+        file_path_new="cram/cram_io.c",
+        patch_text=bad_extra_patch,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=10,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({"_extra_cram_io.c": extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        None,
+        patch_path=str(bundle_path),
+        file_path="/src/htslib/cram/cram_io.c",
+        symbol_name="__revert_deadbeef_cram_update_curr_slice",
+        version="v1",
+    )
+
+    note = str(out.get("note") or "")
+    assert "normalized malformed existing extra hunk" in note, out
+    actions = out.get("normalization_actions") or []
+    assert "move_revert_decls_out_of_enum" in actions, out
+
+    ref = out.get("patch_text") or {}
+    text_out = ""
+    if isinstance(ref, dict):
+        p = Path(str(ref.get("artifact_path") or "")).resolve()
+        text_out = p.read_text(encoding="utf-8", errors="replace")
+    elif isinstance(ref, str):
+        text_out = ref
+    assert text_out, out
+
+    decl_pos = text_out.find("-void __revert_deadbeef_cram_update_curr_slice(")
+    enum_close_pos = text_out.find("-};")
+    bm_pos = text_out.find("BM_ERROR = -1")
+    raw_pos = text_out.find("RAW = 0")
+    assert decl_pos > 0 and enum_close_pos > 0 and bm_pos > 0 and raw_pos > 0, text_out
+    assert enum_close_pos < decl_pos, text_out
+    assert not (bm_pos < decl_pos < raw_pos), text_out
+
+    # Header lengths must match body counts after normalization.
+    lines = text_out.splitlines()
+    hidx = next(i for i, l in enumerate(lines) if l.startswith("@@ "))
+    m = re.match(r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@", lines[hidx])
+    assert m, lines[hidx]
+    old_len_hdr = int(m.group(2) or "1")
+    new_len_hdr = int(m.group(4) or "1")
+    old_len = 0
+    new_len = 0
+    for l in lines[hidx + 1 :]:
+        if l.startswith("@@ ") or l.startswith("diff --git "):
+            break
+        if l.startswith("-"):
+            old_len += 1
+        elif l.startswith("+"):
+            new_len += 1
+        elif l.startswith(" "):
+            old_len += 1
+            new_len += 1
+    assert old_len == old_len_hdr, (old_len, old_len_hdr, lines[hidx])
+    assert new_len == new_len_hdr, (new_len, new_len_hdr, lines[hidx])
+
+print("OK")
+PY
+
+# Extra patch override tool: unwrap disabled enum blocks that were wrapped with
+# `#if 0 /* enum duplicated ... */` and remove the leftover enum forward declaration.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    bad_extra_patch = (
+        "diff --git a/cram/cram_io.c b/cram/cram_io.c\n"
+        "--- a/cram/cram_io.c\n"
+        "+++ b/cram/cram_io.c\n"
+        "@@ -1,10 +1,0 @@\n"
+        "-#if 0 /* enum duplicated in cram_structs.h; use that definition instead */\n"
+        "-enum cram_block_method_int {\n"
+        "-    BM_ERROR = -1,\n"
+        "-    RAW = 0,\n"
+        "-};\n"
+        "-#endif\n"
+        "-/* Forward-declare the enum so the following prototype is visible at file scope. */\n"
+        "-enum cram_block_method_int;\n"
+        " int marker(void) { return 0; }\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="cram/cram_io.c",
+        file_path_new="cram/cram_io.c",
+        patch_text=bad_extra_patch,
+        file_type="c",
+        old_start_line=1,
+        old_end_line=11,
+        new_start_line=1,
+        new_end_line=1,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({"_extra_cram_io.c": extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        None,
+        patch_path=str(bundle_path),
+        file_path="/src/htslib/cram/cram_io.c",
+        symbol_name="enum cram_block_method_int",
+        version="v1",
+    )
+
+    note = str(out.get("note") or "")
+    assert "normalized malformed existing extra hunk" in note, out
+    actions = out.get("normalization_actions") or []
+    assert "unwrap_disabled_enum_if0" in actions, out
+
+    ref = out.get("patch_text") or {}
+    text_out = ""
+    if isinstance(ref, dict):
+        p = Path(str(ref.get("artifact_path") or "")).resolve()
+        text_out = p.read_text(encoding="utf-8", errors="replace")
+    elif isinstance(ref, str):
+        text_out = ref
+    assert text_out, out
+
+    assert "#if 0" not in text_out, text_out
+    assert "#endif" not in text_out, text_out
+    assert "-enum cram_block_method_int;" not in text_out, text_out
+    assert "-enum cram_block_method_int {" in text_out, text_out
 
 print("OK")
 PY
@@ -4991,19 +5183,19 @@ enum test {
 };
 """
 names = ["FOO", "BAR", "BAZ"]
-result, rename_map = _prefix_enum_source(code, names, "__revert_enum_")
-assert rename_map == {"FOO": "__revert_enum_FOO", "BAR": "__revert_enum_BAR", "BAZ": "__revert_enum_BAZ"}, rename_map
-assert "__revert_enum_FOO" in result, result
-assert "__revert_enum_BAR" in result, result
-assert "__revert_enum_BAZ = __revert_enum_FOO" in result, result
+result, rename_map = _prefix_enum_source(code, names, "_revert_")
+assert rename_map == {"FOO": "_revert_FOO", "BAR": "_revert_BAR", "BAZ": "_revert_BAZ"}, rename_map
+assert "_revert_FOO" in result, result
+assert "_revert_BAR" in result, result
+assert "_revert_BAZ = _revert_FOO" in result, result
 # Original names should not appear (except inside the prefix)
 for line in result.splitlines():
     stripped = line.strip()
     if not stripped or stripped.startswith("enum") or stripped.startswith("}"):
         continue
-    # After removing all __revert_enum_ prefixed names, original names shouldn't remain
+    # After removing all _revert_ prefixed names, original names shouldn't remain
     import re
-    cleaned = re.sub(r"__revert_enum_\w+", "", stripped)
+    cleaned = re.sub(r"_revert_\w+", "", stripped)
     for n in names:
         assert n not in cleaned, f"{n!r} found in cleaned line: {stripped!r}"
 
@@ -5021,7 +5213,7 @@ sys.path.insert(0, str(script_dir))
 
 from tools.extra_patch_tools import _apply_rename_map_to_minus_lines
 
-rename_map = {"FOO": "__revert_enum_FOO", "BAR": "__revert_enum_BAR"}
+rename_map = {"FOO": "_revert_FOO", "BAR": "_revert_BAR"}
 patch_text = (
     "diff --git a/test.c b/test.c\n"
     "--- a/test.c\n"
@@ -5035,8 +5227,8 @@ patch_text = (
 result = _apply_rename_map_to_minus_lines(patch_text, rename_map)
 lines = result.splitlines()
 # '-' lines should be renamed
-assert "-  if (x == __revert_enum_FOO) {" in lines, lines
-assert "-    return __revert_enum_BAR;" in lines, lines
+assert "-  if (x == _revert_FOO) {" in lines, lines
+assert "-    return _revert_BAR;" in lines, lines
 # context and '+' lines should NOT be renamed
 assert " /* context line with FOO */" in lines, lines
 assert "+added line with FOO" in lines, lines
@@ -5139,15 +5331,15 @@ bundle = FakeBundle({
     "_extra_cram_io.c": extra_patch,
 })
 
-rename_map = {"GZIP": "__revert_enum_GZIP", "RAW": "__revert_enum_RAW"}
+rename_map = {"GZIP": "_revert_GZIP", "RAW": "_revert_RAW"}
 overrides = _rename_enum_refs_in_bundle(bundle, "cram_io.c", rename_map)
 
 # Should produce exactly one override for the main (non-extra) hunk
 assert len(overrides) == 1, overrides
 assert overrides[0]["patch_key"] == "tail-cram_io.c-f1_", overrides
 modified = overrides[0]["patch_text"]
-assert "__revert_enum_GZIP" in modified, modified
-assert "__revert_enum_RAW" in modified, modified
+assert "_revert_GZIP" in modified, modified
+assert "_revert_RAW" in modified, modified
 # Context line should be untouched
 assert " /* context */" in modified, modified
 
@@ -5286,10 +5478,10 @@ with tempfile.TemporaryDirectory() as td_raw:
     assert isinstance(ref, dict) and ref.get("artifact_path"), f"Missing patch_text artifact: {out}"
     p = Path(str(ref.get("artifact_path"))).resolve()
     text = p.read_text(encoding="utf-8", errors="replace")
-    assert "__revert_enum_BM_ERROR" in text, f"Expected prefixed BM_ERROR in extra hunk:\n{text}"
-    assert "__revert_enum_RAW" in text, f"Expected prefixed RAW in extra hunk:\n{text}"
-    assert "__revert_enum_GZIP" in text, f"Expected prefixed GZIP in extra hunk:\n{text}"
-    assert "__revert_enum_FQZ" in text, f"Expected prefixed FQZ in extra hunk:\n{text}"
+    assert "_revert_BM_ERROR" in text, f"Expected prefixed BM_ERROR in extra hunk:\n{text}"
+    assert "_revert_RAW" in text, f"Expected prefixed RAW in extra hunk:\n{text}"
+    assert "_revert_GZIP" in text, f"Expected prefixed GZIP in extra hunk:\n{text}"
+    assert "_revert_FQZ" in text, f"Expected prefixed FQZ in extra hunk:\n{text}"
 
     # Check that enum_rename_overrides are present
     overrides = out.get("enum_rename_overrides") or []
@@ -5300,8 +5492,8 @@ with tempfile.TemporaryDirectory() as td_raw:
     ov_ref = ov.get("patch_text")
     assert isinstance(ov_ref, dict) and ov_ref.get("artifact_path"), ov
     ov_text = Path(str(ov_ref["artifact_path"])).read_text(encoding="utf-8", errors="replace")
-    assert "__revert_enum_GZIP" in ov_text, f"Expected prefixed GZIP in main hunk override:\n{ov_text}"
-    assert "__revert_enum_FQZ" in ov_text, f"Expected prefixed FQZ in main hunk override:\n{ov_text}"
+    assert "_revert_GZIP" in ov_text, f"Expected prefixed GZIP in main hunk override:\n{ov_text}"
+    assert "_revert_FQZ" in ov_text, f"Expected prefixed FQZ in main hunk override:\n{ov_text}"
 
 print("OK")
 PY
