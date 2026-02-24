@@ -468,7 +468,15 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
                 if not stripped:
                     ceiling = i
                     continue
-                if stripped in ("}", "#endif") or re.match(r"^#\s*(?:ifdef|ifndef|else|endif)\b", stripped):
+                # #ifdef / #ifndef mark the START of a preprocessor conditional
+                # block.  Include this line in the ceiling but stop walking —
+                # everything above is real code that must not be swallowed
+                # (e.g. a function closing '}' separated from the guard block
+                # by blank lines).
+                if re.match(r'^#\s*(?:ifdef|ifndef)\b', stripped):
+                    ceiling = i
+                    break
+                if stripped in ("}", "#endif") or re.match(r'^#\s*(?:else|endif)\b', stripped):
                     ceiling = i
                     continue
                 if stripped.startswith("extern") and "{" in stripped:
@@ -1172,12 +1180,24 @@ def _insert_minus_block_into_patch_text(patch_text: str, *, insert_lines: List[s
 
     insert_at = first_hunk + 1
     if not prefer_prepend:
-        # Insert after the last '-' line in the first hunk body (before trailing context).
+        # Insert after the last '-' line that is at brace depth 0 (file scope)
+        # in the first hunk body.  This prevents inserting inside enum, struct,
+        # or function body definitions that were previously prepended.
+        brace_depth = 0
         for i in range(first_hunk + 1, len(lines)):
             if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
                 break
             if lines[i].startswith("-") and not lines[i].startswith("---"):
-                insert_at = i + 1
+                code = lines[i][1:]  # strip the '-' prefix
+                # Strip single-line comments and inline block comments before
+                # counting braces so that `// }` or `/* { */` don't skew depth.
+                code_for_braces = re.sub(r'//.*$', '', code)
+                code_for_braces = re.sub(r'/\*.*?\*/', '', code_for_braces)
+                brace_depth += code_for_braces.count("{") - code_for_braces.count("}")
+                if brace_depth < 0:
+                    brace_depth = 0  # closing brace of outer scope; reset
+                if brace_depth == 0:
+                    insert_at = i + 1
 
     # Convert raw code lines to diff '-' lines.
     block: List[str] = []
@@ -1793,7 +1813,7 @@ def _apply_rename_map_to_minus_lines(patch_text: str, rename_map: Dict[str, str]
             changed = True
     if not changed:
         return patch_text
-    return "\n".join(updated)
+    return "\n".join(updated).rstrip("\n") + "\n"
 
 
 def _rename_enum_refs_in_bundle(

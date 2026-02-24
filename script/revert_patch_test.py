@@ -487,7 +487,14 @@ def _clamp_insert_before_include_guard(target_repo_path, next_commit, file_path,
         if not stripped:
             ceiling = i + 1  # 1-based
             continue
-        if stripped in ('}', '#endif') or re.match(r'^#\s*(?:ifdef|ifndef|else|endif)\b', stripped):
+        # #ifdef / #ifndef mark the START of a preprocessor conditional block.
+        # Include this line in the ceiling but stop walking — everything above
+        # is real code that must not be swallowed (e.g. a function closing '}'
+        # separated from the guard block by blank lines).
+        if re.match(r'^#\s*(?:ifdef|ifndef)\b', stripped):
+            ceiling = i + 1
+            break
+        if stripped in ('}', '#endif') or re.match(r'^#\s*(?:else|endif)\b', stripped):
             ceiling = i + 1
             continue
         if stripped.startswith('extern') and '{' in stripped:
