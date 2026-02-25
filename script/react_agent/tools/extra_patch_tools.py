@@ -626,6 +626,44 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
     return False
 
 
+def _symbol_function_definition_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
+    """Return True when `_extra_*` minus lines contain a real function definition for symbol_name."""
+    want = str(symbol_name or "").strip()
+    if not want:
+        return False
+    fn_pat = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
+    lines = str(patch_text or "").splitlines()
+    for idx, raw in enumerate(lines):
+        if not raw.startswith("-") or raw.startswith("---"):
+            continue
+        code = _strip_diff_prefix(raw).rstrip()
+        stripped = code.lstrip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if not fn_pat.search(stripped):
+            continue
+        if _looks_like_statement(stripped):
+            continue
+        # Scan contiguous minus-lines and require '{' before ';' to distinguish
+        # definitions from prototypes.
+        chunk: List[str] = []
+        for j in range(idx, min(len(lines), idx + 512)):
+            nxt = lines[j]
+            if not nxt.startswith("-") or nxt.startswith("---"):
+                break
+            chunk.append(_strip_diff_prefix(nxt).rstrip())
+        if not chunk:
+            continue
+        joined = "\n".join(chunk)
+        brace_pos = joined.find("{")
+        semi_pos = joined.find(";")
+        if brace_pos >= 0 and (semi_pos < 0 or brace_pos < semi_pos):
+            return True
+    return False
+
+
 _FORWARD_TYPEDEF_RE = re.compile(
     r"^typedef\s+(?P<tag_kind>struct|union|enum)\s+"
     r"(?P<tag>[A-Za-z_][A-Za-z0-9_]*)\s+"
@@ -1119,6 +1157,92 @@ def _extract_function_prototype_from_bundle(bundle: Any, *, symbol_name: str) ->
             proto = _extract_c_declaration_from_function_code("\n".join(block) + "\n")
             if proto and _is_valid_function_prototype(proto, symbol_name=want):
                 return proto
+    return []
+
+
+def _extract_function_definition_from_bundle(bundle: Any, *, symbol_name: str) -> List[str]:
+    """Try to find a file-scope function definition for symbol_name in patch `-` lines."""
+    want = str(symbol_name or "").strip()
+    if not want:
+        return []
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return []
+
+    needle = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(want)}\s*\(")
+    for patch in patches.values():
+        patch_text = str(getattr(patch, "patch_text", "") or "")
+        if not patch_text:
+            continue
+        lines = patch_text.splitlines()
+        for idx, line in enumerate(lines):
+            if not line.startswith("-") or line.startswith("---"):
+                continue
+            code = _strip_diff_prefix(line).rstrip()
+            if not needle.search(code):
+                continue
+            if code[:1] in {" ", "\t"}:
+                continue
+            if _looks_like_statement(code):
+                continue
+
+            # Include leading qualifiers/attributes above the symbol line.
+            start = idx
+            for j in range(idx - 1, max(-1, idx - 16), -1):
+                prev = lines[j]
+                if not prev.startswith("-") or prev.startswith("---"):
+                    break
+                prev_code = _strip_diff_prefix(prev).rstrip()
+                if not prev_code.strip():
+                    break
+                if "{" in prev_code:
+                    break
+                if prev_code.strip() in {"}", "};"} or prev_code.strip().endswith("}"):
+                    break
+                stripped_prev = prev_code.strip()
+                if (
+                    stripped_prev.endswith("*/")
+                    or stripped_prev.startswith("/*")
+                    or stripped_prev.startswith("*")
+                    or stripped_prev.startswith("//")
+                ):
+                    break
+                start = j
+
+            saw_open = False
+            brace_depth = 0
+            in_block_comment = False
+            end = -1
+            for j in range(start, min(len(lines), start + 2000)):
+                cur = lines[j]
+                if not cur.startswith("-") or cur.startswith("---"):
+                    if saw_open:
+                        break
+                    continue
+                cur_code = _strip_diff_prefix(cur).rstrip()
+                if "{" in cur_code:
+                    saw_open = True
+                if saw_open:
+                    delta, in_block_comment = _brace_delta_ignoring_comments(cur_code, in_block_comment)
+                    brace_depth += delta
+                    if brace_depth <= 0:
+                        end = j
+                        break
+
+            if not saw_open or end < idx:
+                continue
+
+            block_lines = []
+            for raw in lines[start : end + 1]:
+                if raw.startswith("-") and not raw.startswith("---"):
+                    block_lines.append(_strip_diff_prefix(raw).rstrip())
+            joined = "\n".join(block_lines)
+            if "{" not in joined:
+                continue
+            if not needle.search(joined):
+                continue
+            return [str(l) for l in block_lines if l is not None]
+
     return []
 
 
@@ -2161,12 +2285,16 @@ def make_extra_patch_override(
     file_path: str,
     symbol_name: str,
     version: str = "v1",
+    prefer_definition: bool = False,
 ) -> Dict[str, Any]:
     """Deterministically extend an `_extra_*` hunk to provide a missing decl/define/typedef.
 
     Primary goal: when the build log reports an undeclared symbol (often a generated `__revert_*` function),
     add a forward declaration (or macro/type) into the file's `_extra_<file>` hunk so the agent doesn't
     inline declarations into the active function body.
+
+    When prefer_definition=True and symbol_name is a `__revert_*` function, prefer inserting a full
+    function definition (bundle/KB sourced) instead of only a prototype.
     """
     import sys
     from migration_tools.patch_bundle import load_patch_bundle  # type: ignore
@@ -2180,6 +2308,7 @@ def make_extra_patch_override(
     symbol = str(symbol_name or "").strip()
     if not symbol:
         raise ValueError("symbol_name must be non-empty")
+    prefer_definition = bool(prefer_definition)
     # Detect when the LLM accidentally passes a full prototype or declaration
     # instead of a bare symbol name (e.g. "void foo(int x);" instead of "foo").
     if '(' in symbol or symbol.endswith(';'):
@@ -2191,6 +2320,7 @@ def make_extra_patch_override(
     tag_symbol_match = re.match(r"^(struct|union|enum)\s+(\w+)$", symbol)
     tag_symbol_kind = str(tag_symbol_match.group(1) if tag_symbol_match else "").strip()
     tag_symbol_name = str(tag_symbol_match.group(2) if tag_symbol_match else "").strip()
+    kind, underlying = _symbol_underlying_name(symbol)
 
     bundle = load_patch_bundle(patch_path_s, allowed_roots=_allowed_patch_roots_from_env())
     extra_key = _infer_extra_patch_key(bundle=bundle, file_path=file_path_s)
@@ -2275,7 +2405,19 @@ def make_extra_patch_override(
                 existing = refreshed
                 normalized_actions.append("regenerate_empty_extra_skeleton")
 
-    if _symbol_defined_in_extra_hunk(existing, symbol_name=symbol):
+    symbol_defined = _symbol_defined_in_extra_hunk(existing, symbol_name=symbol)
+    symbol_has_definition = (
+        _symbol_function_definition_in_extra_hunk(existing, symbol_name=symbol)
+        if kind == "revert_function"
+        else False
+    )
+    can_upgrade_to_definition = (
+        prefer_definition
+        and kind == "revert_function"
+        and symbol_defined
+        and not symbol_has_definition
+    )
+    if symbol_defined and not can_upgrade_to_definition:
         # If the symbol exists but is unsafe (common: opaque typedef used by-value), rewrite it.
         updated_existing = ""
         if agent_tools is not None:
@@ -2444,16 +2586,20 @@ def make_extra_patch_override(
             inserted_lines = [f"{type_kind} {type_name};"]
             insert_kind = "forward_tag_declaration"
 
-    kind, underlying = _symbol_underlying_name(symbol)
-
-    # 1) Best-effort: for generated __revert_* functions, extract the prototype from the bundle itself.
-    #    _extract_function_prototype_from_bundle uses _is_valid_function_prototype which rejects bare
-    #    call sites (e.g., `funcname(args);` without a return type prefix).
+    # 1) Best-effort for generated __revert_* functions:
+    #    - prefer_definition=True: extract full function body from bundle
+    #    - otherwise: extract prototype from bundle
     if kind == "revert_function":
-        proto = _extract_function_prototype_from_bundle(bundle, symbol_name=symbol)
-        if proto:
-            inserted_lines = proto
-            insert_kind = "function_prototype_from_bundle"
+        if prefer_definition:
+            func_def = _extract_function_definition_from_bundle(bundle, symbol_name=symbol)
+            if func_def:
+                inserted_lines = func_def
+                insert_kind = "function_definition_from_bundle"
+        if not inserted_lines:
+            proto = _extract_function_prototype_from_bundle(bundle, symbol_name=symbol)
+            if proto:
+                inserted_lines = proto
+                insert_kind = "function_prototype_from_bundle"
 
     # 2) Fallback to KB/JSON: locate underlying symbol code and synthesize a declaration.
     sys.stderr.write(f"[make_extra_patch_override] Step 2: inserted_lines={bool(inserted_lines)}, agent_tools={agent_tools is not None}\n")
@@ -2479,7 +2625,10 @@ def make_extra_patch_override(
                 continue
 
             if "FUNCTION" in chosen_kind:
-                decl_lines = _extract_c_declaration_from_function_code(code)
+                if kind == "revert_function" and prefer_definition and "{" in code:
+                    decl_lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
+                else:
+                    decl_lines = _extract_c_declaration_from_function_code(code)
             else:
                 decl_lines = [l.rstrip("\n") for l in code.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
             decl_lines = [l.rstrip() for l in decl_lines if l is not None and str(l).strip()]
@@ -2493,7 +2642,10 @@ def make_extra_patch_override(
                     decl_lines = _rewrite_first_identifier(decl_lines, old=underlying, new=symbol)
 
             inserted_lines = decl_lines
-            insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
+            if kind == "revert_function" and prefer_definition and "{" in code and "FUNCTION" in chosen_kind:
+                insert_kind = f"function_definition_from_kb:{ver}:{chosen_kind}{reason_suffix}"
+            else:
+                insert_kind = f"declaration_from_kb:{ver}:{chosen_kind}{reason_suffix}"
             break
 
     # If KB lookup failed for a type name, try harder to extract full enum/struct/union definition
@@ -2552,16 +2704,20 @@ def make_extra_patch_override(
                     )
                     insert_kind = (insert_kind + ":enum_values_prefixed").strip(":")
 
-    # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) that would cause
-    # parse errors in V2 code.  Only the return-type area before the function
-    # name is touched; parameter-list types are preserved.
-    if inserted_lines and kind == "revert_function":
+    is_function_definition_insert = (
+        kind == "revert_function"
+        and ("function_definition_" in str(insert_kind or ""))
+    )
+
+    # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) from prototypes.
+    # For full function-definition insertion, keep the body unchanged.
+    if inserted_lines and kind == "revert_function" and not is_function_definition_insert:
         inserted_lines = _strip_attribute_macros_from_prototype(inserted_lines, func_name=symbol)
 
     # For revert functions being inserted into header files, wrap in extern "C"
     # to ensure C++ code can link against the C-defined functions.
     # Use conditional compilation so C files don't see the C++-specific syntax.
-    if inserted_lines and kind == "revert_function":
+    if inserted_lines and kind == "revert_function" and not is_function_definition_insert:
         target_file = str(file_path_s or "").strip()
         if target_file.endswith(".h") or target_file.endswith(".hpp"):
             # Check if already wrapped
@@ -2647,6 +2803,7 @@ def make_extra_patch_override(
 
     # Persist enum rename overrides for regular hunks as artifacts.
     serialized_enum_overrides = _serialize_enum_rename_overrides(enum_rename_overrides)
+    inserted_mode = "definition" if "function_definition_" in str(insert_kind or "") else "declaration"
 
     result: Dict[str, Any] = {
         "patch_path": str(Path(patch_path_s).expanduser().resolve()),
@@ -2660,7 +2817,10 @@ def make_extra_patch_override(
         "patch_text": ref.to_dict(),
         "patch_text_truncated": False,
         "patch_text_lines_total": len(updated_text.splitlines()),
-        "note": "Inserted missing declaration into the file's _extra_* hunk and returned an override diff artifact.",
+        "note": (
+            f"Inserted missing {inserted_mode} into the file's _extra_* hunk "
+            "and returned an override diff artifact."
+        ),
     }
     if serialized_enum_overrides:
         result["enum_rename_overrides"] = serialized_enum_overrides

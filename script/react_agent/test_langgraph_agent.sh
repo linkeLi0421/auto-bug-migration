@@ -791,6 +791,23 @@ with tempfile.TemporaryDirectory() as td:
     text = p.read_text(encoding="utf-8", errors="replace")
     assert "int __revert_deadbeef_myfunc(int x);" in text, text
 
+    # prefer_definition=True should insert the full function body into _extra_*.
+    out_def = make_extra_patch_override(
+        None,
+        patch_path=str(bundle_path),
+        file_path="/src/libxml2/dict.c",
+        symbol_name="__revert_deadbeef_myfunc",
+        version="v1",
+        prefer_definition=True,
+    )
+    ref_def = out_def.get("patch_text") or {}
+    assert isinstance(ref_def, dict) and ref_def.get("artifact_path"), out_def
+    p_def = Path(str(ref_def.get("artifact_path"))).resolve()
+    assert p_def.is_file(), p_def
+    text_def = p_def.read_text(encoding="utf-8", errors="replace")
+    assert "int __revert_deadbeef_myfunc(int x) {" in text_def, text_def
+    assert "return x;" in text_def, text_def
+
 print("OK")
 PY
 
@@ -1897,6 +1914,7 @@ PY
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import os
 import pickle
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -2638,6 +2656,67 @@ forced = _missing_prototype_extra_patch_guardrail(state, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
 assert forced.get("args", {}).get("symbol_name") == "__revert_e11519_xmlParserNsCreate", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/parser.c", forced
+
+print("OK")
+PY
+
+# Revert-missing-definition guardrail: for unresolved __revert_* helpers (linker or undefined-internal),
+# force make_extra_patch_override(..., prefer_definition=true) targeting the using file.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _revert_missing_definition_extra_patch_guardrail  # noqa: E402
+
+err = "/usr/bin/ld: header.c:(.text.build_header_line+0x6d): undefined reference to `__revert_deadbeef_ks_resize'"
+state = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err,
+    snippet="",
+)
+state.grouped_errors = [
+    {
+        "kind": "linker",
+        "raw": "header.c:(.text.build_header_line+0x6d): undefined reference to `__revert_deadbeef_ks_resize'",
+        "msg": "undefined reference to `__revert_deadbeef_ks_resize'",
+        "file": "/src/htslib/header.c",
+        "symbol": "__revert_deadbeef_ks_resize",
+        "function": "build_header_line",
+        "line": 0,
+        "col": 0,
+    }
+]
+
+decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "rewrite function", "args": {}}
+forced = _revert_missing_definition_extra_patch_guardrail(state, decision)
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
+assert forced.get("args", {}).get("symbol_name") == "__revert_deadbeef_ks_resize", forced
+assert forced.get("args", {}).get("file_path") == "/src/htslib/header.c", forced
+assert forced.get("args", {}).get("prefer_definition") is True, forced
+
+# Once we've already attempted prefer_definition for this symbol, do not force again.
+state.step_history = [
+    {
+        "decision": {
+            "type": "tool",
+            "tool": "make_extra_patch_override",
+            "args": {
+                "patch_path": "bundle.patch2",
+                "file_path": "/src/htslib/header.c",
+                "symbol_name": "__revert_deadbeef_ks_resize",
+                "prefer_definition": True,
+            },
+        },
+        "observation": {},
+    }
+]
+forced2 = _revert_missing_definition_extra_patch_guardrail(state, decision)
+assert forced2 is None, forced2
 
 print("OK")
 PY
@@ -3837,7 +3916,7 @@ assert "OVERRIDE_LINE" in merged_text, merged_path
 assert "p2" in (out.get("overridden_patch_keys") or []), out
 assert "_extra_error.c" in (out.get("overridden_patch_keys") or []), out
 assert "EXTRA_DECL" in merged_text, merged_path
-assert merged_path.parent == artifact_dir.resolve(), (merged_path, artifact_dir)
+assert merged_path.parent in {artifact_dir.resolve(), artifact_root.resolve()}, (merged_path, artifact_dir)
 
 nested_extra_dir = (artifact_dir / "_extra_error.c").resolve()
 nested_extra_dir.mkdir(parents=True, exist_ok=True)
@@ -3862,7 +3941,7 @@ assert merged_path2.is_file(), out2
 merged_text2 = merged_path2.read_text(encoding="utf-8", errors="replace")
 assert "_extra_error.c" in (out2.get("overridden_patch_keys") or []), out2
 assert "EXTRA_ONLY_DECL" in merged_text2, merged_path2
-assert merged_path2.parent == artifact_dir.resolve(), (merged_path2, artifact_dir)
+assert merged_path2.parent in {artifact_dir.resolve(), artifact_root.resolve()}, (merged_path2, artifact_dir)
 
 # Multiple override diffs for the same `_extra_*` key should be merged (not last-write-wins).
 out3 = merge_patch_bundle_with_overrides(
@@ -5048,6 +5127,36 @@ assert kind == "text", f"Expected 'text', got {kind!r}"
 print("OK")
 PY
 
+# Test: iter_compiler_errors parses __revert_* undefined-internal warnings and maps to using TU.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from build_log import iter_compiler_errors  # noqa: E402
+
+log = (
+    "clang -Wall -c -o sam.o sam.c\n"
+    "In file included from /src/htslib/sam.c:45:\n"
+    "In file included from /src/htslib/cram/cram.h:46:\n"
+    "/src/htslib/htslib/kstring.h:40:19: warning: function '__revert_deadbeef_ks_resize' has internal linkage but is not defined [-Wundefined-internal]\n"
+    "   40 | static inline int __revert_deadbeef_ks_resize(kstring_t *s, size_t size);\n"
+    "      |                   ^\n"
+)
+errs = iter_compiler_errors(log, snippet_lines=4)
+assert len(errs) == 1, errs
+err = errs[0]
+assert err.get("level") == "warning", err
+assert err.get("kind") == "undefined_internal", err
+assert err.get("symbol") == "__revert_deadbeef_ks_resize", err
+assert err.get("file") == "/src/htslib/sam.c", err
+assert int(err.get("line") or 0) == 45, err
+
+print("OK")
+PY
+
 # Test: iter_linker_errors parses linker undefined reference errors.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import sys
@@ -5103,17 +5212,24 @@ assert _error_type_priority(err_implicit) == 1, f"Expected 1, got {_error_type_p
 err_undeclared = {"msg": "call to undeclared function 'bar'"}
 assert _error_type_priority(err_undeclared) == 1, f"Expected 1, got {_error_type_priority(err_undeclared)}"
 
-# Priority 2: linker error by kind
+# Priority 2: __revert_* undefined-internal warning
+err_undef_internal = {
+    "kind": "undefined_internal",
+    "msg": "function '__revert_deadbeef_ks_resize' has internal linkage but is not defined [-Wundefined-internal]",
+}
+assert _error_type_priority(err_undef_internal) == 2, f"Expected 2, got {_error_type_priority(err_undef_internal)}"
+
+# Priority 3: linker error by kind
 err_linker_kind = {"kind": "linker", "msg": "undefined reference to `foo`"}
-assert _error_type_priority(err_linker_kind) == 2, f"Expected 2, got {_error_type_priority(err_linker_kind)}"
+assert _error_type_priority(err_linker_kind) == 3, f"Expected 3, got {_error_type_priority(err_linker_kind)}"
 
-# Priority 2: linker error by message content
+# Priority 3: linker error by message content
 err_linker_msg = {"msg": "undefined reference to `bar`"}
-assert _error_type_priority(err_linker_msg) == 2, f"Expected 2, got {_error_type_priority(err_linker_msg)}"
+assert _error_type_priority(err_linker_msg) == 3, f"Expected 3, got {_error_type_priority(err_linker_msg)}"
 
-# Priority 3: other errors
+# Priority 4: other errors
 err_other = {"msg": "some other error"}
-assert _error_type_priority(err_other) == 3, f"Expected 3, got {_error_type_priority(err_other)}"
+assert _error_type_priority(err_other) == 4, f"Expected 4, got {_error_type_priority(err_other)}"
 
 print("OK")
 PY

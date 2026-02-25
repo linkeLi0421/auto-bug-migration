@@ -17,6 +17,14 @@ _UNDECLARED_FUNC_WARNING_PATTERNS = [
     "implicit declaration of function",
     "no previous prototype for function",
 ]
+_REVERT_UNDEFINED_INTERNAL_RE = re.compile(
+    r"function\s+'(?P<symbol>__revert_[^']+)'\s+has internal linkage but is not defined",
+    re.IGNORECASE,
+)
+_INCLUDED_FROM_RE = re.compile(
+    r"^In file included from (?P<file>[^:\n]+):(?P<line>\d+)(?::\d+)?:?\s*$"
+)
+_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
 
 _LD_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LD_UNDEF_REF_SECTION_RE = re.compile(
@@ -152,6 +160,30 @@ def _is_undeclared_func_warning(line: str) -> bool:
     return any(pattern in lower for pattern in _UNDECLARED_FUNC_WARNING_PATTERNS)
 
 
+def _is_revert_undefined_internal_warning(line: str) -> bool:
+    """Check if a warning line is about an unresolved __revert_* internal helper."""
+    m = _REVERT_UNDEFINED_INTERNAL_RE.search(str(line or ""))
+    return bool(m and str(m.group("symbol") or "").startswith("__revert_"))
+
+
+def _extract_translation_unit_from_diag_block(block: str) -> Tuple[str, int]:
+    """Best-effort extraction of the compiling TU from 'In file included from ...' lines."""
+    for raw in str(block or "").splitlines():
+        m = _INCLUDED_FROM_RE.match(raw.strip())
+        if not m:
+            continue
+        fp = str(m.group("file") or "").strip()
+        try:
+            ln = int(m.group("line") or 0)
+        except (TypeError, ValueError):
+            ln = 0
+        if not fp or ln <= 0:
+            continue
+        if Path(fp).suffix.lower() in _SOURCE_SUFFIXES:
+            return fp, ln
+    return "", 0
+
+
 def find_first_fatal(build_log: str) -> Tuple[str, str]:
     """Return the first compiler error line and its full diagnostic block.
 
@@ -170,9 +202,11 @@ def find_first_fatal(build_log: str) -> Tuple[str, str]:
                     end = j
                     break
             return stripped, "\n".join(lines[idx:end]).strip()
-        # Check for undeclared function warnings (treated as errors)
+        # Check for warnings that are treated as errors in our workflow.
+        # - undeclared function warnings
+        # - unresolved __revert_* static/inline helpers (undefined-internal)
         m_warn = _COMPILER_WARNING_RE.match(stripped)
-        if m_warn and _is_undeclared_func_warning(stripped):
+        if m_warn and (_is_undeclared_func_warning(stripped) or _is_revert_undefined_internal_warning(stripped)):
             end = len(lines)
             for j in range(idx + 1, len(lines)):
                 nxt = lines[j].strip()
@@ -251,11 +285,13 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
         if level == "warning":
             # Include only a small subset of warnings that frequently represent hard build
             # failures in OSS-Fuzz (e.g. -Werror=implicit-function-declaration).
+            is_revert_undefined_internal = _is_revert_undefined_internal_warning(msg)
             if (
                 "undeclared function" not in msg
                 and "implicit declaration of function" not in msg
                 and "no previous prototype for function" not in msg
                 and "will not be visible" not in msg
+                and not is_revert_undefined_internal
             ):
                 continue
 
@@ -270,13 +306,30 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
         if has_visibility_warning and "conflicting types" in msg:
             continue
 
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
+        block = "\n".join(lines[idx:end]).strip()
+        # For diagnostics emitted from headers, the include stack that points to the
+        # compiling translation unit appears *before* the warning line.
+        context_start = starts[i - 1][0] + 1 if i > 0 else 0
+        context_block = "\n".join(lines[context_start:end]).strip()
+        kind = ""
+        symbol = ""
+        if level == "warning":
+            m_internal = _REVERT_UNDEFINED_INTERNAL_RE.search(msg)
+            if m_internal:
+                kind = "undefined_internal"
+                symbol = str(m_internal.group("symbol") or "").strip()
+                # Map this header warning back to the compiling TU when possible.
+                # This helps downstream patch-key grouping target the using source file.
+                tu_file, tu_line = _extract_translation_unit_from_diag_block(context_block)
+                if tu_file and tu_line > 0:
+                    file_path = tu_file
+                    line_no = tu_line
+                    col_no = 1
         key = (file_path, line_no, col_no, msg)
         if key in seen:
             continue
         seen.add(key)
-
-        end = starts[i + 1][0] if i + 1 < len(starts) else len(lines)
-        block = "\n".join(lines[idx:end]).strip()
         errors.append(
             {
                 "file": file_path,
@@ -286,6 +339,8 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
                 "raw": lines[idx].strip(),
                 "level": level,
                 "snippet": block,
+                **({"kind": kind} if kind else {}),
+                **({"symbol": symbol} if symbol else {}),
             }
         )
     return errors

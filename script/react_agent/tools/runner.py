@@ -478,6 +478,7 @@ class ToolRunner:
                 patch_path = str(args.get("patch_path", "")).strip()
                 file_path = str(args.get("file_path", "")).strip()
                 symbol_name = str(args.get("symbol_name", "")).strip()
+                prefer_definition = _as_bool(args.get("prefer_definition"), False)
                 if not patch_path:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: patch_path")
                 if not file_path:
@@ -489,6 +490,7 @@ class ToolRunner:
                     patch_path=patch_path,
                     file_path=file_path,
                     symbol_name=symbol_name,
+                    prefer_definition=prefer_definition,
                 )
                 return ToolObservation(
                     True,
@@ -497,6 +499,7 @@ class ToolRunner:
                         "patch_path": patch_path,
                         "file_path": file_path,
                         "symbol_name": symbol_name,
+                        "prefer_definition": prefer_definition,
                     },
                     output=out,
                 )
