@@ -136,6 +136,340 @@ def rename_func(patch_text, fname, commit, replacement_string=None):
     return modified_lines
 
 
+_HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx"}
+_SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
+_HUNK_HEADER_RE = re.compile(
+    r'^@@\s*-(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s*@@'
+)
+_REVERT_FUNC_RE = re.compile(r'(?<![\w.])(?P<sym>__revert_[A-Za-z0-9]+_[A-Za-z_][A-Za-z0-9_]*)\s*\(')
+
+
+def _is_header_file_path(file_path: str) -> bool:
+    suffix = os.path.splitext(str(file_path or "").strip())[1].lower()
+    return suffix in _HEADER_SUFFIXES
+
+
+def _is_source_file_path(file_path: str) -> bool:
+    suffix = os.path.splitext(str(file_path or "").strip())[1].lower()
+    return suffix in _SOURCE_SUFFIXES
+
+
+def _extract_revert_removed_function_blocks_from_header_patch(patch_text: str) -> List[Dict[str, Any]]:
+    """Extract removed `static ... __revert_* (...) { ... }` function blocks from one patch text."""
+    lines = str(patch_text or "").split('\n')
+    blocks: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.startswith('-') or raw.startswith('---'):
+            i += 1
+            continue
+        code = raw[1:]
+        m = _REVERT_FUNC_RE.search(code)
+        if not m:
+            i += 1
+            continue
+        if not re.search(r'^\s*static\b', code):
+            i += 1
+            continue
+
+        symbol = str(m.group('sym') or '').strip()
+        start = i
+        j = i
+        found_open = False
+        brace_depth = 0
+        block_lines: List[str] = []
+
+        while j < len(lines):
+            cur = lines[j]
+            if not cur.startswith('-') or cur.startswith('---'):
+                # Keep extraction conservative; stop at first non-removed line.
+                break
+            cur_code = cur[1:]
+            block_lines.append(cur)
+            if '{' in cur_code:
+                found_open = True
+            if found_open:
+                brace_depth += cur_code.count('{')
+                brace_depth -= cur_code.count('}')
+                if brace_depth <= 0:
+                    break
+            j += 1
+
+        if found_open and brace_depth <= 0 and block_lines:
+            blocks.append({
+                'symbol': symbol,
+                'start': start,
+                'end': j,
+                'lines': block_lines,
+            })
+            i = j + 1
+            continue
+
+        i += 1
+
+    return blocks
+
+
+def _patch_has_nonblock_hunk_content(patch_text: str, blocks: List[Dict[str, Any]]) -> bool:
+    """Return True when patch text has changed hunk content outside extracted block ranges.
+
+    Context lines (' ') are ignored here. We only treat added/removed lines
+    outside the extracted function blocks as mixed content.
+    """
+    lines = str(patch_text or "").split('\n')
+    covered: Set[int] = set()
+    for b in blocks:
+        st = int(b.get('start', -1))
+        ed = int(b.get('end', -1))
+        if st < 0 or ed < st:
+            continue
+        for idx in range(st, ed + 1):
+            covered.add(idx)
+
+    for idx, line in enumerate(lines):
+        if idx in covered:
+            continue
+        if not line:
+            continue
+        if line.startswith('diff --git ') or line.startswith('--- ') or line.startswith('+++ ') or line.startswith('@@'):
+            continue
+        if line.startswith('+') and not line.startswith('+++'):
+            return True
+        if line.startswith('-') and not line.startswith('---'):
+            return True
+    return False
+
+
+def _find_symbol_callsites_in_patch(patch_text: str, symbol: str) -> List[Tuple[int, str]]:
+    """Find callsite line numbers for `symbol` in one patch hunk (old/new coordinates)."""
+    if not symbol:
+        return []
+    sym_re = re.compile(r'(?<![\w.])' + re.escape(symbol) + r'\s*\(')
+    lines = str(patch_text or "").split('\n')
+    out: List[Tuple[int, str]] = []
+    i = 0
+    while i < len(lines):
+        m = _HUNK_HEADER_RE.match(lines[i].strip())
+        if not m:
+            i += 1
+            continue
+
+        old_line = int(m.group('old_start') or 0)
+        new_line = int(m.group('new_start') or 0)
+        i += 1
+
+        while i < len(lines):
+            line = lines[i]
+            if line.startswith('@@') or line.startswith('diff --git ') or line.startswith('--- ') or line.startswith('+++ '):
+                break
+            if line.startswith('-') and not line.startswith('---'):
+                code = line[1:]
+                if sym_re.search(code):
+                    out.append((old_line, 'old'))
+                old_line += 1
+            elif line.startswith('+') and not line.startswith('+++'):
+                code = line[1:]
+                if sym_re.search(code):
+                    out.append((new_line, 'new'))
+                new_line += 1
+            elif line.startswith(' '):
+                code = line[1:]
+                if sym_re.search(code):
+                    out.append((old_line, 'ctx'))
+                old_line += 1
+                new_line += 1
+            i += 1
+    return out
+
+
+def _choose_insert_line_for_callsite(patch: PatchInfo, *, line_no: int, line_kind: str) -> int:
+    old_fn = int(getattr(patch, 'old_function_start_line', 0) or 0)
+    new_fn = int(getattr(patch, 'new_function_start_line', 0) or 0)
+    if line_kind == 'old' and old_fn > 0:
+        return old_fn
+    if line_kind == 'new' and new_fn > 0:
+        return new_fn
+    if old_fn > 0 and new_fn > 0:
+        return min(old_fn, new_fn)
+    if old_fn > 0:
+        return old_fn
+    if new_fn > 0:
+        return new_fn
+    return max(1, int(line_no or 1))
+
+
+def _select_best_symbol_callsite_target(
+    diff_results: Dict[str, PatchInfo],
+    patch_keys: List[str],
+    *,
+    skip_key: str,
+    symbol: str,
+) -> Optional[Dict[str, Any]]:
+    """Pick earliest callsite target for a `__revert_*` symbol across current hunks."""
+    best: Optional[Tuple[int, int, str, str, str]] = None
+    best_payload: Optional[Dict[str, Any]] = None
+
+    for key in patch_keys:
+        if key == skip_key:
+            continue
+        patch = diff_results.get(key)
+        if patch is None:
+            continue
+        target_file = str(patch.file_path_new or patch.file_path_old or "").strip()
+        if not target_file or target_file == '/dev/null':
+            continue
+        target_file = os.path.normpath(target_file)
+        if not _is_source_file_path(target_file):
+            continue
+
+        for line_no, line_kind in _find_symbol_callsites_in_patch(patch.patch_text, symbol):
+            if int(line_no or 0) <= 0:
+                continue
+            insert_line = _choose_insert_line_for_callsite(patch, line_no=int(line_no), line_kind=line_kind)
+            rank = (int(line_no), int(insert_line), target_file, str(key), line_kind)
+            if best is None or rank < best:
+                best = rank
+                best_payload = {
+                    'key': key,
+                    'file_path': target_file,
+                    'call_line': int(line_no),
+                    'insert_line': int(insert_line),
+                    'line_kind': line_kind,
+                }
+
+    return best_payload
+
+
+def _allocate_unique_patch_key(diff_results: Dict[str, PatchInfo], patch_text: str) -> str:
+    """Return a stable unique key for patch_text."""
+    base = stable_hash(patch_text)
+    if base not in diff_results:
+        return base
+    if str(getattr(diff_results[base], 'patch_text', '') or '') == patch_text:
+        return base
+    i = 1
+    while True:
+        cand = f'{base}_{i}'
+        if cand not in diff_results:
+            return cand
+        if str(getattr(diff_results[cand], 'patch_text', '') or '') == patch_text:
+            return cand
+        i += 1
+
+
+def relocate_header_revert_defs_before_add_context(
+    diff_results: Dict[str, PatchInfo],
+    patch_keys: List[str],
+    *,
+    commit_id: str,
+) -> List[str]:
+    """Move header `__revert_*` function definitions into caller source-file hunks.
+
+    Conservative mode: only relocate when the header patch consists solely of one or more
+    extracted revert definition blocks (no mixed extra content).
+    """
+    updated_keys = list(patch_keys)
+
+    for key in list(updated_keys):
+        patch = diff_results.get(key)
+        if patch is None:
+            continue
+        header_file = str(patch.file_path_new or patch.file_path_old or "").strip()
+        if not header_file or not _is_header_file_path(header_file):
+            continue
+
+        blocks = _extract_revert_removed_function_blocks_from_header_patch(patch.patch_text)
+        if not blocks:
+            continue
+
+        if _patch_has_nonblock_hunk_content(patch.patch_text, blocks):
+            logger.info(f"Header revert relocation skipped for {key} ({header_file}): mixed hunk content.")
+            continue
+
+        selected_targets: List[Dict[str, Any]] = []
+        failed = False
+        for b in blocks:
+            symbol = str(b.get('symbol') or '').strip()
+            if not symbol:
+                failed = True
+                break
+            target = _select_best_symbol_callsite_target(
+                diff_results,
+                updated_keys,
+                skip_key=str(key),
+                symbol=symbol,
+            )
+            if target is None:
+                failed = True
+                logger.info(f"Header revert relocation skipped for {key}: no callsite target for {symbol}.")
+                break
+            selected_targets.append(target)
+
+        if failed:
+            continue
+
+        for b, target in zip(blocks, selected_targets):
+            symbol = str(b.get('symbol') or '').strip()
+            target_file = str(target.get('file_path') or '').strip()
+            insert_line = int(target.get('insert_line') or 0)
+            if not target_file or insert_line <= 0:
+                logger.info(f"Header revert relocation skipped for {symbol}: invalid target.")
+                continue
+
+            block_lines = [str(l) for l in (b.get('lines') or []) if str(l)]
+            block_len = sum(1 for l in block_lines if l.startswith('-') and not l.startswith('---'))
+            if block_len <= 0:
+                logger.info(f"Header revert relocation skipped for {symbol}: empty block.")
+                continue
+
+            patch_header = (
+                f"diff --git a/{target_file} b/{target_file}\n"
+                f"--- a/{target_file}\n"
+                f"+++ b/{target_file}\n"
+                f"@@ -{insert_line},{block_len} +{insert_line},0 @@\n"
+            )
+            relocated_text = patch_header + '\n'.join(block_lines) + '\n'
+
+            target_suffix = os.path.splitext(target_file)[1].lower()
+            target_type = patch.file_type
+            if target_suffix in _SOURCE_SUFFIXES:
+                target_type = 'c'
+            elif target_suffix in _HEADER_SUFFIXES:
+                target_type = 'h'
+
+            relocated_patch = PatchInfo(
+                file_path_old=target_file,
+                file_path_new=target_file,
+                file_type=target_type,
+                patch_text=relocated_text,
+                old_signature=patch.old_signature,
+                patch_type={'Function removed', 'Function body change', 'Recreated function'},
+                dependent_func=set(),
+                new_start_line=insert_line,
+                new_end_line=insert_line,
+                old_start_line=insert_line,
+                old_end_line=insert_line + block_len,
+                old_function_start_line=insert_line,
+                old_function_end_line=insert_line + block_len,
+            )
+            new_key = _allocate_unique_patch_key(diff_results, relocated_patch.patch_text)
+            diff_results[new_key] = relocated_patch
+            if new_key not in updated_keys:
+                updated_keys.append(new_key)
+            logger.info(
+                f"Relocated header revert definition {symbol} from {header_file} "
+                f"to {target_file}:{insert_line} (new key: {new_key})"
+            )
+
+        # Candidate patch contained only moved definition blocks; drop it from apply list.
+        if key in updated_keys:
+            updated_keys.remove(key)
+            logger.info(f"Dropped original header definition patch key {key} ({header_file}) after relocation.")
+
+    return updated_keys
+
+
 def normalize_function_pointer_params(signature: str) -> str:
     """
     Fix libclang's function-pointer parameter syntax:
@@ -2975,6 +3309,11 @@ def apply_and_test_patches(
     patch_key_list = list(set(patch_to_apply))
     add_patch_for_trace_funcs(diff_results, patch_key_list, trace1, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target)
     llvm_fuzzer_test_one_input_patch_update(diff_results, patch_key_list, recreated_functions, target_repo_path, commit['commit_id'], next_commit['commit_id'], target, trace1)
+    patch_key_list = relocate_header_revert_defs_before_add_context(
+        diff_results,
+        patch_key_list,
+        commit_id=commit['commit_id'],
+    )
     # Sort patch_key_list by new_start_line
     patch_key_list = list(set(patch_key_list))
     patch_key_list = sorted(patch_key_list, key=lambda key: diff_results[key].new_start_line, reverse=True)
