@@ -515,9 +515,14 @@ def _load_bundle(patch_path: str) -> Tuple[Any, Any]:
 def _error_type_priority(err: Dict[str, Any]) -> int:
     """Return priority for error type ordering (lower = handled first).
 
-    Order: unknown type name (0) < undeclared function (1) < linker undefined reference (2) < others (3)
+    Order:
+      unknown type name (0)
+      < undeclared function (1)
+      < __revert_* undefined-internal (2)
+      < linker undefined reference (3)
+      < others (4)
     Rationale: fix type definitions first, then function declarations that may use those types,
-    then linker errors (link-time, after compile fixes).
+    then missing internal helper definitions, then linker errors (link-time, after compile fixes).
     """
     msg = str(err.get("msg", "")).lower()
     kind = str(err.get("kind", "")).lower()
@@ -528,11 +533,17 @@ def _error_type_priority(err: Dict[str, Any]) -> int:
     # Priority 1: undeclared function (compile-time)
     if "undeclared function" in msg or "implicit declaration of function" in msg:
         return 1
-    # Priority 2: linker undefined reference (link-time, after compile fixes)
-    if kind == "linker" or "undefined reference" in msg:
+    # Priority 2: __revert_* helper with internal linkage but no definition.
+    if (
+        kind == "undefined_internal"
+        or ("has internal linkage but is not defined" in msg and "__revert_" in msg)
+    ):
         return 2
-    # Priority 3: everything else
-    return 3
+    # Priority 3: linker undefined reference (link-time, after compile fixes)
+    if kind == "linker" or "undefined reference" in msg:
+        return 3
+    # Priority 4: everything else
+    return 4
 
 
 _ARG_COUNT_RE = re.compile(r"too (?:few|many) arguments to function call", re.IGNORECASE)

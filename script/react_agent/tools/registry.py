@@ -175,10 +175,17 @@ TOOL_SPECS: list[Dict[str, Any]] = [
     },
     {
         "name": "make_extra_patch_override",
-        "args": {"patch_path": "string", "file_path": "string", "symbol_name": "string"},
+        "args": {
+            "patch_path": "string",
+            "file_path": "string",
+            "symbol_name": "string",
+            "prefer_definition": "bool?",
+        },
         "description": (
             "Deterministically extend a file's `_extra_*` hunk to provide a missing declaration/define/typedef. "
             "Use for undeclared function/type/macro issues (including warning-level diagnostics like 'call to undeclared function ...'). "
+            "For unresolved `__revert_*` helpers (e.g. undefined reference / undefined-internal), set prefer_definition=true "
+            "to insert a full function definition into the using file's `_extra_*` hunk. "
             "The tool infers the `_extra_<file>` patch_key from file_path and returns a full override diff (never truncated)."
         ),
     },

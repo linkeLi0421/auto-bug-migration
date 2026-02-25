@@ -34,6 +34,22 @@ def _env_flag(name: str) -> bool:
     return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+    return default
+
+
 def _undeclared_symbol_guardrail_enabled() -> bool:
     # Disabled by default: sometimes rewriting a function to remove/replace an undeclared symbol is the
     # correct minimal fix (e.g. replace a removed global with a local).
@@ -466,9 +482,11 @@ def _select_function_group_errors(
 def _prioritize_warnings_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Stable ordering helper: warnings first, then errors.
 
-    Within warnings, prioritize missing-prototype warnings first (they are deterministic to fix via _extra_* prototypes).
+    Within warnings:
+      1) missing-prototype warnings first
+      2) unresolved `__revert_*` undefined-internal warnings
     """
-    ranked: List[tuple[int, int, int, Dict[str, Any]]] = []
+    ranked: List[tuple[int, int, int, int, Dict[str, Any]]] = []
     for idx, err in enumerate(errors or []):
         if not isinstance(err, dict):
             continue
@@ -476,9 +494,18 @@ def _prioritize_warnings_within_hunk(errors: List[Dict[str, Any]]) -> List[Dict[
         msg = str(err.get("msg", "") or "")
         is_warning = level == "warning"
         is_missing_proto = is_warning and ("no previous prototype for function" in msg)
-        ranked.append((0 if is_warning else 1, 0 if is_missing_proto else 1, idx, err))
-    ranked.sort(key=lambda t: (t[0], t[1], t[2]))
-    return [e for _, _, _, e in ranked]
+        is_undefined_internal = is_warning and bool(_REVERT_UNDEFINED_INTERNAL_RE.search(msg))
+        ranked.append(
+            (
+                0 if is_warning else 1,
+                0 if is_missing_proto else 1,
+                0 if is_undefined_internal else 1,
+                idx,
+                err,
+            )
+        )
+    ranked.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+    return [e for _, _, _, _, e in ranked]
 
 
 def _error_matches_focus(err: Dict[str, Any], focus: str) -> bool:
@@ -3346,6 +3373,26 @@ def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) ->
     return False
 
 
+def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: AgentState, symbol: str) -> bool:
+    want = str(symbol or "").strip()
+    if not want:
+        return False
+    for step in (state.step_history or []):
+        if not isinstance(step, dict):
+            continue
+        decision = step.get("decision")
+        if not isinstance(decision, dict):
+            continue
+        if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+            continue
+        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+        if str(args.get("symbol_name", "")).strip() != want:
+            continue
+        if _as_bool(args.get("prefer_definition"), False):
+            return True
+    return False
+
+
 def _count_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> int:
     want = str(symbol or "").strip()
     if not want:
@@ -3513,6 +3560,51 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
         }
 
     return None
+
+
+def _revert_missing_definition_extra_patch_guardrail(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Force `_extra_*` insertion of full `__revert_*` definitions for unresolved helpers."""
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+
+    sym = _extract_revert_missing_definition_symbol_name(state, active_only=True)
+    if not sym:
+        return None
+
+    if _has_make_extra_patch_override_for_symbol_with_prefer_definition(state, sym):
+        return None
+
+    # If model already proposes the exact deterministic action, don't rewrite it.
+    if (
+        str(decision.get("type", "")).strip() == "tool"
+        and str(decision.get("tool", "")).strip() == "make_extra_patch_override"
+        and isinstance(decision.get("args"), dict)
+    ):
+        args = decision.get("args") or {}
+        if (
+            str(args.get("symbol_name", "")).strip() == sym
+            and _as_bool(args.get("prefer_definition"), False)
+        ):
+            return None
+
+    file_path = _extract_revert_missing_definition_file_path(state, active_only=True)
+    if not file_path:
+        return None
+
+    return {
+        "type": "tool",
+        "thought": (
+            f"Unresolved {sym} helper: add a file-scope function definition via the using file's _extra_* hunk "
+            "(prefer definition insertion over prototype-only fixes)."
+        ),
+        "tool": "make_extra_patch_override",
+        "args": {
+            "patch_path": state.patch_path,
+            "file_path": file_path,
+            "symbol_name": sym,
+            "prefer_definition": True,
+        },
+    }
 
 
 def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decision) -> Optional[Decision]:
@@ -3715,6 +3807,14 @@ _INCOMPLETE_TYPE_RE = re.compile(
     re.IGNORECASE,
 )
 _MISSING_PROTOTYPE_RE = re.compile(r"no previous prototype for function\s*'(?P<symbol>[^']+)'", re.IGNORECASE)
+_REVERT_UNDEFINED_INTERNAL_RE = re.compile(
+    r"function\s+'(?P<symbol>__revert_[^']+)'\s+has internal linkage but is not defined",
+    re.IGNORECASE,
+)
+_REVERT_UNDEFINED_REFERENCE_RE = re.compile(
+    r"undefined reference to\s*[`'](?P<symbol>__revert_[^`']+)[`']",
+    re.IGNORECASE,
+)
 _VISIBILITY_DECL_RE = re.compile(
     r"declaration of '(?P<tag>(?:struct|union|enum)\s+\w+)' will not be visible"
 )
@@ -3722,6 +3822,7 @@ _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
 _LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
+_INCLUDED_FROM_RE = re.compile(r"In file included from\s+(?P<file>[^:\n]+):(?P<line>\d+)")
 
 
 def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
@@ -3882,6 +3983,82 @@ def _extract_missing_prototype_symbol_name(state: AgentState, *, active_only: bo
         if sym:
             return sym
     return ""
+
+
+def _extract_revert_missing_definition_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
+    """Best-effort extraction of `__revert_*` symbols missing a definition."""
+    candidates: List[str] = []
+    grouped = state.grouped_errors[:1] if active_only and state.grouped_errors else (state.grouped_errors or [])
+    for e in grouped:
+        if not isinstance(e, dict):
+            continue
+        raw = str(e.get("raw", "") or "").strip()
+        if raw:
+            candidates.append(raw)
+        msg = str(e.get("msg", "") or "").strip()
+        if msg:
+            candidates.append(msg)
+    if str(state.error_line or "").strip():
+        candidates.append(str(state.error_line))
+    if str(state.snippet or "").strip():
+        candidates.append(str(state.snippet))
+
+    for text in candidates:
+        m = _REVERT_UNDEFINED_INTERNAL_RE.search(str(text or ""))
+        if m:
+            sym = str(m.group("symbol") or "").strip()
+            if sym.startswith("__revert_"):
+                return sym
+        m2 = _REVERT_UNDEFINED_REFERENCE_RE.search(str(text or ""))
+        if m2:
+            sym = str(m2.group("symbol") or "").strip()
+            if sym.startswith("__revert_"):
+                return sym
+    return ""
+
+
+def _extract_revert_missing_definition_file_path(state: AgentState, *, active_only: bool = False) -> str:
+    """Best-effort extraction of the using file path for unresolved `__revert_*` helpers."""
+    entries = state.grouped_errors[:1] if active_only and state.grouped_errors else list(state.grouped_errors or [])
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        msg = str(e.get("msg", "") or "")
+        raw = str(e.get("raw", "") or "")
+        kind = str(e.get("kind", "") or "").strip().lower()
+        has_revert_missing_def = bool(
+            _REVERT_UNDEFINED_INTERNAL_RE.search(msg)
+            or _REVERT_UNDEFINED_INTERNAL_RE.search(raw)
+            or _REVERT_UNDEFINED_REFERENCE_RE.search(msg)
+            or _REVERT_UNDEFINED_REFERENCE_RE.search(raw)
+        )
+        if not has_revert_missing_def and kind not in {"linker", "undefined_internal"}:
+            continue
+        fp = str(e.get("file", "") or "").strip()
+        if fp:
+            return fp
+        using_fp = str(e.get("using_file", "") or "").strip()
+        if using_fp:
+            return using_fp
+        snippet = str(e.get("snippet", "") or "").strip()
+        for line in snippet.splitlines():
+            m = _INCLUDED_FROM_RE.search(line.strip())
+            if m:
+                cand = str(m.group("file") or "").strip()
+                if cand:
+                    return cand
+
+    # Fallback to active state snippet when grouped_errors are sparse.
+    for line in str(state.snippet or "").splitlines():
+        m = _INCLUDED_FROM_RE.search(line.strip())
+        if m:
+            cand = str(m.group("file") or "").strip()
+            if cand:
+                return cand
+
+    fp, _ = _first_error_location(state)
+    return fp
+
 
 def _first_error_location(state: AgentState) -> tuple[str, int]:
     if state.grouped_errors:
@@ -5644,6 +5821,12 @@ def _run_langgraph(
                                 "error": _error_payload(st),
                             },
                         }
+
+        forced_revert_def = _revert_missing_definition_extra_patch_guardrail(st, decision)
+        if forced_revert_def:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_revert_def)
+            _validate_tool_decision(forced_revert_def)
+            return {"state": st, "pending": forced_revert_def}
 
         forced_missing_proto = _missing_prototype_extra_patch_guardrail(st, decision)
         if forced_missing_proto:
