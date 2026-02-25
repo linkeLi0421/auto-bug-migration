@@ -13,6 +13,7 @@ from .types import PatchInfo
 
 _HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_start>\d+)(?:,(?P<new_len>\d+))? @@")
 _REVERT_FUNC_RE = re.compile(r"^__revert_[A-Za-z0-9]+_(?P<base>[A-Za-z_][A-Za-z0-9_]*)$")
+_C_CONTROL_NAMES = {"if", "for", "while", "switch"}
 
 
 def _strip_revert_prefix(name: str) -> str:
@@ -105,6 +106,107 @@ def _iter_hunks(patch_text: str) -> List[Dict[str, Any]]:
     if current:
         hunks.append(current)
     return hunks
+
+
+def _first_hunk_body_lines(patch_text: str) -> List[str]:
+    lines = (patch_text or "").splitlines()
+    first_hunk_idx = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    body_start = first_hunk_idx + 1 if first_hunk_idx >= 0 else 4
+    if body_start >= len(lines):
+        return []
+    body: List[str] = []
+    for i in range(body_start, len(lines)):
+        line = lines[i]
+        if line.startswith("@@") or line.startswith("diff --git "):
+            break
+        body.append(line)
+    return body
+
+
+def _extract_function_signature_from_minus_window(window: List[str]) -> Tuple[str, str]:
+    """Best-effort parse (signature, name) from minus-only lines that contain a function definition head."""
+    if not window:
+        return "", ""
+    # Strip diff prefixes and join so multi-line signatures are parseable.
+    joined = "\n".join(str(x[1:] if x.startswith("-") else x) for x in window)
+    # Require an opening brace before any ';' to avoid prototypes.
+    cut = joined.find("{")
+    if cut < 0:
+        return "", ""
+    semi = joined.find(";")
+    if semi >= 0 and semi < cut:
+        return "", ""
+
+    head = joined[:cut]
+    # Function-like head: name(args) with no ';' between the ')' and '{'.
+    m = re.search(r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<args>[^{};]*)\)\s*$", head, flags=re.DOTALL)
+    if not m:
+        return "", ""
+    name = str(m.group("name") or "").strip()
+    if not name or name in _C_CONTROL_NAMES:
+        return "", ""
+    sig = re.sub(r"\s+", " ", head.strip())
+    if "(" not in sig or ")" not in sig:
+        return "", ""
+    return sig, name
+
+
+def _infer_hiden_func_dict_from_patch_text(patch_text: str) -> Dict[str, int]:
+    """Infer hiden_func_dict-like offsets from first-hunk minus lines.
+
+    This is primarily for `_extra_*` hunks that may contain multiple inserted function
+    definitions but have no explicit hiden_func_dict metadata.
+    """
+    body = _first_hunk_body_lines(patch_text)
+    if not body:
+        return {}
+
+    inferred: Dict[str, int] = {}
+    i = 0
+    n = len(body)
+    while i < n:
+        line = body[i]
+        if not line.startswith("-") or line.startswith("---"):
+            i += 1
+            continue
+        raw_head = str(line[1:] if len(line) > 1 else "").strip()
+        if (
+            not raw_head
+            or raw_head in {"{", "}"}
+            or raw_head.startswith("#")
+            or raw_head.startswith("//")
+            or raw_head.startswith("/*")
+            or raw_head.startswith("*")
+        ):
+            i += 1
+            continue
+
+        window: List[str] = []
+        j = i
+        saw_lbrace = False
+        # Keep window small to avoid scanning whole hunk for malformed content.
+        while j < n:
+            cur = body[j]
+            if not cur.startswith("-") or cur.startswith("---"):
+                break
+            window.append(cur)
+            raw = cur[1:]
+            if "{" in raw:
+                saw_lbrace = True
+                break
+            if len(window) >= 24:
+                break
+            j += 1
+
+        if saw_lbrace:
+            sig, _name = _extract_function_signature_from_minus_window(window)
+            if sig:
+                inferred.setdefault(sig, i)
+                i = j + 1
+                continue
+        i += 1
+
+    return inferred
 
 
 def _expand_to_mixed_block(body_lines: List[str], fs: int, fe: int) -> Tuple[int, int]:
@@ -454,6 +556,25 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
                 return i + 1
         return 0
 
+    def effective_hiden_func_items() -> List[Tuple[str, int]]:
+        items: List[Tuple[str, int]] = []
+        for sig, off in (patch.hiden_func_dict or {}).items():
+            try:
+                items.append((str(sig), int(off)))
+            except (TypeError, ValueError):
+                continue
+        # `_extra_*` hunks often don't carry hiden_func_dict metadata; infer starts from
+        # minus-side function definitions so follow-up rewrites can target one function.
+        if not items and "Extra" in (patch.patch_type or set()):
+            inferred = _infer_hiden_func_dict_from_patch_text(patch.patch_text or "")
+            for sig, off in inferred.items():
+                try:
+                    items.append((str(sig), int(off)))
+                except (TypeError, ValueError):
+                    continue
+        items.sort(key=lambda x: x[1])
+        return items
+
     if "Recreated function" not in (patch.patch_type or set()):
         # Generic (non-recreated-function) slice: choose a rewriteable '-' run inside the hunk that matches the error line.
         target_ln = ln + add_num
@@ -613,6 +734,36 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
 
         h_start = int(chosen_hunk["body_start"])
         h_end = int(chosen_hunk["body_end"])
+        hiden_items = effective_hiden_func_items()
+        if hiden_items:
+            chosen_start: Optional[int] = None
+            chosen_sig: Optional[str] = None
+            for sig, off in hiden_items:
+                if off <= int(chosen_idx):
+                    chosen_start = off
+                    chosen_sig = sig
+                else:
+                    break
+            if chosen_start is None:
+                chosen_sig, chosen_start = hiden_items[0]
+            idx = next((i for i, (_, off) in enumerate(hiden_items) if off == chosen_start), -1)
+            func_start_index = int(chosen_start)
+            if idx >= 0 and idx + 1 < len(hiden_items):
+                func_end_index = int(hiden_items[idx + 1][1])
+            else:
+                func_end_index = last_minus_end_index()
+            if chosen_sig:
+                old_function_signature = chosen_sig
+            return {
+                "patch_path": str(Path(patch_path)),
+                "file_path": file_path,
+                "line_number": ln,
+                "patch_key": key_of_line_num,
+                "old_signature": old_function_signature,
+                "func_start_index": func_start_index,
+                "func_end_index": func_end_index,
+            }
+
         run = nearest_minus_run(h_start, h_end, int(chosen_idx))
         if run is None:
             return {
@@ -752,6 +903,23 @@ def _get_link_error_patch_from_bundle(
                 return i + 1
         return 0
 
+    def effective_hiden_func_items_for(p: PatchInfo) -> List[Tuple[str, int]]:
+        items: List[Tuple[str, int]] = []
+        for sig, off in (p.hiden_func_dict or {}).items():
+            try:
+                items.append((str(sig), int(off)))
+            except (TypeError, ValueError):
+                continue
+        if not items and "Extra" in (p.patch_type or set()):
+            inferred = _infer_hiden_func_dict_from_patch_text(p.patch_text or "")
+            for sig, off in inferred.items():
+                try:
+                    items.append((str(sig), int(off)))
+                except (TypeError, ValueError):
+                    continue
+        items.sort(key=lambda x: x[1])
+        return items
+
     best_key: Optional[str] = None
     best_score = -1
     best_hit_idx = -1
@@ -774,8 +942,9 @@ def _get_link_error_patch_from_bundle(
         if base and base == new_fn:
             score = max(score, 90)
 
-        if patch.hiden_func_dict:
-            for sig in (patch.hiden_func_dict or {}).keys():
+        hiden_items = effective_hiden_func_items_for(patch)
+        if hiden_items:
+            for sig, _off in hiden_items:
                 if base and _func_name_from_sig(sig) == base:
                     score = max(score, 98)
                     break
@@ -829,15 +998,8 @@ def _get_link_error_patch_from_bundle(
 
     hit_idx = best_hit_idx if best_hit_idx >= 0 else locate_hit_index(body)
 
-    if patch.hiden_func_dict:
-        items: List[Tuple[str, int]] = []
-        for sig, off in (patch.hiden_func_dict or {}).items():
-            try:
-                items.append((str(sig), int(off)))
-            except (TypeError, ValueError):
-                continue
-        items.sort(key=lambda x: x[1])
-
+    items = effective_hiden_func_items_for(patch)
+    if items:
         chosen_start: Optional[int] = None
         chosen_sig: Optional[str] = None
 
@@ -1372,6 +1534,17 @@ def _update_hiden_func_dict(
         return None, ""
 
 
+def _ensure_hiden_func_dict_for_extra_patch(patch: "PatchInfo") -> None:
+    """Populate missing hiden_func_dict for `_extra_*` hunks from patch text (best effort)."""
+    if getattr(patch, "hiden_func_dict", None):
+        return
+    if "Extra" not in (patch.patch_type or set()):
+        return
+    inferred = _infer_hiden_func_dict_from_patch_text(str(getattr(patch, "patch_text", "") or ""))
+    if inferred:
+        patch.hiden_func_dict = {str(k): int(v) for k, v in inferred.items()}
+
+
 def _recompute_hunk_headers(patch_lines: List[str]) -> None:
     """Recompute ``@@`` hunk headers in *patch_lines* in-place.
 
@@ -1479,6 +1652,7 @@ def make_error_patch_override(
         }
 
     patch = bundle.patches[str(patch_key)]
+    _ensure_hiden_func_dict_for_extra_patch(patch)
     rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
     rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
     if not rel_file:
@@ -1671,6 +1845,7 @@ def revise_patch_hunk(
         }
 
     patch = bundle.patches[str(patch_key)]
+    _ensure_hiden_func_dict_for_extra_patch(patch)
     rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
     rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
     if not rel_file:
@@ -1821,6 +1996,7 @@ def make_link_error_patch_override(
         }
 
     patch = bundle.patches[str(patch_key)]
+    _ensure_hiden_func_dict_for_extra_patch(patch)
     rel_file = str(patch.file_path_new or patch.file_path_old or file_path or "").strip()
     rel_file = _norm_path(rel_file).lstrip("./").lstrip("/")
     if not rel_file:

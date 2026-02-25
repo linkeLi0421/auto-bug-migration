@@ -3526,6 +3526,86 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# `_extra_*` follow-up rewrite support: when an extra hunk contains multiple inserted
+# function definitions but no hiden_func_dict metadata, mapping should still select the
+# correct function slice (not the full contiguous '-' block).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from migration_tools.patch_bundle import load_patch_bundle  # noqa: E402
+from migration_tools.tools import _get_error_patch_from_bundle, make_error_patch_override  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td:
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = td
+    bundle_path = Path(td) / "bundle.patch2"
+    patch_key = "_extra_demo.c"
+
+    patch_text = (
+        "diff --git a/demo.c b/demo.c\n"
+        "--- a/demo.c\n"
+        "+++ b/demo.c\n"
+        "@@ -100,8 +100,1 @@\n"
+        "-int helper_one(void) {\n"
+        "-  return 1;\n"
+        "-}\n"
+        "-\n"
+        "-int helper_two(void) {\n"
+        "-  return 2;\n"
+        "-}\n"
+        " int anchor = 0;\n"
+    )
+    patch = PatchInfo(
+        file_path_old="demo.c",
+        file_path_new="demo.c",
+        patch_text=patch_text,
+        file_type="c",
+        old_start_line=100,
+        old_end_line=108,
+        new_start_line=100,
+        new_end_line=101,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({patch_key: patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    bundle = load_patch_bundle(str(bundle_path), allowed_roots=[td])
+    m1 = _get_error_patch_from_bundle(bundle, patch_path=str(bundle_path), file_path="/src/demo.c", line_number=101)
+    m2 = _get_error_patch_from_bundle(bundle, patch_path=str(bundle_path), file_path="/src/demo.c", line_number=105)
+    assert m1.get("patch_key") == patch_key, m1
+    assert m2.get("patch_key") == patch_key, m2
+    assert int(m2.get("func_start_index") or -1) > int(m1.get("func_start_index") or -1), (m1, m2)
+    assert "helper_two" in str(m2.get("old_signature") or ""), m2
+
+    out = make_error_patch_override(
+        patch_path=str(bundle_path),
+        file_path="/src/demo.c",
+        line_number=105,
+        new_func_code="int helper_two(void) { return 22; }\n",
+        allowed_roots=[td],
+    )
+    assert out.get("patch_key") == patch_key, out
+    updated = str(out.get("patch_text") or "")
+    assert "helper_one(void)" in updated, updated
+    assert "return 1;" in updated, updated
+    assert "helper_two(void) { return 22; }" in updated, updated
+    assert "return 2;" not in updated, updated
+    upd_hiden = out.get("hiden_func_dict_updated")
+    assert isinstance(upd_hiden, dict) and any("helper_two" in str(k) for k in upd_hiden.keys()), upd_hiden
+
+print("OK")
+PY
+
 for fixture in "${fixtures[@]}"; do
   output="$("$PYTHON" "$SCRIPT_DIR/agent_langgraph.py" --model stub --tools fake --max-steps 3 "$fixture")"
   "$PYTHON" - "$fixture" "$output" <<'PY'
