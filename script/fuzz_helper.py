@@ -1153,6 +1153,38 @@ def run_clusterfuzzlite(args):
     return False
 
 
+def _strict_reverse_patch_apply_snippet():
+  """Return bash snippet that applies /patch with strict location matching."""
+  return '''
+    PATCH_CHECK_LOG="$(mktemp)"
+    if ! patch -p1 -R --fuzz=0 --dry-run --batch --verbose < /patch > "$PATCH_CHECK_LOG" 2>&1; then
+      cat "$PATCH_CHECK_LOG";
+      echo "OSS-FUZZ PATCH APPLY FAILED (check)";
+      exit 1;
+    fi
+    if grep -Eq "offset [+-]?[1-9][0-9]* lines" "$PATCH_CHECK_LOG"; then
+      echo "STRICT APPLY OFFSETS DETECTED:";
+      awk '
+        /^Checking patch / {cur=$0}
+        /offset [+-]?[1-9][0-9]* lines/ {print cur; print $0}
+      ' "$PATCH_CHECK_LOG";
+      echo "OSS-FUZZ PATCH APPLY FAILED (offset)";
+      exit 1;
+    fi
+    if grep -Eq "with fuzz [1-9][0-9]*" "$PATCH_CHECK_LOG"; then
+      echo "STRICT APPLY FUZZ DETECTED:";
+      grep -E "with fuzz [1-9][0-9]*" "$PATCH_CHECK_LOG";
+      echo "OSS-FUZZ PATCH APPLY FAILED (fuzz)";
+      exit 1;
+    fi
+    rm -f "$PATCH_CHECK_LOG";
+    if ! patch -p1 -R --fuzz=0 --batch < /patch; then
+      echo "OSS-FUZZ PATCH APPLY FAILED";
+      exit 1;
+    fi
+  '''
+
+
 def build_fuzzers(args):
   """Builds fuzzers."""
   if args.engine == 'centipede' and args.sanitizer != 'none':
@@ -2071,16 +2103,7 @@ def build_version(args):
   '''
   
   if args.patch:
-    build_bash += f'''
-    if ! git apply --check --ignore-whitespace --ignore-space-change --reverse /patch; then
-      echo "OSS-FUZZ PATCH APPLY FAILED (check)";
-      exit 1;
-    fi
-    if ! git apply --ignore-whitespace --ignore-space-change --reverse /patch; then
-      echo "OSS-FUZZ PATCH APPLY FAILED";
-      exit 1;
-    fi
-    '''
+    build_bash += _strict_reverse_patch_apply_snippet()
     run_args.extend([
         '-v',
         '%s:/patch' % args.patch,
@@ -2166,7 +2189,7 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     
     # Checkout buggy commit and set up environment
     git checkout -f {commit};
-    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch and apply_patch else ''} 
+    {_strict_reverse_patch_apply_snippet() if args.patch and apply_patch else ''} 
     
     # Compile and collect trace
     compile;
@@ -2215,7 +2238,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     cd -;
     {allowlist_cmd}
     python3 /script/add_revert_entries.py --commit {short_bc1} /allowlist.txt -o /allowlist.txt;
-    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
+    {_strict_reverse_patch_apply_snippet() if args.patch else ''}
     
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
@@ -2244,7 +2267,7 @@ def get_cfg_bash(args):
     make -j$(nproc);
     cd -;
     
-    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
+    {_strict_reverse_patch_apply_snippet() if args.patch else ''}
     export LD_LIBRARY_PATH=/usr/local/lib/x86_64-unknown-linux-gnu:$LD_LIBRARY_PATH;
     /cfg-clang/build/cfg-clang -p ./compile_commands.json \
       {args.target_file} &> /data/cfg-{args.project.name}-{args.commit[:8]}-{args.target_file.replace('/', '-')}.txt;
@@ -2521,7 +2544,7 @@ def get_poc_for_new_version(args):
     git checkout -f {args.target_commit}; 
     cd -;
     cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
-    {'git apply --ignore-whitespace --ignore-space-change --reverse /patch;' if args.patch else ''}
+    {_strict_reverse_patch_apply_snippet() if args.patch else ''}
 
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";

@@ -2507,14 +2507,21 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     for key in reversed(final_patches):
         patch = diff_results[key]
         patch_text = patch.patch_text
-        lines = patch_text.split('\n')
+        lines = patch_text.splitlines()
         if len(lines) < 5:
             logger.error(f'patch_text is too short, skip: {patch_text}')
-        if lines[4][0] in {'-', '+'}: # meaning this patch has no context
+            continue
+        if lines[4] and lines[4][0] in {'-', '+'}: # meaning this patch has no context
             if patch.file_path_new in patch_prev_key and patch.new_start_line <= prev_new_end_line[patch.file_path_new]+3:
                 # merge the patches that have overlap
                 patch_prev = diff_results[patch_prev_key[patch.file_path_new]]
-                patch_prev_lines = patch_prev.patch_text.split('\n')
+                patch_prev_lines = patch_prev.patch_text.splitlines()
+                if len(patch_prev_lines) < 5:
+                    logger.error(f'patch_prev_text is too short, skip merge: {patch_prev.patch_text}')
+                    prev_new_start_line[diff_results[key].file_path_new] = diff_results[key].new_start_line
+                    prev_new_end_line[diff_results[key].file_path_new] = diff_results[key].new_end_line
+                    patch_prev_key[diff_results[key].file_path_new] = key
+                    continue
                 connect_lines_end = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 # In most cases, patch_prev.new_end_line is the actually line number+1, except patch_prev.new_end_line = patch_prev.new_start_line
                 connect_lines_begin = int(patch_prev_lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0]) + int(patch_prev_lines[3].split('@@')[-2].strip().split(',')[-1])
@@ -2524,6 +2531,8 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
                 else:
                     connect_lines = []
                 merged_lines = patch_prev_lines[4:] + connect_lines + lines[4:]
+                # Keep unified-diff body lines well-formed (no raw empty lines).
+                merged_lines = [line for line in merged_lines if line != ""]
                 
                 patch_prev_old_start = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[0].split('-')[-1])
                 patch_prev_old_offset = int(patch_prev_lines[3].split('@@')[-2].strip().split(' ')[0].split(',')[1])
@@ -2575,9 +2584,10 @@ def add_context(diff_results, final_patches, new_commit, target_repo_path):
     for key in final_patches:
         patch = diff_results[key]
         patch_text = patch.patch_text
-        lines = patch_text.split('\n')
-        if lines[-1] == '':
-            lines = lines[:-1]
+        lines = patch_text.splitlines()
+        if len(lines) < 5:
+            logger.error(f'patch_text is too short in context pass, skip: {patch_text}')
+            continue
         if not patch.file_path_new or patch.file_path_new == '/dev/null':
             # a patch delete a file, skip now
             continue
