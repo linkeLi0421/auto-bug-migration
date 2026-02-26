@@ -3823,6 +3823,103 @@ _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
 _INCLUDED_FROM_RE = re.compile(r"In file included from\s+(?P<file>[^:\n]+):(?P<line>\d+)")
+_DIFF_GIT_PATH_RE = re.compile(r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$")
+
+
+def _extract_file_path_from_diff_hunk_text(text: str) -> str:
+    """Extract repo-relative file path from a unified-diff hunk header."""
+    lines = str(text or "").splitlines()
+    if not lines:
+        return ""
+
+    old_fp = ""
+    new_fp = ""
+    for raw in lines:
+        line = str(raw or "").strip()
+        m = _DIFF_GIT_PATH_RE.match(line)
+        if m:
+            old_fp = str(m.group("old") or "").strip()
+            new_fp = str(m.group("new") or "").strip()
+            break
+    if not old_fp and not new_fp:
+        for raw in lines:
+            line = str(raw or "").strip()
+            if line.startswith("--- "):
+                v = line[len("--- ") :].strip()
+                old_fp = v[2:] if v.startswith("a/") else v
+            elif line.startswith("+++ "):
+                v = line[len("+++ ") :].strip()
+                new_fp = v[2:] if v.startswith("b/") else v
+            if old_fp and new_fp:
+                break
+
+    if new_fp and new_fp != "/dev/null":
+        return new_fp
+    if old_fp and old_fp != "/dev/null":
+        return old_fp
+    return ""
+
+
+def _extra_patch_file_path_from_error_hunk(state: AgentState) -> str:
+    """Prefer the exact file path encoded in get_error_patch_context excerpt hunk."""
+    artifact_candidates: List[str] = []
+    for ap in (
+        str(getattr(state, "active_excerpt_artifact_path", "") or "").strip(),
+        _last_artifact_path(state, "get_error_patch_context", "excerpt"),
+        _last_artifact_path(state, "get_link_error_patch_context", "excerpt"),
+    ):
+        if ap and ap not in artifact_candidates:
+            artifact_candidates.append(ap)
+
+    for ap in artifact_candidates:
+        try:
+            text = _read_text(ap)
+        except Exception:
+            continue
+        fp = _extract_file_path_from_diff_hunk_text(text)
+        if fp:
+            return fp
+
+    for step in reversed(state.steps):
+        if not isinstance(step, dict):
+            continue
+        obs = step.get("observation")
+        if not isinstance(obs, dict) or obs.get("ok") is not True:
+            continue
+        tool = str(obs.get("tool", "")).strip()
+        if tool not in {"get_error_patch_context", "get_link_error_patch_context"}:
+            continue
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            continue
+        excerpt = out.get("excerpt")
+        if isinstance(excerpt, str):
+            fp = _extract_file_path_from_diff_hunk_text(excerpt)
+            if fp:
+                return fp
+        elif isinstance(excerpt, dict):
+            ap = str(excerpt.get("artifact_path", "") or "").strip()
+            if not ap:
+                continue
+            try:
+                text = _read_text(ap)
+            except Exception:
+                continue
+            fp = _extract_file_path_from_diff_hunk_text(text)
+            if fp:
+                return fp
+    return ""
+
+
+def _pick_make_extra_patch_file_path(state: AgentState, fallback_file: str = "") -> str:
+    """Pick file_path for make_extra_patch_override, preferring hunk-derived paths."""
+    from_hunk = _extra_patch_file_path_from_error_hunk(state)
+    if from_hunk:
+        return from_hunk
+    fb = str(fallback_file or "").strip()
+    if fb:
+        return fb
+    return str(getattr(state, "active_file_path", "") or "").strip()
 
 
 def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = False) -> str:
@@ -4886,7 +4983,7 @@ def _run_langgraph(
             unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
             if unfixed:
                 sym, fp = unfixed[0]
-                file_for_override = Path(fp).name if fp else ""
+                file_for_override = _pick_make_extra_patch_file_path(st, fallback_file=fp)
                 forced_extra: Decision = {
                     "type": "tool",
                     "thought": f"Additional undeclared symbol in grouped errors: {sym}. Add forward declaration before building.",
@@ -4917,7 +5014,7 @@ def _run_langgraph(
                     if _has_make_extra_patch_override_for_symbol(st, tag):
                         continue
                     fp = str(e.get("file", "") or "").strip()
-                    file_for_override_vis = Path(fp).name if fp else ""
+                    file_for_override_vis = _pick_make_extra_patch_file_path(st, fallback_file=fp)
                     forced_vis: Decision = {
                         "type": "tool",
                         "thought": (
