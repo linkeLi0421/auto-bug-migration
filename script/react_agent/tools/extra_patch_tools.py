@@ -70,6 +70,32 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
     raw = str(file_path or "").strip()
     if not raw:
         return ""
+
+    def _strip_src_repo_prefix(path_s: str, *, repo_name: str = "") -> str:
+        """Normalize /src/<repo>/... and src/<repo>/... to repo-relative path."""
+        s = str(path_s or "").replace("\\", "/").strip()
+        if not s:
+            return ""
+        had_src_prefix = s.startswith("/src/") or s == "/src" or s.startswith("src/") or s == "src"
+        if s.startswith("/src/"):
+            s = s[len("/src/") :]
+        elif s == "/src":
+            s = ""
+        elif s.startswith("src/"):
+            s = s[len("src/") :]
+        elif s == "src":
+            s = ""
+        if had_src_prefix and repo_name:
+            if s == repo_name:
+                s = ""
+            elif s.startswith(repo_name + "/"):
+                s = s[len(repo_name) + 1 :]
+            elif s == f"{repo_name}-src":
+                s = ""
+            elif s.startswith(f"{repo_name}-src/"):
+                s = s[len(f"{repo_name}-src/") :]
+        return s
+
     if sm is not None:
         try:
             resolved = sm._resolve_path(raw, version)  # type: ignore[attr-defined]
@@ -78,20 +104,21 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
         if resolved is not None:
             try:
                 root = sm._repo_root(version)  # type: ignore[attr-defined]
-                rel = resolved.resolve().relative_to(root.resolve())
-                return rel.as_posix()
+                rel = resolved.resolve().relative_to(root.resolve()).as_posix()
+                repo_name = str(getattr(root, "name", "") or "").strip()
+                rel_norm = _strip_src_repo_prefix(rel, repo_name=repo_name)
+                return rel_norm if rel_norm else rel
             except Exception:
                 pass
 
-    # Fallback: strip the /src/<repo>/ prefix when present.
-    if raw.startswith("/src"):
-        rel = raw[len("/src") :].lstrip("/")
+    # Fallback: strip the /src/<repo>/ or src/<repo>/ prefix when present.
+    if raw.startswith("/src") or raw.startswith("src/"):
+        rel = _strip_src_repo_prefix(raw)
         if sm is not None:
             try:
                 repo = sm._repo_root(version)  # type: ignore[attr-defined]
                 repo_name = str(getattr(repo, "name", "") or "").strip()
-                if repo_name and rel.replace("\\", "/").startswith(repo_name + "/"):
-                    rel = rel.replace("\\", "/")[len(repo_name) + 1 :]
+                rel = _strip_src_repo_prefix(rel, repo_name=repo_name)
             except Exception:
                 pass
         return rel.replace("\\", "/")
@@ -413,6 +440,21 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         if resolved is not None and resolved.exists():
             version_used = ver
             break
+    if resolved is None or not resolved.exists():
+        # Fallback: file may be in a subdirectory (e.g. cram_index.c → cram/cram_index.c).
+        # Search by basename; accept only an unambiguous single match.
+        basename = Path(str(file_path or "")).name
+        if basename:
+            for ver in ("v2", "v1"):
+                try:
+                    repo_root = sm._repo_root(ver)  # type: ignore[attr-defined]
+                except Exception:
+                    continue
+                candidates = [p for p in repo_root.rglob(basename) if p.is_file()]
+                if len(candidates) == 1:
+                    resolved = candidates[0]
+                    version_used = ver
+                    break
     if resolved is None or not resolved.exists():
         return ""
     text = resolved.read_text(encoding="utf-8", errors="replace")

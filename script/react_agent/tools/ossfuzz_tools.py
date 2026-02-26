@@ -25,7 +25,15 @@ _PATCH_APPLY_ERROR_PATTERNS = [
     re.compile(r"^error:\s+no valid patches in input.*$", re.IGNORECASE),
     re.compile(r"^patch:\s+\*{4}.*$", re.IGNORECASE),
     re.compile(r"^fatal:\s+patch failed.*$", re.IGNORECASE),
+    # fuzz_helper strict reverse-apply guardrails
+    re.compile(r"^oss-fuzz patch apply failed(?:\s*\(.*\))?\s*$", re.IGNORECASE),
+    # `patch(1)` apply failures that may not be prefixed with "error:"
+    re.compile(r"^can't find file to patch(?:\s+at\s+input\s+line\s+\d+)?\s*$", re.IGNORECASE),
+    re.compile(r"^no file to patch\.\s+skipping patch\.\s*$", re.IGNORECASE),
+    re.compile(r"^hunk\s+#\d+\s+ignored\s+at\s+\d+\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\d+\s+out of\s+\d+\s+hunks?\s+ignored\b.*$", re.IGNORECASE),
 ]
+_PATCH_INPUT_LINE_RE = re.compile(r"\binput line (?P<line>\d+)\b", re.IGNORECASE)
 # Warnings about undeclared functions (treated as errors for build_ok)
 _UNDECLARED_FUNC_WARNING_PATTERNS = [
     "call to undeclared function",
@@ -169,6 +177,53 @@ def _find_patch_apply_error(text: str) -> str:
             if pat.search(stripped):
                 return stripped
     return ""
+
+
+def _extract_last_patch_input_line(text: str) -> int:
+    """Return the last `input line N` value from patch output."""
+    raw = str(text or "")
+    if not raw.strip():
+        return 0
+    last = 0
+    for m in _PATCH_INPUT_LINE_RE.finditer(raw):
+        try:
+            n = int(m.group("line") or 0)
+        except Exception:
+            continue
+        if n > 0:
+            last = n
+    return last
+
+
+def _extract_diff_block_for_line(patch_text: str, line_no: int) -> str:
+    """Return the `diff --git` block that contains `line_no` (1-based)."""
+    lines = str(patch_text or "").splitlines()
+    if not lines:
+        return ""
+    n = int(line_no or 0)
+    if n <= 0:
+        return ""
+    if n > len(lines):
+        n = len(lines)
+
+    start = -1
+    for i in range(n - 1, -1, -1):
+        if str(lines[i] or "").startswith("diff --git "):
+            start = i
+            break
+    if start < 0:
+        return ""
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if str(lines[j] or "").startswith("diff --git "):
+            end = j
+            break
+
+    block = lines[start:end]
+    if not block:
+        return ""
+    return "\n".join(block).rstrip("\n") + "\n"
 
 
 def _has_undeclared_func_warning(text: str) -> bool:
@@ -1617,15 +1672,18 @@ def ossfuzz_apply_patch_and_test(
     with _FileLock(lock_path, wait_message=wait_message):
         build_res = _run(build_cmd, label="build_version", cwd=str(repo_root), timeout_seconds=timeout_seconds)
         build_output = build_res.get("output", "")
-        # build_ok is based on parsing the build output for actual errors, not the return code.
-        # This ensures accurate status even if the subprocess exit code is unreliable.
+        build_returncode = int(build_res.get("returncode", 1) or 0)
+        patch_apply_error = _find_patch_apply_error(build_output)
+        patch_apply_ok = not bool(patch_apply_error)
+        # Keep log-based checks for rich diagnostics, but never report success when the command
+        # failed or strict patch-apply checks reported an apply failure.
         build_ok = (
-            not _has_compiler_errors(build_output)
+            build_returncode == 0
+            and patch_apply_ok
+            and not _has_compiler_errors(build_output)
             and not _has_undeclared_func_warning(build_output)
             and not _has_linker_errors(build_output)
         )
-        patch_apply_error = _find_patch_apply_error(build_output)
-        patch_apply_ok = not bool(patch_apply_error)
 
     # Write build outputs as artifacts under the same directory as the merged patch
     artifact_dir = patch_file.parent
@@ -1636,6 +1694,27 @@ def ossfuzz_apply_patch_and_test(
         text=build_res["output"],
         ext=".log",
     )
+    failed_hunk_ref: Optional[Dict[str, Any]] = None
+    failed_hunk_input_line = 0
+    if not patch_apply_ok:
+        failed_hunk_input_line = _extract_last_patch_input_line(build_output)
+        try:
+            merged_patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            merged_patch_text = ""
+        failed_hunk_text = _extract_diff_block_for_line(merged_patch_text, failed_hunk_input_line)
+        if failed_hunk_text:
+            ref = store.write_text(
+                name="ossfuzz_apply_patch_and_test_failed_hunk",
+                text=failed_hunk_text,
+                ext=".diff",
+            )
+            failed_hunk_ref = ref.to_dict()
+            sys.stderr.write("[ossfuzz_apply_patch_and_test] failing patch hunk:\n")
+            sys.stderr.write(failed_hunk_text)
+            if not failed_hunk_text.endswith("\n"):
+                sys.stderr.write("\n")
+            sys.stderr.flush()
 
     return {
         "project": project_name,
@@ -1647,6 +1726,9 @@ def ossfuzz_apply_patch_and_test(
         "patch_apply_ok": patch_apply_ok,
         "patch_apply_error": patch_apply_error,
         "build_ok": build_ok,
+        "build_returncode": build_returncode,
         "build_cmd": build_cmd,
         "build_output": build_output_ref.to_dict(),
+        "failed_hunk_input_line": failed_hunk_input_line,
+        "failed_hunk": failed_hunk_ref,
     }
