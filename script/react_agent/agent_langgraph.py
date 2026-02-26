@@ -6215,8 +6215,14 @@ def _run_langgraph(
                 st.patch_override_by_key[extra_patch_key] = patch_text_path
                 st.patch_override_paths = list(st.patch_override_by_key.values())
 
-            # Apply enum rename overrides to regular hunks (from V1/V2 enum conflict detection)
+            # Apply enum rename overrides ONLY to the agent's own active patch_key.
+            # Other hunks may be handled by parallel agents; modifying them here is unsafe.
             _enum_overrides = (st.patch_result or {}).get("enum_rename_overrides") or []
+            _active_pk = str(st.active_patch_key or st.patch_key or "").strip()
+            _enum_overrides = [
+                _ov for _ov in _enum_overrides
+                if isinstance(_ov, dict) and str(_ov.get("patch_key", "")).strip() == _active_pk
+            ]
             for _ov in _enum_overrides:
                 _ov_key = str(_ov.get("patch_key", "") if isinstance(_ov, dict) else "").strip()
                 _ov_pt = ""

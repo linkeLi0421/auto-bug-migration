@@ -16,8 +16,9 @@ Special-case: undefined reference to `__revert_<commit>_<func>`:
 - Workflow:
   1) Derive `func` by stripping the `__revert_<commit>_` prefix.
   2) `search_definition(symbol_name="func", version="v1")` to get the real definition/signature.
-  3) Insert a renamed copy as `__revert_<commit>_<func>` into a single `.c` file (NOT a header) using `make_error_patch_override`
-     (or rewrite an existing `_extra_*` hunk for that file). Keep the body identical.
+  3) Use `make_extra_patch_override(symbol_name="__revert_<commit>_<func>", prefer_definition=true)` to insert the
+     full function definition into the file's `_extra_*` hunk. This is the ONLY case where prefer_definition=true is correct.
+     Fallback: if the tool fails to find the definition, use `make_error_patch_override` to manually insert a renamed copy.
 
 Multiple definition strategy ("multiple definition of `symbol`"):
 - This usually means the symbol is defined in a header (.h/.hpp) with external linkage, so every `.c` that includes it emits a global definition.

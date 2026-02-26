@@ -2354,21 +2354,17 @@ def make_extra_patch_override(
     enum_rename_overrides: List[Dict[str, Any]] = []
 
     def _serialize_enum_rename_overrides(overrides: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Return overrides as inline text (no artifact files written).
+        # The agent-side consumer filters to active_patch_key and persists only that one.
         serialized: List[Dict[str, Any]] = []
         for ov in overrides:
             ov_key = str(ov.get("patch_key", "")).strip()
             ov_text = str(ov.get("patch_text", "")).strip()
             if not ov_key or not ov_text:
                 continue
-            ov_store = ArtifactStore(_artifact_root() / ov_key, overwrite=False)
-            ov_ref = ov_store.write_text(
-                name=f"enum_rename_override_{_normalize_file_basename(file_path_s)}_{symbol}",
-                text=ov_text,
-                ext=".diff",
-            )
             serialized.append({
                 "patch_key": ov_key,
-                "patch_text": ov_ref.to_dict(),
+                "patch_text": ov_text,
             })
         return serialized
 
@@ -2470,8 +2466,6 @@ def make_extra_patch_override(
                 "note": "Symbol already present as a forward typedef; inserted the tag body definition into the extra hunk.",
             }
 
-        # If this is an enum tag and the extra hunk already contains its definition,
-        # proactively prefix conflicting V1 constants to avoid V2 redefinition errors.
         if tag_symbol_kind == "enum" and tag_symbol_name and agent_tools is not None:
             kb_index = getattr(agent_tools, "kb_index", None)
             if kb_index is not None:

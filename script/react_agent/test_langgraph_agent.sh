@@ -5679,15 +5679,14 @@ with tempfile.TemporaryDirectory() as td_raw:
     assert "_revert_GZIP" in text, f"Expected prefixed GZIP in extra hunk:\n{text}"
     assert "_revert_FQZ" in text, f"Expected prefixed FQZ in extra hunk:\n{text}"
 
-    # Check that enum_rename_overrides are present
+    # Tool returns enum_rename_overrides as inline text (no artifact files for other hunks).
+    # Agent filters to active patch_key only at apply time.
     overrides = out.get("enum_rename_overrides") or []
     assert len(overrides) >= 1, f"Expected at least one enum_rename_override: {out}"
-    # The override for the main hunk should reference GZIP/FQZ with prefixed names
     ov = overrides[0]
     assert ov.get("patch_key") == "tail-cram_io.c-f1_", ov
-    ov_ref = ov.get("patch_text")
-    assert isinstance(ov_ref, dict) and ov_ref.get("artifact_path"), ov
-    ov_text = Path(str(ov_ref["artifact_path"])).read_text(encoding="utf-8", errors="replace")
+    ov_text = ov.get("patch_text", "")
+    assert isinstance(ov_text, str), f"Expected inline text, got: {type(ov_text)}"
     assert "_revert_GZIP" in ov_text, f"Expected prefixed GZIP in main hunk override:\n{ov_text}"
     assert "_revert_FQZ" in ov_text, f"Expected prefixed FQZ in main hunk override:\n{ov_text}"
 
