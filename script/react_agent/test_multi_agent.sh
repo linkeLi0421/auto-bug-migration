@@ -561,4 +561,71 @@ assert rmap["p1"].get("attempts") == 7, rmap["p1"]  # skipped (not rerun)
 assert rmap["p2"].get("attempts") == 1, rmap["p2"]  # rerun once in this resumed invocation
 PY
 
+########################################################################
+# Test: __revert_* linker errors with unmapped file fall back to _extra_<file>
+########################################################################
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os, pickle, sys
+from pathlib import Path
+
+tmp = sys.argv[1]
+sys.path.insert(0, str(Path.cwd() / "script"))
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+
+from multi_agent import _group_errors_by_patch_key
+from migration_tools.types import PatchInfo
+
+# Create a minimal patch bundle with a kstring.c patch that contains ks_resize
+# but NO patch for hfile.c or multipart.c.
+patches = {}
+patches["_extra_kstring.c"] = PatchInfo(
+    file_path_old="kstring.c", file_path_new="kstring.c",
+    patch_text=(
+        "diff --git a/kstring.c b/kstring.c\n"
+        "--- a/kstring.c\n"
+        "+++ b/kstring.c\n"
+        "@@ -36,4 +36,3 @@\n"
+        "-static inline int __revert_abc123_ks_resize(kstring_t *s, size_t size);\n"
+        " int kputd(double d, kstring_t *s) {\n"
+    ),
+    file_type="c",
+    old_start_line=36, old_end_line=40,
+    new_start_line=36, new_end_line=39,
+    patch_type={"Extra"},
+    old_signature="",
+    dependent_func=set(),
+    hiden_func_dict={},
+)
+
+bundle_path = os.path.join(tmp, "test_linker_fallback.patch2")
+with open(bundle_path, "wb") as f:
+    f.write(pickle.dumps(patches, protocol=pickle.HIGHEST_PROTOCOL))
+
+# Simulate a build log with linker errors in hfile.c and multipart.c
+build_log = """\
+/usr/bin/ld: libhts.a(hfile.o): in function `haddextension':
+hfile.c:(.text.haddextension[haddextension]+0x148): undefined reference to `__revert_abc123_ks_resize'
+/usr/bin/ld: libhts.a(multipart.o): in function `hopen_htsget_redirect':
+multipart.c:(.text.hopen_htsget_redirect[hopen_htsget_redirect]+0x843): undefined reference to `__revert_abc123_ks_resize'
+clang++: error: linker command failed with exit code 1
+"""
+
+groups = _group_errors_by_patch_key(build_log_text=build_log, patch_path=bundle_path)
+
+# The errors should be grouped under _extra_hfile.c and _extra_multipart.c (fallback keys)
+assert "_extra_hfile.c" in groups, f"Expected _extra_hfile.c in groups, got: {sorted(groups.keys())}"
+assert "_extra_multipart.c" in groups, f"Expected _extra_multipart.c in groups, got: {sorted(groups.keys())}"
+
+hfile_errs = groups["_extra_hfile.c"]
+assert len(hfile_errs) == 1, f"Expected 1 error in _extra_hfile.c, got {len(hfile_errs)}"
+assert hfile_errs[0]["kind"] == "linker", hfile_errs[0]
+assert hfile_errs[0]["symbol"] == "__revert_abc123_ks_resize", hfile_errs[0]
+
+multi_errs = groups["_extra_multipart.c"]
+assert len(multi_errs) == 1, f"Expected 1 error in _extra_multipart.c, got {len(multi_errs)}"
+assert multi_errs[0]["symbol"] == "__revert_abc123_ks_resize", multi_errs[0]
+
+print("  __revert_* linker error fallback to _extra_<file> OK")
+PY
+
 echo "OK"
