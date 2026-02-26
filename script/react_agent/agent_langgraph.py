@@ -103,6 +103,22 @@ def _extract_file_path_from_error(error_line: str) -> str:
     return ""
 
 
+def _dedupe_concatenated_file_path(file_path: str) -> str:
+    """Collapse accidental path concatenation like `foo.cfoo.c` -> `foo.c`."""
+    raw = str(file_path or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    n = len(raw)
+    if n % 2 == 0:
+        half = n // 2
+        if raw[:half] == raw[half:]:
+            return raw[:half]
+    m = re.match(r"^(?P<p>.+\.[A-Za-z0-9_+\-]+)(?P=p)$", raw)
+    if m:
+        return str(m.group("p") or "").strip()
+    return raw
+
+
 class Decision(TypedDict, total=False):
     type: Literal["tool", "final"]
     thought: str
@@ -3304,6 +3320,47 @@ def _override_location_guardrail_for_override(state: AgentState, decision: Decis
     return new_decision
 
 
+def _error_context_location_guardrail_for_mapping_tools(state: AgentState, decision: Decision) -> Optional[Decision]:
+    """Force mapping tools to use active parsed error location (not model-inferred paths).
+
+    This prevents accidental file_path drift when the model copies path-like prefixes from
+    patch keys (e.g. `foo.cfoo.c-...`) into get_error_patch_context arguments.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+
+    tool = str(decision.get("tool", "")).strip()
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    if not isinstance(args_obj, dict):
+        args_obj = {}
+
+    if tool == "get_error_patch_context":
+        fp, ln = _first_error_location(state)
+        if not (fp and ln > 0):
+            return None
+        out: Decision = dict(decision)
+        new_args = dict(args_obj)
+        new_args["file_path"] = fp
+        new_args["line_number"] = ln
+        out["args"] = new_args
+        return out
+
+    if tool == "get_link_error_patch_context":
+        fp, fn = _first_link_error_location(state)
+        if not (fp and fn):
+            return None
+        out = dict(decision)
+        new_args = dict(args_obj)
+        new_args["file_path"] = fp
+        new_args["function_name"] = fn
+        out["args"] = new_args
+        return out
+
+    return None
+
+
 def _has_read_file_context_for_token(state: AgentState, token: str) -> bool:
     t = str(token or "").strip()
     if not t:
@@ -4159,14 +4216,14 @@ def _extract_revert_missing_definition_file_path(state: AgentState, *, active_on
 
 def _first_error_location(state: AgentState) -> tuple[str, int]:
     if state.grouped_errors:
-        fp = str(state.grouped_errors[0].get("file", "") or "").strip()
+        fp = _dedupe_concatenated_file_path(str(state.grouped_errors[0].get("file", "") or "").strip())
         ln = int(state.grouped_errors[0].get("line", 0) or 0)
         if fp and ln > 0:
             return fp, ln
 
     m = _ERROR_LOC_RE.match(str(state.error_line or "").strip())
     if m:
-        fp = m.group("file")
+        fp = _dedupe_concatenated_file_path(m.group("file"))
         ln = int(m.group("line"))
         return fp, ln
     return "", 0
@@ -4179,7 +4236,7 @@ def _first_link_error_location(state: AgentState) -> tuple[str, str]:
         err = state.grouped_errors[0]
         kind = str(err.get("kind", "") or "").strip().lower()
         if kind == "linker":
-            fp = str(err.get("file", "") or "").strip()
+            fp = _dedupe_concatenated_file_path(str(err.get("file", "") or "").strip())
             fn = str(err.get("function", "") or "").strip()
             if fp and fn:
                 return fp, fn
@@ -4189,7 +4246,7 @@ def _first_link_error_location(state: AgentState) -> tuple[str, str]:
         # Pattern: "file.c:(.text.func+0x...): undefined reference"
         m = _LINK_UNDEF_SECTION_LOC_RE.search(text)
         if m:
-            fp = str(m.group("file") or "").strip()
+            fp = _dedupe_concatenated_file_path(str(m.group("file") or "").strip())
             fn = str(m.group("func") or "").strip()
             if fp and fn:
                 return fp, fn
@@ -4202,9 +4259,9 @@ def _first_link_error_location(state: AgentState) -> tuple[str, str]:
             # Try to get file from grouped_errors or active state
             fp = ""
             if state.grouped_errors:
-                fp = str(state.grouped_errors[0].get("file", "") or "").strip()
+                fp = _dedupe_concatenated_file_path(str(state.grouped_errors[0].get("file", "") or "").strip())
             if not fp:
-                fp = str(getattr(state, "active_file_path", "") or "").strip()
+                fp = _dedupe_concatenated_file_path(str(getattr(state, "active_file_path", "") or "").strip())
             if fp and fn:
                 return fp, fn
 
@@ -5451,7 +5508,7 @@ def _run_langgraph(
                         _validate_tool_decision(forced_extra)
                         return {"state": st, "pending": forced_extra}
 
-                # Ensure we have an artifact-backed view of the full V1-origin function before asking for a patch.
+                # Ensure we have an artifact-backed view of the mapped V1-origin slice before asking for a patch.
                 if not _has_tool_call(st, "read_artifact"):
                     if remaining < 3:
                         return {
@@ -5478,7 +5535,7 @@ def _run_langgraph(
                     )
                     forced_read: Decision = {
                         "type": "tool",
-                        "thought": "Before generating the patch, read the full V1-origin function artifact so we can rewrite it safely.",
+                        "thought": "Before generating the patch, read the mapped V1-origin slice artifact so we can edit only the necessary lines.",
                         "tool": "read_artifact",
                         "args": {
                             "artifact_path": artifact_path,
@@ -5490,7 +5547,7 @@ def _run_langgraph(
                     _validate_tool_decision(forced_read)
                     return {"state": st, "pending": forced_read}
 
-                # We just read the function code; require the model to emit a patch-generation tool call next.
+                # We just read the mapped slice; require the model to emit a patch-generation tool call next.
                 base_rewrite_messages = list(messages)
                 base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
                 base_rewrite_messages.append(
@@ -5504,7 +5561,8 @@ def _run_langgraph(
                             f'- args.patch_path="{st.patch_path}"\n'
                             f'- args.file_path="{file_path}"\n'
                             f"- args.line_number={line_number}\n"
-                            "- args.new_func_code=<the full replacement function body as a JSON string with \\\\n escapes>\n"
+                            "- args.new_func_code=<the full replacement mapped '-' slice as a JSON string with \\\\n escapes>\n"
+                            "For call-site/argument-fix hunks, this should be only the call-site line(s), not an unrelated full caller function.\n"
                             "Do not include any extra text."
                         ),
                     }
@@ -5601,6 +5659,10 @@ def _run_langgraph(
                 },
             }
         _validate_tool_decision(decision)
+
+        mapping_loc_fixed = _error_context_location_guardrail_for_mapping_tools(st, decision)
+        if mapping_loc_fixed:
+            decision = mapping_loc_fixed  # type: ignore[assignment]
 
         field_rewrite = _struct_member_search_guardrail_for_search_definition(st, decision)
         if field_rewrite:
@@ -6692,6 +6754,7 @@ def main(argv: List[str]) -> int:
                 mapping = map_error_patch(patch_path=patch_path, file_path=err["file"], line_number=err["line"])
                 key = str(mapping.get("patch_key") or "").strip()
                 enriched = dict(err)
+                enriched["file"] = _dedupe_concatenated_file_path(str(enriched.get("file", "") or "").strip())
                 enriched["patch_key"] = mapping.get("patch_key")
                 enriched["old_signature"] = mapping.get("old_signature")
                 enriched["func_start_index"] = mapping.get("func_start_index")
@@ -6706,6 +6769,7 @@ def main(argv: List[str]) -> int:
             # Also process linker errors (undefined reference errors from the linker stage).
             for err in iter_linker_errors(build_log, snippet_lines=10):
                 fp = str(err.get("file", "") or "").strip()
+                fp = _dedupe_concatenated_file_path(fp)
                 fn = str(err.get("function", "") or "").strip()
                 symbol = str(err.get("symbol", "") or "").strip()
                 if not fp or not (fn or symbol):
@@ -6730,6 +6794,7 @@ def main(argv: List[str]) -> int:
                     if not key:
                         continue
                 enriched = dict(err)
+                enriched["file"] = fp
                 enriched["patch_key"] = key
                 enriched["old_signature"] = mapping.get("old_signature")
                 enriched["func_start_index"] = mapping.get("func_start_index")
@@ -6819,12 +6884,12 @@ def main(argv: List[str]) -> int:
     active_func_start_index: Optional[int] = None
     active_func_end_index: Optional[int] = None
     if grouped_errors:
-        active_file_path = str(grouped_errors[0].get("file", "") or "").strip()
+        active_file_path = _dedupe_concatenated_file_path(str(grouped_errors[0].get("file", "") or "").strip())
         active_line_number = int(grouped_errors[0].get("line", 0) or 0)
     else:
         m = _ERROR_LOC_RE.match(str(error_line or "").strip())
         if m:
-            active_file_path = str(m.group("file") or "").strip()
+            active_file_path = _dedupe_concatenated_file_path(str(m.group("file") or "").strip())
             active_line_number = int(m.group("line") or 0)
 
     if cfg.error_scope == "patch" and patch_path and active_file_path and active_line_number > 0:
