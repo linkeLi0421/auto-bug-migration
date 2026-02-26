@@ -6610,12 +6610,28 @@ def main(argv: List[str]) -> int:
             for err in iter_linker_errors(build_log, snippet_lines=10):
                 fp = str(err.get("file", "") or "").strip()
                 fn = str(err.get("function", "") or "").strip()
-                if not fp or not fn:
+                symbol = str(err.get("symbol", "") or "").strip()
+                if not fp or not (fn or symbol):
                     continue
-                mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=fn)
-                key = str(mapping.get("patch_key") or "").strip()
+                key = ""
+                mapping = {}
+                for cand in (fn, symbol):
+                    c = str(cand or "").strip()
+                    if not c:
+                        continue
+                    mapping = get_link_error_patch(patch_path=patch_path, file_path=fp, function_name=c)
+                    key = str(mapping.get("patch_key") or "").strip()
+                    if key:
+                        break
                 if not key:
-                    continue
+                    # Fallback: for __revert_* undefined references, assign to
+                    # _extra_<caller_file> so the agent can inject the definition.
+                    if symbol and symbol.startswith("__revert_"):
+                        base_file = Path(fp).name if fp else ""
+                        if base_file:
+                            key = f"_extra_{base_file}"
+                    if not key:
+                        continue
                 enriched = dict(err)
                 enriched["patch_key"] = key
                 enriched["old_signature"] = mapping.get("old_signature")

@@ -616,7 +616,15 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
             if key:
                 break
         if not key:
-            continue
+            # Fallback: for __revert_* undefined references, assign to _extra_<caller_file>.
+            # The agent will inject the missing definition via
+            # make_extra_patch_override(prefer_definition=true).
+            if symbol and symbol.startswith("__revert_"):
+                base_file = Path(fp).name if fp else ""
+                if base_file:
+                    key = f"_extra_{base_file}"
+            if not key:
+                continue
         enriched = dict(err)
         enriched["patch_key"] = key
         enriched["old_signature"] = mapping.get("old_signature")
