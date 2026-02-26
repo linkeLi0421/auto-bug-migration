@@ -82,8 +82,10 @@ class SourceManager:
 
     def _resolve_path(self, json_path: str, version: str) -> Optional[Path]:
         """Resolve a JSON path to a local file path."""
-        if json_path.startswith("/src"):
-            rel = json_path[len("/src") :].lstrip("/")
+        norm_path = str(json_path or "").replace("\\", "/").strip()
+        if norm_path.startswith("/src") or norm_path.startswith("src/"):
+            rel = norm_path[len("/src") :] if norm_path.startswith("/src") else norm_path[len("src") :]
+            rel = rel.lstrip("/")
             repo_root = self._repo_root(version)
             repo_name = repo_root.name
             if repo_name:
@@ -99,18 +101,18 @@ class SourceManager:
                 elif rel_norm == f"{repo_name}-src":
                     rel = ""
             return repo_root if not rel else (repo_root / rel)
-        if json_path.lstrip().startswith("#include") or "#include" in json_path:
-            after = json_path.split("#include", 1)[-1].strip()
+        if norm_path.lstrip().startswith("#include") or "#include" in norm_path:
+            after = norm_path.split("#include", 1)[-1].strip()
             header = (
                 after.split("<")[-1].split(">")[0].strip()
                 if "<" in after and ">" in after
                 else after.strip().strip('"')
             )
             return self._resolve_include(header, version)
-        path = Path(json_path)
+        path = Path(norm_path)
         if path.is_absolute():
             return path
-        return self._repo_root(version) / json_path
+        return self._repo_root(version) / norm_path
 
     def get_code_segment(self, file_path: str, start_line: int, end_line: int, version: str) -> str:
         """Read a code segment between start_line and end_line (inclusive)."""

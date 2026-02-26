@@ -241,6 +241,22 @@ def _patch_has_nonblock_hunk_content(patch_text: str, blocks: List[Dict[str, Any
     return False
 
 
+def _is_static_revert_block(block: Dict[str, Any]) -> bool:
+    """Return True when the `__revert_*` definition line in block is static."""
+    symbol = str(block.get('symbol') or '').strip()
+    if not symbol:
+        return False
+    sym_re = re.compile(r'(?<![\w.])' + re.escape(symbol) + r'\s*\(')
+    for raw in (block.get('lines') or []):
+        line = str(raw or "")
+        if not line.startswith('-') or line.startswith('---'):
+            continue
+        code = line[1:]
+        if sym_re.search(code):
+            return bool(re.search(r'^\s*static\b', code))
+    return False
+
+
 def _find_symbol_callsites_in_patch(patch_text: str, symbol: str) -> List[Tuple[int, str]]:
     """Find callsite line numbers for `symbol` in one patch hunk (old/new coordinates)."""
     if not symbol:
@@ -382,6 +398,22 @@ def relocate_header_revert_defs_before_add_context(
         blocks = _extract_revert_removed_function_blocks_from_header_patch(patch.patch_text)
         if not blocks:
             continue
+
+        static_blocks: List[Dict[str, Any]] = []
+        movable_blocks: List[Dict[str, Any]] = []
+        for b in blocks:
+            if _is_static_revert_block(b):
+                static_blocks.append(b)
+            else:
+                movable_blocks.append(b)
+        if static_blocks:
+            logger.info(
+                f"Header revert relocation skipped for {key} ({header_file}): "
+                f"static __revert_* definitions stay in header."
+            )
+            blocks = movable_blocks
+            if not blocks:
+                continue
 
         if _patch_has_nonblock_hunk_content(patch.patch_text, blocks):
             logger.info(f"Header revert relocation skipped for {key} ({header_file}): mixed hunk content.")
