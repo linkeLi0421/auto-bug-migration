@@ -11,6 +11,7 @@ Rule: only `__revert_*` functions get declarations; everything else gets REMOVED
      a) Derive `func` by stripping the `__revert_<commit>_` prefix.
      b) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
      c) If the active patch_key is NOT `_extra_*`: call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>")`.
+        Do NOT set prefer_definition — only a forward declaration (prototype) is needed here, not a full function body.
         If the active patch_key IS `_extra_*`: insert the prototype into the hunk via `make_error_patch_override`.
    - Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
      If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.

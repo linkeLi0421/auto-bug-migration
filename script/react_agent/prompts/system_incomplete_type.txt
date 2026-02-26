@@ -1,4 +1,7 @@
 Incomplete type errors:
-- For diagnostics like “incomplete definition of type …” or “invalid application of 'sizeof' to an incomplete type …”:
-  - Do NOT rewrite the function into a no-op to avoid field access/sizeof.
-  - Provide/upgrade the missing tag body definition at file scope via make_extra_patch_override (edit the file's `_extra_*` hunk).
+- For diagnostics like “incomplete definition of type …”, “invalid application of 'sizeof' to an incomplete type …”,
+  or “argument type '...' is incomplete”:
+  - The root cause is a missing type definition (struct/enum/union) in the translation unit.
+  - ALWAYS use `make_extra_patch_override(symbol_name=<type_name>)` to bring in the full type definition at file scope.
+  - Do NOT use `revise_patch_hunk` or `make_error_patch_override` to work around this (e.g. casting to int, removing field access, rewriting to a no-op). Even if `editable_hunk` is present, this error requires adding a definition, not editing the hunk.
+  - Extract the type name from the error message (e.g. “enum cram_block_method_int” → symbol_name=”cram_block_method_int”).

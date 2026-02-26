@@ -2,35 +2,51 @@ Conflicting types errors:
 - Error pattern: "conflicting types for '__revert_*'" or "conflicting types for 'func'"
 - This error occurs when a function declaration has a DIFFERENT signature than the function definition.
 
-COMMON CAUSE:
-- A previous fix for "implicit declaration of function" or "call to undeclared function" added a forward declaration with the WRONG return type or parameters.
-- Example: The function definition is `void __revert_5f664a_foo(int x)` but a declaration `int __revert_5f664a_foo(int x);` was added.
+TWO COMMON CAUSES:
+
+CAUSE A — Previous implicit declaration (no forward declaration exists):
+- The note says "previous implicit declaration is here" at a call site BEFORE the function definition.
+- The compiler assumed `int` return type, which conflicts with the actual definition.
+- Fix: add a correct forward declaration using `make_extra_patch_override(symbol_name=<func_name>)`.
+  - Do NOT set prefer_definition=true — only a declaration (prototype) is needed, not a full definition.
+  - The tool will automatically insert a matching forward declaration into the `_extra_*` hunk.
+
+CAUSE B — Wrong forward declaration in `_extra_*` hunk:
+- A previous fix added a forward declaration with the WRONG return type or parameters.
+- Example: Definition is `void __revert_5f664a_foo(int x)` but declaration says `int __revert_5f664a_foo(int x);`
 
 FIX WORKFLOW:
 
-1. IDENTIFY THE CONFLICT: The error shows both locations - the declaration and the definition.
-   - Look at the error message to find which signature is expected vs. provided.
-   - The function DEFINITION is the source of truth - declarations must match it.
+1. IDENTIFY THE CONFLICT: Read the error and note carefully.
+   - If note says "previous implicit declaration is here" → CAUSE A (missing declaration).
+   - If note points to an explicit declaration → CAUSE B (wrong declaration).
 
-2. FIND THE BAD DECLARATION: Use `list_patch_bundle` to find `_extra_*` hunks for the file.
-   - Bad declarations are often in `_extra_<filename>` hunks added by make_extra_patch_override.
+2A. FOR CAUSE A (implicit declaration):
+   - Use `make_extra_patch_override(symbol_name=<func_name>)` — do NOT set prefer_definition.
+   - This adds a correct forward declaration before the first usage.
+
+2B. FOR CAUSE B (wrong declaration):
+   - Use `list_patch_bundle` to find `_extra_*` hunks for the file.
    - Use `get_patch(patch_key="_extra_<filename>")` to view the hunk contents.
-
-3. FIX THE DECLARATION: Use `make_error_patch_override` on the `_extra_*` hunk to correct the declaration.
-   - Match the return type EXACTLY to the function definition.
-   - Match the parameters EXACTLY to the function definition.
+   - Use `make_error_patch_override` on the `_extra_*` hunk to correct the declaration.
+   - Match the return type and parameters EXACTLY to the function definition.
    - If the declaration cannot be fixed, REMOVE it entirely from the `_extra_*` hunk.
 
 CRITICAL RULES:
 - Do NOT change the function DEFINITION to match a wrong declaration.
 - Do NOT delete the function definition - that causes linker errors.
 - The declaration must match the definition, not the other way around.
-- If you added the wrong declaration, you must fix or remove it.
+- Do NOT use prefer_definition=true for conflicting types errors — that inserts a full function body which causes redefinition errors. Only a forward declaration is needed.
 
-EXAMPLE:
+EXAMPLE A (implicit declaration):
+Error: conflicting types for '__revert_9e1ffd_cram_block_method2str'
+Note: previous implicit declaration is here (line 1779, before definition at line 2202)
+Fix: `make_extra_patch_override(symbol_name="__revert_9e1ffd_cram_block_method2str")`
+This inserts: `char *__revert_9e1ffd_cram_block_method2str(enum cram_block_method_int m);`
+
+EXAMPLE B (wrong declaration in _extra_* hunk):
 Error: conflicting types for '__revert_5f664a_xmlRegisterCharEncodingHandler'
 - Definition (line 1503): `void __revert_5f664a_xmlRegisterCharEncodingHandler(xmlCharEncodingHandlerPtr handler)`
 - Declaration (in _extra_encoding.c): `int __revert_5f664a_xmlRegisterCharEncodingHandler(xmlCharEncodingHandlerPtr handler);`
-
 Fix: Edit the `_extra_encoding.c` hunk to change `int` to `void`:
 `void __revert_5f664a_xmlRegisterCharEncodingHandler(xmlCharEncodingHandlerPtr handler);`
