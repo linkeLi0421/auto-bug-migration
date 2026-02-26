@@ -101,7 +101,7 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
             resolved = sm._resolve_path(raw, version)  # type: ignore[attr-defined]
         except Exception:
             resolved = None
-        if resolved is not None:
+        if resolved is not None and resolved.exists():
             try:
                 root = sm._repo_root(version)  # type: ignore[attr-defined]
                 rel = resolved.resolve().relative_to(root.resolve()).as_posix()
@@ -534,7 +534,15 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         ctx = [lines[0]]
         start_line = 1
 
-    rel = _normalize_repo_rel_path(agent_tools, file_path=str(file_path or "").strip(), version=version_used)
+    rel = ""
+    if resolved is not None and resolved.exists():
+        try:
+            repo_root = sm._repo_root(version_used)  # type: ignore[attr-defined]
+            rel = resolved.resolve().relative_to(repo_root.resolve()).as_posix()
+        except Exception:
+            rel = ""
+    if not rel:
+        rel = _normalize_repo_rel_path(agent_tools, file_path=str(file_path or "").strip(), version=version_used)
     if not rel:
         rel = _normalize_file_basename(file_path)
     if not rel:
