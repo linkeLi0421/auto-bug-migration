@@ -1765,21 +1765,33 @@ def prepare_v1_v2_repos(
     v1_target_path = os.path.join(v1_repo_base, target)
     v2_target_path = os.path.join(v2_repo_base, target)
 
+    def _checkout_with_submodules(commit: str, label: str) -> None:
+        logger.info(f"Checking out {label} commit {commit} in {source_repo_path}")
+        subprocess.run(
+            ["git", "clean", "-fdx"],
+            cwd=source_repo_path,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["git", "checkout", "-f", commit],
+            cwd=source_repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Keep submodules aligned with the checked-out superproject commit so
+        # copied V1/V2 trees include required nested sources (e.g. htscodecs).
+        subprocess.run(
+            ["git", "submodule", "update", "--init", "--recursive"],
+            cwd=source_repo_path,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     # Checkout V1 commit in source repo and copy to V1 path
-    logger.info(f"Checking out V1 commit {v1_commit} in {source_repo_path}")
-    subprocess.run(
-        ["git", "clean", "-fdx"],
-        cwd=source_repo_path,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["git", "checkout", "-f", v1_commit],
-        cwd=source_repo_path,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _checkout_with_submodules(v1_commit, "V1")
 
     # Remove old V1 target and copy fresh
     if os.path.exists(v1_target_path):
@@ -1789,20 +1801,7 @@ def prepare_v1_v2_repos(
     shutil.copytree(source_repo_path, v1_target_path, symlinks=True)
 
     # Checkout V2 commit in source repo and copy to V2 path
-    logger.info(f"Checking out V2 commit {v2_commit} in {source_repo_path}")
-    subprocess.run(
-        ["git", "clean", "-fdx"],
-        cwd=source_repo_path,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["git", "checkout", "-f", v2_commit],
-        cwd=source_repo_path,
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _checkout_with_submodules(v2_commit, "V2")
 
     # Remove old V2 target and copy fresh
     if os.path.exists(v2_target_path):

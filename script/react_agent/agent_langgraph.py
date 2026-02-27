@@ -3530,6 +3530,8 @@ def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) 
     token = tokens[0]
     if _has_make_extra_patch_override_for_symbol(state, token):
         return None
+    if _make_extra_should_fallback_to_model(state, token):
+        return None
 
     return {
         "type": "tool",
@@ -3539,81 +3541,64 @@ def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) 
     }
 
 
-def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> bool:
-    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
-        # Backward-compatible fallback for tests/synthetic histories that don't carry observation payloads.
-        obs = step.get("observation")
-        if not isinstance(obs, dict):
-            return True
-        if obs.get("ok") is not True:
-            return False
-        out = obs.get("output")
-        if not isinstance(out, dict):
-            return False
-        pt = out.get("patch_text")
-        if isinstance(pt, str):
-            return bool(pt.strip())
-        if isinstance(pt, dict):
-            ap = str(pt.get("artifact_path", "") or "").strip()
-            if not ap:
-                return False
-            b = pt.get("bytes")
-            if isinstance(b, int):
-                return b > 0
-            # Best-effort fallback when bytes isn't present.
-            try:
-                return bool(_read_text(ap).strip())
-            except Exception:
-                return False
-        return False
+_MAKE_EXTRA_UNRESOLVABLE_NOTE_TOKENS = (
+    "none produced readable source code",
+    "failed to locate a definition/decl for the symbol",
+    "failed to create a new _extra_* patch hunk skeleton",
+    "no matching _extra_* patch_key found",
+    "could not read v2 source for file",
+)
 
-    want = str(symbol or "").strip()
-    if not want:
+
+def _step_make_extra_has_effective_patch(step: Dict[str, Any]) -> bool:
+    # Backward-compatible fallback for tests/synthetic histories that don't carry observation payloads.
+    obs = step.get("observation")
+    if not isinstance(obs, dict):
+        return True
+    if obs.get("ok") is not True:
         return False
-    for step in (state.step_history or []):
-        if not isinstance(step, dict):
-            continue
-        decision = step.get("decision")
-        if not isinstance(decision, dict):
-            continue
-        if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
-            continue
-        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
-        if str(args.get("symbol_name", "")).strip() == want:
-            if _step_has_effective_patch(step):
-                return True
+    out = obs.get("output")
+    if not isinstance(out, dict):
+        return False
+    pt = out.get("patch_text")
+    if isinstance(pt, str):
+        return bool(pt.strip())
+    if isinstance(pt, dict):
+        ap = str(pt.get("artifact_path", "") or "").strip()
+        if not ap:
+            return False
+        b = pt.get("bytes")
+        if isinstance(b, int):
+            return b > 0
+        # Best-effort fallback when bytes isn't present.
+        try:
+            return bool(_read_text(ap).strip())
+        except Exception:
+            return False
     return False
 
 
-def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: AgentState, symbol: str) -> bool:
-    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
-        obs = step.get("observation")
-        if not isinstance(obs, dict):
-            return True
-        if obs.get("ok") is not True:
-            return False
-        out = obs.get("output")
-        if not isinstance(out, dict):
-            return False
-        pt = out.get("patch_text")
-        if isinstance(pt, str):
-            return bool(pt.strip())
-        if isinstance(pt, dict):
-            ap = str(pt.get("artifact_path", "") or "").strip()
-            if not ap:
-                return False
-            b = pt.get("bytes")
-            if isinstance(b, int):
-                return b > 0
-            try:
-                return bool(_read_text(ap).strip())
-            except Exception:
-                return False
-        return False
+def _step_make_extra_note(step: Dict[str, Any]) -> str:
+    obs = step.get("observation")
+    if not isinstance(obs, dict):
+        return ""
+    out = obs.get("output")
+    if not isinstance(out, dict):
+        return ""
+    return str(out.get("note", "") or "").strip()
 
+
+def _make_extra_note_indicates_unresolvable(note: str) -> bool:
+    low = str(note or "").strip().lower()
+    if not low:
+        return False
+    return any(tok in low for tok in _MAKE_EXTRA_UNRESOLVABLE_NOTE_TOKENS)
+
+
+def _iter_make_extra_steps_for_symbol(state: AgentState, symbol: str):
     want = str(symbol or "").strip()
     if not want:
-        return False
+        return
     for step in (state.step_history or []):
         if not isinstance(step, dict):
             continue
@@ -3625,54 +3610,69 @@ def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: Agen
         args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
         if str(args.get("symbol_name", "")).strip() != want:
             continue
+        yield step
+
+
+def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> bool:
+    for step in _iter_make_extra_steps_for_symbol(state, symbol):
+        if _step_make_extra_has_effective_patch(step):
+            return True
+    return False
+
+
+def _count_make_extra_patch_attempts_for_symbol(state: AgentState, symbol: str) -> int:
+    count = 0
+    for _ in _iter_make_extra_steps_for_symbol(state, symbol):
+        count += 1
+    return count
+
+
+def _has_make_extra_unresolvable_attempt_for_symbol(state: AgentState, symbol: str) -> bool:
+    for step in _iter_make_extra_steps_for_symbol(state, symbol):
+        if _step_make_extra_has_effective_patch(step):
+            continue
+        note = _step_make_extra_note(step)
+        if _make_extra_note_indicates_unresolvable(note):
+            return True
+    return False
+
+
+def _last_make_extra_unresolvable_note_for_symbol(state: AgentState, symbol: str) -> str:
+    notes: List[str] = []
+    for step in _iter_make_extra_steps_for_symbol(state, symbol):
+        if _step_make_extra_has_effective_patch(step):
+            continue
+        note = _step_make_extra_note(step)
+        if note and _make_extra_note_indicates_unresolvable(note):
+            notes.append(note)
+    return notes[-1] if notes else ""
+
+
+def _make_extra_should_fallback_to_model(state: AgentState, symbol: str, *, max_attempts: int = 2) -> bool:
+    if _has_make_extra_patch_override_for_symbol(state, symbol):
+        return False
+    if _has_make_extra_unresolvable_attempt_for_symbol(state, symbol):
+        return True
+    if _count_make_extra_patch_attempts_for_symbol(state, symbol) >= max(1, int(max_attempts or 1)):
+        return True
+    return False
+
+
+def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: AgentState, symbol: str) -> bool:
+    for step in _iter_make_extra_steps_for_symbol(state, symbol):
+        decision = step.get("decision")
+        args = decision.get("args") if isinstance(decision, dict) and isinstance(decision.get("args"), dict) else {}
         if _as_bool(args.get("prefer_definition"), False):
-            if _step_has_effective_patch(step):
+            if _step_make_extra_has_effective_patch(step):
                 return True
     return False
 
 
 def _count_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> int:
-    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
-        obs = step.get("observation")
-        if not isinstance(obs, dict):
-            return True
-        if obs.get("ok") is not True:
-            return False
-        out = obs.get("output")
-        if not isinstance(out, dict):
-            return False
-        pt = out.get("patch_text")
-        if isinstance(pt, str):
-            return bool(pt.strip())
-        if isinstance(pt, dict):
-            ap = str(pt.get("artifact_path", "") or "").strip()
-            if not ap:
-                return False
-            b = pt.get("bytes")
-            if isinstance(b, int):
-                return b > 0
-            try:
-                return bool(_read_text(ap).strip())
-            except Exception:
-                return False
-        return False
-
-    want = str(symbol or "").strip()
-    if not want:
-        return 0
     count = 0
-    for step in (state.step_history or []):
-        if not isinstance(step, dict):
-            continue
-        decision = step.get("decision")
-        if not isinstance(decision, dict):
-            continue
-        if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
-            continue
-        args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
-        if str(args.get("symbol_name", "")).strip() == want:
-            if _step_has_effective_patch(step):
-                count += 1
+    for step in _iter_make_extra_steps_for_symbol(state, symbol):
+        if _step_make_extra_has_effective_patch(step):
+            count += 1
     return count
 
 
@@ -3700,6 +3700,8 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
     if not _should_use_make_extra_for_undeclared_symbol(undeclared, str(state.error_line or state.snippet or "")):
         return None
     if _has_make_extra_patch_override_for_symbol(state, undeclared):
+        return None
+    if _make_extra_should_fallback_to_model(state, undeclared):
         return None
 
     file_path, _ = _first_error_location(state)
@@ -3780,6 +3782,65 @@ def _block_make_extra_patch_override_for_extra_hunk(
     }
 
 
+def _block_make_extra_patch_override_after_unresolvable_lookup(
+    state: AgentState, decision: Decision, *, remaining_steps: int
+) -> Optional[Decision]:
+    """After repeated/unresolvable make_extra lookups, switch to model-guided override rewrite."""
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+
+    args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    symbol = str(args.get("symbol_name", "") or "").strip()
+    if not symbol:
+        return None
+    if not _make_extra_should_fallback_to_model(state, symbol):
+        return None
+
+    # Ensure mapping prerequisites first.
+    prereq = _next_patch_prereq_tool(state)
+    if prereq:
+        return prereq
+
+    # Need enough remaining steps to read -> patch -> ossfuzz.
+    if remaining_steps < 3:
+        return None
+
+    artifact_path = (
+        str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_patch_minus_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        or _last_artifact_path(state, "get_error_patch_context", "patch_minus_code")
+        or _last_artifact_path(state, "get_error_patch_context", "error_func_code")
+        or _last_artifact_path(state, "get_error_patch_context", "excerpt")
+    )
+    if not str(artifact_path or "").strip():
+        return None
+
+    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}}
+    note = _last_make_extra_unresolvable_note_for_symbol(state, symbol)
+    note_hint = f" Previous deterministic lookup note: {note}" if note else ""
+    return {
+        "type": "tool",
+        "thought": (
+            f"Deterministic make_extra lookup for {symbol} is unavailable or exhausted.{note_hint} "
+            "Read the mapped BASE slice and switch to a model-guided make_error_patch_override."
+        ),
+        "tool": "read_artifact",
+        "args": {
+            "artifact_path": artifact_path,
+            "start_line": 1,
+            "query": "",
+            "context_lines": 0,
+            "max_lines": 8000,
+            "max_chars": 200000,
+        },
+    }
+
+
 def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Prefer deterministic `_extra_*` type definitions over semantic no-op function rewrites.
 
@@ -3809,7 +3870,7 @@ def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decis
         return None
 
     for sym in candidates:
-        if _count_make_extra_patch_override_for_symbol(state, sym) >= 2:
+        if _make_extra_should_fallback_to_model(state, sym):
             continue
         return {
             "type": "tool",
@@ -3838,6 +3899,8 @@ def _revert_missing_definition_extra_patch_guardrail(state: AgentState, decision
         return None
 
     if _has_make_extra_patch_override_for_symbol_with_prefer_definition(state, sym):
+        return None
+    if _make_extra_should_fallback_to_model(state, sym):
         return None
 
     # If model already proposes the exact deterministic action, don't rewrite it.
@@ -3889,6 +3952,8 @@ def _missing_prototype_extra_patch_guardrail(state: AgentState, decision: Decisi
     if not sym:
         return None
     if _has_make_extra_patch_override_for_symbol(state, sym):
+        return None
+    if _make_extra_should_fallback_to_model(state, sym):
         return None
     if (
         str(decision.get("type", "")).strip() == "tool"
@@ -5445,7 +5510,11 @@ def _run_langgraph(
             if file_path:
                 tokens = _macro_lookup_pick_tokens(st, max_tokens=3)
                 token = tokens[0] if tokens else ""
-                if token and not _has_make_extra_patch_override_for_symbol(st, token):
+                if (
+                    token
+                    and (not _has_make_extra_patch_override_for_symbol(st, token))
+                    and (not _make_extra_should_fallback_to_model(st, token))
+                ):
                     forced: Decision = {
                         "type": "tool",
                         "thought": f"Macro preflight: add the real definition for {token} via the file's _extra_* hunk (do not invent #define values).",
@@ -5661,6 +5730,7 @@ def _run_langgraph(
                             undeclared_symbol, str(st.error_line or st.snippet or "")
                         )
                         and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
+                        and not _make_extra_should_fallback_to_model(st, undeclared_symbol)
                     ):
                         # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
                         # deterministically before trying to rewrite the active function body.
@@ -6258,6 +6328,13 @@ def _run_langgraph(
             _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_block)
             _validate_tool_decision(forced_extra_block)
             return {"state": st, "pending": forced_extra_block}
+        forced_extra_fallback = _block_make_extra_patch_override_after_unresolvable_lookup(
+            st, decision, remaining_steps=remaining
+        )
+        if forced_extra_fallback:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_extra_fallback)
+            _validate_tool_decision(forced_extra_fallback)
+            return {"state": st, "pending": forced_extra_fallback}
 
         if tool == "read_artifact" and remaining < 3:
             return {
