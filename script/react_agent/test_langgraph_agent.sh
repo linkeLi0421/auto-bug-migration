@@ -1297,6 +1297,94 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override node selection: DECL_REF_EXPR -> ENUM_CONSTANT_DECL should
+# recover the parent ENUM_DECL so make_extra can insert a real declaration block.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from tools.extra_patch_tools import _kb_pick_insertable_node  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    (src_v1 / "cram").mkdir(parents=True)
+    (src_v2 / "cram").mkdir(parents=True)
+
+    enum_code = (
+        "enum cram_block_method_int {\n"
+        "    RAW = 0,\n"
+        "    RANSPR = 5,\n"
+        "    BM_ERROR = -1,\n"
+        "};\n"
+    )
+    (src_v1 / "cram" / "cram_structs.h").write_text(enum_code, encoding="utf-8")
+    (src_v2 / "cram" / "cram_structs.h").write_text("/* v2 */\n", encoding="utf-8")
+
+    v1_nodes = [
+        {
+            "kind": "DECL_REF_EXPR",
+            "spelling": "RANSPR",
+            "location": {"file": "cram/cram_io.c", "line": 1940, "column": 57},
+            "type_ref": {
+                "target_kind": "ENUM_CONSTANT_DECL",
+                "target_name": "RANSPR",
+                "usr": "c:@E@cram_block_method_int@RANSPR",
+                "typedef_extent": {
+                    "start": {"file": "cram/cram_structs.h", "line": 3, "column": 5},
+                    "end": {"file": "cram/cram_structs.h", "line": 3, "column": 17},
+                },
+            },
+            "extent": {
+                "start": {"file": "cram/cram_io.c", "line": 1940, "column": 57},
+                "end": {"file": "cram/cram_io.c", "line": 1940, "column": 63},
+            },
+        },
+        {
+            "kind": "ENUM_DECL",
+            "spelling": "cram_block_method_int",
+            "usr": "c:@E@cram_block_method_int",
+            "location": {"file": "cram/cram_structs.h", "line": 1, "column": 1},
+            "extent": {
+                "start": {"file": "cram/cram_structs.h", "line": 1, "column": 1},
+                "end": {"file": "cram/cram_structs.h", "line": 5, "column": 2},
+            },
+        },
+    ]
+    (kb_v1 / "cram_structs.h_analysis.json").write_text(json.dumps(v1_nodes), encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    picked = _kb_pick_insertable_node(tools, symbol="RANSPR", version="v1")
+    assert picked is not None, picked
+    assert picked.get("kind") == "ENUM_DECL", picked
+    assert picked.get("spelling") == "cram_block_method_int", picked
+    code = tools.source_manager.get_function_code(picked, "v1")
+    assert "enum cram_block_method_int" in code, code
+    assert "RANSPR" in code, code
+
+print("OK")
+PY
+
 # Extra patch override tool: if the symbol is already present in the `_extra_*` hunk but the declaration
 # uses an unsafe by-value opaque typedef (e.g. `static xmlMutex xmlRngMutex;` in V2), rewrite it to a
 # pointer form and emit an override diff (do not no-op).
@@ -2550,6 +2638,12 @@ state.steps = [
 state.step_history = list(state.steps)
 
 decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "remove missing global", "args": {}}
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
+assert forced and forced.get("tool") == "make_extra_patch_override", forced
+assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
+assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+
+os.environ["REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL"] = "0"
 forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
 assert forced is None, forced
 
@@ -4733,8 +4827,8 @@ with tempfile.TemporaryDirectory() as td:
     # After the transition from the first OSS-Fuzz run, we must restart patch mapping via get_error_patch_context.
     # Verify this via actual tool calls in this run, not by scanning final["steps"] (which includes pre-populated steps).
     assert "get_error_patch_context" in runner.calls, runner.calls
-    # Undeclared-symbol guardrail is disabled by default; either make_error_patch_override or make_extra_patch_override
-    # can be used to address the follow-up errors in this patch_key during auto-loop.
+    # Undeclared-symbol guardrail is enabled by default; make_extra_patch_override is preferred for
+    # undeclared identifiers/types/macros during auto-loop.
     assert (runner.calls.count("make_error_patch_override") + runner.calls.count("make_extra_patch_override")) >= 2, runner.calls
     assert runner.calls.count("ossfuzz_apply_patch_and_test") >= 2, runner.calls
     assert "get_error_v1_code_slice" not in runner.calls, runner.calls
@@ -4972,27 +5066,116 @@ st = AgentState(build_log_path="-", patch_path="", error_scope="first", error_li
 st.grouped_errors = [
     {"raw": "/src/a.h:10:8: error: use of undeclared identifier '__revert_foo'", "file": "/src/a.h", "line": 10},
     {"raw": "/src/a.h:10:40: error: use of undeclared identifier '__revert_bar'", "file": "/src/a.h", "line": 10},
+    {"raw": "/src/a.h:11:5: error: call to undeclared function 'legacy_call'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]", "file": "/src/a.h", "line": 11},
+    {"raw": "/src/a.h:12:9: error: use of undeclared identifier 'RANSPR'", "file": "/src/a.h", "line": 12},
 ]
 
 unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert len(unfixed) == 2, f"expected 2 unfixed, got {unfixed}"
+assert len(unfixed) == 3, f"expected 3 unfixed, got {unfixed}"
 assert unfixed[0] == ("__revert_foo", "/src/a.h"), unfixed[0]
 assert unfixed[1] == ("__revert_bar", "/src/a.h"), unfixed[1]
+assert unfixed[2] == ("RANSPR", "/src/a.h"), unfixed[2]
 
 # Simulate fixing the first symbol
 st.step_history = [
     {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_foo"}}},
 ]
 unfixed2 = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert len(unfixed2) == 1, f"expected 1 unfixed after fixing foo, got {unfixed2}"
+assert len(unfixed2) == 2, f"expected 2 unfixed after fixing foo, got {unfixed2}"
 assert unfixed2[0] == ("__revert_bar", "/src/a.h"), unfixed2[0]
+assert unfixed2[1] == ("RANSPR", "/src/a.h"), unfixed2[1]
 
-# Simulate fixing both
+# A no-op make_extra result (empty patch_text) must NOT count as fixed.
+st.step_history.append(
+    {
+        "decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "RANSPR"}},
+        "observation": {"ok": True, "tool": "make_extra_patch_override", "output": {"patch_text": ""}},
+    }
+)
+unfixed_noop = _iter_unfixed_undeclared_symbols_from_grouped(st)
+assert ("RANSPR", "/src/a.h") in unfixed_noop, unfixed_noop
+
+# Simulate fixing all remaining eligible symbols
 st.step_history.append(
     {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_bar"}}},
 )
+st.step_history.append(
+    {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "RANSPR"}}},
+)
 unfixed3 = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert len(unfixed3) == 0, f"expected 0 unfixed after fixing both, got {unfixed3}"
+assert len(unfixed3) == 0, f"expected 0 unfixed after fixing all eligible symbols, got {unfixed3}"
+
+print("OK")
+PY
+
+# After one generated patch, run OSS-Fuzz immediately (do not batch-fix additional grouped undeclared
+# symbols via make_extra_patch_override before rebuilding).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentConfig, AgentState, _run_langgraph  # noqa: E402
+from artifacts import ArtifactStore  # noqa: E402
+from models import ChatModel  # noqa: E402
+from tools.runner import ToolObservation  # noqa: E402
+
+
+class NoModel(ChatModel):
+    def complete(self, messages):  # pragma: no cover - should not be called in this forced-build path
+        raise AssertionError("Model should not be called.")
+
+
+class Runner:
+    def __init__(self):
+        self.calls = []
+
+    def call(self, tool, args):
+        self.calls.append(tool)
+        if tool == "ossfuzz_apply_patch_and_test":
+            return ToolObservation(
+                ok=True,
+                tool=tool,
+                args=args,
+                output={"build_output": "ok\n", "check_build_output": "ok\n"},
+                error=None,
+            )
+        return ToolObservation(ok=True, tool=tool, args=args, output={}, error=None)
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(root)
+
+    st = AgentState(
+        build_log_path="-",
+        patch_path=str(root / "bundle.patch2"),
+        error_scope="patch",
+        error_line="/src/a.c:1:1: error: use of undeclared identifier 'X'",
+        snippet="",
+        patch_generated=True,
+        ossfuzz_test_attempted=False,
+        ossfuzz_project="example",
+        ossfuzz_commit="deadbeef",
+        grouped_errors=[
+            {"raw": "/src/a.c:2:1: error: use of undeclared identifier 'A'", "file": "/src/a.c"},
+            {"raw": "/src/a.c:3:1: error: use of undeclared identifier 'B'", "file": "/src/a.c"},
+        ],
+        patch_override_paths=[str(root / "override.diff")],
+    )
+
+    cfg = AgentConfig(max_steps=3, tools_mode="fake", error_scope="patch")
+    runner = Runner()
+    final = _run_langgraph(NoModel(), runner, st, cfg, artifact_store=ArtifactStore(root, overwrite=False))
+
+    assert final.get("type") == "final", final
+    assert runner.calls, runner.calls
+    assert runner.calls[0] == "ossfuzz_apply_patch_and_test", runner.calls
+    assert "make_extra_patch_override" not in runner.calls, runner.calls
 
 print("OK")
 PY

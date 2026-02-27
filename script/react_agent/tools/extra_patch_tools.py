@@ -1893,6 +1893,77 @@ def _kb_node_key(node: dict) -> str:
     return f"ext:{kind}:{spelling}:{fp}:{sl}:{el}"
 
 
+_ENUM_CONST_USR_RE = re.compile(r"@E@(?P<enum_name>[^@]+)@[^@]+$")
+
+
+def _enum_name_from_enum_constant_usr(usr: str) -> str:
+    """Extract enum type name from an enum-constant USR (e.g. ``c:@E@Type@VALUE``)."""
+    text = str(usr or "").strip()
+    if not text:
+        return ""
+    m = _ENUM_CONST_USR_RE.search(text)
+    if not m:
+        return ""
+    return str(m.group("enum_name") or "").strip()
+
+
+def _kb_enum_decl_candidates_from_enum_constant_refs(
+    agent_tools: Any,
+    *,
+    nodes: List[dict],
+    version: str,
+    max_nodes: int = 200,
+) -> List[dict]:
+    """Derive ENUM_DECL candidates from enum-constant references.
+
+    Some KBs only surface ``DECL_REF_EXPR``/``ENUM_CONSTANT_DECL`` for a queried
+    token (for example, ``RANSPR``). In that shape we still want an insertable
+    node, so we recover the parent enum name from type-ref USR and query the
+    corresponding ``ENUM_DECL``.
+    """
+    ver = str(version or "").strip().lower()
+    if ver not in {"v1", "v2"}:
+        return []
+    kb_index = getattr(agent_tools, "kb_index", None)
+    if kb_index is None:
+        return []
+
+    enum_names: set[str] = set()
+    for n in list(nodes or [])[: max(0, int(max_nodes or 0))]:
+        if not isinstance(n, dict):
+            continue
+        kind = str(n.get("kind", "") or "").strip()
+        if kind == "ENUM_CONSTANT_DECL":
+            enum_name = _enum_name_from_enum_constant_usr(str(n.get("usr", "") or ""))
+            if enum_name:
+                enum_names.add(enum_name)
+        type_ref = n.get("type_ref", {}) if isinstance(n.get("type_ref"), dict) else {}
+        if str(type_ref.get("target_kind", "") or "").strip() == "ENUM_CONSTANT_DECL":
+            enum_name = _enum_name_from_enum_constant_usr(str(type_ref.get("usr", "") or ""))
+            if enum_name:
+                enum_names.add(enum_name)
+
+    derived: List[dict] = []
+    seen: set[str] = set()
+    for enum_name in sorted(enum_names):
+        for query in (enum_name, f"enum {enum_name}"):
+            try:
+                found = (kb_index.query_all(query) or {}).get(ver, [])
+            except Exception:
+                found = []
+            for n in found:
+                if not isinstance(n, dict):
+                    continue
+                if str(n.get("kind", "") or "").strip() != "ENUM_DECL":
+                    continue
+                k = _kb_node_key(n)
+                if k in seen:
+                    continue
+                seen.add(k)
+                derived.append(n)
+    return derived
+
+
 def _kb_pick_insertable_node(agent_tools: Any, *, symbol: str, version: str, max_nodes: int = 200) -> Optional[dict]:
     """Pick a KB node that can be safely inserted at file scope.
 
@@ -1930,6 +2001,17 @@ def _kb_pick_insertable_node(agent_tools: Any, *, symbol: str, version: str, max
                 continue
             seen.add(k)
             candidates.append(cand)
+
+    # Enum constants often arrive as DECL_REF_EXPR/ENUM_CONSTANT_DECL and are not
+    # directly insertable at file scope. Recover the parent ENUM_DECL when possible.
+    for cand in _kb_enum_decl_candidates_from_enum_constant_refs(
+        agent_tools, nodes=candidates, version=ver, max_nodes=max_nodes
+    ):
+        k = _kb_node_key(cand)
+        if k in seen:
+            continue
+        seen.add(k)
+        candidates.append(cand)
 
     insertable = [c for c in candidates if str(c.get("kind", "") or "").strip() in _KB_INSERTABLE_KINDS]
     if not insertable:
@@ -2005,6 +2087,15 @@ def _kb_pick_insertable_node_filtered(
                 continue
             seen.add(k)
             candidates.append(cand)
+
+    for cand in _kb_enum_decl_candidates_from_enum_constant_refs(
+        agent_tools, nodes=candidates, version=ver, max_nodes=max_nodes
+    ):
+        k = _kb_node_key(cand)
+        if k in seen:
+            continue
+        seen.add(k)
+        candidates.append(cand)
 
     insertable = [c for c in candidates if str(c.get("kind", "") or "").strip() in kinds]
     if not insertable:
