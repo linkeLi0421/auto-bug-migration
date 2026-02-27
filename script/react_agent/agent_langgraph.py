@@ -2350,11 +2350,28 @@ def _extract_function_name_from_signature(signature: str) -> str:
     return s[j + 1 : end + 1]
 
 
-def _extract_first_top_level_function_name(code: str) -> str:
-    """Best-effort: extract the function name for the first top-level `(...) {` body in code."""
+_TOP_LEVEL_NON_FUNCTION_NAMES = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "do",
+    "case",
+    "return",
+    "sizeof",
+}
+
+
+def _find_first_top_level_function_signature_span(code: str) -> Optional[tuple[int, int, str]]:
+    """Best-effort locate the first top-level function signature span.
+
+    Returns:
+      (start_idx, end_idx_exclusive, function_name), where the span covers
+      from the signature start up to the closing ')' before the opening '{'.
+    """
     text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
     if not text.strip():
-        return ""
+        return None
 
     in_sl_comment = False
     in_ml_comment = False
@@ -2437,7 +2454,18 @@ def _extract_first_top_level_function_name(code: str) -> str:
                     while j >= 0 and (text[j].isalnum() or text[j] == "_"):
                         j -= 1
                     name = text[j + 1 : end + 1].strip()
-                    return name if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or "") else ""
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name or "") and name not in _TOP_LEVEL_NON_FUNCTION_NAMES:
+                        sig_start = j + 1
+                        k = sig_start
+                        while k > 0:
+                            ch = text[k - 1]
+                            if ch in ";{}":
+                                break
+                            k -= 1
+                        sig_start = k
+                        while sig_start < len(text) and text[sig_start].isspace():
+                            sig_start += 1
+                        return (sig_start, last_close_paren_at_top + 1, name)
             brace_depth += 1
             i += 1
             continue
@@ -2460,7 +2488,42 @@ def _extract_first_top_level_function_name(code: str) -> str:
             continue
 
         i += 1
-    return ""
+
+    return None
+
+
+def _extract_first_top_level_function_signature(code: str) -> str:
+    """Best-effort: extract the first top-level function signature text."""
+    text = str(code or "").replace("\r\n", "\n").replace("\r", "\n")
+    span = _find_first_top_level_function_signature_span(text)
+    if not span:
+        return ""
+    start, end, _ = span
+    if not (0 <= start < end <= len(text)):
+        return ""
+    return text[start:end].strip()
+
+
+def _normalize_signature_for_compare(signature: str) -> str:
+    """Normalize signature text for strict equivalence checks."""
+    s = str(signature or "")
+    if not s:
+        return ""
+    # Drop comments so harmless comment edits in the header do not trigger mismatches.
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.DOTALL)
+    s = re.sub(r"//[^\n]*", " ", s)
+    # Ignore formatting-only whitespace differences.
+    s = re.sub(r"\s+", "", s)
+    return s
+
+
+def _extract_first_top_level_function_name(code: str) -> str:
+    """Best-effort: extract the function name for the first top-level `(...) {` body in code."""
+    span = _find_first_top_level_function_signature_span(code)
+    if not span:
+        return ""
+    _, _, name = span
+    return name
 
 
 def _count_top_level_bodies(code: str) -> tuple[int, bool]:
@@ -3092,6 +3155,67 @@ def _override_preserve_function_name_guardrail_error(state: AgentState, decision
             "Do NOT change/rename the function name; keep the original name and only edit the body as needed."
         )
     return None
+
+
+def _override_preserve_function_signature_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if make_error_patch_override changes the function signature."""
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
+    if not base_text.strip():
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    base_sig = _extract_first_top_level_function_signature(base_text)
+    new_sig = _extract_first_top_level_function_signature(new_text)
+    if not base_sig or not new_sig:
+        return None
+
+    if _normalize_signature_for_compare(base_sig) == _normalize_signature_for_compare(new_sig):
+        return None
+
+    expected = " ".join(base_sig.split())
+    actual = " ".join(new_sig.split())
+    if len(expected) > 220:
+        expected = expected[:220] + " ..."
+    if len(actual) > 220:
+        actual = actual[:220] + " ..."
+    return (
+        f"new_func_code changes the function signature from the BASE slice ({base_source}). "
+        f"Expected: `{expected}`; got: `{actual}`. "
+        "Do NOT change return type or parameter types/names; copy the BASE signature exactly and only edit the body."
+    )
 
 
 def _brace_balance(code: str) -> tuple[int, bool]:
@@ -5784,6 +5908,54 @@ def _run_langgraph(
 
         # Guardrail: when the BASE slice is function-scoped, new_func_code must be a complete function body.
         if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            sig_err = _override_preserve_function_signature_guardrail_error(st, decision)
+            if sig_err:
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
+                            "make_error_patch_override.new_func_code changed the function signature.\n"
+                            f"{sig_err}\n\n"
+                            "Fix: copy the function signature character-for-character from the BASE slice, "
+                            "then apply minimal edits only inside the body.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    ),
+                    label="override_signature_repair",
+                )
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    sig_err2 = _override_preserve_function_signature_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not sig_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly changed the function signature in override code.",
+                                "summary": "Stopped before patch generation due to a signature mismatch in make_error_patch_override.",
+                                "next_step": (
+                                    f"{sig_err2}\n\n"
+                                    "Manually copy the BASE signature exactly and edit only the function body, then rerun."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
             name_err = _override_preserve_function_name_guardrail_error(st, decision)
             if name_err:
                 repair_model = _guardrail_repair_model(model)
