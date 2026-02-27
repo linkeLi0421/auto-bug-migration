@@ -1,9 +1,17 @@
 Undeclared symbol/type errors (C/C++):
 - Applies to: "use of undeclared identifier 'X'", "call to undeclared function 'X'", "unknown type name 'X'".
 
-Rule: only `__revert_*` functions get declarations; everything else gets REMOVED.
+Rule:
+- Undeclared identifiers/types/macros should use `make_extra_patch_override` first.
+- Undeclared `__revert_*` functions should use `make_extra_patch_override` (forward declarations).
+- Undeclared non-`__revert_*` function calls should be removed via caller rewrite.
 
-1) Undeclared functions starting with `__revert_`:
+1) Undeclared identifiers/types/macros (for example: "use of undeclared identifier 'RANSPR'", "unknown type name 'foo_t'"):
+   - **PRIORITY**: use `make_extra_patch_override` for `symbol_name='X'` before any function-body rewrite.
+   - Do not replace/drop the symbol inside the active function as a first step.
+   - If the active patch_key is `_extra_*`, follow the `_extra_*` rule below (fix that hunk with `make_error_patch_override` instead of extending `_extra_*` again).
+
+2) Undeclared functions starting with `__revert_`:
    - `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
    - **PRIORITY**: When the error is an undeclared `__revert_*` function, ALWAYS use `make_extra_patch_override` to add the forward declaration, even if `editable_hunk` is present.
      Do NOT use `revise_patch_hunk` to revert the call back to the original function - this defeats the purpose of the revert wrapper.
@@ -16,7 +24,7 @@ Rule: only `__revert_*` functions get declarations; everything else gets REMOVED
    - Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
      If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.
 
-2) Undeclared functions NOT starting with `__revert_`:
+3) Undeclared functions NOT starting with `__revert_`:
    - These are V1-only helpers removed in V2. They have NO definition in V2.
    - Do NOT use `make_extra_patch_override` — adding a forward declaration only defers the failure to a linker error.
    - Do NOT insert a prototype or extern declaration.

@@ -51,8 +51,11 @@ def _as_bool(value: Any, default: bool = False) -> bool:
 
 
 def _undeclared_symbol_guardrail_enabled() -> bool:
-    # Disabled by default: sometimes rewriting a function to remove/replace an undeclared symbol is the
-    # correct minimal fix (e.g. replace a removed global with a local).
+    # Enabled by default: undeclared identifiers/types/macros should generally be handled via
+    # deterministic _extra_* insertions before trying body rewrites.
+    raw = str(os.environ.get("REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL", "") or "").strip()
+    if not raw:
+        return True
     return _env_flag("REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL")
 
 
@@ -3537,6 +3540,33 @@ def _macro_define_guardrail_for_override(state: AgentState, decision: Decision) 
 
 
 def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> bool:
+    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
+        # Backward-compatible fallback for tests/synthetic histories that don't carry observation payloads.
+        obs = step.get("observation")
+        if not isinstance(obs, dict):
+            return True
+        if obs.get("ok") is not True:
+            return False
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            return False
+        pt = out.get("patch_text")
+        if isinstance(pt, str):
+            return bool(pt.strip())
+        if isinstance(pt, dict):
+            ap = str(pt.get("artifact_path", "") or "").strip()
+            if not ap:
+                return False
+            b = pt.get("bytes")
+            if isinstance(b, int):
+                return b > 0
+            # Best-effort fallback when bytes isn't present.
+            try:
+                return bool(_read_text(ap).strip())
+            except Exception:
+                return False
+        return False
+
     want = str(symbol or "").strip()
     if not want:
         return False
@@ -3550,11 +3580,37 @@ def _has_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) ->
             continue
         args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
         if str(args.get("symbol_name", "")).strip() == want:
-            return True
+            if _step_has_effective_patch(step):
+                return True
     return False
 
 
 def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: AgentState, symbol: str) -> bool:
+    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
+        obs = step.get("observation")
+        if not isinstance(obs, dict):
+            return True
+        if obs.get("ok") is not True:
+            return False
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            return False
+        pt = out.get("patch_text")
+        if isinstance(pt, str):
+            return bool(pt.strip())
+        if isinstance(pt, dict):
+            ap = str(pt.get("artifact_path", "") or "").strip()
+            if not ap:
+                return False
+            b = pt.get("bytes")
+            if isinstance(b, int):
+                return b > 0
+            try:
+                return bool(_read_text(ap).strip())
+            except Exception:
+                return False
+        return False
+
     want = str(symbol or "").strip()
     if not want:
         return False
@@ -3570,11 +3626,37 @@ def _has_make_extra_patch_override_for_symbol_with_prefer_definition(state: Agen
         if str(args.get("symbol_name", "")).strip() != want:
             continue
         if _as_bool(args.get("prefer_definition"), False):
-            return True
+            if _step_has_effective_patch(step):
+                return True
     return False
 
 
 def _count_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) -> int:
+    def _step_has_effective_patch(step: Dict[str, Any]) -> bool:
+        obs = step.get("observation")
+        if not isinstance(obs, dict):
+            return True
+        if obs.get("ok") is not True:
+            return False
+        out = obs.get("output")
+        if not isinstance(out, dict):
+            return False
+        pt = out.get("patch_text")
+        if isinstance(pt, str):
+            return bool(pt.strip())
+        if isinstance(pt, dict):
+            ap = str(pt.get("artifact_path", "") or "").strip()
+            if not ap:
+                return False
+            b = pt.get("bytes")
+            if isinstance(b, int):
+                return b > 0
+            try:
+                return bool(_read_text(ap).strip())
+            except Exception:
+                return False
+        return False
+
     want = str(symbol or "").strip()
     if not want:
         return 0
@@ -3589,7 +3671,8 @@ def _count_make_extra_patch_override_for_symbol(state: AgentState, symbol: str) 
             continue
         args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
         if str(args.get("symbol_name", "")).strip() == want:
-            count += 1
+            if _step_has_effective_patch(step):
+                count += 1
     return count
 
 
@@ -3613,6 +3696,8 @@ def _undeclared_symbol_extra_patch_guardrail_for_override(state: AgentState, dec
 
     undeclared = _extract_undeclared_symbol_name(state, active_only=True)
     if not undeclared:
+        return None
+    if not _should_use_make_extra_for_undeclared_symbol(undeclared, str(state.error_line or state.snippet or "")):
         return None
     if _has_make_extra_patch_override_for_symbol(state, undeclared):
         return None
@@ -4007,6 +4092,29 @@ _INCLUDED_FROM_RE = re.compile(r"In file included from\s+(?P<file>[^:\n]+):(?P<l
 _DIFF_GIT_PATH_RE = re.compile(r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$")
 
 
+def _is_undeclared_identifier_or_type_error(text: str) -> bool:
+    low = str(text or "").lower()
+    return ("use of undeclared identifier" in low) or ("unknown type name" in low)
+
+
+def _is_undeclared_function_error(text: str) -> bool:
+    low = str(text or "").lower()
+    return (
+        ("call to undeclared function" in low)
+        or ("implicit declaration of function" in low)
+        or ("undeclared function" in low)
+    )
+
+
+def _should_use_make_extra_for_undeclared_symbol(symbol: str, error_text: str) -> bool:
+    sym = str(symbol or "").strip()
+    if not sym:
+        return False
+    if sym.startswith("__revert_"):
+        return True
+    return _is_undeclared_identifier_or_type_error(error_text)
+
+
 def _extract_file_path_from_diff_hunk_text(text: str) -> str:
     """Extract repo-relative file path from a unified-diff hunk header."""
     lines = str(text or "").splitlines()
@@ -4134,11 +4242,12 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
 
 
 def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tuple]:
-    """Return [(symbol_name, file_path), ...] for undeclared __revert_* symbols in grouped_errors not yet fixed.
+    """Return [(symbol_name, file_path), ...] for undeclared symbols to fix via make_extra_patch_override.
 
-    Only ``__revert_*`` symbols are eligible for ``make_extra_patch_override`` (forward declarations).
-    Non-``__revert_*`` symbols are V1-only helpers removed in V2 and should be REMOVED from the
-    function body via ``make_error_patch_override`` instead.
+    Eligibility:
+    - Any ``__revert_*`` symbol (forward declaration/definition via _extra_*).
+    - Non-``__revert_*`` undeclared identifiers/types/macros.
+    - Non-``__revert_*`` undeclared function calls are excluded (rewrite call sites instead).
     """
     result: List[tuple] = []
     seen: set = set()
@@ -4154,9 +4263,9 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
         sym = str(m.group("symbol") or "").strip()
         if not sym or not _C_IDENT_RE.match(sym):
             continue
-        # Only __revert_* symbols get forward declarations; everything else should be removed
-        # from the function body by the LLM via make_error_patch_override.
-        if not sym.startswith("__revert_"):
+        # For non-__revert symbols, only undeclared identifier/type errors are eligible for _extra_*.
+        # Non-__revert undeclared function calls should be fixed by call-site rewrites.
+        if (not sym.startswith("__revert_")) and _is_undeclared_function_error(raw):
             continue
         if sym in seen:
             continue
@@ -5159,59 +5268,6 @@ def _run_langgraph(
                     },
                 }
 
-            # Before forcing the build, fix any remaining undeclared symbols from grouped_errors.
-            # This allows batch-fixing all undeclared identifiers in one pass (one build).
-            unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
-            if unfixed:
-                sym, fp = unfixed[0]
-                file_for_override = _pick_make_extra_patch_file_path(st, fallback_file=fp)
-                forced_extra: Decision = {
-                    "type": "tool",
-                    "thought": f"Additional undeclared symbol in grouped errors: {sym}. Add forward declaration before building.",
-                    "tool": "make_extra_patch_override",
-                    "args": {
-                        "patch_path": st.patch_path,
-                        "file_path": file_for_override,
-                        "symbol_name": sym,
-                    },
-                }
-                _validate_tool_decision(forced_extra)
-                return {"state": st, "pending": forced_extra}
-
-            # Also fix any -Wvisibility warnings (forward struct/union/enum declarations).
-            if not unfixed:
-                for e in st.grouped_errors or []:
-                    if not isinstance(e, dict):
-                        continue
-                    raw = str(e.get("raw", "") or "").strip()
-                    if not raw:
-                        continue
-                    m = _VISIBILITY_DECL_RE.search(raw)
-                    if not m:
-                        continue
-                    tag = str(m.group("tag") or "").strip()
-                    if not tag:
-                        continue
-                    if _has_make_extra_patch_override_for_symbol(st, tag):
-                        continue
-                    fp = str(e.get("file", "") or "").strip()
-                    file_for_override_vis = _pick_make_extra_patch_file_path(st, fallback_file=fp)
-                    forced_vis: Decision = {
-                        "type": "tool",
-                        "thought": (
-                            f"Visibility warning in grouped errors: '{tag}' used before defined. "
-                            f"Adding forward declaration '{tag};' via _extra_* hunk before building."
-                        ),
-                        "tool": "make_extra_patch_override",
-                        "args": {
-                            "patch_path": st.patch_path,
-                            "file_path": file_for_override_vis,
-                            "symbol_name": tag,
-                        },
-                    }
-                    _validate_tool_decision(forced_vis)
-                    return {"state": st, "pending": forced_vis}
-
             decision = {
                 "type": "tool",
                 "thought": "Test the generated patch in OSS-Fuzz using the patch bundle + override diff artifacts.",
@@ -5601,6 +5657,9 @@ def _run_langgraph(
                     if (
                         undeclared_symbol
                         and _C_IDENT_RE.match(undeclared_symbol)
+                        and _should_use_make_extra_for_undeclared_symbol(
+                            undeclared_symbol, str(st.error_line or st.snippet or "")
+                        )
                         and not _has_make_extra_patch_override_for_symbol(st, undeclared_symbol)
                     ):
                         # For undeclared identifiers/types/macros, prefer extending the file's `_extra_*` hunk
