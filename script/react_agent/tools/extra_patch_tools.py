@@ -2199,14 +2199,41 @@ def _extract_enum_constant_names(code: str) -> List[str]:
     """Extract enumerator names from C enum source code.
 
     Handles patterns like ``NAME = VALUE,``, ``NAME,``, ``NAME = OTHER,``,
-    and multiple enumerators per line.  Skips comments and preprocessor directives.
+    and multiple enumerators per line.
+
+    Important: inline comments are stripped before tokenization so plain words
+    in comments (for example "Specialisation of EXTERNAL") are not mistaken for
+    enum constants.
     """
     names: List[str] = []
     in_body = False
+    in_block_comment = False
     for line in str(code or "").splitlines():
-        stripped = line.strip()
-        # Skip comments and preprocessor lines
-        if stripped.startswith("//") or stripped.startswith("#"):
+        # Strip // and /* ... */ comments while preserving code text.
+        clean_chars: List[str] = []
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            nxt = line[i + 1] if i + 1 < len(line) else ""
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                    i += 2
+                    continue
+                i += 1
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                i += 2
+                continue
+            if ch == "/" and nxt == "/":
+                break
+            clean_chars.append(ch)
+            i += 1
+
+        stripped = "".join(clean_chars).strip()
+        # Skip preprocessor lines
+        if not stripped or stripped.startswith("#"):
             continue
         if "{" in stripped:
             in_body = True
@@ -2405,7 +2432,7 @@ def _rename_conflicting_enum_constants_in_extra_hunk(
     if not conflicts:
         return raw, {}
 
-    prefixed_code, rename_map = _prefix_enum_source(enum_code, enum_names, prefix)
+    prefixed_code, rename_map = _prefix_enum_source(enum_code, sorted(conflicts), prefix)
     if not rename_map:
         return raw, {}
 
@@ -2826,7 +2853,7 @@ def make_extra_patch_override(
                 if conflicts:
                     code_prefixed, rename_map = _prefix_enum_source(
                         enum_code,
-                        enum_names,
+                        sorted(conflicts),
                         _ENUM_RENAME_PREFIX,
                     )
                     inserted_lines = [

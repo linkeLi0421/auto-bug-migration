@@ -2398,6 +2398,101 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# SourceManager + make_extra_patch_override: recover definitions from generated headers
+# (for example version.h) by synthesizing target content from Makefile recipes.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    node = {
+        "kind": "MACRO_DEFINITION",
+        "spelling": "HTS_VERSION_TEXT",
+        "location": {"file": "version.h", "line": 1, "column": 1},
+        "extent": {
+            "start": {"file": "version.h", "line": 1, "column": 1},
+            "end": {"file": "version.h", "line": 1, "column": 64},
+        },
+    }
+    (kb_v1 / "version.h_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1" / "htslib"
+    src_v2 = td / "src_v2" / "htslib"
+    src_v1.mkdir(parents=True)
+    src_v2.mkdir(parents=True)
+
+    # version.h is generated (not present in the tree).
+    (src_v1 / "Makefile").write_text(
+        "PACKAGE_VERSION = 9.9.9\n"
+        "version.h:\n"
+        "\techo '#define HTS_VERSION_TEXT \"$(PACKAGE_VERSION)\"' > $@\n",
+        encoding="utf-8",
+    )
+
+    # The missing file path should still resolve through include-form inputs.
+    sm = SourceManager(str(src_v1), str(src_v2))
+    seg = sm.get_code_segment('#include "version.h"', 1, 1, "v1")
+    assert "#define HTS_VERSION_TEXT" in seg, seg
+
+    # v2 file anchors where _extra_target.c should be inserted.
+    (src_v2 / "target.c").write_text("#include \"x.h\"\nint marker = 0;\n", encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), sm)
+
+    bundle_path = td / "bundle.patch2"
+    main_patch = PatchInfo(
+        file_path_old="target.c",
+        file_path_new="target.c",
+        patch_text="diff --git a/target.c b/target.c\n--- a/target.c\n+++ b/target.c\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Recreated function"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({"p_main": main_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/htslib/target.c",
+        symbol_name="HTS_VERSION_TEXT",
+        version="v1",
+    )
+    inserted = str(out.get("inserted_code") or "")
+    assert "#define HTS_VERSION_TEXT" in inserted, inserted
+    assert '"9.9.9"' in inserted or '"$(PACKAGE_VERSION)"' in inserted, inserted
+
+print("OK")
+PY
+
 # search_definition tool: accept only v1/v2, but coerce common model mistakes (commit hashes) to v2.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import json
@@ -2618,7 +2713,11 @@ from pathlib import Path
 script_dir = Path(sys.argv[1]).resolve()
 sys.path.insert(0, str(script_dir))
 
-from agent_langgraph import AgentState, _undeclared_symbol_extra_patch_guardrail_for_override  # noqa: E402
+from agent_langgraph import (  # noqa: E402
+    AgentState,
+    _block_make_extra_patch_override_after_unresolvable_lookup,
+    _undeclared_symbol_extra_patch_guardrail_for_override,
+)
 
 err = "/src/libxml2/dict.c:1519:21: error: use of undeclared identifier 'xmlRngMutex'"
 state = AgentState(
@@ -2642,6 +2741,57 @@ forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
 assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+
+# If a prior make_extra lookup for the same symbol reported unreadable source,
+# guardrail should stop forcing make_extra and let model-guided override proceed.
+state2 = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err,
+    snippet="",
+)
+state2.grouped_errors = [{"raw": err, "file": "/src/libxml2/dict.c", "line": 1519, "col": 21}]
+state2.steps = [
+    {
+        "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
+        "observation": {"ok": True, "tool": "get_error_patch_context", "args": {}, "output": {"patch_key": "p"}, "error": None},
+    },
+    {
+        "decision": {
+            "type": "tool",
+            "tool": "make_extra_patch_override",
+            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "xmlRngMutex"},
+        },
+        "observation": {
+            "ok": True,
+            "tool": "make_extra_patch_override",
+            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "xmlRngMutex"},
+            "output": {
+                "patch_path": "bundle.patch2",
+                "file_path": "/src/libxml2/dict.c",
+                "symbol_name": "xmlRngMutex",
+                "patch_key": "_extra_dict.c",
+                "patch_text": "",
+                "note": "KB has nodes for 'xmlRngMutex' (v1=1, v2=0), but none produced readable source code.",
+            },
+            "error": None,
+        },
+    },
+]
+state2.step_history = list(state2.steps)
+state2.loop_base_func_code_artifact_path = "/tmp/base.c"
+
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state2, decision)
+assert forced is None, forced
+
+forced = _block_make_extra_patch_override_after_unresolvable_lookup(
+    state2,
+    {"type": "tool", "tool": "make_extra_patch_override", "thought": "retry", "args": {"symbol_name": "xmlRngMutex"}},
+    remaining_steps=10,
+)
+assert forced and forced.get("tool") == "read_artifact", forced
+assert state2.pending_patch and state2.pending_patch.get("tool") == "make_error_patch_override", state2.pending_patch
 
 os.environ["REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL"] = "0"
 forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
@@ -5518,6 +5668,7 @@ enum cram_block_method_int {
     LZMA    = 3,
     RANS    = 4,
     RANS0   = RANS,
+    E_VARINT_UNSIGNED = 41, // Specialisation of EXTERNAL
     FQZ     = 7,
 };
 """
@@ -5527,8 +5678,10 @@ assert "RAW" in names1, names1
 assert "GZIP" in names1, names1
 assert "RANS" in names1, names1
 assert "RANS0" in names1, names1
+assert "E_VARINT_UNSIGNED" in names1, names1
 assert "FQZ" in names1, names1
 assert "enum" not in names1, names1
+assert "EXTERNAL" not in names1, names1
 
 # Typedef enum
 code2 = "typedef enum { A, B = 1, C } my_enum;"
@@ -5803,15 +5956,16 @@ with tempfile.TemporaryDirectory() as td_raw:
     sm = SourceManager(str(v1_src), str(v2_src))
     agent_tools = AgentTools(kb_index=kb_index, source_manager=sm)
 
-    # Create bundle with a main hunk that references the enum values
+    # Create bundle with a main hunk that references conflicting enum values
     main_patch_text = (
         "diff --git a/cram_io.c b/cram_io.c\n"
         "--- a/cram_io.c\n"
         "+++ b/cram_io.c\n"
-        "@@ -10,3 +10,0 @@\n"
-        "-  if (method == GZIP) {\n"
-        "-    return FQZ;\n"
+        "@@ -10,4 +10,0 @@\n"
+        "-  if (method == RAW) {\n"
+        "-    return BM_ERROR;\n"
         "-  }\n"
+        "-  return GZIP;\n"
     )
     extra_patch_text = (
         "diff --git a/cram_io.c b/cram_io.c\n"
@@ -5824,7 +5978,7 @@ with tempfile.TemporaryDirectory() as td_raw:
     main_patch = PatchInfo(
         file_path_old="cram_io.c", file_path_new="cram_io.c",
         patch_text=main_patch_text, file_type="c",
-        old_start_line=10, old_end_line=13,
+        old_start_line=10, old_end_line=14,
         new_start_line=10, new_end_line=10,
         patch_type=set(), old_signature="",
         dependent_func=set(), hiden_func_dict={},
@@ -5852,15 +6006,15 @@ with tempfile.TemporaryDirectory() as td_raw:
         version="v1",
     )
 
-    # Check that the extra hunk has prefixed enum names
+    # Check that the extra hunk has only conflicting enum names prefixed
     ref = out.get("patch_text")
     assert isinstance(ref, dict) and ref.get("artifact_path"), f"Missing patch_text artifact: {out}"
     p = Path(str(ref.get("artifact_path"))).resolve()
     text = p.read_text(encoding="utf-8", errors="replace")
     assert "_revert_BM_ERROR" in text, f"Expected prefixed BM_ERROR in extra hunk:\n{text}"
     assert "_revert_RAW" in text, f"Expected prefixed RAW in extra hunk:\n{text}"
-    assert "_revert_GZIP" in text, f"Expected prefixed GZIP in extra hunk:\n{text}"
-    assert "_revert_FQZ" in text, f"Expected prefixed FQZ in extra hunk:\n{text}"
+    assert "_revert_GZIP" not in text, f"Did not expect prefixed GZIP in extra hunk:\n{text}"
+    assert "_revert_FQZ" not in text, f"Did not expect prefixed FQZ in extra hunk:\n{text}"
 
     # Tool returns enum_rename_overrides as inline text (no artifact files for other hunks).
     # Agent filters to active patch_key only at apply time.
@@ -5870,8 +6024,9 @@ with tempfile.TemporaryDirectory() as td_raw:
     assert ov.get("patch_key") == "tail-cram_io.c-f1_", ov
     ov_text = ov.get("patch_text", "")
     assert isinstance(ov_text, str), f"Expected inline text, got: {type(ov_text)}"
-    assert "_revert_GZIP" in ov_text, f"Expected prefixed GZIP in main hunk override:\n{ov_text}"
-    assert "_revert_FQZ" in ov_text, f"Expected prefixed FQZ in main hunk override:\n{ov_text}"
+    assert "_revert_RAW" in ov_text, f"Expected prefixed RAW in main hunk override:\n{ov_text}"
+    assert "_revert_BM_ERROR" in ov_text, f"Expected prefixed BM_ERROR in main hunk override:\n{ov_text}"
+    assert "_revert_GZIP" not in ov_text, f"Did not expect prefixed GZIP in main hunk override:\n{ov_text}"
 
 print("OK")
 PY

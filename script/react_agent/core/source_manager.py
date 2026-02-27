@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,6 +16,7 @@ class SourceManager:
         self.local_v2_path = Path(local_v2_path).resolve()
         self._include_cache: Dict[Tuple[str, str], Optional[Path]] = {}
         self._git_file_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
+        self._generated_file_cache: Dict[Tuple[str, str], Optional[str]] = {}
         self._include_dirs = {
             "v1": self._default_include_dirs(self.local_v1_path),
             "v2": self._default_include_dirs(self.local_v2_path),
@@ -39,6 +41,227 @@ class SourceManager:
                 return self._include_cache[cache_key]
         self._include_cache[cache_key] = None
         return None
+
+    @staticmethod
+    def _strip_src_repo_prefix(path_s: str, *, repo_name: str = "") -> str:
+        s = str(path_s or "").replace("\\", "/").strip()
+        if not s:
+            return ""
+        had_src_prefix = s.startswith("/src/") or s == "/src" or s.startswith("src/") or s == "src"
+        if s.startswith("/src/"):
+            s = s[len("/src/") :]
+        elif s == "/src":
+            s = ""
+        elif s.startswith("src/"):
+            s = s[len("src/") :]
+        elif s == "src":
+            s = ""
+        if had_src_prefix and repo_name:
+            if s == repo_name:
+                s = ""
+            elif s.startswith(repo_name + "/"):
+                s = s[len(repo_name) + 1 :]
+            elif s == f"{repo_name}-src":
+                s = ""
+            elif s.startswith(f"{repo_name}-src/"):
+                s = s[len(f"{repo_name}-src/") :]
+        return s
+
+    def _repo_relative_path(self, file_path: str, version: str, *, resolved: Optional[Path] = None) -> str:
+        root = self._repo_root(version).resolve()
+        repo_name = str(root.name or "").strip()
+
+        if resolved is not None:
+            try:
+                return resolved.resolve().relative_to(root).as_posix()
+            except Exception:
+                pass
+
+        raw = str(file_path or "").strip()
+        if not raw:
+            return ""
+
+        if raw.lstrip().startswith("#include") or "#include" in raw:
+            after = raw.split("#include", 1)[-1].strip()
+            if "<" in after and ">" in after:
+                return str(after.split("<", 1)[1].split(">", 1)[0]).strip()
+            return str(after).strip().strip('"').strip("<>")
+
+        path = raw.replace("\\", "/")
+        if path.startswith("/src") or path.startswith("src/"):
+            return self._strip_src_repo_prefix(path, repo_name=repo_name)
+        return path.lstrip("/")
+
+    @staticmethod
+    def _expand_make_vars(text: str, variables: Dict[str, str]) -> str:
+        out = str(text or "")
+        for _ in range(4):
+            updated = re.sub(r"\$\(([^)]+)\)", lambda m: variables.get(str(m.group(1) or "").strip(), m.group(0)), out)
+            if updated == out:
+                break
+            out = updated
+        return out
+
+    @staticmethod
+    def _parse_echo_recipe_line(line: str) -> Tuple[str, str, str]:
+        cmd = str(line or "").strip()
+        if cmd.startswith("@"):
+            cmd = cmd[1:].lstrip()
+        if not cmd.startswith("echo "):
+            return "", "", ""
+        body = cmd[len("echo ") :].lstrip()
+        if not body:
+            return "", "", ""
+
+        quote = body[0]
+        if quote not in {"'", '"'}:
+            return "", "", ""
+        i = 1
+        payload_chars: List[str] = []
+        while i < len(body):
+            ch = body[i]
+            if quote == '"' and ch == "\\" and i + 1 < len(body):
+                payload_chars.append(body[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                break
+            payload_chars.append(ch)
+            i += 1
+        if i >= len(body) or body[i] != quote:
+            return "", "", ""
+
+        tail = body[i + 1 :].strip()
+        if not tail.startswith(">"):
+            return "", "", ""
+        redir = ">>" if tail.startswith(">>") else ">"
+        out_tail = tail[len(redir) :].strip()
+        out = out_tail.split()[0] if out_tail else ""
+        if not out:
+            return "", "", ""
+        return "".join(payload_chars), redir, out
+
+    @staticmethod
+    def _make_var_map(lines: List[str]) -> Dict[str, str]:
+        vars_map: Dict[str, str] = {}
+        assign_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*([:+?]?=)\s*(.*?)\s*$")
+        for raw in lines:
+            line = str(raw or "")
+            if not line.strip() or line.lstrip().startswith("#") or line.startswith("\t"):
+                continue
+            m = assign_re.match(line)
+            if not m:
+                continue
+            name = str(m.group(1) or "").strip()
+            op = str(m.group(2) or "").strip()
+            value = str(m.group(3) or "").strip()
+            if not name:
+                continue
+            if op == "?=" and name in vars_map:
+                continue
+            if op == "+=":
+                vars_map[name] = (str(vars_map.get(name, "")).strip() + " " + value).strip()
+            else:
+                vars_map[name] = value
+        return vars_map
+
+    def _candidate_makefiles(self, rel_path: str, version: str) -> List[Path]:
+        root = self._repo_root(version)
+        names = ("Makefile", "makefile", "GNUmakefile")
+        candidates: List[Path] = []
+        seen: set[Path] = set()
+
+        def add(path: Path) -> None:
+            if path in seen:
+                return
+            seen.add(path)
+            if path.is_file():
+                candidates.append(path)
+
+        for name in names:
+            add(root / name)
+
+        parent = Path(str(rel_path or "")).parent
+        while str(parent) not in {"", "."}:
+            for name in names:
+                add(root / parent / name)
+            parent = parent.parent
+        return candidates
+
+    @staticmethod
+    def _normalize_target_token(token: str) -> str:
+        s = str(token or "").strip()
+        if s.startswith("./"):
+            s = s[2:]
+        return s.replace("\\", "/")
+
+    def _synthesize_generated_file(self, rel_path: str, version: str) -> str:
+        rel_norm = self._normalize_target_token(rel_path)
+        if not rel_norm:
+            return ""
+        cache_key = (version, rel_norm)
+        if cache_key in self._generated_file_cache:
+            return self._generated_file_cache[cache_key] or ""
+
+        rel_base = Path(rel_norm).name
+        for makefile in self._candidate_makefiles(rel_norm, version):
+            try:
+                lines = makefile.read_text(encoding="utf-8", errors="replace").splitlines()
+            except Exception:
+                continue
+            vars_map = self._make_var_map(lines)
+
+            i = 0
+            while i < len(lines):
+                line = str(lines[i] or "")
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#") or line.startswith("\t") or ":" not in line:
+                    i += 1
+                    continue
+
+                lhs = line.split(":", 1)[0].strip()
+                # Skip variable assignments and special forms that are not target rules.
+                if not lhs or any(op in lhs for op in ("=", ":=", "+=", "?=")):
+                    i += 1
+                    continue
+                targets = [self._normalize_target_token(t) for t in lhs.split() if t.strip()]
+                if not targets:
+                    i += 1
+                    continue
+                matched_target = ""
+                for t in targets:
+                    if t == rel_norm or t == rel_base:
+                        matched_target = t
+                        break
+                if not matched_target:
+                    i += 1
+                    continue
+
+                j = i + 1
+                generated_lines: List[str] = []
+                while j < len(lines):
+                    recipe_line = str(lines[j] or "")
+                    if not recipe_line.startswith("\t"):
+                        break
+                    payload, redir, out = self._parse_echo_recipe_line(recipe_line.lstrip("\t"))
+                    if payload and out:
+                        out_norm = self._normalize_target_token(out)
+                        if out_norm in {"$@", matched_target, rel_norm, rel_base} or out_norm.endswith("/" + rel_norm):
+                            expanded = self._expand_make_vars(payload, vars_map)
+                            if redir == ">":
+                                generated_lines = [expanded]
+                            else:
+                                generated_lines.append(expanded)
+                    j += 1
+                if generated_lines:
+                    text = "\n".join(generated_lines).rstrip("\n") + "\n"
+                    self._generated_file_cache[cache_key] = text
+                    return text
+                i = j
+            # Keep scanning other makefiles.
+
+        self._generated_file_cache[cache_key] = None
+        return ""
 
     def _repo_root(self, version: str) -> Path:
         return self.local_v1_path if version == "v1" else self.local_v2_path
@@ -89,17 +312,7 @@ class SourceManager:
             repo_root = self._repo_root(version)
             repo_name = repo_root.name
             if repo_name:
-                rel_norm = rel.replace("\\", "/")
-                prefix = f"{repo_name}/"
-                if rel_norm == repo_name:
-                    rel = ""
-                elif rel_norm.startswith(prefix):
-                    rel = rel_norm[len(prefix) :]
-                # OSS-Fuzz convention: repo may have -src suffix (e.g., php-src, matio-src)
-                elif rel_norm.startswith(f"{repo_name}-src/"):
-                    rel = rel_norm[len(f"{repo_name}-src/") :]
-                elif rel_norm == f"{repo_name}-src":
-                    rel = ""
+                rel = self._strip_src_repo_prefix(rel, repo_name=repo_name)
             return repo_root if not rel else (repo_root / rel)
         if norm_path.lstrip().startswith("#include") or "#include" in norm_path:
             after = norm_path.split("#include", 1)[-1].strip()
@@ -108,7 +321,14 @@ class SourceManager:
                 if "<" in after and ">" in after
                 else after.strip().strip('"')
             )
-            return self._resolve_include(header, version)
+            resolved = self._resolve_include(header, version)
+            if resolved is not None:
+                return resolved
+            # Generated headers (for example, version.h) may not exist before build.
+            # Return the expected repo path so later fallbacks can synthesize content.
+            if header:
+                return self._repo_root(version) / header
+            return None
         path = Path(norm_path)
         if path.is_absolute():
             return path
@@ -117,22 +337,13 @@ class SourceManager:
     def get_code_segment(self, file_path: str, start_line: int, end_line: int, version: str) -> str:
         """Read a code segment between start_line and end_line (inclusive)."""
         resolved = self._resolve_path(file_path, version)
+        rel = self._repo_relative_path(file_path, version, resolved=resolved)
         text = ""
 
         # Prefer git-object reads when a commit hint is configured. This avoids subtle mismatches where
         # the configured --v1-src/--v2-src worktrees exist but are checked out at a different revision
         # than the KB JSON (line numbers/extents drift and we extract the wrong lines).
-        rel = ""
-        if self._git_commit_hint(version):
-            if resolved is not None:
-                try:
-                    rel = resolved.resolve().relative_to(self._repo_root(version).resolve()).as_posix()
-                except Exception:
-                    rel = ""
-            if not rel:
-                rel = str(file_path or "").lstrip("/").replace("\\", "/").strip()
-                if rel.startswith("src/"):
-                    rel = rel[len("src/") :]
+        if self._git_commit_hint(version) and rel and not Path(rel).is_absolute():
             if rel:
                 text = self._git_show_file(rel, version)
 
@@ -142,17 +353,11 @@ class SourceManager:
             else:
                 # Fallback: if the file isn't present in the working tree, try reading from git objects
                 # using REACT_AGENT_V1_SRC_COMMIT / REACT_AGENT_V2_SRC_COMMIT.
-                if not rel:
-                    if resolved is not None:
-                        try:
-                            rel = resolved.resolve().relative_to(self._repo_root(version).resolve()).as_posix()
-                        except Exception:
-                            rel = ""
-                    if not rel:
-                        rel = str(file_path or "").lstrip("/").replace("\\", "/").strip()
-                        if rel.startswith("src/"):
-                            rel = rel[len("src/") :]
-                text = self._git_show_file(rel, version)
+                if rel and not Path(rel).is_absolute():
+                    text = self._git_show_file(rel, version)
+                if not text and rel:
+                    # Generated headers may not exist in either the worktree or git objects.
+                    text = self._synthesize_generated_file(rel, version)
                 if not text:
                     return ""
         lines = text.splitlines()
