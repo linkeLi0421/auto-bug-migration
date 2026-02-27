@@ -43,11 +43,27 @@ class SourceManager:
         return None
 
     @staticmethod
+    def _strip_repo_name_prefix(path_s: str, *, repo_name: str = "") -> str:
+        s = str(path_s or "").replace("\\", "/").strip()
+        repo = str(repo_name or "").strip()
+        if not s or not repo:
+            return s
+        if s == repo:
+            return ""
+        if s.startswith(repo + "/"):
+            return s[len(repo) + 1 :]
+        repo_src = f"{repo}-src"
+        if s == repo_src:
+            return ""
+        if s.startswith(repo_src + "/"):
+            return s[len(repo_src) + 1 :]
+        return s
+
+    @staticmethod
     def _strip_src_repo_prefix(path_s: str, *, repo_name: str = "") -> str:
         s = str(path_s or "").replace("\\", "/").strip()
         if not s:
             return ""
-        had_src_prefix = s.startswith("/src/") or s == "/src" or s.startswith("src/") or s == "src"
         if s.startswith("/src/"):
             s = s[len("/src/") :]
         elif s == "/src":
@@ -56,16 +72,7 @@ class SourceManager:
             s = s[len("src/") :]
         elif s == "src":
             s = ""
-        if had_src_prefix and repo_name:
-            if s == repo_name:
-                s = ""
-            elif s.startswith(repo_name + "/"):
-                s = s[len(repo_name) + 1 :]
-            elif s == f"{repo_name}-src":
-                s = ""
-            elif s.startswith(f"{repo_name}-src/"):
-                s = s[len(f"{repo_name}-src/") :]
-        return s
+        return SourceManager._strip_repo_name_prefix(s, repo_name=repo_name)
 
     def _repo_relative_path(self, file_path: str, version: str, *, resolved: Optional[Path] = None) -> str:
         root = self._repo_root(version).resolve()
@@ -90,7 +97,8 @@ class SourceManager:
         path = raw.replace("\\", "/")
         if path.startswith("/src") or path.startswith("src/"):
             return self._strip_src_repo_prefix(path, repo_name=repo_name)
-        return path.lstrip("/")
+        path = path.lstrip("/")
+        return self._strip_repo_name_prefix(path, repo_name=repo_name)
 
     @staticmethod
     def _expand_make_vars(text: str, variables: Dict[str, str]) -> str:
@@ -313,7 +321,27 @@ class SourceManager:
             repo_name = repo_root.name
             if repo_name:
                 rel = self._strip_src_repo_prefix(rel, repo_name=repo_name)
-            return repo_root if not rel else (repo_root / rel)
+            if not rel:
+                return repo_root
+
+            candidate = repo_root / rel
+            if candidate.exists():
+                return candidate
+
+            # Fallback: some diagnostics still include an extra "<repo>/" segment after /src stripping.
+            rel_wo_repo = self._strip_repo_name_prefix(rel, repo_name=repo_name)
+            if rel_wo_repo and rel_wo_repo != rel:
+                candidate2 = repo_root / rel_wo_repo
+                if candidate2.exists():
+                    return candidate2
+
+            # Fallback: prefer a top-level file match when basename is unique at repo root.
+            base = Path(rel).name
+            if base:
+                root_base = repo_root / base
+                if root_base.exists():
+                    return root_base
+            return candidate
         if norm_path.lstrip().startswith("#include") or "#include" in norm_path:
             after = norm_path.split("#include", 1)[-1].strip()
             header = (
@@ -332,7 +360,18 @@ class SourceManager:
         path = Path(norm_path)
         if path.is_absolute():
             return path
-        return self._repo_root(version) / norm_path
+        repo_root = self._repo_root(version)
+        candidate = repo_root / norm_path
+        if candidate.exists():
+            return candidate
+
+        repo_name = repo_root.name
+        rel_wo_repo = self._strip_repo_name_prefix(norm_path, repo_name=repo_name)
+        if rel_wo_repo and rel_wo_repo != norm_path:
+            candidate2 = repo_root / rel_wo_repo
+            if candidate2.exists():
+                return candidate2
+        return candidate
 
     def get_code_segment(self, file_path: str, start_line: int, end_line: int, version: str) -> str:
         """Read a code segment between start_line and end_line (inclusive)."""
