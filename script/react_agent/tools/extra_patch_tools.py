@@ -76,7 +76,6 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
         s = str(path_s or "").replace("\\", "/").strip()
         if not s:
             return ""
-        had_src_prefix = s.startswith("/src/") or s == "/src" or s.startswith("src/") or s == "src"
         if s.startswith("/src/"):
             s = s[len("/src/") :]
         elif s == "/src":
@@ -85,7 +84,7 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
             s = s[len("src/") :]
         elif s == "src":
             s = ""
-        if had_src_prefix and repo_name:
+        if repo_name:
             if s == repo_name:
                 s = ""
             elif s.startswith(repo_name + "/"):
@@ -96,14 +95,34 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
                 s = s[len(f"{repo_name}-src/") :]
         return s
 
+    path_norm = raw.replace("\\", "/")
+
     if sm is not None:
+        root = None
+        try:
+            root = sm._repo_root(version)  # type: ignore[attr-defined]
+        except Exception:
+            root = None
+
+        if root is not None:
+            try:
+                p = Path(path_norm)
+                if p.is_absolute() and p.exists():
+                    rel = p.resolve().relative_to(root.resolve()).as_posix()
+                    repo_name = str(getattr(root, "name", "") or "").strip()
+                    rel_norm = _strip_src_repo_prefix(rel, repo_name=repo_name)
+                    return rel_norm if rel_norm else rel
+            except Exception:
+                pass
+
         try:
             resolved = sm._resolve_path(raw, version)  # type: ignore[attr-defined]
         except Exception:
             resolved = None
         if resolved is not None and resolved.exists():
             try:
-                root = sm._repo_root(version)  # type: ignore[attr-defined]
+                if root is None:
+                    root = sm._repo_root(version)  # type: ignore[attr-defined]
                 rel = resolved.resolve().relative_to(root.resolve()).as_posix()
                 repo_name = str(getattr(root, "name", "") or "").strip()
                 rel_norm = _strip_src_repo_prefix(rel, repo_name=repo_name)
@@ -111,18 +130,145 @@ def _normalize_repo_rel_path(agent_tools: Any, *, file_path: str, version: str =
             except Exception:
                 pass
 
-    # Fallback: strip the /src/<repo>/ or src/<repo>/ prefix when present.
-    if raw.startswith("/src") or raw.startswith("src/"):
-        rel = _strip_src_repo_prefix(raw)
-        if sm is not None:
-            try:
-                repo = sm._repo_root(version)  # type: ignore[attr-defined]
-                repo_name = str(getattr(repo, "name", "") or "").strip()
-                rel = _strip_src_repo_prefix(rel, repo_name=repo_name)
-            except Exception:
-                pass
-        return rel.replace("\\", "/")
-    return raw.replace("\\", "/")
+    # Fallback: strip /src and repo-name aliases when present.
+    rel = path_norm.lstrip("/")
+    if path_norm.startswith("/src") or path_norm.startswith("src/"):
+        rel = _strip_src_repo_prefix(path_norm)
+    if sm is not None:
+        try:
+            repo = sm._repo_root(version)  # type: ignore[attr-defined]
+            repo_name = str(getattr(repo, "name", "") or "").strip()
+            rel = _strip_src_repo_prefix(rel, repo_name=repo_name)
+        except Exception:
+            pass
+    return rel.replace("\\", "/")
+
+
+_TEST_LIKE_DIR_NAMES = {
+    "test",
+    "tests",
+    "testing",
+    "fuzz",
+    "fuzzer",
+    "examples",
+    "example",
+    "docs",
+    "doc",
+    "bench",
+    "benches",
+    "benchmark",
+    "benchmarks",
+}
+
+
+def _looks_test_like_relpath(rel_path: str) -> bool:
+    parts = [str(p).lower() for p in Path(str(rel_path or "")).parts[:-1]]
+    for seg in parts:
+        if seg in _TEST_LIKE_DIR_NAMES or seg.startswith("test"):
+            return True
+    return False
+
+
+def _normalize_requested_relpath(requested_path: str, *, repo_name: str = "") -> str:
+    s = str(requested_path or "").replace("\\", "/").strip()
+    if not s:
+        return ""
+    if s.startswith("/src/"):
+        s = s[len("/src/") :]
+    elif s == "/src":
+        s = ""
+    elif s.startswith("src/"):
+        s = s[len("src/") :]
+    elif s == "src":
+        s = ""
+    s = s.lstrip("/")
+    if repo_name:
+        if s == repo_name:
+            s = ""
+        elif s.startswith(repo_name + "/"):
+            s = s[len(repo_name) + 1 :]
+        elif s == f"{repo_name}-src":
+            s = ""
+        elif s.startswith(f"{repo_name}-src/"):
+            s = s[len(f"{repo_name}-src/") :]
+    return s
+
+
+def _best_basename_candidate(candidates: List[Path], *, repo_root: Path, requested_path: str) -> Optional[Path]:
+    """Pick a deterministic best file when basename lookup yields multiple matches."""
+    if not candidates:
+        return None
+
+    repo_name = str(getattr(repo_root, "name", "") or "").strip()
+    req_rel = _normalize_requested_relpath(requested_path, repo_name=repo_name)
+    req_parts = [str(p) for p in Path(req_rel).parts if str(p) not in {"", "."}]
+    req_dir_parts = [p.lower() for p in req_parts[:-1]]
+
+    def _dir_suffix_match_len(rel_parts: List[str]) -> int:
+        if not req_dir_parts:
+            return 0
+        rel_dir = [p.lower() for p in rel_parts[:-1]]
+        n = 0
+        while n < len(req_dir_parts) and n < len(rel_dir):
+            if req_dir_parts[-1 - n] != rel_dir[-1 - n]:
+                break
+            n += 1
+        return n
+
+    def _score(path: Path) -> tuple:
+        try:
+            rel = path.resolve().relative_to(repo_root.resolve()).as_posix()
+        except Exception:
+            rel = path.name
+        rel_parts = [str(p) for p in Path(rel).parts if str(p) not in {"", "."}]
+        exact_hint = 1 if req_rel and rel == req_rel else 0
+        suffix_hint = 1 if req_rel and rel.endswith("/" + req_rel) else 0
+        dir_hint = _dir_suffix_match_len(rel_parts)
+        is_test_like = 1 if _looks_test_like_relpath(rel) else 0
+        is_top_level = 1 if len(rel_parts) <= 1 else 0
+        return (
+            -exact_hint,
+            -suffix_hint,
+            -dir_hint,
+            is_test_like,
+            -is_top_level,
+            len(rel_parts),
+            len(rel),
+            rel,
+        )
+
+    return min(candidates, key=_score)
+
+
+def _resolve_extra_skeleton_file(agent_tools: Any, *, file_path: str) -> Tuple[Optional[Path], str]:
+    """Resolve a file path for `_extra_*` skeleton creation, with deterministic fallbacks."""
+    sm = getattr(agent_tools, "source_manager", None)
+    if sm is None:
+        return None, "v2"
+
+    # Try V2 first, then V1.
+    for ver in ("v2", "v1"):
+        try:
+            resolved = sm._resolve_path(str(file_path or "").strip(), ver)  # type: ignore[attr-defined]
+        except Exception:
+            resolved = None
+        if resolved is not None and resolved.exists():
+            return resolved, ver
+
+    basename = Path(str(file_path or "")).name
+    if not basename:
+        return None, "v2"
+
+    for ver in ("v2", "v1"):
+        try:
+            repo_root = sm._repo_root(ver)  # type: ignore[attr-defined]
+        except Exception:
+            continue
+        candidates = [p for p in repo_root.rglob(basename) if p.is_file()]
+        chosen = _best_basename_candidate(candidates, repo_root=repo_root, requested_path=str(file_path or ""))
+        if chosen is not None:
+            return chosen, ver
+    return None, "v2"
 
 
 _PP_IF_RE = re.compile(r"^#\s*(?:if|ifdef|ifndef)\b")
@@ -429,32 +575,7 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     if sm is None:
         return ""
 
-    resolved = None
-    version_used = "v2"
-    # Try V2 first, then fall back to V1 (for fuzzer harness files that may not exist in V2)
-    for ver in ("v2", "v1"):
-        try:
-            resolved = sm._resolve_path(str(file_path or "").strip(), ver)  # type: ignore[attr-defined]
-        except Exception:
-            resolved = None
-        if resolved is not None and resolved.exists():
-            version_used = ver
-            break
-    if resolved is None or not resolved.exists():
-        # Fallback: file may be in a subdirectory (e.g. cram_index.c → cram/cram_index.c).
-        # Search by basename; accept only an unambiguous single match.
-        basename = Path(str(file_path or "")).name
-        if basename:
-            for ver in ("v2", "v1"):
-                try:
-                    repo_root = sm._repo_root(ver)  # type: ignore[attr-defined]
-                except Exception:
-                    continue
-                candidates = [p for p in repo_root.rglob(basename) if p.is_file()]
-                if len(candidates) == 1:
-                    resolved = candidates[0]
-                    version_used = ver
-                    break
+    resolved, version_used = _resolve_extra_skeleton_file(agent_tools, file_path=str(file_path or "").strip())
     if resolved is None or not resolved.exists():
         return ""
     text = resolved.read_text(encoding="utf-8", errors="replace")
