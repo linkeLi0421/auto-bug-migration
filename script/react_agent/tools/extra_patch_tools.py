@@ -401,6 +401,47 @@ def _env_flag(name: str) -> bool:
     return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name: str) -> int:
+    """Scan regular hunks in *bundle* for the earliest reference to *symbol_name*.
+
+    Returns the ``old_start_line`` of the earliest hunk whose ``-`` lines
+    mention *symbol_name*, or -1 if not found.  Only non-``_extra_*`` hunks
+    for the same file (by basename) are considered.
+    """
+    if bundle is None or not symbol_name:
+        return -1
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return -1
+    target_basename = Path(str(file_path or "")).name
+    if not target_basename:
+        return -1
+
+    earliest = -1
+    for key, patch_info in patches.items():
+        key_s = str(key or "")
+        if key_s.startswith("_extra_"):
+            continue
+        pt = str(getattr(patch_info, "patch_text", "") or "")
+        if not pt.strip():
+            continue
+        if target_basename not in pt:
+            continue
+        # Check if any - line references the symbol
+        has_ref = False
+        for line in pt.splitlines():
+            if line.startswith("-") and not line.startswith("---"):
+                if symbol_name in line:
+                    has_ref = True
+                    break
+        if not has_ref:
+            continue
+        osl = int(getattr(patch_info, "old_start_line", 0) or 0)
+        if osl > 0 and (earliest < 0 or osl < earliest):
+            earliest = osl
+    return earliest
+
+
 def _llm_find_insertion_line_for_revert_symbol(
     agent_tools: Any,
     *,
@@ -527,14 +568,16 @@ def _llm_find_insertion_line_for_revert_symbol(
         return -1
 
 
-def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2", symbol_name: str = "") -> int:
+def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2", symbol_name: str = "", bundle: Any = None) -> int:
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
     Strategy: insert before a selected function definition start line (start.line).
-    - For __revert_* functions: fall through to the default "before first function" logic.
-      Forward declarations must appear before call sites, not after the V2 function body.
+    - Tier 0 (bundle scan): for __revert_* symbols, find the earliest regular hunk
+      that references the symbol and anchor before that hunk's start line.
+    - Tier 1 (LLM): read V2 source and find the first caller of the underlying function.
+    - Tier 2 (KB): find the underlying V2 function and anchor before the preceding function.
+    - Tier 3 (fallback): insert before the first function definition in the file.
     - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
-    - Otherwise, insert before the first function definition in the file (smallest start line).
     """
     def no_anchor() -> int:
         return -1
@@ -565,10 +608,15 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                 nodes = ver_index[key]
                 break
     if not isinstance(nodes, list) or not nodes:
-        # No KB data; still try the LLM tier for __revert_* symbols before
-        # giving up, since it reads the source file directly.
+        # No KB data; try bundle scan and LLM tiers for __revert_* symbols
+        # before giving up.
         _kind0, _underlying0 = _symbol_underlying_name(str(symbol_name or ""))
         if _kind0 == "revert_function" and _underlying0:
+            bundle_line = _bundle_earliest_reference_line(
+                bundle, file_path=str(file_path or "").strip(), symbol_name=str(symbol_name or "").strip(),
+            )
+            if bundle_line > 0:
+                return bundle_line
             llm_line = _llm_find_insertion_line_for_revert_symbol(
                 agent_tools,
                 file_path=str(file_path or "").strip(),
@@ -637,6 +685,14 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     # and "conflicting types" errors.
     _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
     if _kind == "revert_function" and _underlying:
+        # Tier 0: Bundle scan — find the earliest regular hunk that references
+        # the __revert_* symbol.  This is deterministic and doesn't need an LLM.
+        bundle_line = _bundle_earliest_reference_line(
+            bundle, file_path=str(file_path or "").strip(), symbol_name=str(symbol_name or "").strip(),
+        )
+        if bundle_line > 0:
+            return bundle_line
+
         # Tier 1: LLM-guided — read V2 source and find the first caller.
         llm_line = _llm_find_insertion_line_for_revert_symbol(
             agent_tools,
@@ -759,7 +815,7 @@ def _skip_past_macro_continuation(lines: List[str], idx: int) -> int:
     return min(idx, len(lines))
 
 
-def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3, symbol_name: str = "") -> str:
+def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3, symbol_name: str = "", bundle: Any = None) -> str:
     """Create a minimal unified diff skeleton for a brand-new `_extra_*` patch key."""
     sm = getattr(agent_tools, "source_manager", None)
     if sm is None:
@@ -775,7 +831,8 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
 
     insert_at = -1
     insert_line = _ast_insert_line_number_for_extra_skeleton(
-        agent_tools, file_path=str(file_path or "").strip(), version=version_used, symbol_name=str(symbol_name or "").strip()
+        agent_tools, file_path=str(file_path or "").strip(), version=version_used, symbol_name=str(symbol_name or "").strip(),
+        bundle=bundle,
     )
     if insert_line > 0:
         # We insert before the context line at insert_line; index is 0-based.
@@ -2582,8 +2639,32 @@ def _check_v2_enum_conflict(kb_index: Any, enum_names: List[str]) -> set:
     return conflicts
 
 
-def _prefix_enum_source(code: str, enum_names: List[str], prefix: str) -> Tuple[str, Dict[str, str]]:
-    """Rename all enumerator names in enum source code with a prefix.
+def _check_v2_enum_tag_conflict(kb_index: Any, tag_name: str) -> bool:
+    """Return True if *tag_name* exists in V2 as ``ENUM_DECL``."""
+    if not kb_index or not tag_name:
+        return False
+    try:
+        v2_nodes = (kb_index.query_all(tag_name) or {}).get("v2", [])
+    except Exception:
+        return False
+    return any(
+        isinstance(n, dict) and n.get("kind") == "ENUM_DECL"
+        for n in v2_nodes
+    )
+
+
+def _extract_enum_tag_from_code(code: str) -> str:
+    """Extract the enum tag name from C enum source, or ``''`` if anonymous."""
+    m = re.search(r"(?:typedef\s+)?enum\s+([A-Za-z_]\w*)", str(code or ""))
+    return m.group(1) if m else ""
+
+
+def _prefix_enum_source(code: str, enum_names: List[str], prefix: str, tag_rename_map: Optional[Dict[str, str]] = None) -> Tuple[str, Dict[str, str]]:
+    """Rename enumerator names and optionally the enum tag in source code.
+
+    *tag_rename_map* is an optional ``{old_tag: new_tag}`` dict.  When
+    provided the enum tag name is also renamed and included in the returned
+    *rename_map*.
 
     Returns (modified_code, rename_map) where rename_map maps old→new.
     Processes longest names first to avoid partial replacements.
@@ -2603,6 +2684,17 @@ def _prefix_enum_source(code: str, enum_names: List[str], prefix: str) -> Tuple[
             new_name,
             result,
         )
+    # Apply enum tag renames (e.g. enum htsExactFormat -> enum _revert_htsExactFormat)
+    if tag_rename_map:
+        sorted_tags = sorted(tag_rename_map.keys(), key=len, reverse=True)
+        for old_tag in sorted_tags:
+            new_tag = tag_rename_map[old_tag]
+            rename_map[old_tag] = new_tag
+            result = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(old_tag)}(?![A-Za-z0-9_])",
+                new_tag,
+                result,
+            )
     return result, rename_map
 
 
@@ -2736,14 +2828,21 @@ def _rename_conflicting_enum_constants_in_extra_hunk(
 
     enum_code = "\n".join(block)
     enum_names = _extract_enum_constant_names(enum_code)
-    if not enum_names:
+
+    conflicts = _check_v2_enum_conflict(kb_index, enum_names) if enum_names else set()
+
+    # Also check if the enum tag itself conflicts with V2
+    detected_tag = _extract_enum_tag_from_code(enum_code)
+    tag_rename_map: Optional[Dict[str, str]] = None
+    if detected_tag and _check_v2_enum_tag_conflict(kb_index, detected_tag):
+        tag_rename_map = {detected_tag: f"{prefix}{detected_tag}"}
+
+    if not conflicts and not tag_rename_map:
         return raw, {}
 
-    conflicts = _check_v2_enum_conflict(kb_index, enum_names)
-    if not conflicts:
-        return raw, {}
-
-    prefixed_code, rename_map = _prefix_enum_source(enum_code, sorted(conflicts), prefix)
+    prefixed_code, rename_map = _prefix_enum_source(
+        enum_code, sorted(conflicts), prefix, tag_rename_map=tag_rename_map,
+    )
     if not rename_map:
         return raw, {}
 
@@ -2816,7 +2915,7 @@ def make_extra_patch_override(
     patches = bundle.patches if isinstance(getattr(bundle, "patches", None), dict) else {}
     patch = patches.get(extra_key)
     if patch is None:
-        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol)
+        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol, bundle=bundle)
         if not existing.strip():
             return {
                 "patch_path": str(Path(patch_path_s).expanduser().resolve()),
@@ -2875,7 +2974,7 @@ def make_extra_patch_override(
         ex_lines = existing.splitlines()
         has_minus = any(l.startswith("-") and not l.startswith("---") for l in ex_lines)
         if not has_minus:
-            refreshed = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol)
+            refreshed = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol, bundle=bundle)
             if refreshed.strip():
                 existing = refreshed
                 normalized_actions.append("regenerate_empty_extra_skeleton")
@@ -3148,7 +3247,7 @@ def make_extra_patch_override(
                     break
 
     # For inserted enum definitions, proactively prefix conflicting V1 constants
-    # so they do not collide with V2 enum constants in the same translation unit.
+    # and/or the enum tag so they do not collide with V2 in the same translation unit.
     if inserted_lines and agent_tools is not None:
         kb_index = getattr(agent_tools, "kb_index", None)
         enum_code = "\n".join(inserted_lines)
@@ -3159,23 +3258,35 @@ def make_extra_patch_override(
             and "}" in enum_code
         ):
             enum_names = _extract_enum_constant_names(enum_code)
-            if enum_names:
-                conflicts = _check_v2_enum_conflict(kb_index, enum_names)
+            conflicts = _check_v2_enum_conflict(kb_index, enum_names) if enum_names else set()
+
+            # Check if the enum tag itself conflicts with V2
+            detected_tag = _extract_enum_tag_from_code(enum_code)
+            tag_rename_map: Optional[Dict[str, str]] = None
+            if detected_tag and _check_v2_enum_tag_conflict(kb_index, detected_tag):
+                tag_rename_map = {detected_tag: f"{_ENUM_RENAME_PREFIX}{detected_tag}"}
+
+            if conflicts or tag_rename_map:
+                code_prefixed, rename_map = _prefix_enum_source(
+                    enum_code,
+                    sorted(conflicts),
+                    _ENUM_RENAME_PREFIX,
+                    tag_rename_map=tag_rename_map,
+                )
+                inserted_lines = [
+                    l.rstrip()
+                    for l in code_prefixed.splitlines()
+                    if l.strip()
+                ]
+                enum_rename_overrides = _rename_enum_refs_in_bundle(
+                    bundle, file_path_s, rename_map
+                )
+                suffixes = []
                 if conflicts:
-                    code_prefixed, rename_map = _prefix_enum_source(
-                        enum_code,
-                        sorted(conflicts),
-                        _ENUM_RENAME_PREFIX,
-                    )
-                    inserted_lines = [
-                        l.rstrip()
-                        for l in code_prefixed.splitlines()
-                        if l.strip()
-                    ]
-                    enum_rename_overrides = _rename_enum_refs_in_bundle(
-                        bundle, file_path_s, rename_map
-                    )
-                    insert_kind = (insert_kind + ":enum_values_prefixed").strip(":")
+                    suffixes.append("enum_values_prefixed")
+                if tag_rename_map:
+                    suffixes.append("enum_tag_prefixed")
+                insert_kind = (insert_kind + ":" + ":".join(suffixes)).strip(":")
 
     is_function_definition_insert = (
         kind == "revert_function"

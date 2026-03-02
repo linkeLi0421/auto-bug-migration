@@ -1034,56 +1034,50 @@ def _maybe_llm_repair_extra_hunk_insert_lines(*, insert_lines: list[str], issues
         return None
 
 
-def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str]) -> str:
-    """Merge multiple `_extra_*` override diffs into one by unioning inserted blocks (never partial lines).
+def _extract_override_anchor(text: str) -> int:
+    """Return ``old_start`` from the first ``@@`` hunk header, or 0 on failure."""
+    for line in str(text or "").splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if m:
+            return int(m.group("old_start"))
+    return 0
 
-    In patch-scope runs, `_extra_*` hunks are reverse-applied: '-' lines become additions. Multiple agents can
-    independently extend the same `_extra_*` hunk; we must not drop earlier insertions.
 
-    Strategy: preserve the order from overrides rather than sorting by category. If there's one override,
-    just use it. If multiple different overrides exist, union their blocks while preserving appearance order.
+def _extract_diff_header(text: str) -> str:
+    """Return diff header lines (``diff --git``, ``---``, ``+++``) before the first ``@@``."""
+    out: list[str] = []
+    for line in str(text or "").splitlines():
+        if line.startswith("@@"):
+            break
+        out.append(line)
+    return "\n".join(out) + "\n" if out else ""
+
+
+def _extract_hunk_body(text: str) -> str:
+    """Return everything starting from the first ``@@`` line."""
+    lines = str(text or "").splitlines()
+    idx = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if idx < 0:
+        return text
+    return "\n".join(lines[idx:])
+
+
+def _merge_single_anchor_group(unique_overrides: list[str]) -> str:
+    """Merge override texts that share the same anchor line into one hunk.
+
+    This is the original block-level merge logic extracted into a helper.
     """
-    texts = [str(t or "") for t in (override_texts or []) if str(t or "").strip()]
-    base = str(base_text or "")
-    if not texts:
-        return base
-
-    base_from_override = False
-    if not base.strip():
-        base = texts[0]
-        texts = texts[1:]
-        base_from_override = True
-        if not texts:
-            return base
-
-    # Deduplicate override texts (keep first occurrence of each unique text).
-    unique_overrides: list[str] = []
-    seen: set[str] = set()
-    if base_from_override and base.strip():
-        texts = [base] + texts
-    for t in texts:
-        key = t.strip()
-        if key not in seen:
-            seen.add(key)
-            unique_overrides.append(t)
-
-    # If there's exactly one unique override, just use it directly - no block-level merge.
-    # This preserves the agent's intended ordering (e.g., typedef before prototypes).
     if len(unique_overrides) == 1:
         return unique_overrides[0]
 
-    # Multiple different overrides: union blocks, preserving order from the last (most recent) override.
-    # Import late to avoid tool-level import cycles.
     try:
         from tools.extra_patch_tools import _insert_minus_block_into_patch_text  # type: ignore
     except Exception:
         _insert_minus_block_into_patch_text = None  # type: ignore[assignment]
 
-    # Use the last override as the "primary" ordering source, then add any missing blocks from earlier overrides.
     primary = unique_overrides[-1]
     primary_blocks = _extra_hunk_minus_blocks_first_hunk(primary)
 
-    # Collect blocks from all overrides, keyed by semantic ID.
     all_blocks: dict[str, list[str]] = {}
     for ovr in unique_overrides:
         for block in _extra_hunk_minus_blocks_first_hunk(ovr):
@@ -1092,10 +1086,8 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
             if key not in all_blocks:
                 all_blocks[key] = list(block)
             else:
-                # Keep the better version.
                 all_blocks[key] = list(_choose_better_extra_block(kind, current=all_blocks[key], candidate=block))
 
-    # Build merged block list: start with primary's order, then append any extra blocks from earlier overrides.
     merged_blocks: list[list[str]] = []
     used_keys: set[str] = set()
     for block in primary_blocks:
@@ -1105,7 +1097,6 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
             merged_blocks.append(all_blocks[key])
             used_keys.add(key)
 
-    # Add blocks that exist in earlier overrides but not in primary.
     for ovr in unique_overrides[:-1]:
         for block in _extra_hunk_minus_blocks_first_hunk(ovr):
             kind, name = _extra_insert_block_semantic_id(block)
@@ -1114,8 +1105,6 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
                 merged_blocks.append(all_blocks[key])
                 used_keys.add(key)
 
-    # Enforce sane ordering across categories. Even when a newer override introduces a prototype before
-    # a dependent typedef/tag, merged output should keep macros/typedefs/tags before prototypes.
     kind_pri = {"define": 0, "typedef": 1, "tag": 2, "prototype": 3, "text": 4}
     merged_blocks = [
         block
@@ -1160,6 +1149,81 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
         sys.stderr.write("[_extra_* merge] sanity issues: " + "; ".join(issues[:5]) + "\n")
         sys.stderr.flush()
     return merged
+
+
+_ANCHOR_TOLERANCE = 15  # lines
+
+
+def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str]) -> str:
+    """Merge multiple `_extra_*` override diffs into one by unioning inserted blocks (never partial lines).
+
+    In patch-scope runs, `_extra_*` hunks are reverse-applied: '-' lines become additions. Multiple agents can
+    independently extend the same `_extra_*` hunk; we must not drop earlier insertions.
+
+    Strategy: preserve the order from overrides rather than sorting by category. If there's one override,
+    just use it. If multiple different overrides exist, union their blocks while preserving appearance order.
+
+    When overrides originate from different anchor lines (different ``@@`` positions), the result is a
+    multi-hunk diff so that each anchor group keeps its original position in the file.
+    """
+    texts = [str(t or "") for t in (override_texts or []) if str(t or "").strip()]
+    base = str(base_text or "")
+    if not texts:
+        return base
+
+    base_from_override = False
+    if not base.strip():
+        base = texts[0]
+        texts = texts[1:]
+        base_from_override = True
+        if not texts:
+            return base
+
+    # Deduplicate override texts (keep first occurrence of each unique text).
+    unique_overrides: list[str] = []
+    seen: set[str] = set()
+    if base_from_override and base.strip():
+        texts = [base] + texts
+    for t in texts:
+        key = t.strip()
+        if key not in seen:
+            seen.add(key)
+            unique_overrides.append(t)
+
+    # If there's exactly one unique override, just use it directly - no block-level merge.
+    # This preserves the agent's intended ordering (e.g., typedef before prototypes).
+    if len(unique_overrides) == 1:
+        return unique_overrides[0]
+
+    # ---- Group overrides by anchor line (±_ANCHOR_TOLERANCE) ----
+    anchor_groups: dict[int, list[str]] = {}
+    for ovr in unique_overrides:
+        anchor = _extract_override_anchor(ovr)
+        matched_anchor: int | None = None
+        for existing_anchor in anchor_groups:
+            if abs(anchor - existing_anchor) <= _ANCHOR_TOLERANCE:
+                matched_anchor = existing_anchor
+                break
+        if matched_anchor is not None:
+            anchor_groups[matched_anchor].append(ovr)
+        else:
+            anchor_groups[anchor] = [ovr]
+
+    # Single anchor group: existing behaviour (single hunk merge).
+    if len(anchor_groups) <= 1:
+        return _merge_single_anchor_group(unique_overrides)
+
+    # Multiple anchor groups: merge each independently, produce multi-hunk diff.
+    diff_header = ""
+    hunk_bodies: list[str] = []
+    for anchor in sorted(anchor_groups.keys()):
+        group = anchor_groups[anchor]
+        merged_hunk = _merge_single_anchor_group(group)
+        if not diff_header:
+            diff_header = _extract_diff_header(merged_hunk)
+        hunk_bodies.append(_extract_hunk_body(merged_hunk))
+
+    return (diff_header + "\n".join(hunk_bodies)).rstrip("\n") + "\n"
 
 
 def merge_patch_bundle_with_overrides(
