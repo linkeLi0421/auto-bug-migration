@@ -1904,6 +1904,55 @@ with tempfile.TemporaryDirectory() as td_raw:
     )
     assert llm_result == -1, f"Expected -1 (LLM disabled), got {llm_result}"
 
+    # Tier 2 KB heuristic: with 3 functions, the __revert_* anchor should pick
+    # the preceding function (caller_func at line 500), NOT the first function
+    # in the file (first_func at line 10 which may precede type definitions).
+    first_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "first_func",
+        "location": {"file": "big.h", "line": 10, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 10, "column": 1},
+            "end": {"file": "big.h", "line": 20, "column": 1},
+        },
+    }
+    caller_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "caller_func",
+        "location": {"file": "big.h", "line": 500, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 500, "column": 1},
+            "end": {"file": "big.h", "line": 510, "column": 1},
+        },
+    }
+    target_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "targetfn",
+        "location": {"file": "big.h", "line": 600, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 600, "column": 1},
+            "end": {"file": "big.h", "line": 700, "column": 1},
+        },
+    }
+    (kb_v2 / "big.h_analysis.json").write_text(
+        json.dumps([first_func, caller_func, target_func]), encoding="utf-8"
+    )
+    kb3 = KbIndex(str(kb_v1), str(kb_v2))
+    tools3 = AgentTools(kb3, SourceManager(str(td / "v1"), str(td / "v2")))
+
+    result3 = _ast_insert_line_number_for_extra_skeleton(
+        tools3, file_path="big.h", version="v2",
+        symbol_name="__revert_deadbeef_targetfn",
+    )
+    assert result3 == 500, f"Expected 500 (preceding func), got {result3}"
+
+    # Non-__revert_* symbol still gets line 10 (first func, unchanged default).
+    result4 = _ast_insert_line_number_for_extra_skeleton(
+        tools3, file_path="big.h", version="v2",
+        symbol_name="some_symbol",
+    )
+    assert result4 == 10, f"Expected 10 (first func), got {result4}"
+
     os.environ.pop("REACT_AGENT_DISABLE_SKELETON_LLM", None)
 
 print("OK")
