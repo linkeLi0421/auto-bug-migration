@@ -1,5 +1,7 @@
 # OSS-Fuzz for Select
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/linkeLi0421/auto-bug-migration)
+
 This repository contains scripts and examples used to explore automated fuzzing workflows.  It is focused on building and testing fuzzing harnesses for specific open-source projects.
 
 ## Repository structure
