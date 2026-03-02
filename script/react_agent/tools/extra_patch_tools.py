@@ -397,6 +397,116 @@ def _extra_skeleton_anchor_func_sig() -> str:
     return str(os.environ.get("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", "") or "").strip()
 
 
+def _env_flag(name: str) -> bool:
+    return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _llm_find_insertion_line_for_revert_symbol(
+    agent_tools: Any,
+    *,
+    file_path: str,
+    underlying_name: str,
+    version: str = "v2",
+) -> int:
+    """Use an LLM sub-task to find the optimal insertion line for a __revert_* forward declaration.
+
+    Reads the V2 source file, asks a lightweight LLM to locate the first function
+    that calls/references ``underlying_name``, and returns that function's start
+    line (1-based).  Returns -1 when the LLM is unavailable, disabled, or fails.
+
+    Gating: enabled by default when OPENAI_API_KEY is set.
+    Disable with REACT_AGENT_DISABLE_SKELETON_LLM=1.
+    Model override: REACT_AGENT_SKELETON_LLM_MODEL.
+    Max-tokens override: REACT_AGENT_SKELETON_LLM_MAX_TOKENS (default 512).
+    """
+    if _env_flag("REACT_AGENT_DISABLE_SKELETON_LLM"):
+        return -1
+    if not underlying_name:
+        return -1
+
+    # 1. Read the V2 source file.
+    resolved, _version_used = _resolve_extra_skeleton_file(
+        agent_tools, file_path=str(file_path or "").strip()
+    )
+    if resolved is None or not resolved.exists():
+        return -1
+    try:
+        text = resolved.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return -1
+    if not text.strip():
+        return -1
+
+    file_lines = text.splitlines()
+    MAX_LINES = 4000
+    truncated = len(file_lines) > MAX_LINES
+    if truncated:
+        file_lines = file_lines[:MAX_LINES]
+
+    numbered_text = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(file_lines))
+
+    # 2. Call the LLM.
+    try:
+        import json as _json  # noqa: PLC0415
+
+        from react_agent.models import ModelError, OpenAIChatCompletionsModel  # type: ignore
+    except Exception:
+        return -1
+
+    try:
+        model = OpenAIChatCompletionsModel.from_env()
+        override_model = str(os.environ.get("REACT_AGENT_SKELETON_LLM_MODEL", "") or "").strip()
+        if override_model:
+            model.model = override_model
+        try:
+            model.max_tokens = int(os.environ.get("REACT_AGENT_SKELETON_LLM_MAX_TOKENS", "") or "") or 512
+        except Exception:
+            model.max_tokens = 512
+
+        system_prompt = (
+            "You are a C/C++ source code analyzer. "
+            "Given a source file with line numbers, find the first function definition "
+            "that CALLS or REFERENCES the specified function name.\n\n"
+            "Return ONLY valid JSON with this format:\n"
+            '{"function_start_line": <int>, "function_name": "<name>", "reason": "<brief>"}\n\n'
+            "Rules:\n"
+            "- Find the first CALL SITE or REFERENCE to the target function (not its own definition).\n"
+            "- Return the START LINE of the enclosing function DEFINITION that contains that call.\n"
+            "- The start line is the line where the function's return type or storage-class specifier begins.\n"
+            "- If the target function is only declared (prototype) but never called, return {\"function_start_line\": -1}.\n"
+            "- If the target function is not found at all, return {\"function_start_line\": -1}.\n"
+        )
+
+        user_prompt = (
+            f"Target function name: {underlying_name}\n\n"
+            f"Source file ({len(file_lines)} lines{', truncated' if truncated else ''}):\n\n"
+            f"{numbered_text}\n"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        raw = model.complete(messages)
+        # Strip markdown fences if the model wraps JSON in ```json ... ```.
+        raw_stripped = raw.strip()
+        if raw_stripped.startswith("```"):
+            lines_raw = raw_stripped.splitlines()
+            lines_raw = [l for l in lines_raw if not l.strip().startswith("```")]
+            raw_stripped = "\n".join(lines_raw).strip()
+        data = _json.loads(raw_stripped)
+        if not isinstance(data, dict):
+            return -1
+        line_num = int(data.get("function_start_line", -1) or -1)
+        if line_num <= 0 or line_num > len(file_lines):
+            return -1
+        return line_num
+
+    except Exception:
+        return -1
+
+
 def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2", symbol_name: str = "") -> int:
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
@@ -480,6 +590,22 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
             if sig and _compare_function_signatures(sig, want_sig, ignore_arg_types=True):
                 sl = start_line(n)
                 return sl if sl > 0 else -1
+
+    # For __revert_* symbols, try the LLM-guided insertion point before
+    # falling through to the first-function heuristic.  The LLM reads the
+    # V2 source and finds the first function that calls the underlying
+    # symbol, so the forward declaration lands after all required type
+    # definitions and before the call site.
+    _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
+    if _kind == "revert_function" and _underlying:
+        llm_line = _llm_find_insertion_line_for_revert_symbol(
+            agent_tools,
+            file_path=str(file_path or "").strip(),
+            underlying_name=_underlying,
+            version=ver,
+        )
+        if llm_line > 0:
+            return llm_line
 
     first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
     sl = start_line(first)
