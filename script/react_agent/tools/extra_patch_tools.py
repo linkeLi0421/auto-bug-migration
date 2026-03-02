@@ -591,13 +591,13 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                 sl = start_line(n)
                 return sl if sl > 0 else -1
 
-    # For __revert_* symbols, try the LLM-guided insertion point before
-    # falling through to the first-function heuristic.  The LLM reads the
-    # V2 source and finds the first function that calls the underlying
-    # symbol, so the forward declaration lands after all required type
-    # definitions and before the call site.
+    # For __revert_* symbols, use smarter insertion logic instead of blindly
+    # anchoring at the first function.  The first-function anchor may precede
+    # required type definitions (e.g. bcf_hdr_t), causing "unknown type name"
+    # and "conflicting types" errors.
     _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
     if _kind == "revert_function" and _underlying:
+        # Tier 1: LLM-guided — read V2 source and find the first caller.
         llm_line = _llm_find_insertion_line_for_revert_symbol(
             agent_tools,
             file_path=str(file_path or "").strip(),
@@ -606,6 +606,30 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
         )
         if llm_line > 0:
             return llm_line
+
+        # Tier 2: KB heuristic — find the underlying V2 function in the
+        # candidates and anchor before the immediately preceding function.
+        # In typical header layouts (e.g. vcf.h) the caller is defined just
+        # before the callee, so this places the forward declaration after all
+        # type definitions and before the call site.
+        target_node = None
+        for n in candidates:
+            sp = str(n.get("spelling", "") or "").strip()
+            if sp == _underlying:
+                target_node = n
+                break
+        if target_node is not None:
+            target_sl = start_line(target_node)
+            if target_sl > 0:
+                preceding = [n for n in candidates if 0 < start_line(n) < target_sl]
+                if preceding:
+                    prev = max(preceding, key=lambda n: start_line(n))
+                    prev_sl = start_line(prev)
+                    if prev_sl > 0:
+                        return prev_sl
+                # No preceding function — anchor at the underlying function
+                # itself; types it uses must already be defined by then.
+                return target_sl
 
     first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
     sl = start_line(first)
