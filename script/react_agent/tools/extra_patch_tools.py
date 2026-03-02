@@ -402,12 +402,15 @@ def _env_flag(name: str) -> bool:
 
 
 def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name: str) -> int:
-    """Scan regular hunks in *bundle* for the earliest reference to *symbol_name*.
+    """Scan regular hunks in *bundle* for the earliest *call/use* of *symbol_name*.
 
-    Returns the **old-file line number** of the first ``-`` line that mentions
-    *symbol_name* (computed from ``old_start_line`` + offset within the hunk),
-    or -1 if not found.  Only non-``_extra_*`` hunks for the same file (by
-    basename) are considered.
+    Returns the ``new_start_line`` (V2 line number) of the earliest hunk whose
+    ``-`` lines contain a call/use (not a forward-declaration/definition) of
+    *symbol_name*, or -1 if not found.  Only non-``_extra_*`` hunks for the
+    same file (by basename) are considered.
+
+    We return the V2 (new-side) line rather than V1 (old-side) because the
+    skeleton generator reads V2 source to build the ``_extra_*`` hunk context.
     """
     if bundle is None or not symbol_name:
         return -1
@@ -417,6 +420,10 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
     target_basename = Path(str(file_path or "")).name
     if not target_basename:
         return -1
+
+    _C_STMT_KW = {"return", "if", "else", "while", "for",
+                   "switch", "case", "do", "goto", "break",
+                   "continue", "sizeof", "typeof"}
 
     earliest = -1
     for key, patch_info in patches.items():
@@ -428,35 +435,18 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
             continue
         if target_basename not in pt:
             continue
-        osl = int(getattr(patch_info, "old_start_line", 0) or 0)
-        if osl <= 0:
+        nsl = int(getattr(patch_info, "new_start_line", 0) or 0)
+        if nsl <= 0:
             continue
-        # Walk hunk lines twice:
-        # 1st pass — find old-file line of the first *call/use* (not decl/def)
-        # 2nd pass — find the nearest file-scope boundary (closing '}' at
-        #            column 0) before that call, so the declaration lands at
-        #            file scope rather than inside a function body.
-        body_lines: list[tuple[int, str]] = []  # (old_line, raw_line)
-        old_offset = 0
-        for line in pt.splitlines():
-            if line.startswith("diff ") or line.startswith("--- ") or line.startswith("+++ ") or line.startswith("@@"):
-                continue
-            if line.startswith("+"):
-                continue
-            body_lines.append((osl + old_offset, line))
-            old_offset += 1
 
-        _C_STMT_KW = {"return", "if", "else", "while", "for",
-                       "switch", "case", "do", "goto", "break",
-                       "continue", "sizeof", "typeof"}
-        call_line = -1
-        for old_line, line in body_lines:
-            raw = line[1:] if line.startswith("-") else line[1:] if line.startswith(" ") else line
-            if not line.startswith("-"):
+        # Check if any '-' line has a call/use (not decl/def) of the symbol.
+        has_use = False
+        for line in pt.splitlines():
+            if not line.startswith("-") or line.startswith("---"):
                 continue
             if symbol_name not in line:
                 continue
-            content = raw.strip()
+            content = line[1:].strip()
             # Skip forward declarations / definitions of the symbol itself.
             _stripped = content
             for _q in ("static", "inline", "extern", "const",
@@ -469,25 +459,14 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
             )
             if _dm and _dm.group(1) not in _C_STMT_KW:
                 continue  # declaration/definition — skip
-            call_line = old_line
+            has_use = True
             break
 
-        if call_line < 0:
+        if not has_use:
             continue
 
-        # Walk backwards from call_line to find the nearest file-scope
-        # boundary: a context or '-' line that is '}' at column 0.
-        insert_line = osl  # fallback: hunk start
-        for old_line, line in body_lines:
-            if old_line >= call_line:
-                break
-            text = line[1:] if (line.startswith("-") or line.startswith(" ")) else line
-            if text.rstrip() == "}":
-                # File-scope closing brace — insert right after it.
-                insert_line = old_line + 1
-
-        if earliest < 0 or insert_line < earliest:
-            earliest = insert_line
+        if earliest < 0 or nsl < earliest:
+            earliest = nsl
     return earliest
 
 
@@ -887,6 +866,15 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         # We insert before the context line at insert_line; index is 0-based.
         idx = insert_line - 1
         if 0 <= idx < len(lines):
+            # If the target line is inside a function body, walk backwards
+            # in V2 source to find the nearest file-scope boundary (closing
+            # '}' at column 0) and insert right after it.
+            raw_at = lines[idx].rstrip() if idx < len(lines) else ""
+            if raw_at and not raw_at.startswith("}") and raw_at != "":
+                for back_i in range(idx - 1, -1, -1):
+                    if lines[back_i].rstrip() == "}":
+                        idx = back_i + 1
+                        break
             insert_at = idx
 
     if insert_at < 0:
