@@ -431,48 +431,63 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
         osl = int(getattr(patch_info, "old_start_line", 0) or 0)
         if osl <= 0:
             continue
-        # Walk hunk lines, tracking old-file line offset.
-        # Context lines and '-' lines consume old-file line numbers;
-        # '+' lines do not.
+        # Walk hunk lines twice:
+        # 1st pass — find old-file line of the first *call/use* (not decl/def)
+        # 2nd pass — find the nearest file-scope boundary (closing '}' at
+        #            column 0) before that call, so the declaration lands at
+        #            file scope rather than inside a function body.
+        body_lines: list[tuple[int, str]] = []  # (old_line, raw_line)
         old_offset = 0
         for line in pt.splitlines():
             if line.startswith("diff ") or line.startswith("--- ") or line.startswith("+++ ") or line.startswith("@@"):
                 continue
             if line.startswith("+"):
-                # '+' lines don't consume old-file lines
                 continue
-            if line.startswith("-"):
-                if symbol_name in line:
-                    content = line[1:].strip()
-                    # Skip forward declarations / definitions of the symbol
-                    # itself (e.g. "int sym(args);" or "void sym(args) {").
-                    # We want the first *call/use*, not the decl we're
-                    # re-inserting.  A decl/def has a C return-type token
-                    # (not a control keyword) immediately before the symbol.
-                    _skip = False
-                    _stripped = content
-                    for _q in ("static", "inline", "extern", "const",
-                               "unsigned", "signed", "struct", "enum",
-                               "volatile"):
-                        _stripped = re.sub(r"^" + _q + r"\s+", "", _stripped)
-                    _dm = re.match(
-                        r"(\w+)[\s*]+" + re.escape(symbol_name) + r"\s*\(",
-                        _stripped,
-                    )
-                    _C_STMT_KW = {"return", "if", "else", "while", "for",
-                                  "switch", "case", "do", "goto", "break",
-                                  "continue", "sizeof", "typeof"}
-                    if _dm and _dm.group(1) not in _C_STMT_KW:
-                        _skip = True
-                    if not _skip:
-                        ref_line = osl + old_offset
-                        if earliest < 0 or ref_line < earliest:
-                            earliest = ref_line
-                        break  # first use in this hunk is enough
-                old_offset += 1
-            else:
-                # context line
-                old_offset += 1
+            body_lines.append((osl + old_offset, line))
+            old_offset += 1
+
+        _C_STMT_KW = {"return", "if", "else", "while", "for",
+                       "switch", "case", "do", "goto", "break",
+                       "continue", "sizeof", "typeof"}
+        call_line = -1
+        for old_line, line in body_lines:
+            raw = line[1:] if line.startswith("-") else line[1:] if line.startswith(" ") else line
+            if not line.startswith("-"):
+                continue
+            if symbol_name not in line:
+                continue
+            content = raw.strip()
+            # Skip forward declarations / definitions of the symbol itself.
+            _stripped = content
+            for _q in ("static", "inline", "extern", "const",
+                       "unsigned", "signed", "struct", "enum",
+                       "volatile"):
+                _stripped = re.sub(r"^" + _q + r"\s+", "", _stripped)
+            _dm = re.match(
+                r"(\w+)[\s*]+" + re.escape(symbol_name) + r"\s*\(",
+                _stripped,
+            )
+            if _dm and _dm.group(1) not in _C_STMT_KW:
+                continue  # declaration/definition — skip
+            call_line = old_line
+            break
+
+        if call_line < 0:
+            continue
+
+        # Walk backwards from call_line to find the nearest file-scope
+        # boundary: a context or '-' line that is '}' at column 0.
+        insert_line = osl  # fallback: hunk start
+        for old_line, line in body_lines:
+            if old_line >= call_line:
+                break
+            text = line[1:] if (line.startswith("-") or line.startswith(" ")) else line
+            if text.rstrip() == "}":
+                # File-scope closing brace — insert right after it.
+                insert_line = old_line + 1
+
+        if earliest < 0 or insert_line < earliest:
+            earliest = insert_line
     return earliest
 
 
