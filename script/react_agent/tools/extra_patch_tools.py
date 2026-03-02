@@ -501,6 +501,26 @@ def _llm_find_insertion_line_for_revert_symbol(
         line_num = int(data.get("function_start_line", -1) or -1)
         if line_num <= 0 or line_num > len(file_lines):
             return -1
+
+        # Post-validate: if the returned line is a lone opening brace `{`,
+        # the LLM picked the function body start instead of the signature.
+        # Scan backward to find the actual function definition start line
+        # (the return-type / storage-class line).
+        idx = line_num - 1  # 0-based
+        if file_lines[idx].strip() == "{":
+            for back in range(idx - 1, max(idx - 20, -1), -1):
+                stripped = file_lines[back].strip()
+                if not stripped:
+                    continue
+                # A line ending with `)` or `) {` is the function signature.
+                # A line starting with a storage-class / type keyword also qualifies.
+                if stripped.endswith(")") or re.match(r"^(?:static|extern|inline|const|void|int|unsigned|char|long|short|float|double|struct|enum|union|_Bool|__attribute__)\b", stripped):
+                    line_num = back + 1  # back to 1-based
+                    break
+            # If still on `{`, reject this result.
+            if file_lines[line_num - 1].strip() == "{":
+                return -1
+
         return line_num
 
     except Exception:
