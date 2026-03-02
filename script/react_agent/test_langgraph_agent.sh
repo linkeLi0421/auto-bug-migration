@@ -1953,6 +1953,42 @@ with tempfile.TemporaryDirectory() as td_raw:
     )
     assert result4 == 10, f"Expected 10 (first func), got {result4}"
 
+    # file_index key mismatch: KB may use "subdir/file.h" as key while
+    # file_path is just "file.h".  The lookup must fall back to basename
+    # matching so that Tier 2 still works.
+    subdir_func_a = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "func_a",
+        "location": {"file": "mylib/api.h", "line": 50, "column": 1},
+        "extent": {
+            "start": {"file": "mylib/api.h", "line": 50, "column": 1},
+            "end": {"file": "mylib/api.h", "line": 60, "column": 1},
+        },
+    }
+    subdir_func_b = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "func_b",
+        "location": {"file": "mylib/api.h", "line": 200, "column": 1},
+        "extent": {
+            "start": {"file": "mylib/api.h", "line": 200, "column": 1},
+            "end": {"file": "mylib/api.h", "line": 250, "column": 1},
+        },
+    }
+    # Write with "mylib/api.h" prefix so KbIndex keys by the full relative path.
+    (kb_v2 / "mylib").mkdir(exist_ok=True)
+    (kb_v2 / "mylib" / "api.h_analysis.json").write_text(
+        json.dumps([subdir_func_a, subdir_func_b]), encoding="utf-8"
+    )
+    kb4 = KbIndex(str(kb_v1), str(kb_v2))
+    tools4 = AgentTools(kb4, SourceManager(str(td / "v1"), str(td / "v2")))
+
+    # Lookup by basename "api.h" must find the nodes keyed by "mylib/api.h".
+    result5 = _ast_insert_line_number_for_extra_skeleton(
+        tools4, file_path="api.h", version="v2",
+        symbol_name="__revert_deadbeef_func_b",
+    )
+    assert result5 == 50, f"Expected 50 (preceding func via basename fallback), got {result5}"
+
     os.environ.pop("REACT_AGENT_DISABLE_SKELETON_LLM", None)
 
 print("OK")
