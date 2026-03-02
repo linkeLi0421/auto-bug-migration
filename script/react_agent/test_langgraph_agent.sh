@@ -6128,6 +6128,413 @@ print("OK")
 PY
 
 # ---------------------------------------------------------------------------
+# Enum tag rename: _extract_enum_tag_from_code and _check_v2_enum_tag_conflict
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _extract_enum_tag_from_code, _check_v2_enum_tag_conflict
+
+# Named enum
+assert _extract_enum_tag_from_code("enum htsExactFormat { a, b }") == "htsExactFormat"
+assert _extract_enum_tag_from_code("typedef enum cram_block_method { X }") == "cram_block_method"
+# Anonymous enum
+assert _extract_enum_tag_from_code("enum { A, B }") == ""
+assert _extract_enum_tag_from_code("typedef enum { X, Y } mytype;") == ""
+# Empty
+assert _extract_enum_tag_from_code("") == ""
+
+# _check_v2_enum_tag_conflict with mock KB
+class MockKB:
+    def __init__(self, data):
+        self._data = data
+    def query_all(self, name):
+        return self._data.get(name, {})
+
+kb = MockKB({
+    "htsExactFormat": {"v2": [{"kind": "ENUM_DECL", "spelling": "htsExactFormat"}]},
+    "otherEnum": {"v2": [{"kind": "STRUCT_DECL", "spelling": "otherEnum"}]},
+})
+assert _check_v2_enum_tag_conflict(kb, "htsExactFormat") is True
+assert _check_v2_enum_tag_conflict(kb, "otherEnum") is False
+assert _check_v2_enum_tag_conflict(kb, "nonexistent") is False
+assert _check_v2_enum_tag_conflict(None, "foo") is False
+assert _check_v2_enum_tag_conflict(kb, "") is False
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum tag rename: _prefix_enum_source with tag_rename_map
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _prefix_enum_source
+
+code = "enum htsExactFormat {\n    unknown_format = 0,\n    bam = 1,\n};\n"
+
+# Rename both constants and tag
+result, rmap = _prefix_enum_source(
+    code, ["unknown_format"], "_revert_",
+    tag_rename_map={"htsExactFormat": "_revert_htsExactFormat"},
+)
+assert "_revert_unknown_format" in result, result
+assert "_revert_htsExactFormat" in result, result
+assert "htsExactFormat" not in result.replace("_revert_htsExactFormat", ""), result
+assert rmap["unknown_format"] == "_revert_unknown_format"
+assert rmap["htsExactFormat"] == "_revert_htsExactFormat"
+
+# Tag-only rename (no constant conflicts)
+result2, rmap2 = _prefix_enum_source(
+    code, [], "_revert_",
+    tag_rename_map={"htsExactFormat": "_revert_htsExactFormat"},
+)
+assert "_revert_htsExactFormat" in result2, result2
+assert "unknown_format" in result2 and "_revert_unknown_format" not in result2, result2
+assert rmap2 == {"htsExactFormat": "_revert_htsExactFormat"}
+
+# No tag rename (existing behavior)
+result3, rmap3 = _prefix_enum_source(code, ["unknown_format"], "_revert_")
+assert "_revert_unknown_format" in result3, result3
+assert "enum htsExactFormat" in result3, result3  # tag unchanged
+assert "htsExactFormat" not in rmap3  # tag not in rename map
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum tag rename: _rename_conflicting_enum_constants_in_extra_hunk with tag
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _rename_conflicting_enum_constants_in_extra_hunk
+
+class MockKB:
+    def __init__(self, data):
+        self._data = data
+    def query_all(self, name):
+        return self._data.get(name, {})
+
+# V2 has both the tag and some constants
+kb = MockKB({
+    "htsExactFormat": {"v2": [{"kind": "ENUM_DECL", "spelling": "htsExactFormat"}]},
+    "unknown_format": {"v2": [{"kind": "ENUM_CONSTANT_DECL", "spelling": "unknown_format"}]},
+})
+
+patch_text = (
+    "diff --git a/hts.c b/hts.c\n"
+    "--- a/hts.c\n"
+    "+++ b/hts.c\n"
+    "@@ -10,5 +10,0 @@\n"
+    "-enum htsExactFormat {\n"
+    "-    unknown_format = 0,\n"
+    "-    bam = 1,\n"
+    "-    sam = 2,\n"
+    "-};\n"
+)
+
+result, rmap = _rename_conflicting_enum_constants_in_extra_hunk(
+    patch_text, kb_index=kb, enum_tag="htsExactFormat", prefix="_revert_",
+)
+
+# Both tag and constant should be renamed
+assert "_revert_htsExactFormat" in result, f"Tag not renamed:\n{result}"
+assert "_revert_unknown_format" in result, f"Constant not renamed:\n{result}"
+assert "htsExactFormat" in rmap, f"Tag missing from rename_map: {rmap}"
+assert "unknown_format" in rmap, f"Constant missing from rename_map: {rmap}"
+# Non-conflicting constants should be untouched
+assert "bam" in result and "_revert_bam" not in result, result
+assert "sam" in result and "_revert_sam" not in result, result
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum tag rename: tag-only conflict (no constant conflicts)
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _rename_conflicting_enum_constants_in_extra_hunk
+
+class MockKB:
+    def __init__(self, data):
+        self._data = data
+    def query_all(self, name):
+        return self._data.get(name, {})
+
+# V2 has the tag but none of the constants
+kb = MockKB({
+    "htsExactFormat": {"v2": [{"kind": "ENUM_DECL", "spelling": "htsExactFormat"}]},
+})
+
+patch_text = (
+    "diff --git a/hts.c b/hts.c\n"
+    "--- a/hts.c\n"
+    "+++ b/hts.c\n"
+    "@@ -10,4 +10,0 @@\n"
+    "-enum htsExactFormat {\n"
+    "-    val_a = 0,\n"
+    "-    val_b = 1,\n"
+    "-};\n"
+)
+
+result, rmap = _rename_conflicting_enum_constants_in_extra_hunk(
+    patch_text, kb_index=kb, enum_tag="htsExactFormat", prefix="_revert_",
+)
+
+# Tag should be renamed, constants should NOT (no constant conflicts)
+assert "_revert_htsExactFormat" in result, f"Tag not renamed:\n{result}"
+assert "val_a" in result and "_revert_val_a" not in result, f"val_a incorrectly renamed:\n{result}"
+assert "val_b" in result and "_revert_val_b" not in result, f"val_b incorrectly renamed:\n{result}"
+assert rmap == {"htsExactFormat": "_revert_htsExactFormat"}, f"Unexpected rename_map: {rmap}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Enum tag rename: end-to-end make_extra_patch_override with tag conflict
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json, os, pickle, sys, tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex
+from core.source_manager import SourceManager
+from migration_tools.types import PatchInfo
+from tools.extra_patch_tools import make_extra_patch_override
+from tools.symbol_tools import AgentTools
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"; kb_v1.mkdir()
+    kb_v2 = td / "kb_v2"; kb_v2.mkdir()
+    v1_src = td / "v1_src"; v1_src.mkdir()
+    v2_src = td / "v2_src"; v2_src.mkdir()
+
+    # V1 enum code
+    v1_code = (
+        "enum htsExactFormat {\n"
+        "    unknown_format = 0,\n"
+        "    bam = 1,\n"
+        "    sam = 2,\n"
+        "};\n"
+    )
+    (v1_src / "hts.c").write_text(v1_code + "\nint dummy(void) { return 0; }\n", encoding="utf-8")
+    (v2_src / "hts.c").write_text("/* v2 */\nint dummy(void) { return 0; }\n", encoding="utf-8")
+
+    # V1 KB: ENUM_DECL
+    v1_node = {
+        "kind": "ENUM_DECL",
+        "spelling": "htsExactFormat",
+        "usr": "c:@E@htsExactFormat",
+        "location": {"file": "hts.c", "line": 1, "column": 1},
+        "extent": {"start": {"file": "hts.c", "line": 1, "column": 1},
+                    "end": {"file": "hts.c", "line": 5, "column": 2}},
+    }
+    (kb_v1 / "hts_analysis.json").write_text(json.dumps([v1_node]), encoding="utf-8")
+
+    # V2 KB: ENUM_DECL for the tag + ENUM_CONSTANT_DECL for unknown_format
+    v2_nodes = [
+        {"kind": "ENUM_DECL", "spelling": "htsExactFormat",
+         "usr": "c:@E@htsExactFormat",
+         "location": {"file": "hts.c", "line": 5, "column": 1},
+         "extent": {"start": {"file": "hts.c", "line": 5, "column": 1},
+                    "end": {"file": "hts.c", "line": 10, "column": 2}}},
+        {"kind": "ENUM_CONSTANT_DECL", "spelling": "unknown_format",
+         "usr": "c:@E@htsExactFormat@unknown_format",
+         "location": {"file": "hts.c", "line": 6, "column": 5},
+         "extent": {"start": {"file": "hts.c", "line": 6, "column": 5},
+                    "end": {"file": "hts.c", "line": 6, "column": 19}}},
+    ]
+    (kb_v2 / "hts_analysis.json").write_text(json.dumps(v2_nodes), encoding="utf-8")
+
+    kb_index = KbIndex(str(kb_v1), str(kb_v2))
+    sm = SourceManager(str(v1_src), str(v2_src))
+    agent_tools = AgentTools(kb_index=kb_index, source_manager=sm)
+
+    # Create bundle with a main hunk that references enum tag and constants
+    main_patch_text = (
+        "diff --git a/hts.c b/hts.c\n"
+        "--- a/hts.c\n"
+        "+++ b/hts.c\n"
+        "@@ -20,3 +20,0 @@\n"
+        "-  enum htsExactFormat fmt = unknown_format;\n"
+        "-  if (fmt == bam) return 1;\n"
+        "-  return 0;\n"
+    )
+    extra_patch_text = (
+        "diff --git a/hts.c b/hts.c\n"
+        "--- a/hts.c\n"
+        "+++ b/hts.c\n"
+        "@@ -2,1 +2,1 @@\n"
+        " int dummy(void) { return 0; }\n"
+    )
+
+    main_patch = PatchInfo(
+        file_path_old="hts.c", file_path_new="hts.c",
+        patch_text=main_patch_text, file_type="c",
+        old_start_line=20, old_end_line=23,
+        new_start_line=20, new_end_line=20,
+        patch_type=set(), old_signature="",
+        dependent_func=set(), hiden_func_dict={},
+    )
+    extra_patch = PatchInfo(
+        file_path_old="hts.c", file_path_new="hts.c",
+        patch_text=extra_patch_text, file_type="c",
+        old_start_line=2, old_end_line=2,
+        new_start_line=2, new_end_line=2,
+        patch_type={"Extra"}, old_signature="",
+        dependent_func=set(), hiden_func_dict={},
+    )
+
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({
+        "tail-hts.c-f1_": main_patch,
+        "_extra_hts.c": extra_patch,
+    }, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        agent_tools,
+        patch_path=str(bundle_path),
+        file_path="/src/htslib/hts.c",
+        symbol_name="enum htsExactFormat",
+        version="v1",
+    )
+
+    ref = out.get("patch_text")
+    assert isinstance(ref, dict) and ref.get("artifact_path"), f"Missing patch_text artifact: {out}"
+    p = Path(str(ref.get("artifact_path"))).resolve()
+    text = p.read_text(encoding="utf-8", errors="replace")
+
+    # Enum tag should be renamed
+    assert "_revert_htsExactFormat" in text, f"Tag not renamed in extra hunk:\n{text}"
+    # Conflicting constant should be renamed
+    assert "_revert_unknown_format" in text, f"Constant not renamed in extra hunk:\n{text}"
+    # Non-conflicting constants should be untouched
+    assert "bam" in text and "_revert_bam" not in text, f"bam incorrectly renamed:\n{text}"
+
+    # Check enum rename overrides propagated to main hunk
+    overrides = out.get("enum_rename_overrides") or []
+    assert len(overrides) >= 1, f"Expected enum_rename_overrides: {out}"
+    ov = overrides[0]
+    ov_text = ov.get("patch_text", "")
+    # Main hunk references "enum htsExactFormat" and "unknown_format" in - lines
+    assert "_revert_htsExactFormat" in ov_text, f"Tag not renamed in main hunk:\n{ov_text}"
+    assert "_revert_unknown_format" in ov_text, f"Constant not renamed in main hunk:\n{ov_text}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Multi-anchor _extra_* merge: _extract_override_anchor and multi-hunk output
+# ---------------------------------------------------------------------------
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.ossfuzz_tools import (
+    _extract_override_anchor,
+    _merge_extra_hunk_override_texts,
+)
+
+# --- _extract_override_anchor ---
+assert _extract_override_anchor(
+    "diff --git a/f.c b/f.c\n--- a/f.c\n+++ b/f.c\n@@ -97,5 +97,3 @@\n-foo\n ctx\n"
+) == 97
+assert _extract_override_anchor(
+    "diff --git a/f.c b/f.c\n--- a/f.c\n+++ b/f.c\n@@ -847,6 +847,3 @@\n-bar\n ctx\n"
+) == 847
+assert _extract_override_anchor("no hunk header at all") == 0
+
+# --- Multi-anchor merge produces two hunks ---
+ovr_97 = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -97,4 +97,3 @@\n"
+    "-#define MYMACRO 42\n"
+    " void first_func(void)\n"
+    " {\n"
+)
+ovr_847 = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -847,4 +847,3 @@\n"
+    "-void helper(int x);\n"
+    " int later_func(void)\n"
+    " {\n"
+)
+
+merged = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_97, ovr_847])
+
+# Should have two @@ hunks
+hunk_count = merged.count("@@ -")
+assert hunk_count == 2, f"Expected 2 hunks, got {hunk_count}:\n{merged}"
+
+# Both blocks should be present
+assert "#define MYMACRO 42" in merged, f"Missing macro in merged:\n{merged}"
+assert "void helper(int x);" in merged, f"Missing prototype in merged:\n{merged}"
+
+# First hunk should be at line 97, second at 847
+lines = merged.splitlines()
+hunk_lines = [l for l in lines if l.startswith("@@ -")]
+assert "97" in hunk_lines[0], f"First hunk not at 97: {hunk_lines[0]}"
+assert "847" in hunk_lines[1], f"Second hunk not at 847: {hunk_lines[1]}"
+
+# Only one diff --git header
+assert merged.count("diff --git") == 1, f"Expected 1 diff header:\n{merged}"
+
+# --- Same-anchor merge still produces one hunk (no regression) ---
+ovr_97b = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -97,4 +97,3 @@\n"
+    "-int other_func(void);\n"
+    " void first_func(void)\n"
+    " {\n"
+)
+
+merged_same = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_97, ovr_97b])
+hunk_count_same = merged_same.count("@@ -")
+assert hunk_count_same == 1, f"Expected 1 hunk for same anchor, got {hunk_count_same}:\n{merged_same}"
+assert "#define MYMACRO 42" in merged_same, f"Missing macro:\n{merged_same}"
+assert "int other_func(void);" in merged_same, f"Missing prototype:\n{merged_same}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
 # build_errors.py: redefinition of enumerator pattern
 # ---------------------------------------------------------------------------
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
