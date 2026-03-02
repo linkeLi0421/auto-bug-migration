@@ -866,15 +866,61 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
         # We insert before the context line at insert_line; index is 0-based.
         idx = insert_line - 1
         if 0 <= idx < len(lines):
-            # If the target line is inside a function body, walk backwards
-            # in V2 source to find the nearest file-scope boundary (closing
-            # '}' at column 0) and insert right after it.
-            raw_at = lines[idx].rstrip() if idx < len(lines) else ""
-            if raw_at and not raw_at.startswith("}") and raw_at != "":
+            # Walk backwards in V2 source to find a safe insertion boundary.
+            # Two-pass approach:
+            # Pass 1: look for '}' at column 0 (strongest file-scope signal).
+            # Pass 2 (header fallback): if no col-0 '}' found, look for
+            #         indented '}', semicolon-terminated decl, or blank line.
+            raw_at = lines[idx].rstrip()
+            if raw_at and raw_at.lstrip() not in ("}", ""):
+                found_boundary = False
+                # Pass 1: column-0 '}'
                 for back_i in range(idx - 1, -1, -1):
                     if lines[back_i].rstrip() == "}":
                         idx = back_i + 1
+                        found_boundary = True
                         break
+                # Pass 2: header-file fallback (no col-0 braces)
+                if not found_boundary:
+                    for back_i in range(idx - 1, -1, -1):
+                        bl = lines[back_i].rstrip()
+                        bls = bl.lstrip()
+                        # Indented closing brace
+                        if bls == "}":
+                            idx = back_i + 1
+                            found_boundary = True
+                            break
+                        # Semicolon-terminated non-comment line
+                        if bls.endswith(";") and "/*" not in bls and not bls.startswith("*") and not bls.startswith("//"):
+                            idx = back_i + 1
+                            found_boundary = True
+                            break
+                        # Blank line
+                        if not bls:
+                            idx = back_i + 1
+                            found_boundary = True
+                            break
+
+            # If idx landed inside or at the start of a block comment,
+            # advance past the closing */.
+            if idx < len(lines):
+                in_comment = False
+                # Check if we're inside a /* ... */ block by scanning from
+                # a few lines above through the current line.
+                scan_start = max(0, idx - 30)
+                for ci in range(scan_start, idx + 1):
+                    cl = lines[ci]
+                    if "/*" in cl:
+                        in_comment = True
+                    if "*/" in cl:
+                        in_comment = False
+                if in_comment:
+                    # Advance past the closing */
+                    for ci in range(idx + 1, len(lines)):
+                        if "*/" in lines[ci]:
+                            idx = ci + 1
+                            break
+
             insert_at = idx
 
     if insert_at < 0:
