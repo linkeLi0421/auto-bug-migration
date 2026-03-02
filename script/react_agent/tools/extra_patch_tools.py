@@ -404,9 +404,10 @@ def _env_flag(name: str) -> bool:
 def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name: str) -> int:
     """Scan regular hunks in *bundle* for the earliest reference to *symbol_name*.
 
-    Returns the ``old_start_line`` of the earliest hunk whose ``-`` lines
-    mention *symbol_name*, or -1 if not found.  Only non-``_extra_*`` hunks
-    for the same file (by basename) are considered.
+    Returns the **old-file line number** of the first ``-`` line that mentions
+    *symbol_name* (computed from ``old_start_line`` + offset within the hunk),
+    or -1 if not found.  Only non-``_extra_*`` hunks for the same file (by
+    basename) are considered.
     """
     if bundle is None or not symbol_name:
         return -1
@@ -427,18 +428,51 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
             continue
         if target_basename not in pt:
             continue
-        # Check if any - line references the symbol
-        has_ref = False
-        for line in pt.splitlines():
-            if line.startswith("-") and not line.startswith("---"):
-                if symbol_name in line:
-                    has_ref = True
-                    break
-        if not has_ref:
-            continue
         osl = int(getattr(patch_info, "old_start_line", 0) or 0)
-        if osl > 0 and (earliest < 0 or osl < earliest):
-            earliest = osl
+        if osl <= 0:
+            continue
+        # Walk hunk lines, tracking old-file line offset.
+        # Context lines and '-' lines consume old-file line numbers;
+        # '+' lines do not.
+        old_offset = 0
+        for line in pt.splitlines():
+            if line.startswith("diff ") or line.startswith("--- ") or line.startswith("+++ ") or line.startswith("@@"):
+                continue
+            if line.startswith("+"):
+                # '+' lines don't consume old-file lines
+                continue
+            if line.startswith("-"):
+                if symbol_name in line:
+                    content = line[1:].strip()
+                    # Skip forward declarations / definitions of the symbol
+                    # itself (e.g. "int sym(args);" or "void sym(args) {").
+                    # We want the first *call/use*, not the decl we're
+                    # re-inserting.  A decl/def has a C return-type token
+                    # (not a control keyword) immediately before the symbol.
+                    _skip = False
+                    _stripped = content
+                    for _q in ("static", "inline", "extern", "const",
+                               "unsigned", "signed", "struct", "enum",
+                               "volatile"):
+                        _stripped = re.sub(r"^" + _q + r"\s+", "", _stripped)
+                    _dm = re.match(
+                        r"(\w+)[\s*]+" + re.escape(symbol_name) + r"\s*\(",
+                        _stripped,
+                    )
+                    _C_STMT_KW = {"return", "if", "else", "while", "for",
+                                  "switch", "case", "do", "goto", "break",
+                                  "continue", "sizeof", "typeof"}
+                    if _dm and _dm.group(1) not in _C_STMT_KW:
+                        _skip = True
+                    if not _skip:
+                        ref_line = osl + old_offset
+                        if earliest < 0 or ref_line < earliest:
+                            earliest = ref_line
+                        break  # first use in this hunk is enough
+                old_offset += 1
+            else:
+                # context line
+                old_offset += 1
     return earliest
 
 
