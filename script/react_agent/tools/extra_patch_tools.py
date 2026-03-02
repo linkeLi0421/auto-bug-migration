@@ -535,8 +535,28 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     if not isinstance(file_index, dict) or ver not in file_index:
         return -1
 
-    nodes = file_index[ver].get(base) if isinstance(file_index[ver], dict) else None
+    # Try basename first, then scan for a key ending with the basename (the
+    # KB file_index may be keyed by a relative path like "htslib/vcf.h").
+    ver_index = file_index[ver] if isinstance(file_index[ver], dict) else {}
+    nodes = ver_index.get(base)
     if not isinstance(nodes, list) or not nodes:
+        for key in ver_index:
+            if Path(key).name == base:
+                nodes = ver_index[key]
+                break
+    if not isinstance(nodes, list) or not nodes:
+        # No KB data; still try the LLM tier for __revert_* symbols before
+        # giving up, since it reads the source file directly.
+        _kind0, _underlying0 = _symbol_underlying_name(str(symbol_name or ""))
+        if _kind0 == "revert_function" and _underlying0:
+            llm_line = _llm_find_insertion_line_for_revert_symbol(
+                agent_tools,
+                file_path=str(file_path or "").strip(),
+                underlying_name=_underlying0,
+                version=ver,
+            )
+            if llm_line > 0:
+                return llm_line
         return no_anchor()
 
     # NOTE: For __revert_* functions (kind == "revert_function"), we intentionally
