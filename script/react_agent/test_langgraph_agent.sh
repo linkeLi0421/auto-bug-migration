@@ -1845,11 +1845,14 @@ sys.path.insert(0, str(script_dir.parents[0]))
 from core.kb_index import KbIndex  # noqa: E402
 from core.source_manager import SourceManager  # noqa: E402
 from tools.extra_patch_tools import _ast_insert_line_number_for_extra_skeleton  # noqa: E402
+from tools.extra_patch_tools import _llm_find_insertion_line_for_revert_symbol  # noqa: E402
 from tools.symbol_tools import AgentTools  # noqa: E402
 
 with tempfile.TemporaryDirectory() as td_raw:
     td = Path(td_raw)
     os.environ.pop("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", None)
+    # Disable LLM skeleton anchor so tests are deterministic/offline.
+    os.environ["REACT_AGENT_DISABLE_SKELETON_LLM"] = "1"
 
     kb_v1 = td / "kb_v1"; kb_v1.mkdir()
     kb_v2 = td / "kb_v2"; kb_v2.mkdir()
@@ -1894,6 +1897,14 @@ with tempfile.TemporaryDirectory() as td_raw:
         symbol_name="some_other_symbol",
     )
     assert result2 == 10, f"Expected 10, got {result2}"
+
+    # _llm_find_insertion_line_for_revert_symbol returns -1 when disabled via env var.
+    llm_result = _llm_find_insertion_line_for_revert_symbol(
+        tools, file_path="test.c", underlying_name="myfunc", version="v2",
+    )
+    assert llm_result == -1, f"Expected -1 (LLM disabled), got {llm_result}"
+
+    os.environ.pop("REACT_AGENT_DISABLE_SKELETON_LLM", None)
 
 print("OK")
 PY
