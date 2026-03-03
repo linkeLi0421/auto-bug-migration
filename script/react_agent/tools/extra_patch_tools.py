@@ -479,9 +479,13 @@ def _llm_find_insertion_line_for_revert_symbol(
 ) -> int:
     """Use an LLM sub-task to find the optimal insertion line for a __revert_* forward declaration.
 
-    Reads the V2 source file, asks a lightweight LLM to locate the first function
-    that calls/references ``underlying_name``, and returns that function's start
-    line (1-based).  Returns -1 when the LLM is unavailable, disabled, or fails.
+    Follows the same principle as the bundle-scan tier: find the earliest
+    *reference/usage* of ``underlying_name`` in the V2 source, then return a
+    file-scope anchor line just before that reference so a forward declaration
+    placed there is visible to all downstream call sites.
+
+    Returns a 1-based line number, or -1 when the LLM is unavailable, disabled,
+    or fails.
 
     Gating: enabled by default when OPENAI_API_KEY is set.
     Disable with REACT_AGENT_DISABLE_SKELETON_LLM=1.
@@ -534,16 +538,27 @@ def _llm_find_insertion_line_for_revert_symbol(
 
         system_prompt = (
             "You are a C/C++ source code analyzer. "
-            "Given a source file with line numbers, find the first function definition "
-            "that CALLS or REFERENCES the specified function name.\n\n"
+            "Given a source file with line numbers, find the EARLIEST line where "
+            "the specified function is called or referenced (not where it is "
+            "defined or forward-declared).\n\n"
+            "A forward declaration needs to be inserted BEFORE this earliest "
+            "reference.  To ensure it lands at file scope (outside any function "
+            "body), also identify the enclosing top-level construct (function "
+            "definition, global variable, etc.) that contains the reference.\n\n"
             "Return ONLY valid JSON with this format:\n"
-            '{"function_start_line": <int>, "function_name": "<name>", "reason": "<brief>"}\n\n'
+            '{"earliest_reference_line": <int>, "enclosing_construct_start_line": <int>, '
+            '"enclosing_name": "<name>", "reason": "<brief>"}\n\n'
             "Rules:\n"
-            "- Find the first CALL SITE or REFERENCE to the target function (not its own definition).\n"
-            "- Return the START LINE of the enclosing function DEFINITION that contains that call.\n"
-            "- The start line is the line where the function's return type or storage-class specifier begins.\n"
-            "- If the target function is only declared (prototype) but never called, return {\"function_start_line\": -1}.\n"
-            "- If the target function is not found at all, return {\"function_start_line\": -1}.\n"
+            "- earliest_reference_line: the actual line number of the first call/use.\n"
+            "- enclosing_construct_start_line: the start line of the top-level "
+            "function/struct/declaration that contains the reference.  This is "
+            "where the return type or storage-class specifier begins.  "
+            "A forward declaration will be inserted just before this line.\n"
+            "- If the function is only defined/declared but never called or "
+            "referenced, return {\"earliest_reference_line\": -1, "
+            "\"enclosing_construct_start_line\": -1}.\n"
+            "- If the function is not found at all, return "
+            "{\"earliest_reference_line\": -1, \"enclosing_construct_start_line\": -1}.\n"
         )
 
         user_prompt = (
@@ -567,7 +582,12 @@ def _llm_find_insertion_line_for_revert_symbol(
         data = _json.loads(raw_stripped)
         if not isinstance(data, dict):
             return -1
-        line_num = int(data.get("function_start_line", -1) or -1)
+
+        # Primary: use enclosing_construct_start_line (file-scope anchor).
+        # Fallback: use earliest_reference_line directly.
+        line_num = int(data.get("enclosing_construct_start_line", -1) or -1)
+        if line_num <= 0 or line_num > len(file_lines):
+            line_num = int(data.get("earliest_reference_line", -1) or -1)
         if line_num <= 0 or line_num > len(file_lines):
             return -1
 
@@ -600,9 +620,8 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
     Strategy: insert before a selected function definition start line (start.line).
-    - Tier 0 (bundle scan): for __revert_* symbols, find the earliest regular hunk
-      that references the symbol and anchor before that hunk's start line.
-    - Tier 1 (LLM): read V2 source and find the first caller of the underlying function.
+    - Tier 1 (LLM): for __revert_* symbols, read V2 source and find the earliest
+      reference/usage of the underlying function, then anchor before that reference.
     - Tier 2 (KB): find the underlying V2 function and anchor before the preceding function.
     - Tier 3 (fallback): insert before the first function definition in the file.
     - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
@@ -636,15 +655,9 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                 nodes = ver_index[key]
                 break
     if not isinstance(nodes, list) or not nodes:
-        # No KB data; try bundle scan and LLM tiers for __revert_* symbols
-        # before giving up.
+        # No KB data; try LLM tier for __revert_* symbols before giving up.
         _kind0, _underlying0 = _symbol_underlying_name(str(symbol_name or ""))
         if _kind0 == "revert_function" and _underlying0:
-            bundle_line = _bundle_earliest_reference_line(
-                bundle, file_path=str(file_path or "").strip(), symbol_name=str(symbol_name or "").strip(),
-            )
-            if bundle_line > 0:
-                return bundle_line
             llm_line = _llm_find_insertion_line_for_revert_symbol(
                 agent_tools,
                 file_path=str(file_path or "").strip(),
@@ -713,15 +726,8 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     # and "conflicting types" errors.
     _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
     if _kind == "revert_function" and _underlying:
-        # Tier 0: Bundle scan — find the earliest regular hunk that references
-        # the __revert_* symbol.  This is deterministic and doesn't need an LLM.
-        bundle_line = _bundle_earliest_reference_line(
-            bundle, file_path=str(file_path or "").strip(), symbol_name=str(symbol_name or "").strip(),
-        )
-        if bundle_line > 0:
-            return bundle_line
-
-        # Tier 1: LLM-guided — read V2 source and find the first caller.
+        # LLM-guided — read V2 source and find the earliest reference to
+        # the underlying function, then anchor before that reference.
         llm_line = _llm_find_insertion_line_for_revert_symbol(
             agent_tools,
             file_path=str(file_path or "").strip(),

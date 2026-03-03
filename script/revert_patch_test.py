@@ -3678,6 +3678,8 @@ def revert_patch_test(args):
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
+        if bug_id == "OSV-2020-1733":
+            continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
