@@ -4175,9 +4175,11 @@ def _should_use_make_extra_for_undeclared_symbol(symbol: str, error_text: str) -
     sym = str(symbol or "").strip()
     if not sym:
         return False
-    if sym.startswith("__revert_"):
-        return True
-    return _is_undeclared_identifier_or_type_error(error_text)
+    # Only __revert_* symbols get deterministic _extra_* overrides.
+    # Non-__revert_* symbols don't exist in V2; a forward declaration
+    # alone won't provide an implementation and causes linker errors.
+    # Let the model handle these via rewrite or patch-level fixes.
+    return sym.startswith("__revert_")
 
 
 def _extract_file_path_from_diff_hunk_text(text: str) -> str:
@@ -4310,9 +4312,9 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
     """Return [(symbol_name, file_path), ...] for undeclared symbols to fix via make_extra_patch_override.
 
     Eligibility:
-    - Any ``__revert_*`` symbol (forward declaration/definition via _extra_*).
-    - Non-``__revert_*`` undeclared identifiers/types/macros.
-    - Non-``__revert_*`` undeclared function calls are excluded (rewrite call sites instead).
+    - Only ``__revert_*`` symbols (forward declaration/definition via _extra_*).
+    - Non-``__revert_*`` symbols are excluded: they don't exist in V2, so a forward
+      declaration alone can't provide an implementation and leads to linker errors.
     """
     result: List[tuple] = []
     seen: set = set()
@@ -4328,9 +4330,8 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
         sym = str(m.group("symbol") or "").strip()
         if not sym or not _C_IDENT_RE.match(sym):
             continue
-        # For non-__revert symbols, only undeclared identifier/type errors are eligible for _extra_*.
-        # Non-__revert undeclared function calls should be fixed by call-site rewrites.
-        if (not sym.startswith("__revert_")) and _is_undeclared_function_error(raw):
+        # Only __revert_* symbols are eligible for deterministic _extra_* overrides.
+        if not sym.startswith("__revert_"):
             continue
         if sym in seen:
             continue

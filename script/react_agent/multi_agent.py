@@ -623,6 +623,18 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
                 base_file = Path(fp).name if fp else ""
                 if base_file:
                     key = f"_extra_{base_file}"
+            # Broader fallback: for any unmapped linker error, derive the source
+            # file from the object path ("libhts.a(hfile.o)" → "hfile.c") and
+            # check if _extra_<source_file> exists in the bundle.
+            if not key:
+                import re as _re
+                _m_obj = _re.match(r".*\(([^)]+\.o)\)$", fp)
+                obj_name = _m_obj.group(1) if _m_obj else (fp if fp.endswith(".o") else "")
+                if obj_name:
+                    source_file = obj_name[:-2] + ".c"  # "hfile.o" → "hfile.c"
+                    candidate = f"_extra_{source_file}"
+                    if candidate in bundle.patches:
+                        key = candidate
             if not key:
                 continue
         enriched = dict(err)
@@ -1112,6 +1124,14 @@ def main(argv: List[str]) -> int:
             elif parse_error:
                 task_status = "agent_output_parse_error"
                 task_success = False
+            elif target_fixed is True:
+                # The agent resolved its target error(s) for this patch_key.
+                # Even if the overall build still fails (e.g. linker errors
+                # from other patch_keys), this hunk's job is done.
+                task_status = "fixed"
+                task_success = True
+                if hunk_fixed is None:
+                    hunk_fixed = True
             elif (
                 (isinstance(patch_key_verdict, dict) and patch_key_verdict.get("status") == "failed")
                 or (isinstance(ossfuzz_verdict, dict) and ossfuzz_verdict.get("status") == "failed")
