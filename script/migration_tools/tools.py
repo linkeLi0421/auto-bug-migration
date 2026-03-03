@@ -341,6 +341,9 @@ def _norm_path(path: str) -> str:
     return str(path or "").replace("\\", "/")
 
 
+_OBJ_IN_ARCHIVE_RE = re.compile(r".*\(([^)]+\.o)\)$")
+
+
 def _file_candidates(file_path: str) -> List[str]:
     fp = _norm_path(file_path).strip()
     candidates: List[str] = []
@@ -354,6 +357,20 @@ def _file_candidates(file_path: str) -> List[str]:
         if len(parts) > 1:
             candidates.append("/".join(parts[1:]))
     candidates.append(fp.lstrip("/"))
+
+    # Handle linker error file paths: extract source names from object files.
+    # "libfoo.a(bar.o)" → "bar.o" → "bar.c", "bar.cc", ...
+    # "bar.o" → "bar.c", "bar.cc", ...
+    m_obj = _OBJ_IN_ARCHIVE_RE.match(fp)
+    obj_name = m_obj.group(1) if m_obj else None
+    if not obj_name and fp.endswith(".o"):
+        obj_name = fp.rsplit("/", 1)[-1] if "/" in fp else fp
+    if obj_name:
+        candidates.append(obj_name)
+        base = obj_name[:-2]  # strip ".o"
+        for ext in (".c", ".cc", ".cpp", ".cxx"):
+            candidates.append(base + ext)
+
     # Dedup preserve order
     seen: set[str] = set()
     out: List[str] = []
@@ -1545,11 +1562,16 @@ def _ensure_hiden_func_dict_for_extra_patch(patch: "PatchInfo") -> None:
         patch.hiden_func_dict = {str(k): int(v) for k, v in inferred.items()}
 
 
-def _recompute_hunk_headers(patch_lines: List[str]) -> None:
+def _recompute_hunk_headers(patch_lines: List[str], *, reverse_apply: bool = False) -> None:
     """Recompute ``@@`` hunk headers in *patch_lines* in-place.
 
     Keeps ``-old_start`` stable and recomputes ``+new_start`` by accumulating
     the per-hunk delta ``(new_len - old_len)`` from the rewritten hunk bodies.
+
+    When *reverse_apply* is True (used for ``_extra_*`` patches that are applied
+    via ``patch -R``), each hunk keeps ``+new_start == -old_start`` instead of
+    accumulating shifts across hunks.  These patches encode absolute insertion
+    points in the V1 file on both sides of the ``@@`` header.
     """
     new_shift = 0
     i = 0
@@ -1595,7 +1617,12 @@ def _recompute_hunk_headers(patch_lines: List[str]) -> None:
 
         is_file_add = old_start == 0 and old_len_hdr == 0
         is_file_del = new_start_hdr == 0 and new_len_hdr == 0
-        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
+        if reverse_apply:
+            new_start = old_start
+        elif is_file_add or is_file_del:
+            new_start = new_start_hdr
+        else:
+            new_start = old_start + new_shift
         patch_lines[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
 
         new_shift += new_len_hunk - old_len
@@ -1762,7 +1789,7 @@ def make_error_patch_override(
     patch_lines[slice_start:slice_end] = rewritten_slice
 
     hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, func_end_n, delta)
-    _recompute_hunk_headers(patch_lines)
+    _recompute_hunk_headers(patch_lines, reverse_apply=str(patch_key or "").startswith("_extra_"))
 
     patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
     patch_total_lines = len(patch_lines)
@@ -1925,7 +1952,7 @@ def revise_patch_hunk(
     patch_lines[slice_start_abs:slice_end_abs] = reconstructed
 
     hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, exp_end, delta)
-    _recompute_hunk_headers(patch_lines)
+    _recompute_hunk_headers(patch_lines, reverse_apply=str(patch_key or "").startswith("_extra_"))
 
     patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
 

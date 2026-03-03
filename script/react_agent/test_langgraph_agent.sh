@@ -2815,6 +2815,8 @@ from agent_langgraph import (  # noqa: E402
     _undeclared_symbol_extra_patch_guardrail_for_override,
 )
 
+# Non-__revert_* symbols should NOT be forced via make_extra_patch_override:
+# a forward declaration alone doesn't provide an implementation and causes linker errors.
 err = "/src/libxml2/dict.c:1519:21: error: use of undeclared identifier 'xmlRngMutex'"
 state = AgentState(
     build_log_path="build.log",
@@ -2834,20 +2836,36 @@ state.step_history = list(state.steps)
 
 decision = {"type": "tool", "tool": "make_error_patch_override", "thought": "remove missing global", "args": {}}
 forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
-assert forced and forced.get("tool") == "make_extra_patch_override", forced
-assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
-assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
+assert forced is None, f"non-__revert_ symbol should not trigger guardrail, got {forced}"
 
-# If a prior make_extra lookup for the same symbol reported unreadable source,
+# __revert_* symbols SHOULD still be forced.
+err_revert = "/src/libxml2/dict.c:1519:21: error: use of undeclared identifier '__revert_abc123_xmlRngMutex'"
+state_rv = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err_revert,
+    snippet="",
+)
+state_rv.grouped_errors = [{"raw": err_revert, "file": "/src/libxml2/dict.c", "line": 1519, "col": 21}]
+state_rv.steps = list(state.steps)
+state_rv.step_history = list(state_rv.steps)
+
+forced_rv = _undeclared_symbol_extra_patch_guardrail_for_override(state_rv, decision)
+assert forced_rv and forced_rv.get("tool") == "make_extra_patch_override", forced_rv
+assert forced_rv.get("args", {}).get("symbol_name") == "__revert_abc123_xmlRngMutex", forced_rv
+assert forced_rv.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced_rv
+
+# If a prior make_extra lookup for the same __revert_ symbol reported unreadable source,
 # guardrail should stop forcing make_extra and let model-guided override proceed.
 state2 = AgentState(
     build_log_path="build.log",
     patch_path="bundle.patch2",
     error_scope="patch",
-    error_line=err,
+    error_line=err_revert,
     snippet="",
 )
-state2.grouped_errors = [{"raw": err, "file": "/src/libxml2/dict.c", "line": 1519, "col": 21}]
+state2.grouped_errors = [{"raw": err_revert, "file": "/src/libxml2/dict.c", "line": 1519, "col": 21}]
 state2.steps = [
     {
         "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
@@ -2857,19 +2875,19 @@ state2.steps = [
         "decision": {
             "type": "tool",
             "tool": "make_extra_patch_override",
-            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "xmlRngMutex"},
+            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "__revert_abc123_xmlRngMutex"},
         },
         "observation": {
             "ok": True,
             "tool": "make_extra_patch_override",
-            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "xmlRngMutex"},
+            "args": {"patch_path": "bundle.patch2", "file_path": "/src/libxml2/dict.c", "symbol_name": "__revert_abc123_xmlRngMutex"},
             "output": {
                 "patch_path": "bundle.patch2",
                 "file_path": "/src/libxml2/dict.c",
-                "symbol_name": "xmlRngMutex",
+                "symbol_name": "__revert_abc123_xmlRngMutex",
                 "patch_key": "_extra_dict.c",
                 "patch_text": "",
-                "note": "KB has nodes for 'xmlRngMutex' (v1=1, v2=0), but none produced readable source code.",
+                "note": "KB has nodes for '__revert_abc123_xmlRngMutex' (v1=1, v2=0), but none produced readable source code.",
             },
             "error": None,
         },
@@ -2883,20 +2901,20 @@ assert forced is None, forced
 
 forced = _block_make_extra_patch_override_after_unresolvable_lookup(
     state2,
-    {"type": "tool", "tool": "make_extra_patch_override", "thought": "retry", "args": {"symbol_name": "xmlRngMutex"}},
+    {"type": "tool", "tool": "make_extra_patch_override", "thought": "retry", "args": {"symbol_name": "__revert_abc123_xmlRngMutex"}},
     remaining_steps=10,
 )
 assert forced and forced.get("tool") == "read_artifact", forced
 assert state2.pending_patch and state2.pending_patch.get("tool") == "make_error_patch_override", state2.pending_patch
 
 os.environ["REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL"] = "0"
-forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state_rv, decision)
 assert forced is None, forced
 
 os.environ["REACT_AGENT_ENABLE_UNDECLARED_SYMBOL_GUARDRAIL"] = "1"
-forced = _undeclared_symbol_extra_patch_guardrail_for_override(state, decision)
+forced = _undeclared_symbol_extra_patch_guardrail_for_override(state_rv, decision)
 assert forced and forced.get("tool") == "make_extra_patch_override", forced
-assert forced.get("args", {}).get("symbol_name") == "xmlRngMutex", forced
+assert forced.get("args", {}).get("symbol_name") == "__revert_abc123_xmlRngMutex", forced
 assert forced.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced
 print("OK")
 PY
@@ -5317,36 +5335,22 @@ st.grouped_errors = [
 ]
 
 unfixed = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert len(unfixed) == 3, f"expected 3 unfixed, got {unfixed}"
+# Only __revert_* symbols are eligible; non-__revert (RANSPR, legacy_call) are excluded.
+assert len(unfixed) == 2, f"expected 2 unfixed, got {unfixed}"
 assert unfixed[0] == ("__revert_foo", "/src/a.h"), unfixed[0]
 assert unfixed[1] == ("__revert_bar", "/src/a.h"), unfixed[1]
-assert unfixed[2] == ("RANSPR", "/src/a.h"), unfixed[2]
 
 # Simulate fixing the first symbol
 st.step_history = [
     {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_foo"}}},
 ]
 unfixed2 = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert len(unfixed2) == 2, f"expected 2 unfixed after fixing foo, got {unfixed2}"
+assert len(unfixed2) == 1, f"expected 1 unfixed after fixing foo, got {unfixed2}"
 assert unfixed2[0] == ("__revert_bar", "/src/a.h"), unfixed2[0]
-assert unfixed2[1] == ("RANSPR", "/src/a.h"), unfixed2[1]
-
-# A no-op make_extra result (empty patch_text) must NOT count as fixed.
-st.step_history.append(
-    {
-        "decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "RANSPR"}},
-        "observation": {"ok": True, "tool": "make_extra_patch_override", "output": {"patch_text": ""}},
-    }
-)
-unfixed_noop = _iter_unfixed_undeclared_symbols_from_grouped(st)
-assert ("RANSPR", "/src/a.h") in unfixed_noop, unfixed_noop
 
 # Simulate fixing all remaining eligible symbols
 st.step_history.append(
     {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "__revert_bar"}}},
-)
-st.step_history.append(
-    {"decision": {"tool": "make_extra_patch_override", "args": {"symbol_name": "RANSPR"}}},
 )
 unfixed3 = _iter_unfixed_undeclared_symbols_from_grouped(st)
 assert len(unfixed3) == 0, f"expected 0 unfixed after fixing all eligible symbols, got {unfixed3}"
@@ -6530,6 +6534,256 @@ hunk_count_same = merged_same.count("@@ -")
 assert hunk_count_same == 1, f"Expected 1 hunk for same anchor, got {hunk_count_same}:\n{merged_same}"
 assert "#define MYMACRO 42" in merged_same, f"Missing macro:\n{merged_same}"
 assert "int other_func(void);" in merged_same, f"Missing prototype:\n{merged_same}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Cross-anchor dedup: identical enum at two anchors → keep only topmost
+# ---------------------------------------------------------------------------
+echo "  - cross-anchor dedup (identical enum)"
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.ossfuzz_tools import _merge_extra_hunk_override_texts
+
+# Two overrides: identical enum at line 61 and line 556
+ovr_61 = (
+    "diff --git a/hts.c b/hts.c\n"
+    "--- a/hts.c\n"
+    "+++ b/hts.c\n"
+    "@@ -61,14 +61,3 @@\n"
+    "-\n"
+    "-enum _revert_htsExactFormat {\n"
+    "-    _revert_unknown_format,\n"
+    "-    _revert_sam, _revert_bam, _revert_vcf,\n"
+    "-    _revert_htsget,\n"
+    "-    _revert_empty_format,\n"
+    "-    _revert_hts_crypt4gh_format,\n"
+    "-    _revert_format_maximum = 32767\n"
+    "-};\n"
+    "-#define HTS_VERSION_TEXT \"1.0\"\n"
+    "-\n"
+    " KHASH_INIT2(s2i,, kh_cstr_t, int64_t, 1, kh_str_hash_func, kh_str_hash_equal)\n"
+    " \n"
+    " int hts_verbose = HTS_LOG_WARNING;\n"
+)
+
+ovr_556 = (
+    "diff --git a/hts.c b/hts.c\n"
+    "--- a/hts.c\n"
+    "+++ b/hts.c\n"
+    "@@ -556,13 +556,3 @@\n"
+    "-\n"
+    "-enum _revert_htsExactFormat {\n"
+    "-    _revert_unknown_format,\n"
+    "-    _revert_sam, _revert_bam, _revert_vcf,\n"
+    "-    _revert_htsget,\n"
+    "-    _revert_empty_format,\n"
+    "-    _revert_hts_crypt4gh_format,\n"
+    "-    _revert_format_maximum = 32767\n"
+    "-};\n"
+    "-htsFile *hts_hopen(hFILE *hfile, const char *fn, const char *mode);\n"
+    " \n"
+    " htsFile *hts_open_format(const char *fn, const char *mode, const htsFormat *fmt)\n"
+    " {\n"
+)
+
+merged = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_61, ovr_556])
+
+# Enum should appear only ONCE in merged output
+enum_count = merged.count("enum _revert_htsExactFormat")
+assert enum_count == 1, f"Expected enum once, got {enum_count} times:\n{merged}"
+
+# Enum should be at the topmost anchor (line 61), not at 556
+lines = merged.splitlines()
+hunk_lines = [l for l in lines if l.startswith("@@ -")]
+first_hunk = hunk_lines[0] if hunk_lines else ""
+assert "61" in first_hunk, f"Enum should be in first hunk (line 61): {first_hunk}"
+# Find which hunk contains the enum
+enum_hunk_idx = None
+current_hunk = -1
+for l in lines:
+    if l.startswith("@@ -"):
+        current_hunk += 1
+    if "enum _revert_htsExactFormat" in l:
+        enum_hunk_idx = current_hunk
+        break
+assert enum_hunk_idx == 0, f"Enum should be in hunk 0, found in hunk {enum_hunk_idx}"
+
+# HTS_VERSION_TEXT should still be present (it's unique to line-61 hunk)
+assert "HTS_VERSION_TEXT" in merged, f"Missing HTS_VERSION_TEXT:\n{merged}"
+
+# hts_hopen prototype should still be present (it's unique to line-556 hunk)
+assert "hts_hopen" in merged, f"Missing hts_hopen prototype:\n{merged}"
+
+# There should still be a second hunk at line 556 (for the prototype)
+assert len(hunk_lines) == 2, f"Expected 2 hunks, got {len(hunk_lines)}:\n{merged}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Cross-anchor dedup: all blocks removed → hunk dropped
+# ---------------------------------------------------------------------------
+echo "  - cross-anchor dedup (hunk dropped when empty)"
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.ossfuzz_tools import _merge_extra_hunk_override_texts
+
+# Override at line 61: has the enum
+ovr_61 = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -61,7 +61,3 @@\n"
+    "-\n"
+    "-enum MyEnum { A, B, C };\n"
+    "-#define FOO 1\n"
+    "-\n"
+    " void first_func(void)\n"
+    " {\n"
+    "     return;\n"
+)
+
+# Override at line 500: ONLY has the same enum (no other blocks)
+ovr_500 = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -500,5 +500,3 @@\n"
+    "-\n"
+    "-enum MyEnum { A, B, C };\n"
+    " void second_func(void)\n"
+    " {\n"
+    "     return;\n"
+)
+
+merged = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_61, ovr_500])
+
+# Enum should appear only once
+enum_count = merged.count("enum MyEnum")
+assert enum_count == 1, f"Expected enum once, got {enum_count}:\n{merged}"
+
+# The 500-anchor hunk should be dropped (it only had the enum)
+hunk_lines = [l for l in merged.splitlines() if l.startswith("@@ -")]
+assert len(hunk_lines) == 1, f"Expected 1 hunk (500-hunk dropped), got {len(hunk_lines)}:\n{merged}"
+assert "61" in hunk_lines[0], f"Remaining hunk should be at 61: {hunk_lines[0]}"
+
+# FOO define should still be present
+assert "FOO" in merged, f"Missing #define FOO:\n{merged}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Cross-anchor dedup: non-duplicate blocks preserved at different anchors
+# ---------------------------------------------------------------------------
+echo "  - cross-anchor dedup (non-duplicates preserved)"
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.ossfuzz_tools import _merge_extra_hunk_override_texts
+
+# Two anchors with completely different blocks → no dedup, both preserved
+ovr_a = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -100,4 +100,3 @@\n"
+    "-#define MACRO_A 1\n"
+    " void func_a(void)\n"
+    " {\n"
+    "     return;\n"
+)
+
+ovr_b = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -800,4 +800,3 @@\n"
+    "-void helper_b(int x);\n"
+    " int func_b(void)\n"
+    " {\n"
+    "     return 0;\n"
+)
+
+merged = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_a, ovr_b])
+
+# Both blocks should be present
+assert "MACRO_A" in merged, f"Missing MACRO_A:\n{merged}"
+assert "helper_b" in merged, f"Missing helper_b:\n{merged}"
+
+# Two hunks
+hunk_lines = [l for l in merged.splitlines() if l.startswith("@@ -")]
+assert len(hunk_lines) == 2, f"Expected 2 hunks, got {len(hunk_lines)}:\n{merged}"
+
+print("OK")
+PY
+
+# ---------------------------------------------------------------------------
+# Cross-anchor dedup: near-duplicate (best version kept at top)
+# ---------------------------------------------------------------------------
+echo "  - cross-anchor dedup (near-duplicate, best version at top)"
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.ossfuzz_tools import _merge_extra_hunk_override_texts
+
+# Topmost anchor has a shorter enum; lower anchor has a longer (more complete) version
+ovr_short = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -50,5 +50,3 @@\n"
+    "-enum Fmt { A, B };\n"
+    "-void func_x(void);\n"
+    " void top_func(void)\n"
+    " {\n"
+    "     return;\n"
+)
+
+ovr_long = (
+    "diff --git a/f.c b/f.c\n"
+    "--- a/f.c\n"
+    "+++ b/f.c\n"
+    "@@ -300,5 +300,3 @@\n"
+    "-enum Fmt { A, B, C, D };\n"
+    "-void func_y(void);\n"
+    " void bottom_func(void)\n"
+    " {\n"
+    "     return;\n"
+)
+
+merged = _merge_extra_hunk_override_texts(base_text="", override_texts=[ovr_short, ovr_long])
+
+# Enum should appear only once
+enum_count = merged.count("enum Fmt")
+assert enum_count == 1, f"Expected enum once, got {enum_count}:\n{merged}"
+
+# The longer version (A, B, C, D) should be kept (heuristic: prefer longer for tags)
+assert "C, D" in merged, f"Expected longer enum version (with C, D):\n{merged}"
+
+# Both unique prototypes should be present
+assert "func_x" in merged, f"Missing func_x:\n{merged}"
+assert "func_y" in merged, f"Missing func_y:\n{merged}"
 
 print("OK")
 PY

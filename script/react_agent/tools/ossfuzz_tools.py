@@ -1154,6 +1154,308 @@ def _merge_single_anchor_group(unique_overrides: list[str]) -> str:
 _ANCHOR_TOLERANCE = 15  # lines
 
 
+def _llm_merge_cross_group_blocks(
+    sem_key: str,
+    occurrences: list[tuple[int, list[str]]],
+) -> "list[str] | None":
+    """Use LLM to merge near-duplicate blocks from different anchor groups.
+
+    Returns the merged block lines (raw code, no diff prefix) or ``None`` on failure.
+    """
+    try:
+        import json as _json  # noqa: PLC0415
+
+        from react_agent.models import ModelError, OpenAIChatCompletionsModel  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        model = OpenAIChatCompletionsModel.from_env()
+        override_model = str(os.environ.get("REACT_AGENT_EXTRA_MERGE_REPAIR_MODEL", "") or "").strip()
+        if override_model:
+            model.model = override_model
+        try:
+            model.max_tokens = (
+                int(os.environ.get("REACT_AGENT_EXTRA_MERGE_REPAIR_MAX_TOKENS", "") or "")
+                or model.max_tokens
+            )
+        except Exception:
+            pass
+
+        versions = [{"anchor_line": anchor, "lines": block} for anchor, block in occurrences]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You merge near-duplicate C/C++ definitions that appear at different "
+                    "insertion points in an OSS-Fuzz revert-patch `_extra_*` hunk.\n"
+                    "The same definition (semantic key: `" + sem_key + "`) appears with "
+                    "slightly different content at different anchor lines.\n"
+                    "Produce a single merged version that:\n"
+                    "- Includes all unique members/fields/enumerators from all versions\n"
+                    "- Preserves the most complete signature/body\n"
+                    "- Is valid C/C++ code\n"
+                    "Return ONLY valid JSON: {\"merged_lines\": [\"line1\", \"line2\", ...]}\n"
+                    "Each line is raw code (no diff prefix).\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": _json.dumps(
+                    {"semantic_key": sem_key, "versions": versions},
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+
+        raw = model.complete(messages)
+        data = _json.loads(raw)
+        merged = data.get("merged_lines") if isinstance(data, dict) else None
+        if isinstance(merged, list) and merged:
+            return [str(l) for l in merged]
+        return None
+    except ModelError:
+        return None
+    except Exception:
+        return None
+
+
+def _find_definition_span(
+    lines: "list[str]", kind: str, name: str
+) -> "tuple[int, int] | None":
+    """Find the line range ``[start, end)`` of a definition in raw code lines (no diff prefix).
+
+    Returns ``None`` if the definition is not found.
+    """
+    for i, raw in enumerate(lines):
+        stripped = raw.strip()
+        if kind == "tag":
+            m = _EXTRA_TAG_RE.match(stripped)
+            if m and f"{m.group('kind')} {m.group('name')}".strip() == name:
+                # Walk forward to closing `};` (brace-depth tracking)
+                brace_depth = 0
+                for j in range(i, len(lines)):
+                    code = re.sub(r"//.*$", "", lines[j])
+                    code = re.sub(r"/\*.*?\*/", "", code)
+                    brace_depth += code.count("{") - code.count("}")
+                    if brace_depth <= 0 and "}" in code:
+                        return (i, j + 1)
+                return (i, len(lines))
+        elif kind == "define":
+            dm = _EXTRA_DEFINE_RE.match(stripped)
+            if dm and dm.group(1) == name:
+                j = i
+                while j < len(lines) and lines[j].rstrip().endswith("\\"):
+                    j += 1
+                return (i, j + 1)
+        elif kind == "prototype":
+            for fm in _EXTRA_FUNC_NAME_RE.finditer(stripped):
+                cand = fm.group(1)
+                if cand == name and cand not in _EXTRA_CONTROL_WORDS:
+                    j = i
+                    while j < len(lines) and ";" not in lines[j]:
+                        j += 1
+                    return (i, j + 1 if j < len(lines) else j)
+        elif kind == "typedef":
+            if stripped.startswith("typedef"):
+                tname = _typedef_declared_name([stripped])
+                if tname == name:
+                    brace_depth = 0
+                    for j in range(i, len(lines)):
+                        code = re.sub(r"//.*$", "", lines[j])
+                        code = re.sub(r"/\*.*?\*/", "", code)
+                        brace_depth += code.count("{") - code.count("}")
+                        if ";" in lines[j] and brace_depth <= 0:
+                            return (i, j + 1)
+                    return (i, len(lines))
+    return None
+
+
+def _extract_minus_lines(patch_text: str) -> "list[str]":
+    """Return raw code lines (no diff prefix) from the first hunk's '-' lines."""
+    lines = str(patch_text or "").splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return []
+    end = len(lines)
+    for i in range(first_hunk + 1, len(lines)):
+        if lines[i].startswith("@@") or lines[i].startswith("diff --git "):
+            end = i
+            break
+    result: list[str] = []
+    for l in lines[first_hunk + 1 : end]:
+        if not l.startswith("-") or l.startswith("---"):
+            continue
+        result.append("" if l == "-" else l[1:])
+    return result
+
+
+def _dedup_across_anchor_groups(merged_hunks: "dict[int, str]") -> "dict[int, str]":
+    """Remove duplicate semantic blocks that appear across different anchor groups.
+
+    When the same definition (enum, struct, typedef, macro, prototype) is present
+    in more than one anchor group, keep only the best version in the topmost
+    (lowest line-number) group and delete it from all others.
+
+    Works at the raw ``-`` line level rather than at the block level so that
+    definitions sharing a block with other declarations (e.g. an enum followed
+    by a prototype with no separating blank line) are surgically removed without
+    affecting the surrounding declarations.
+
+    For near-duplicates (same semantic ID, different content) an LLM merge is
+    attempted when available; the best version is placed in the topmost group.
+    """
+    if len(merged_hunks) <= 1:
+        return merged_hunks
+
+    try:
+        from tools.extra_patch_tools import _insert_minus_block_into_patch_text  # type: ignore
+    except Exception:
+        _insert_minus_block_into_patch_text = None  # type: ignore[assignment]
+
+    sorted_anchors = sorted(merged_hunks.keys())
+
+    # --- Phase 1: extract blocks from each hunk (for semantic ID detection) ---
+    blocks_per_anchor: "dict[int, list[tuple[str, str, list[str]]]]" = {}
+    for anchor in sorted_anchors:
+        raw_blocks = _extra_hunk_minus_blocks_first_hunk(merged_hunks[anchor])
+        entries: "list[tuple[str, str, list[str]]]" = []
+        for block in raw_blocks:
+            kind, name = _extra_insert_block_semantic_id(block)
+            sem_key = f"{kind}:{name}"
+            entries.append((sem_key, kind, block))
+        blocks_per_anchor[anchor] = entries
+
+    # --- Phase 2: find semantic IDs in >1 anchor group ---
+    sem_key_by_anchor: "dict[str, list[tuple[int, list[str]]]]" = {}
+    for anchor in sorted_anchors:
+        for sem_key, _kind, block in blocks_per_anchor[anchor]:
+            sem_key_by_anchor.setdefault(sem_key, []).append((anchor, block))
+
+    cross_dupes: "dict[str, list[tuple[int, list[str]]]]" = {}
+    for sem_key, occ_list in sem_key_by_anchor.items():
+        if len(set(a for a, _ in occ_list)) > 1:
+            cross_dupes[sem_key] = occ_list
+
+    if not cross_dupes:
+        return merged_hunks
+
+    # --- Phase 3: determine best version per duplicate and what to remove ---
+    # Extract raw `-` lines per anchor for definition-level comparison.
+    minus_lines_cache: "dict[int, list[str]]" = {}
+    for anchor in sorted_anchors:
+        minus_lines_cache[anchor] = _extract_minus_lines(merged_hunks[anchor])
+
+    # sem_key -> (topmost_anchor, best_definition_lines)
+    best_per_key: "dict[str, tuple[int, list[str]]]" = {}
+    anchors_to_edit: "dict[int, set[str]]" = {}
+
+    for sem_key, occ_list in cross_dupes.items():
+        sorted_occ = sorted(occ_list, key=lambda t: t[0])
+        topmost_anchor = sorted_occ[0][0]
+        kind = sem_key.split(":", 1)[0]
+        name = sem_key.split(":", 1)[1] if ":" in sem_key else ""
+
+        # Extract only the definition lines (not trailing content) from each occurrence.
+        def_versions: "list[tuple[int, list[str]]]" = []
+        for anchor, _block in sorted_occ:
+            span = _find_definition_span(minus_lines_cache[anchor], kind, name)
+            if span:
+                def_versions.append((anchor, minus_lines_cache[anchor][span[0]:span[1]]))
+            else:
+                def_versions.append((anchor, _block))
+
+        # Pick the best definition (heuristic, then optional LLM)
+        best_def = def_versions[0][1]
+        all_identical = True
+        for _, dlines in def_versions[1:]:
+            if dlines != best_def:
+                all_identical = False
+            best_def = _choose_better_extra_block(kind, current=best_def, candidate=dlines)
+
+        if not all_identical:
+            llm_result = _llm_merge_cross_group_blocks(sem_key, def_versions)
+            if llm_result is not None:
+                best_def = llm_result
+
+        best_per_key[sem_key] = (topmost_anchor, best_def)
+
+        # Mark removal from all non-topmost anchors
+        for anchor, _ in sorted_occ[1:]:
+            anchors_to_edit.setdefault(anchor, set()).add(sem_key)
+
+        # If the best definition differs from the topmost's current, mark topmost for edit too
+        if best_def != def_versions[0][1]:
+            anchors_to_edit.setdefault(topmost_anchor, set()).add(sem_key)
+
+    # --- Phase 4: surgically edit raw `-` lines in affected hunks ---
+    result: "dict[int, str]" = {}
+    dedup_log: list[str] = []
+
+    for anchor in sorted_anchors:
+        if anchor not in anchors_to_edit:
+            result[anchor] = merged_hunks[anchor]
+            continue
+
+        minus_lines = _extract_minus_lines(merged_hunks[anchor])
+        edits = anchors_to_edit[anchor]
+
+        for sem_key in edits:
+            kind = sem_key.split(":", 1)[0]
+            name = sem_key.split(":", 1)[1] if ":" in sem_key else ""
+            topmost_anchor, best_block = best_per_key[sem_key]
+
+            span = _find_definition_span(minus_lines, kind, name)
+            if span is None:
+                continue
+
+            start, end = span
+            if anchor == topmost_anchor:
+                # Replace with best version
+                minus_lines[start:end] = best_block
+                dedup_log.append(f"replaced {sem_key} at anchor {anchor} with best version")
+            else:
+                # Remove the definition lines; also remove an adjacent blank separator
+                minus_lines[start:end] = []
+                # Clean up: remove a leading blank line left by the removal
+                if start < len(minus_lines) and start > 0 and minus_lines[start - 1] == "":
+                    del minus_lines[start - 1]
+                elif start == 0 and minus_lines and minus_lines[0] == "":
+                    del minus_lines[0]
+                dedup_log.append(f"removed {sem_key} from anchor {anchor}")
+
+        # Rebuild hunk from edited minus_lines
+        if not minus_lines or all(l == "" for l in minus_lines):
+            dedup_log.append(f"dropped empty hunk at anchor {anchor}")
+            continue
+
+        # Strip trailing blank lines
+        while minus_lines and minus_lines[-1] == "":
+            minus_lines.pop()
+        # Strip leading blank lines
+        while minus_lines and minus_lines[0] == "":
+            minus_lines.pop(0)
+
+        stripped = _strip_first_hunk_minus_lines(merged_hunks[anchor])
+        if _insert_minus_block_into_patch_text is not None:
+            result[anchor] = _insert_minus_block_into_patch_text(
+                stripped, insert_lines=minus_lines, prefer_prepend=True
+            )
+        else:
+            result[anchor] = (
+                stripped.rstrip("\n") + "\n"
+                + "\n".join("-" + l if l else "-" for l in minus_lines) + "\n"
+            )
+
+    if dedup_log:
+        sys.stderr.write(
+            "[_extra_* merge] cross-anchor dedup: " + "; ".join(dedup_log[:10]) + "\n"
+        )
+        sys.stderr.flush()
+
+    return result
+
+
 def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str]) -> str:
     """Merge multiple `_extra_*` override diffs into one by unioning inserted blocks (never partial lines).
 
@@ -1213,15 +1515,28 @@ def _merge_extra_hunk_override_texts(*, base_text: str, override_texts: list[str
     if len(anchor_groups) <= 1:
         return _merge_single_anchor_group(unique_overrides)
 
-    # Multiple anchor groups: merge each independently, produce multi-hunk diff.
+    # Multiple anchor groups: merge each independently, then dedup across groups.
     diff_header = ""
-    hunk_bodies: list[str] = []
+    merged_hunks: dict[int, str] = {}
     for anchor in sorted(anchor_groups.keys()):
         group = anchor_groups[anchor]
         merged_hunk = _merge_single_anchor_group(group)
         if not diff_header:
             diff_header = _extract_diff_header(merged_hunk)
-        hunk_bodies.append(_extract_hunk_body(merged_hunk))
+        merged_hunks[anchor] = merged_hunk
+
+    # Cross-anchor deduplication: remove definitions that appear in multiple hunks,
+    # keeping only the topmost (lowest line-number) occurrence.
+    merged_hunks = _dedup_across_anchor_groups(merged_hunks)
+
+    hunk_bodies: list[str] = []
+    for anchor in sorted(merged_hunks.keys()):
+        body = _extract_hunk_body(merged_hunks[anchor])
+        if body.strip():
+            hunk_bodies.append(body)
+
+    if not hunk_bodies:
+        return diff_header.rstrip("\n") + "\n" if diff_header else ""
 
     return (diff_header + "\n".join(hunk_bodies)).rstrip("\n") + "\n"
 
