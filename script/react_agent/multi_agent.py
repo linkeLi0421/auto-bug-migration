@@ -680,20 +680,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max-restarts-per-hunk",
         type=int,
-        default=int(os.environ.get("REACT_AGENT_MAX_RESTARTS_PER_HUNK", "0") or 0),
-        help="If a hunk is not fixed, delete its artifacts dir and rerun (default: 0).",
+        default=int(os.environ.get("REACT_AGENT_MAX_RESTARTS_PER_HUNK", "3") or 3),
+        help="If a hunk is not fixed, delete its artifacts dir and rerun (default: 3).",
     )
     p.add_argument("--jobs", type=int, default=1, help="Max concurrent agents to run (default: 1).")
     p.add_argument(
         "--agent-timeout",
         type=int,
-        default=int(os.environ.get("REACT_AGENT_TIMEOUT", "1800") or 1800),
+        default=int(os.environ.get("REACT_AGENT_TIMEOUT", "3600") or 3600),
         help="Timeout in seconds for each agent subprocess (default: 1800 = 30 min).",
     )
     p.add_argument("--output-format", choices=["none", "auto", "json", "json-pretty", "text"], default="none")
     p.add_argument("--model", choices=["openai", "stub"], default=os.environ.get("REACT_AGENT_MODEL", "openai"))
     p.add_argument("--tools", choices=["real", "fake"], default="real")
-    p.add_argument("--max-steps", type=int, default=10)
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_STEPS", "20") or 20),
+        help="Max steps per agent run (default: REACT_AGENT_MAX_STEPS or 20).",
+    )
     p.add_argument(
         "--recursion-limit",
         type=int,
@@ -981,6 +986,7 @@ def main(argv: List[str]) -> int:
             "build_log": str(args.build_log),
             "patch_path": patch_path,
             "max_groups_requested": max_groups_requested,
+            "max_steps": max(1, int(getattr(args, "max_steps", 1) or 1)),
             "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
             "patch_key_groups_found": patch_key_groups_found,
             "patch_key_groups_after_allowlist": patch_key_groups_after_allowlist,
@@ -1372,6 +1378,7 @@ def main(argv: List[str]) -> int:
         "build_log": str(args.build_log),
         "patch_path": patch_path,
         "max_groups_requested": max_groups_requested,
+        "max_steps": max(1, int(getattr(args, "max_steps", 1) or 1)),
         "max_restarts_per_hunk": max(0, int(getattr(args, "max_restarts_per_hunk", 0) or 0)),
         "final_ossfuzz_test": final_ossfuzz_test,
         "patch_key_groups_found": patch_key_groups_found,

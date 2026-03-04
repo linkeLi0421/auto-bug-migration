@@ -2252,6 +2252,57 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch override internals: when inserting into the first hunk of a
+# multi-hunk diff, keep later hunks' +start anchors stable (do not shift
+# +691 -> +540, etc.).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _insert_minus_block_into_patch_text  # noqa: E402
+
+patch_text = (
+    "diff --git a/src/lib/ndpi_main.c b/src/lib/ndpi_main.c\n"
+    "--- a/src/lib/ndpi_main.c\n"
+    "+++ b/src/lib/ndpi_main.c\n"
+    "@@ -81,42 +81,3 @@\n"
+    "-int old_a;\n"
+    " static inline uint8_t flow_is_proto(struct ndpi_flow_struct *flow, u_int16_t p) {\n"
+    "@@ -691,41 +691,3 @@\n"
+    "-int old_b;\n"
+    " /* ******************************************************************** */\n"
+    "@@ -2094,4 +2094,3 @@\n"
+    "-int old_c;\n"
+    " /* ****************************************** */\n"
+)
+
+updated = _insert_minus_block_into_patch_text(
+    patch_text,
+    insert_lines=["", "static const char *categories[] = {", "  \"X\"", "};"],
+    prefer_prepend=True,
+)
+
+headers = re.findall(
+    r"^@@ -(?P<old_start>\d+),(?P<old_len>\d+) \+(?P<new_start>\d+),(?P<new_len>\d+) @@",
+    updated,
+    re.MULTILINE,
+)
+assert len(headers) == 3, updated
+
+# First hunk changed, but later +start anchors must stay at their original lines.
+assert headers[1][2] == "691", updated
+assert headers[2][2] == "2094", updated
+assert "+540," not in updated, updated
+assert "+1905," not in updated, updated
+
+print("OK")
+PY
+
 # Extra patch override tool: when inserting an enum into an existing `_extra_*`
 # hunk anchored late in the file, re-anchor the hunk to Tier 1 (before first
 # function) and keep existing inserted declarations.
@@ -4890,6 +4941,55 @@ merged_text3 = merged_path3.read_text(encoding="utf-8", errors="replace")
 assert "_extra_error.c" in (out3.get("overridden_patch_keys") or []), out3
 assert "EXTRA_DECL" in merged_text3, merged_path3
 assert "EXTRA_ONLY_DECL" in merged_text3, merged_path3
+
+# Regression: split a multi-hunk override diff into separate single-hunk diff blocks.
+multi_hunk_override_path = artifact_dir / "override_p2_multi_hunk.diff"
+multi_hunk_override_text = (
+    "diff --git a/error.c b/error.c\n"
+    "--- a/error.c\n"
+    "+++ b/error.c\n"
+    "@@ -10,1 +10,1 @@\n"
+    "-line2\n"
+    "+OVERRIDE_MULTI_A\n"
+    "@@ -20,1 +20,1 @@\n"
+    "-line3\n"
+    "+OVERRIDE_MULTI_B\n"
+)
+multi_hunk_override_path.write_text(multi_hunk_override_text, encoding="utf-8", errors="replace")
+
+out_multi = merge_patch_bundle_with_overrides(
+    patch_path=str(bundle_path),
+    patch_override_paths=[str(multi_hunk_override_path)],
+    output_name="merged_test_multi_hunk_split.diff",
+)
+merged_multi_path = Path(out_multi.get("merged_patch_file_path", "")).resolve()
+assert merged_multi_path.is_file(), out_multi
+merged_multi_text = merged_multi_path.read_text(encoding="utf-8", errors="replace")
+
+pos_a = merged_multi_text.find("+OVERRIDE_MULTI_A")
+pos_b = merged_multi_text.find("+OVERRIDE_MULTI_B")
+assert pos_a >= 0, merged_multi_text
+assert pos_b >= 0, merged_multi_text
+
+def _diff_block_for_pos(text: str, pos: int) -> str:
+    start = text.rfind("\ndiff --git ", 0, pos)
+    if start >= 0:
+        start += 1
+    elif text.startswith("diff --git "):
+        start = 0
+    else:
+        start = text.rfind("diff --git ", 0, pos)
+    assert start >= 0, (pos, text[:200])
+    end = text.find("\ndiff --git ", pos)
+    if end < 0:
+        end = len(text)
+    return text[start:end]
+
+block_a = _diff_block_for_pos(merged_multi_text, pos_a)
+block_b = _diff_block_for_pos(merged_multi_text, pos_b)
+assert block_a != block_b, (block_a, block_b)
+assert sum(1 for ln in block_a.splitlines() if ln.startswith("@@")) == 1, block_a
+assert sum(1 for ln in block_b.splitlines() if ln.startswith("@@")) == 1, block_b
 
 bundle_out = write_patch_bundle_with_overrides(
     patch_path=str(bundle_path),

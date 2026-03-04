@@ -1744,12 +1744,10 @@ def _extract_function_definition_from_bundle(bundle: Any, *, symbol_name: str) -
 def _recompute_hunk_headers(lines: List[str]) -> List[str]:
     """Recompute @@ hunk header lengths after edits (best-effort)."""
     out = list(lines)
-    new_shift = 0
     i = 0
     while i < len(out):
         line = out[i]
         if line.startswith("diff --git "):
-            new_shift = 0
             i += 1
             continue
         if not line.startswith("@@"):
@@ -1786,12 +1784,12 @@ def _recompute_hunk_headers(lines: List[str]) -> List[str]:
                 pass
             j += 1
 
-        is_file_add = old_start == 0 and old_len_hdr == 0
-        is_file_del = new_start_hdr == 0 and new_len_hdr == 0
-        new_start = new_start_hdr if (is_file_add or is_file_del) else (old_start + new_shift)
+        # Keep new-side start anchors stable. Recomputing later hunks from a cumulative
+        # shift can move +start backward (e.g. +691 -> +540) after first-hunk edits,
+        # which causes strict reverse-apply checks to report offsets.
+        new_start = new_start_hdr
         out[i] = f"@@ -{old_start},{old_len} +{new_start},{new_len_hunk} @@"
 
-        new_shift += new_len_hunk - old_len
         i = j
     return out
 
