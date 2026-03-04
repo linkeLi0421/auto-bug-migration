@@ -390,6 +390,48 @@ def _skip_out_of_if0_block(lines: List[str], idx: int) -> int:
     return idx
 
 
+def _preprocessor_nesting_before_index(lines: List[str], idx: int) -> int:
+    """Return active #if nesting immediately before insertion index `idx`."""
+    if not lines:
+        return 0
+    idx = max(0, min(int(idx), len(lines)))
+    nesting = 0
+    for i in range(0, idx):
+        stripped = str(lines[i] or "").lstrip()
+        if _PP_IF_RE.match(stripped):
+            nesting += 1
+        elif _PP_ENDIF_RE.match(stripped):
+            nesting = max(nesting - 1, 0)
+    return nesting
+
+
+def _skip_out_of_preprocessor_block(lines: List[str], idx: int) -> int:
+    """Move insertion index out of active #if/#ifdef/#ifndef blocks.
+
+    This is for non-header files where declarations inside conditional regions
+    may not be visible for all build configurations.
+    """
+    if not lines:
+        return 0
+    idx = max(0, min(int(idx), len(lines)))
+    nesting = _preprocessor_nesting_before_index(lines, idx)
+    if nesting <= 0:
+        return idx
+
+    for i in range(idx, len(lines)):
+        stripped = str(lines[i] or "").lstrip()
+        if _PP_IF_RE.match(stripped):
+            nesting += 1
+            continue
+        if _PP_ENDIF_RE.match(stripped):
+            nesting = max(nesting - 1, 0)
+            if nesting == 0:
+                return min(i + 1, len(lines))
+
+    # Unterminated conditional block: keep original insertion point.
+    return idx
+
+
 def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
     """Normalize a C-like function signature into (return_type, name, arg_types).
 
@@ -870,6 +912,8 @@ def _new_extra_patch_skeleton(
     # Do not place inserted declarations inside dead-code regions.
     # Backward boundary selection can otherwise jump to a `}` under `#if 0`.
     insert_at = _skip_out_of_if0_block(lines, insert_at)
+    if not _is_header_path(str(file_path or "")):
+        insert_at = _skip_out_of_preprocessor_block(lines, insert_at)
 
     # Find the last #include line in the initial header section to ensure we don't insert before type definitions
     # Stop tracking includes once we've seen actual code (to avoid late includes in the file)
@@ -893,6 +937,8 @@ def _new_extra_patch_skeleton(
     # advance past the macro to avoid splitting it.
     insert_at = _skip_past_macro_continuation(lines, insert_at)
     insert_at = _skip_out_of_if0_block(lines, insert_at)
+    if not _is_header_path(str(file_path or "")):
+        insert_at = _skip_out_of_preprocessor_block(lines, insert_at)
 
     # For header files with include guards, clamp insert_at to stay inside the guard
     # AND inside any trailing `extern "C" { ... }` block.

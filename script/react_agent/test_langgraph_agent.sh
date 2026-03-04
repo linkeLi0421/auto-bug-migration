@@ -156,6 +156,128 @@ with tempfile.TemporaryDirectory() as td:
 print("OK")
 PY
 
+# read_file_context: avoid empty output when working tree path is missing but
+# content is available via git-object fallback (REACT_AGENT_V2_SRC_COMMIT).
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from agent_tools import AgentTools, KbIndex, SourceManager  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+
+    subprocess.run(["git", "init"], cwd=src_v2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    header_rel = Path("src/include/ndpi_typedefs.h")
+    header_path = src_v2 / header_rel
+    header_path.parent.mkdir(parents=True, exist_ok=True)
+    header_path.write_text(
+        "typedef struct ndpi_detection_module_struct {\\n"
+        "  int ptree;\\n"
+        "  int protocols;\\n"
+        "} ndpi_detection_module_struct;\\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=src_v2, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "init"],
+        cwd=src_v2,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    commit = (
+        subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=src_v2, text=True)
+        .strip()
+    )
+
+    # Remove from worktree to force fallback (path resolution alone would fail).
+    header_path.unlink()
+
+    os.environ["REACT_AGENT_V2_SRC_COMMIT"] = commit
+    try:
+        tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+        out = tools.read_file_context(
+            file_path="src/include/ndpi_typedefs.h",
+            line_number=2,
+            context=1,
+            version="v2",
+        )
+    finally:
+        os.environ.pop("REACT_AGENT_V2_SRC_COMMIT", None)
+
+    assert out, out
+    assert "ndpi_typedefs.h" in out, out
+    assert "ptree" in out, out
+    assert ">>" in out, out
+
+print("OK")
+PY
+
+# Guardrail: do not add local __revert_* prototypes inside make_error_patch_override bodies.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import tempfile
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+
+from agent_langgraph import AgentState, _override_no_local_revert_prototypes_guardrail_error  # noqa: E402
+
+base = (
+    "static int fn(void) {\\n"
+    "  return __revert_deadbeef_target(1);\\n"
+    "}\\n"
+)
+new_bad = (
+    "static int fn(void) {\\n"
+    "  int __revert_deadbeef_target(int);\\n"
+    "  return __revert_deadbeef_target(1);\\n"
+    "}\\n"
+)
+
+with tempfile.TemporaryDirectory() as td:
+    base_path = Path(td) / "base.c"
+    base_path.write_text(base, encoding="utf-8")
+    st = AgentState(build_log_path="-", patch_path="bundle.patch2", error_scope="patch", error_line="x", snippet="")
+    st.loop_base_func_code_artifact_path = str(base_path)
+
+    bad_decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "args": {"new_func_code": new_bad, "patch_path": "bundle.patch2", "file_path": "/src/x.c", "line_number": 1},
+    }
+    err = _override_no_local_revert_prototypes_guardrail_error(st, bad_decision)
+    assert err and "local `__revert_*` prototype" in err, err
+
+    ok_decision = {
+        "type": "tool",
+        "tool": "make_error_patch_override",
+        "args": {"new_func_code": base, "patch_path": "bundle.patch2", "file_path": "/src/x.c", "line_number": 1},
+    }
+    assert _override_no_local_revert_prototypes_guardrail_error(st, ok_decision) is None
+
+print("OK")
+PY
+
 # Guardrail: do not falsely flag __revert_* prefixed BASE function names as "renamed".
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import tempfile
@@ -1835,6 +1957,7 @@ PY
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import json
 import os
+import re
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -1846,6 +1969,7 @@ sys.path.insert(0, str(script_dir.parents[0]))
 
 from core.kb_index import KbIndex  # noqa: E402
 from core.source_manager import SourceManager  # noqa: E402
+import tools.extra_patch_tools as extra_patch_tools  # noqa: E402
 from tools.extra_patch_tools import _ast_insert_line_number_for_extra_skeleton  # noqa: E402
 from tools.extra_patch_tools import _new_extra_patch_skeleton  # noqa: E402
 from tools.symbol_tools import AgentTools  # noqa: E402
@@ -2083,11 +2207,47 @@ with tempfile.TemporaryDirectory() as td_raw:
     tools_if0 = AgentTools(kb_if0, SourceManager(str(td / "v1"), str(td / "v2")))
     skel = _new_extra_patch_skeleton(tools_if0, file_path="if0_anchor.c", symbol_name="dummy")
     assert skel, skel
-    m = re.search(r"^@@ -(?P<old_start>\\d+),(?P<old_len>\\d+) \\+(?P<new_start>\\d+),(?P<new_len>\\d+) @@", skel, re.MULTILINE)
+    m = re.search(r"^@@ -(?P<old_start>\d+),(?P<old_len>\d+) \+(?P<new_start>\d+),(?P<new_len>\d+) @@", skel, re.MULTILINE)
     assert m, skel
     body = skel[m.end():].splitlines()
     first_ctx = next((line for line in body if line.startswith(" ")), "")
     assert first_ctx.strip() != "#endif", skel
+
+    # Regression: for .c files, avoid anchoring inside active #ifdef blocks.
+    # Simulate AST returning a line inside the conditional region.
+    pp_source = "\n".join(
+        [
+            "#include <stdint.h>",
+            "#ifdef FEATURE_TOGGLE",
+            "static int hidden_fn(void) {",
+            "  return 0;",
+            "}",
+            "#endif",
+            "",
+            "int always_visible(void) { return 1; }",
+            "",
+        ]
+    )
+    (td / "v2" / "pp_anchor.c").write_text(pp_source, encoding="utf-8")
+
+    kb_pp = KbIndex(str(kb_v1), str(kb_v2))
+    tools_pp = AgentTools(kb_pp, SourceManager(str(td / "v1"), str(td / "v2")))
+    old_ast = extra_patch_tools._ast_insert_line_number_for_extra_skeleton
+    extra_patch_tools._ast_insert_line_number_for_extra_skeleton = lambda *args, **kwargs: 3
+    try:
+        skel_pp = _new_extra_patch_skeleton(tools_pp, file_path="pp_anchor.c", symbol_name="dummy")
+    finally:
+        extra_patch_tools._ast_insert_line_number_for_extra_skeleton = old_ast
+
+    assert skel_pp, skel_pp
+    m_pp = re.search(
+        r"^@@ -(?P<old_start>\d+),(?P<old_len>\d+) \+(?P<new_start>\d+),(?P<new_len>\d+) @@",
+        skel_pp,
+        re.MULTILINE,
+    )
+    assert m_pp, skel_pp
+    start_pp = int(m_pp.group("old_start"))
+    assert start_pp >= 7, f"expected insertion after #endif (>=7), got {start_pp}\n{skel_pp}"
 
 print("OK")
 PY
