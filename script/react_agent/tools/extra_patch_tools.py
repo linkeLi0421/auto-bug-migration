@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from pathlib import Path
@@ -337,6 +336,60 @@ def _find_include_guard_endif(lines: List[str]) -> int:
     return last_zero_endif
 
 
+def _is_preprocessor_if_zero_line(stripped_line: str) -> bool:
+    s = str(stripped_line or "").strip()
+    m = re.match(r"^#\s*if\b(?P<expr>.*)$", s)
+    if not m:
+        return False
+    expr = str(m.group("expr") or "")
+    expr = re.sub(r"/\*.*?\*/", " ", expr)
+    expr = re.sub(r"//.*$", "", expr)
+    expr = expr.strip()
+    if not expr:
+        return False
+    return bool(re.match(r"^0(?:\b|[()!<>=&|+\-*/%])", expr))
+
+
+def _collect_if0_blocks(lines: List[str]) -> List[Tuple[int, int]]:
+    """Return (start_idx, end_idx) pairs for #if 0 ... #endif blocks."""
+    blocks: List[Tuple[int, int]] = []
+    stack: List[Tuple[int, bool]] = []
+    for i, raw in enumerate(lines):
+        stripped = str(raw or "").lstrip()
+        if _PP_IF_RE.match(stripped):
+            stack.append((i, _is_preprocessor_if_zero_line(stripped)))
+            continue
+        if _PP_ENDIF_RE.match(stripped):
+            if not stack:
+                continue
+            start_i, is_if0 = stack.pop()
+            if is_if0:
+                blocks.append((start_i, i))
+    return blocks
+
+
+def _skip_out_of_if0_block(lines: List[str], idx: int) -> int:
+    """Move insertion index out of #if 0 blocks so inserted code is compiled."""
+    if not lines:
+        return 0
+    idx = max(0, min(int(idx), len(lines)))
+    blocks = _collect_if0_blocks(lines)
+    if not blocks:
+        return idx
+
+    changed = True
+    while changed:
+        changed = False
+        for start_i, end_i in blocks:
+            # idx is an insertion point *before* line idx.
+            # start_i < idx <= end_i means we are inside the disabled block.
+            if start_i < idx <= end_i:
+                idx = min(end_i + 1, len(lines))
+                changed = True
+                break
+    return idx
+
+
 def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
     """Normalize a C-like function signature into (return_type, name, arg_types).
 
@@ -395,10 +448,6 @@ def _compare_function_signatures(sig1: str, sig2: str, *, ignore_arg_types: bool
 
 def _extra_skeleton_anchor_func_sig() -> str:
     return str(os.environ.get("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", "") or "").strip()
-
-
-def _env_flag(name: str) -> bool:
-    return str(os.environ.get(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name: str) -> int:
@@ -470,160 +519,21 @@ def _bundle_earliest_reference_line(bundle: Any, *, file_path: str, symbol_name:
     return earliest
 
 
-def _llm_find_insertion_line_for_revert_symbol(
+def _ast_insert_line_number_for_extra_skeleton(
     agent_tools: Any,
     *,
     file_path: str,
-    underlying_name: str,
     version: str = "v2",
+    symbol_name: str = "",
+    bundle: Any = None,
+    force_tier1: bool = False,
 ) -> int:
-    """Use an LLM sub-task to find the optimal insertion line for a __revert_* forward declaration.
-
-    Follows the same principle as the bundle-scan tier: find the earliest
-    *reference/usage* of ``underlying_name`` in the V2 source, then return a
-    file-scope anchor line just before that reference so a forward declaration
-    placed there is visible to all downstream call sites.
-
-    Returns a 1-based line number, or -1 when the LLM is unavailable, disabled,
-    or fails.
-
-    Gating: enabled by default when OPENAI_API_KEY is set.
-    Disable with REACT_AGENT_DISABLE_SKELETON_LLM=1.
-    Model override: REACT_AGENT_SKELETON_LLM_MODEL.
-    Max-tokens override: REACT_AGENT_SKELETON_LLM_MAX_TOKENS (default 512).
-    """
-    if _env_flag("REACT_AGENT_DISABLE_SKELETON_LLM"):
-        return -1
-    if not underlying_name:
-        return -1
-
-    # 1. Read the V2 source file.
-    resolved, _version_used = _resolve_extra_skeleton_file(
-        agent_tools, file_path=str(file_path or "").strip()
-    )
-    if resolved is None or not resolved.exists():
-        return -1
-    try:
-        text = resolved.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return -1
-    if not text.strip():
-        return -1
-
-    file_lines = text.splitlines()
-    MAX_LINES = 4000
-    truncated = len(file_lines) > MAX_LINES
-    if truncated:
-        file_lines = file_lines[:MAX_LINES]
-
-    numbered_text = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(file_lines))
-
-    # 2. Call the LLM.
-    try:
-        import json as _json  # noqa: PLC0415
-
-        from react_agent.models import ModelError, OpenAIChatCompletionsModel  # type: ignore
-    except Exception:
-        return -1
-
-    try:
-        model = OpenAIChatCompletionsModel.from_env()
-        override_model = str(os.environ.get("REACT_AGENT_SKELETON_LLM_MODEL", "") or "").strip()
-        if override_model:
-            model.model = override_model
-        try:
-            model.max_tokens = int(os.environ.get("REACT_AGENT_SKELETON_LLM_MAX_TOKENS", "") or "") or 512
-        except Exception:
-            model.max_tokens = 512
-
-        system_prompt = (
-            "You are a C/C++ source code analyzer. "
-            "Given a source file with line numbers, find the EARLIEST line where "
-            "the specified function is called or referenced (not where it is "
-            "defined or forward-declared).\n\n"
-            "A forward declaration needs to be inserted BEFORE this earliest "
-            "reference.  To ensure it lands at file scope (outside any function "
-            "body), also identify the enclosing top-level construct (function "
-            "definition, global variable, etc.) that contains the reference.\n\n"
-            "Return ONLY valid JSON with this format:\n"
-            '{"earliest_reference_line": <int>, "enclosing_construct_start_line": <int>, '
-            '"enclosing_name": "<name>", "reason": "<brief>"}\n\n'
-            "Rules:\n"
-            "- earliest_reference_line: the actual line number of the first call/use.\n"
-            "- enclosing_construct_start_line: the start line of the top-level "
-            "function/struct/declaration that contains the reference.  This is "
-            "where the return type or storage-class specifier begins.  "
-            "A forward declaration will be inserted just before this line.\n"
-            "- If the function is only defined/declared but never called or "
-            "referenced, return {\"earliest_reference_line\": -1, "
-            "\"enclosing_construct_start_line\": -1}.\n"
-            "- If the function is not found at all, return "
-            "{\"earliest_reference_line\": -1, \"enclosing_construct_start_line\": -1}.\n"
-        )
-
-        user_prompt = (
-            f"Target function name: {underlying_name}\n\n"
-            f"Source file ({len(file_lines)} lines{', truncated' if truncated else ''}):\n\n"
-            f"{numbered_text}\n"
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        raw = model.complete(messages)
-        # Strip markdown fences if the model wraps JSON in ```json ... ```.
-        raw_stripped = raw.strip()
-        if raw_stripped.startswith("```"):
-            lines_raw = raw_stripped.splitlines()
-            lines_raw = [l for l in lines_raw if not l.strip().startswith("```")]
-            raw_stripped = "\n".join(lines_raw).strip()
-        data = _json.loads(raw_stripped)
-        if not isinstance(data, dict):
-            return -1
-
-        # Primary: use enclosing_construct_start_line (file-scope anchor).
-        # Fallback: use earliest_reference_line directly.
-        line_num = int(data.get("enclosing_construct_start_line", -1) or -1)
-        if line_num <= 0 or line_num > len(file_lines):
-            line_num = int(data.get("earliest_reference_line", -1) or -1)
-        if line_num <= 0 or line_num > len(file_lines):
-            return -1
-
-        # Post-validate: if the returned line is a lone opening brace `{`,
-        # the LLM picked the function body start instead of the signature.
-        # Scan backward to find the actual function definition start line
-        # (the return-type / storage-class line).
-        idx = line_num - 1  # 0-based
-        if file_lines[idx].strip() == "{":
-            for back in range(idx - 1, max(idx - 20, -1), -1):
-                stripped = file_lines[back].strip()
-                if not stripped:
-                    continue
-                # A line ending with `)` or `) {` is the function signature.
-                # A line starting with a storage-class / type keyword also qualifies.
-                if stripped.endswith(")") or re.match(r"^(?:static|extern|inline|const|void|int|unsigned|char|long|short|float|double|struct|enum|union|_Bool|__attribute__)\b", stripped):
-                    line_num = back + 1  # back to 1-based
-                    break
-            # If still on `{`, reject this result.
-            if file_lines[line_num - 1].strip() == "{":
-                return -1
-
-        return line_num
-
-    except Exception:
-        return -1
-
-
-def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: str, version: str = "v2", symbol_name: str = "", bundle: Any = None) -> int:
     """Return a 1-based insertion line based on AST analysis (best-effort).
 
     Strategy: insert before a selected function definition start line (start.line).
-    - Tier 1 (LLM): for __revert_* symbols, read V2 source and find the earliest
-      reference/usage of the underlying function, then anchor before that reference.
-    - Tier 2 (KB): find the underlying V2 function and anchor before the preceding function.
-    - Tier 3 (fallback): insert before the first function definition in the file.
+    - Tier 1 (default): insert before the first function definition in the file.
+    - Tier 2 (`__revert_*` only): anchor before the function preceding the underlying V2 target.
+    - `force_tier1=True` bypasses Tier 2 and always uses "before first function".
     - If `REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG` is set, try to match that signature (ignore arg types).
     """
     def no_anchor() -> int:
@@ -636,6 +546,7 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     ver = str(version or "v2").strip().lower()
     if ver not in {"v1", "v2"}:
         ver = "v2"
+    _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
 
     base = Path(str(file_path or "").strip()).name
     if not base:
@@ -655,17 +566,7 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                 nodes = ver_index[key]
                 break
     if not isinstance(nodes, list) or not nodes:
-        # No KB data; try LLM tier for __revert_* symbols before giving up.
-        _kind0, _underlying0 = _symbol_underlying_name(str(symbol_name or ""))
-        if _kind0 == "revert_function" and _underlying0:
-            llm_line = _llm_find_insertion_line_for_revert_symbol(
-                agent_tools,
-                file_path=str(file_path or "").strip(),
-                underlying_name=_underlying0,
-                version=ver,
-            )
-            if llm_line > 0:
-                return llm_line
+        # No KB data; give up.
         return no_anchor()
 
     # NOTE: For __revert_* functions (kind == "revert_function"), we intentionally
@@ -712,6 +613,11 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     if not candidates:
         return no_anchor()
 
+    if force_tier1:
+        first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
+        sl = start_line(first)
+        return sl if sl > 0 else -1
+
     want_sig = _extra_skeleton_anchor_func_sig()
     if want_sig:
         for n in candidates:
@@ -724,19 +630,8 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
     # anchoring at the first function.  The first-function anchor may precede
     # required type definitions (e.g. bcf_hdr_t), causing "unknown type name"
     # and "conflicting types" errors.
-    _kind, _underlying = _symbol_underlying_name(str(symbol_name or ""))
-    if _kind == "revert_function" and _underlying:
-        # LLM-guided — read V2 source and find the earliest reference to
-        # the underlying function, then anchor before that reference.
-        llm_line = _llm_find_insertion_line_for_revert_symbol(
-            agent_tools,
-            file_path=str(file_path or "").strip(),
-            underlying_name=_underlying,
-            version=ver,
-        )
-        if llm_line > 0:
-            return llm_line
-
+    if not force_tier1 and _kind == "revert_function" and _underlying:
+        tier2_anchor = -1
         # Tier 2: KB heuristic — find the underlying V2 function in the
         # candidates and anchor before the immediately preceding function.
         # In typical header layouts (e.g. vcf.h) the caller is defined just
@@ -756,10 +651,42 @@ def _ast_insert_line_number_for_extra_skeleton(agent_tools: Any, *, file_path: s
                     prev = max(preceding, key=lambda n: start_line(n))
                     prev_sl = start_line(prev)
                     if prev_sl > 0:
-                        return prev_sl
+                        tier2_anchor = prev_sl
                 # No preceding function — anchor at the underlying function
                 # itself; types it uses must already be defined by then.
-                return target_sl
+                if tier2_anchor <= 0:
+                    tier2_anchor = target_sl
+
+        # Guardrail: if we can see an earlier reference from existing non-extra
+        # hunks, never place the declaration after that first use.
+        ref_line = _bundle_earliest_reference_line(
+            bundle,
+            file_path=str(file_path or "").strip(),
+            symbol_name=str(symbol_name or "").strip(),
+        )
+        ref_anchor = -1
+        if ref_line > 0:
+            containing = [
+                n for n in candidates
+                if start_line(n) > 0 and end_line(n) > 0 and start_line(n) <= ref_line <= end_line(n)
+            ]
+            if containing:
+                ref_anchor = max(containing, key=lambda n: start_line(n))
+                ref_anchor = start_line(ref_anchor)
+            else:
+                preceding = [n for n in candidates if 0 < start_line(n) < ref_line]
+                if preceding:
+                    ref_anchor = start_line(max(preceding, key=lambda n: start_line(n)))
+                else:
+                    first_ref = min(candidates, key=lambda n: (start_line(n), end_line(n)))
+                    ref_anchor = start_line(first_ref)
+
+        if ref_anchor > 0 and (tier2_anchor <= 0 or tier2_anchor > ref_line):
+            return ref_anchor
+        if tier2_anchor > 0:
+            return tier2_anchor
+        if ref_anchor > 0:
+            return ref_anchor
 
     first = min(candidates, key=lambda n: (start_line(n), end_line(n)))
     sl = start_line(first)
@@ -849,7 +776,15 @@ def _skip_past_macro_continuation(lines: List[str], idx: int) -> int:
     return min(idx, len(lines))
 
 
-def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines: int = 3, symbol_name: str = "", bundle: Any = None) -> str:
+def _new_extra_patch_skeleton(
+    agent_tools: Any,
+    *,
+    file_path: str,
+    context_lines: int = 3,
+    symbol_name: str = "",
+    bundle: Any = None,
+    force_tier1: bool = False,
+) -> str:
     """Create a minimal unified diff skeleton for a brand-new `_extra_*` patch key."""
     sm = getattr(agent_tools, "source_manager", None)
     if sm is None:
@@ -866,7 +801,7 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     insert_at = -1
     insert_line = _ast_insert_line_number_for_extra_skeleton(
         agent_tools, file_path=str(file_path or "").strip(), version=version_used, symbol_name=str(symbol_name or "").strip(),
-        bundle=bundle,
+        bundle=bundle, force_tier1=bool(force_tier1),
     )
     if insert_line > 0:
         # We insert before the context line at insert_line; index is 0-based.
@@ -932,6 +867,10 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     if insert_at < 0:
         insert_at = _find_file_scope_insertion_index(lines)
 
+    # Do not place inserted declarations inside dead-code regions.
+    # Backward boundary selection can otherwise jump to a `}` under `#if 0`.
+    insert_at = _skip_out_of_if0_block(lines, insert_at)
+
     # Find the last #include line in the initial header section to ensure we don't insert before type definitions
     # Stop tracking includes once we've seen actual code (to avoid late includes in the file)
     last_include_idx = -1
@@ -953,6 +892,7 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
     # Safety: if insert_at lands inside a multi-line #define macro (backslash-continued lines),
     # advance past the macro to avoid splitting it.
     insert_at = _skip_past_macro_continuation(lines, insert_at)
+    insert_at = _skip_out_of_if0_block(lines, insert_at)
 
     # For header files with include guards, clamp insert_at to stay inside the guard
     # AND inside any trailing `extern "C" { ... }` block.
@@ -984,6 +924,8 @@ def _new_extra_patch_skeleton(agent_tools: Any, *, file_path: str, context_lines
                 break
             if insert_at >= ceiling:
                 insert_at = ceiling
+
+    insert_at = _skip_out_of_if0_block(lines, insert_at)
 
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
@@ -2113,6 +2055,79 @@ def _repair_disabled_enum_if0_wrapper(patch_text: str) -> str:
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
+def _first_hunk_minus_code_lines(patch_text: str) -> List[str]:
+    """Return code lines from '-' entries in the first hunk body."""
+    raw = str(patch_text or "")
+    if not raw.strip():
+        return []
+    lines = raw.splitlines()
+    first_hunk = next((i for i, l in enumerate(lines) if l.startswith("@@")), -1)
+    if first_hunk < 0:
+        return []
+
+    out: List[str] = []
+    for i in range(first_hunk + 1, len(lines)):
+        line = lines[i]
+        if line.startswith("@@") or line.startswith("diff --git "):
+            break
+        if line.startswith("-") and not line.startswith("---"):
+            out.append(_strip_diff_prefix(line).rstrip())
+    return out
+
+
+def _split_code_lines_into_blocks(code_lines: List[str]) -> List[List[str]]:
+    """Split code lines into declaration blocks separated by blank lines."""
+    blocks: List[List[str]] = []
+    cur: List[str] = []
+    for raw in (code_lines or []):
+        line = str(raw or "").rstrip()
+        if not line.strip():
+            if cur:
+                blocks.append(cur)
+                cur = []
+            continue
+        cur.append(line)
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def _flatten_blocks_with_blank_lines(blocks: List[List[str]]) -> List[str]:
+    """Flatten declaration blocks into code lines, keeping one blank line between blocks."""
+    out: List[str] = []
+    for block in (blocks or []):
+        clean = [str(l).rstrip() for l in (block or []) if str(l or "").strip()]
+        if not clean:
+            continue
+        if out:
+            out.append("")
+        out.extend(clean)
+    return out
+
+
+def _extra_hunk_contains_enum_tag(patch_text: str, *, tag_name: str) -> bool:
+    """Return True if first hunk minus-lines contain `enum <tag_name>`."""
+    tag = str(tag_name or "").strip()
+    if not tag:
+        return False
+    head_re = re.compile(rf"^(?:typedef\s+)?enum\s+{re.escape(tag)}\b")
+    for code in _first_hunk_minus_code_lines(patch_text):
+        if head_re.match(str(code or "").strip()):
+            return True
+    return False
+
+
+def _is_enum_insertion_block(*, insert_kind: str, inserted_lines: List[str]) -> bool:
+    """Return True when the insertion payload is an enum declaration/definition block."""
+    kind = str(insert_kind or "")
+    if "ENUM_DECL" in kind:
+        return True
+    first = next((str(l).strip() for l in (inserted_lines or []) if str(l).strip()), "")
+    if not first:
+        return False
+    return bool(re.match(r"^(?:typedef\s+)?enum\b", first))
+
+
 def _should_prepend_extra_hunk_insertion(*, insert_kind: str, inserted_lines: List[str]) -> bool:
     """Return True when inserted_lines should be prepended in the `_extra_*` hunk.
 
@@ -3003,19 +3018,7 @@ def make_extra_patch_override(
 
     patches = bundle.patches if isinstance(getattr(bundle, "patches", None), dict) else {}
     patch = patches.get(extra_key)
-    if patch is None:
-        existing = _new_extra_patch_skeleton(agent_tools, file_path=file_path_s, symbol_name=symbol, bundle=bundle)
-        if not existing.strip():
-            return {
-                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
-                "file_path": file_path_s,
-                "symbol_name": symbol,
-                "patch_key": extra_key,
-                "patch_text": "",
-                "note": "Failed to create a new _extra_* patch hunk skeleton (could not read V2 source for file).",
-            }
-    else:
-        existing = str(getattr(patch, "patch_text", "") or "")
+    existing = str(getattr(patch, "patch_text", "") or "") if patch is not None else ""
 
     normalized_actions: List[str] = []
     enum_rename_overrides: List[Dict[str, Any]] = []
@@ -3146,6 +3149,37 @@ def make_extra_patch_override(
                     existing = renamed_existing
                     normalized_actions.append("prefix_conflicting_enum_constants")
                     enum_rename_overrides = _rename_enum_refs_in_bundle(bundle, file_path_s, rename_map)
+
+        # Existing enum blocks may already be present but anchored too late
+        # (e.g. inherited _extra_* hunk). Re-anchor the whole hunk to Tier 1.
+        enum_tag_for_reanchor = ""
+        if tag_symbol_kind == "enum" and tag_symbol_name:
+            enum_tag_for_reanchor = tag_symbol_name
+        elif re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", symbol) and _extra_hunk_contains_enum_tag(existing, tag_name=symbol):
+            enum_tag_for_reanchor = symbol
+
+        if enum_tag_for_reanchor and agent_tools is not None:
+            refreshed = _new_extra_patch_skeleton(
+                agent_tools,
+                file_path=file_path_s,
+                symbol_name=symbol,
+                bundle=bundle,
+                force_tier1=True,
+            )
+            if refreshed.strip():
+                carried_lines = _first_hunk_minus_code_lines(existing)
+                carried_blocks = _split_code_lines_into_blocks(carried_lines)
+                merged_blocks = _merge_extra_hunk_blocks(carried_blocks)
+                merged_lines = _flatten_blocks_with_blank_lines(merged_blocks)
+                if merged_lines:
+                    reanchored = _insert_minus_block_into_patch_text(
+                        refreshed,
+                        insert_lines=[""] + merged_lines,
+                        prefer_prepend=True,
+                    )
+                    if reanchored.strip() and reanchored != existing:
+                        existing = reanchored
+                        normalized_actions.append("reanchor_extra_hunk_tier1_for_enum")
 
         if normalized_actions or enum_rename_overrides:
             store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
@@ -3448,6 +3482,48 @@ def make_extra_patch_override(
             "patch_text": "",
             "note": note,
         }
+
+    # For enum insertions, existing `_extra_*` hunks may be anchored too late.
+    # Move the hunk to Tier 1 and carry prior inserted declarations with the
+    # new enum block so type definitions appear before function declarations.
+    if _is_enum_insertion_block(insert_kind=insert_kind, inserted_lines=inserted_lines) and existing.strip() and agent_tools is not None:
+        refreshed = _new_extra_patch_skeleton(
+            agent_tools,
+            file_path=file_path_s,
+            symbol_name=symbol,
+            bundle=bundle,
+            force_tier1=True,
+        )
+        if refreshed.strip():
+            carried_lines = _first_hunk_minus_code_lines(existing)
+            carried_blocks = _split_code_lines_into_blocks(carried_lines)
+            merged_blocks = _merge_extra_hunk_blocks([list(inserted_lines)], carried_blocks)
+            merged_lines = _flatten_blocks_with_blank_lines(merged_blocks)
+            if merged_lines:
+                existing = refreshed
+                inserted_lines = merged_lines
+                insert_kind = (insert_kind + ":reanchor_tier1").strip(":")
+
+    # For a brand-new `_extra_*` hunk, generate the skeleton after we know the
+    # insertion payload so enum inserts can force Tier 1 anchoring.
+    if not existing.strip():
+        force_tier1 = _is_enum_insertion_block(insert_kind=insert_kind, inserted_lines=inserted_lines)
+        existing = _new_extra_patch_skeleton(
+            agent_tools,
+            file_path=file_path_s,
+            symbol_name=symbol,
+            bundle=bundle,
+            force_tier1=force_tier1,
+        )
+        if not existing.strip():
+            return {
+                "patch_path": str(Path(patch_path_s).expanduser().resolve()),
+                "file_path": file_path_s,
+                "symbol_name": symbol,
+                "patch_key": extra_key,
+                "patch_text": "",
+                "note": "Failed to create a new _extra_* patch hunk skeleton (could not read V2 source for file).",
+            }
 
     # If we are inserting a by-value global of an opaque type (common with typedef'd structs),
     # rewrite it to a pointer form to avoid incomplete-type build errors.

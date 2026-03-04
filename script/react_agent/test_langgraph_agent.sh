@@ -1302,6 +1302,7 @@ PY
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -1836,6 +1837,7 @@ import json
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 script_dir = Path(sys.argv[1]).resolve()
@@ -1845,17 +1847,17 @@ sys.path.insert(0, str(script_dir.parents[0]))
 from core.kb_index import KbIndex  # noqa: E402
 from core.source_manager import SourceManager  # noqa: E402
 from tools.extra_patch_tools import _ast_insert_line_number_for_extra_skeleton  # noqa: E402
-from tools.extra_patch_tools import _llm_find_insertion_line_for_revert_symbol  # noqa: E402
+from tools.extra_patch_tools import _new_extra_patch_skeleton  # noqa: E402
 from tools.symbol_tools import AgentTools  # noqa: E402
 
 with tempfile.TemporaryDirectory() as td_raw:
     td = Path(td_raw)
     os.environ.pop("REACT_AGENT_EXTRA_SKELETON_ANCHOR_FUNC_SIG", None)
-    # Disable LLM skeleton anchor so tests are deterministic/offline.
-    os.environ["REACT_AGENT_DISABLE_SKELETON_LLM"] = "1"
 
     kb_v1 = td / "kb_v1"; kb_v1.mkdir()
     kb_v2 = td / "kb_v2"; kb_v2.mkdir()
+    (td / "v1").mkdir()
+    (td / "v2").mkdir()
 
     # V2 has two functions: early_func at lines 10-20, underlying_func at lines 100-200.
     # The __revert_* prototype must anchor at line 10 (first func), not line 201.
@@ -1898,12 +1900,6 @@ with tempfile.TemporaryDirectory() as td_raw:
     )
     assert result2 == 10, f"Expected 10, got {result2}"
 
-    # _llm_find_insertion_line_for_revert_symbol returns -1 when disabled via env var.
-    llm_result = _llm_find_insertion_line_for_revert_symbol(
-        tools, file_path="test.c", underlying_name="myfunc", version="v2",
-    )
-    assert llm_result == -1, f"Expected -1 (LLM disabled), got {llm_result}"
-
     # Tier 2 KB heuristic: with 3 functions, the __revert_* anchor should pick
     # the preceding function (caller_func at line 500), NOT the first function
     # in the file (first_func at line 10 which may precede type definitions).
@@ -1945,6 +1941,69 @@ with tempfile.TemporaryDirectory() as td_raw:
         symbol_name="__revert_deadbeef_targetfn",
     )
     assert result3 == 500, f"Expected 500 (preceding func), got {result3}"
+
+    # Guardrail: if bundle evidence shows an earlier call site than Tier-2,
+    # anchor before that earliest-use function instead of after it.
+    early_caller = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "early_caller",
+        "location": {"file": "big.h", "line": 619, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 619, "column": 1},
+            "end": {"file": "big.h", "line": 650, "column": 1},
+        },
+    }
+    later_func = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "later_func",
+        "location": {"file": "big.h", "line": 697, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 697, "column": 1},
+            "end": {"file": "big.h", "line": 710, "column": 1},
+        },
+    }
+    target_late = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "targetfn",
+        "location": {"file": "big.h", "line": 746, "column": 1},
+        "extent": {
+            "start": {"file": "big.h", "line": 746, "column": 1},
+            "end": {"file": "big.h", "line": 770, "column": 1},
+        },
+    }
+    (kb_v2 / "big.h_analysis.json").write_text(
+        json.dumps([early_caller, later_func, target_late]), encoding="utf-8"
+    )
+    kb_guard = KbIndex(str(kb_v1), str(kb_v2))
+    tools_guard = AgentTools(kb_guard, SourceManager(str(td / "v1"), str(td / "v2")))
+    bundle = SimpleNamespace(
+        patches={
+            "tail-big.h-f1_": SimpleNamespace(
+                patch_text=(
+                    "diff --git a/big.h b/big.h\n"
+                    "--- a/big.h\n"
+                    "+++ b/big.h\n"
+                    "@@ -620,1 +620,1 @@\n"
+                    "-    return __revert_deadbeef_targetfn(x);\n"
+                ),
+                new_start_line=620,
+            )
+        }
+    )
+    result3_guard = _ast_insert_line_number_for_extra_skeleton(
+        tools_guard, file_path="big.h", version="v2",
+        symbol_name="__revert_deadbeef_targetfn",
+        bundle=bundle,
+    )
+    assert result3_guard == 619, f"Expected 619 (before earliest use), got {result3_guard}"
+
+    # Force Tier 1 for enum-style insertions: before the first function.
+    result3_tier1 = _ast_insert_line_number_for_extra_skeleton(
+        tools3, file_path="big.h", version="v2",
+        symbol_name="__revert_deadbeef_targetfn",
+        force_tier1=True,
+    )
+    assert result3_tier1 == 10, f"Expected 10 (forced Tier 1), got {result3_tier1}"
 
     # Non-__revert_* symbol still gets line 10 (first func, unchanged default).
     result4 = _ast_insert_line_number_for_extra_skeleton(
@@ -1989,7 +2048,186 @@ with tempfile.TemporaryDirectory() as td_raw:
     )
     assert result5 == 50, f"Expected 50 (preceding func via basename fallback), got {result5}"
 
-    os.environ.pop("REACT_AGENT_DISABLE_SKELETON_LLM", None)
+    # Regression: backward boundary scanning must not place insertion before
+    # `#endif` of a `#if 0` dead-code block.
+    if0_source = "\n".join(
+        [
+            "#include <stdint.h>",
+            "",
+            "#if 0",
+            "static int dead(void) {",
+            "    return 0;",
+            "}",
+            "#endif",
+            "",
+            "static int live(void) {",
+            "    return 1;",
+            "}",
+            "",
+        ]
+    )
+    (td / "v2" / "if0_anchor.c").write_text(if0_source, encoding="utf-8")
+    if0_live_node = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "live",
+        "location": {"file": "if0_anchor.c", "line": 9, "column": 1},
+        "extent": {
+            "start": {"file": "if0_anchor.c", "line": 9, "column": 1},
+            "end": {"file": "if0_anchor.c", "line": 11, "column": 1},
+        },
+    }
+    (kb_v2 / "if0_anchor.c_analysis.json").write_text(
+        json.dumps([if0_live_node]), encoding="utf-8"
+    )
+    kb_if0 = KbIndex(str(kb_v1), str(kb_v2))
+    tools_if0 = AgentTools(kb_if0, SourceManager(str(td / "v1"), str(td / "v2")))
+    skel = _new_extra_patch_skeleton(tools_if0, file_path="if0_anchor.c", symbol_name="dummy")
+    assert skel, skel
+    m = re.search(r"^@@ -(?P<old_start>\\d+),(?P<old_len>\\d+) \\+(?P<new_start>\\d+),(?P<new_len>\\d+) @@", skel, re.MULTILINE)
+    assert m, skel
+    body = skel[m.end():].splitlines()
+    first_ctx = next((line for line in body if line.startswith(" ")), "")
+    assert first_ctx.strip() != "#endif", skel
+
+print("OK")
+PY
+
+# Extra patch override tool: when inserting an enum into an existing `_extra_*`
+# hunk anchored late in the file, re-anchor the hunk to Tier 1 (before first
+# function) and keep existing inserted declarations.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import json
+import os
+import pickle
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.extra_patch_tools import make_extra_patch_override  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+
+    (src_v1 / "a.c").write_text(
+        "enum my_enum {\n"
+        "    A = 0,\n"
+        "    B = 1,\n"
+        "};\n",
+        encoding="utf-8",
+    )
+
+    v2_lines = []
+    for i in range(1, 71):
+        if i == 1:
+            v2_lines.append("#include <stdio.h>")
+        elif i == 3:
+            v2_lines.append("typedef int marker_t;")
+        elif i == 10:
+            v2_lines.append("static int first_fn(void) { return 1; }")
+        elif i == 60:
+            v2_lines.append("static int late_context(void) { return 2; }")
+        else:
+            v2_lines.append("")
+    (src_v2 / "a.c").write_text("\n".join(v2_lines) + "\n", encoding="utf-8")
+
+    v1_enum = {
+        "kind": "ENUM_DECL",
+        "spelling": "my_enum",
+        "location": {"file": "a.c", "line": 1, "column": 1},
+        "extent": {
+            "start": {"file": "a.c", "line": 1, "column": 1},
+            "end": {"file": "a.c", "line": 4, "column": 2},
+        },
+    }
+    v2_fn_first = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "first_fn",
+        "location": {"file": "a.c", "line": 10, "column": 1},
+        "extent": {
+            "start": {"file": "a.c", "line": 10, "column": 1},
+            "end": {"file": "a.c", "line": 10, "column": 40},
+        },
+    }
+    v2_fn_late = {
+        "kind": "FUNCTION_DEFI",
+        "spelling": "late_context",
+        "location": {"file": "a.c", "line": 60, "column": 1},
+        "extent": {
+            "start": {"file": "a.c", "line": 60, "column": 1},
+            "end": {"file": "a.c", "line": 60, "column": 46},
+        },
+    }
+    (kb_v1 / "a_analysis.json").write_text(json.dumps([v1_enum]), encoding="utf-8")
+    (kb_v2 / "a_analysis.json").write_text(json.dumps([v2_fn_first, v2_fn_late]), encoding="utf-8")
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+
+    extra_patch_text = (
+        "diff --git a/a.c b/a.c\n"
+        "--- a/a.c\n"
+        "+++ b/a.c\n"
+        "@@ -60,1 +60,0 @@\n"
+        "-char *__revert_deadbeef_fn(enum my_enum m);\n"
+        " static int late_context(void) { return 2; }\n"
+    )
+    extra_patch = PatchInfo(
+        file_path_old="a.c",
+        file_path_new="a.c",
+        patch_text=extra_patch_text,
+        file_type="c",
+        old_start_line=60,
+        old_end_line=61,
+        new_start_line=60,
+        new_end_line=60,
+        patch_type={"Extra"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+
+    bundle_path = td / "bundle.patch2"
+    bundle_path.write_bytes(pickle.dumps({"_extra_a.c": extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    out = make_extra_patch_override(
+        tools,
+        patch_path=str(bundle_path),
+        file_path="/src/proj/a.c",
+        symbol_name="enum my_enum",
+        version="v1",
+    )
+
+    ref = out.get("patch_text") or {}
+    p = Path(str(ref.get("artifact_path") or "")).resolve()
+    assert p.is_file(), out
+    text = p.read_text(encoding="utf-8", errors="replace")
+
+    assert "-enum my_enum {" in text, text
+    assert "__revert_deadbeef_fn(enum my_enum m)" in text, text
+    assert "@@ -60," not in text, text
+    m = re.search(r"^@@ -(?P<old_start>\d+),(?P<old_len>\d+) \+(?P<new_start>\d+),(?P<new_len>\d+) @@", text, re.MULTILINE)
+    assert m, text
+    assert int(m.group("old_start")) < 30, text
 
 print("OK")
 PY
@@ -2585,6 +2823,105 @@ with tempfile.TemporaryDirectory() as td_raw:
     inserted = str(out.get("inserted_code") or "")
     assert "#define HTS_VERSION_TEXT" in inserted, inserted
     assert '"9.9.9"' in inserted or '"$(PACKAGE_VERSION)"' in inserted, inserted
+
+print("OK")
+PY
+
+# ToolRunner: print a warning when make_extra_patch_override returns the
+# "KB has nodes ... none produced readable source code" diagnostic note.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import contextlib
+import io
+import json
+import os
+import pickle
+import sys
+import tempfile
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from core.kb_index import KbIndex  # noqa: E402
+from core.source_manager import SourceManager  # noqa: E402
+from migration_tools.types import PatchInfo  # noqa: E402
+from tools.runner import ToolRunner  # noqa: E402
+from tools.symbol_tools import AgentTools  # noqa: E402
+
+with tempfile.TemporaryDirectory() as td_raw:
+    td = Path(td_raw)
+    os.environ["REACT_AGENT_PATCH_ALLOWED_ROOTS"] = str(td)
+    os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(td / "artifacts")
+
+    kb_v1 = td / "kb_v1"
+    kb_v2 = td / "kb_v2"
+    kb_v1.mkdir()
+    kb_v2.mkdir()
+
+    # v1 has symbol nodes, but source checkout intentionally lacks the file,
+    # so SourceManager cannot read code and make_extra returns the guidance note.
+    node = {
+        "kind": "FUNCTION_DECL",
+        "spelling": "tls_certificate_match",
+        "location": {"file": "ssl/t1_lib.c", "line": 12, "column": 1},
+        "extent": {
+            "start": {"file": "ssl/t1_lib.c", "line": 12, "column": 1},
+            "end": {"file": "ssl/t1_lib.c", "line": 12, "column": 40},
+        },
+    }
+    (kb_v1 / "ssl").mkdir(parents=True)
+    (kb_v1 / "ssl" / "t1_lib.c_analysis.json").write_text(json.dumps([node]), encoding="utf-8")
+
+    src_v1 = td / "src_v1"
+    src_v2 = td / "src_v2"
+    src_v1.mkdir()
+    src_v2.mkdir()
+
+    bundle_path = td / "bundle.patch2"
+    extra_patch = PatchInfo(
+        file_path_old="target.c",
+        file_path_new="target.c",
+        patch_text=(
+            "diff --git a/target.c b/target.c\n"
+            "--- a/target.c\n"
+            "+++ b/target.c\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old\n"
+            "+new\n"
+        ),
+        file_type="c",
+        old_start_line=1,
+        old_end_line=2,
+        new_start_line=1,
+        new_end_line=2,
+        patch_type={"Extra patch"},
+        old_signature="",
+        dependent_func=set(),
+        hiden_func_dict={},
+    )
+    bundle_path.write_bytes(pickle.dumps({"_extra_target.c": extra_patch}, protocol=pickle.HIGHEST_PROTOCOL))
+
+    tools = AgentTools(KbIndex(str(kb_v1), str(kb_v2)), SourceManager(str(src_v1), str(src_v2)))
+    runner = ToolRunner(tools, mode="real")
+
+    err_buf = io.StringIO()
+    with contextlib.redirect_stderr(err_buf):
+        obs = runner.call(
+            "make_extra_patch_override",
+            {
+                "patch_path": str(bundle_path),
+                "file_path": "/src/libtls/target.c",
+                "symbol_name": "tls_certificate_match",
+            },
+        )
+
+    assert obs.ok is True, obs
+    note = str((obs.output or {}).get("note") or "")
+    assert "KB has nodes for 'tls_certificate_match'" in note, note
+    warn_text = err_buf.getvalue()
+    assert "[WARNING][make_extra_patch_override]" in warn_text, warn_text
+    assert "none produced readable source code" in warn_text, warn_text
 
 print("OK")
 PY
