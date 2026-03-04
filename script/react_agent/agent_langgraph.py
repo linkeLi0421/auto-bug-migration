@@ -2856,6 +2856,9 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
 
 
 _REVERT_NAME_RE = re.compile(r"__revert_[0-9a-fA-F]+_[A-Za-z_][A-Za-z0-9_]*")
+_LOCAL_REVERT_PROTO_LINE_RE = re.compile(
+    r"(?m)^\s*(?:(?:static|extern|inline|const|volatile|signed|unsigned|short|long|void|char|int|float|double|size_t|ssize_t|u?int(?:8|16|32|64)_t|struct\s+[A-Za-z_][A-Za-z0-9_]*|union\s+[A-Za-z_][A-Za-z0-9_]*|enum\s+[A-Za-z_][A-Za-z0-9_]*|[A-Za-z_][A-Za-z0-9_]*_t)\s+)+[*\s]*\b(?P<name>__revert_[0-9a-fA-F]+_[A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*;\s*$"
+)
 
 
 def _extract_revert_symbol_names(text: str) -> set[str]:
@@ -2863,6 +2866,13 @@ def _extract_revert_symbol_names(text: str) -> set[str]:
     if not raw.strip():
         return set()
     return set(m.group(0) for m in _REVERT_NAME_RE.finditer(raw))
+
+
+def _extract_local_revert_prototype_names(text: str) -> set[str]:
+    raw = str(text or "")
+    if not raw.strip():
+        return set()
+    return {str(m.group("name") or "").strip() for m in _LOCAL_REVERT_PROTO_LINE_RE.finditer(raw) if str(m.group("name") or "").strip()}
 
 
 def _override_preserve_revert_symbols_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
@@ -2984,6 +2994,66 @@ def _override_no_new_revert_symbols_guardrail_error(state: AgentState, decision:
     return (
         f"new_func_code introduces {len(added)} new __revert_* identifiers not present in the BASE slice ({base_source}): "
         f"{preview}. Do not change function names/call targets by introducing new __revert_* helpers; keep existing names."
+    )
+
+
+def _override_no_local_revert_prototypes_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
+    """Return an error if new_func_code adds local __revert_* prototypes inside a function body.
+
+    Such declarations are often inserted in the middle of a rewritten function and can
+    be invisible to earlier callsites in the translation unit. Missing prototypes should
+    be added via make_extra_patch_override (file scope), not as local statements.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_error_patch_override":
+        return None
+
+    base_text = ""
+    base_source = ""
+
+    loop_base_path = str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+    if loop_base_path:
+        try:
+            base_text = _read_text(loop_base_path)
+            base_source = "loop_base_func_code_artifact_path"
+        except Exception:
+            base_text = ""
+
+    if not base_text.strip():
+        err_func_path = str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        if err_func_path:
+            try:
+                base_text = _read_text(err_func_path)
+                base_source = "get_error_patch_context.error_func_code"
+            except Exception:
+                base_text = ""
+
+    if not base_text.strip():
+        base_text = _last_read_artifact_text(state)
+        base_source = "read_artifact"
+
+    if not base_text.strip():
+        return None
+
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    new_raw = str(args_obj.get("new_func_code", "") or "")
+    new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
+    if not new_text.strip():
+        return "new_func_code is empty."
+
+    base_protos = _extract_local_revert_prototype_names(base_text)
+    new_protos = _extract_local_revert_prototype_names(new_text)
+    added = sorted(new_protos - base_protos)
+    if not added:
+        return None
+
+    preview = ", ".join(added[:6])
+    if len(added) > 6:
+        preview += ", ..."
+    return (
+        f"new_func_code adds {len(added)} local `__revert_*` prototype declaration(s) not present in the BASE slice ({base_source}): "
+        f"{preview}. Do not add local forward declarations inside function bodies; use make_extra_patch_override for file-scope prototypes."
     )
 
 
@@ -6277,6 +6347,57 @@ def _run_langgraph(
                                 "next_step": (
                                     f"{new_revert_err2}\n\n"
                                     "Manually edit the BASE slice (read_artifact output) to avoid introducing new `__revert_*` helper names, then rerun."
+                                ).strip(),
+                                "steps": _steps_for_output(st),
+                                "error": _error_payload(st),
+                            },
+                        }
+
+        # Guardrail: local __revert_* prototypes inside a rewritten function are usually
+        # ineffective; force file-scope insertion via make_extra_patch_override instead.
+        if str(decision.get("tool", "")).strip() == "make_error_patch_override":
+            local_proto_err = _override_no_local_revert_prototypes_guardrail_error(st, decision)
+            if local_proto_err:
+                repair_model = _guardrail_repair_model(model)
+                raw2 = _complete(
+                    repair_model,
+                    _build_guardrail_repair_messages(
+                        st,
+                        messages,
+                        decision,
+                        (
+                            "Your make_error_patch_override.new_func_code adds local `__revert_*` forward declaration(s) inside the function body.\n"
+                            f"{local_proto_err}\n\n"
+                            "Fix: remove local `__revert_*` prototypes from the function body.\n"
+                            "If a prototype is needed, call make_extra_patch_override(symbol_name=...) to add it at file scope.\n"
+                            "Return exactly one JSON object of type tool calling make_error_patch_override."
+                        ),
+                    ),
+                    label="override_local_revert_prototype_repair",
+                )
+                try:
+                    repaired = _parse_decision(raw2)
+                except Exception:
+                    repaired = {}
+                if (
+                    isinstance(repaired, dict)
+                    and repaired.get("type") == "tool"
+                    and str(repaired.get("tool", "")).strip() == "make_error_patch_override"
+                ):
+                    _validate_tool_decision(repaired)  # type: ignore[arg-type]
+                    local_proto_err2 = _override_no_local_revert_prototypes_guardrail_error(st, repaired)  # type: ignore[arg-type]
+                    if not local_proto_err2:
+                        decision = repaired  # type: ignore[assignment]
+                    else:
+                        return {
+                            "state": st,
+                            "final": {
+                                "type": "final",
+                                "thought": "Model repeatedly inserted local __revert_* prototypes in override code.",
+                                "summary": "Stopped before patch generation due to local prototype declarations in the override body.",
+                                "next_step": (
+                                    f"{local_proto_err2}\n\n"
+                                    "Move missing prototype fixes to make_extra_patch_override (file-scope) and keep the function override body free of local forward declarations."
                                 ).strip(),
                                 "steps": _steps_for_output(st),
                                 "error": _error_payload(st),

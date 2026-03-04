@@ -100,6 +100,47 @@ class SourceManager:
         path = path.lstrip("/")
         return self._strip_repo_name_prefix(path, repo_name=repo_name)
 
+    def _repo_relative_candidates(self, file_path: str, version: str, *, resolved: Optional[Path] = None) -> List[str]:
+        """Return ordered repo-relative path candidates for fallbacks (git/generated)."""
+        root = self._repo_root(version).resolve()
+        repo_name = str(root.name or "").strip()
+        raw = str(file_path or "").replace("\\", "/").strip()
+        raw_rel = raw.lstrip("/")
+
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        def add(path_s: str) -> None:
+            rel = str(path_s or "").replace("\\", "/").strip().lstrip("/")
+            if not rel:
+                return
+            if rel in seen:
+                return
+            seen.add(rel)
+            candidates.append(rel)
+
+        # Primary canonical candidate.
+        add(self._repo_relative_path(file_path, version, resolved=resolved))
+
+        # Direct raw relative path and repo-name normalization.
+        add(raw_rel)
+        add(self._strip_repo_name_prefix(raw_rel, repo_name=repo_name))
+
+        if raw_rel.startswith("src/"):
+            add(self._strip_src_repo_prefix(raw_rel, repo_name=repo_name))
+        else:
+            # Many repos nest paths under src/, while diagnostics may omit the prefix.
+            add(f"src/{raw_rel}" if raw_rel else "")
+
+        # If we resolved to an absolute path, include the concrete relative path from repo root.
+        if resolved is not None:
+            try:
+                add(resolved.resolve().relative_to(root).as_posix())
+            except Exception:
+                pass
+
+        return candidates
+
     @staticmethod
     def _expand_make_vars(text: str, variables: Dict[str, str]) -> str:
         out = str(text or "")
@@ -335,6 +376,12 @@ class SourceManager:
                 if candidate2.exists():
                     return candidate2
 
+            # Fallback: the repo may nest sources under src/ (e.g. ndpi/src/include/...),
+            # so try the original path relative to repo root before stripping src/.
+            candidate_orig = repo_root / norm_path.lstrip("/")
+            if candidate_orig.exists():
+                return candidate_orig
+
             # Fallback: prefer a top-level file match when basename is unique at repo root.
             base = Path(rel).name
             if base:
@@ -376,15 +423,19 @@ class SourceManager:
     def get_code_segment(self, file_path: str, start_line: int, end_line: int, version: str) -> str:
         """Read a code segment between start_line and end_line (inclusive)."""
         resolved = self._resolve_path(file_path, version)
-        rel = self._repo_relative_path(file_path, version, resolved=resolved)
+        rel_candidates = self._repo_relative_candidates(file_path, version, resolved=resolved)
         text = ""
 
         # Prefer git-object reads when a commit hint is configured. This avoids subtle mismatches where
         # the configured --v1-src/--v2-src worktrees exist but are checked out at a different revision
         # than the KB JSON (line numbers/extents drift and we extract the wrong lines).
-        if self._git_commit_hint(version) and rel and not Path(rel).is_absolute():
-            if rel:
+        if self._git_commit_hint(version):
+            for rel in rel_candidates:
+                if Path(rel).is_absolute():
+                    continue
                 text = self._git_show_file(rel, version)
+                if text:
+                    break
 
         if not text:
             if resolved and resolved.exists():
@@ -392,11 +443,18 @@ class SourceManager:
             else:
                 # Fallback: if the file isn't present in the working tree, try reading from git objects
                 # using REACT_AGENT_V1_SRC_COMMIT / REACT_AGENT_V2_SRC_COMMIT.
-                if rel and not Path(rel).is_absolute():
+                for rel in rel_candidates:
+                    if Path(rel).is_absolute():
+                        continue
                     text = self._git_show_file(rel, version)
-                if not text and rel:
-                    # Generated headers may not exist in either the worktree or git objects.
-                    text = self._synthesize_generated_file(rel, version)
+                    if text:
+                        break
+                if not text:
+                    for rel in rel_candidates:
+                        # Generated headers may not exist in either the worktree or git objects.
+                        text = self._synthesize_generated_file(rel, version)
+                        if text:
+                            break
                 if not text:
                     return ""
         lines = text.splitlines()

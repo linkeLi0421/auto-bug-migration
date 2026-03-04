@@ -44,26 +44,44 @@ class AgentTools:
         """Return source context around a line number."""
         if not file_path or line_number <= 0:
             return ""
-        start_line = max(line_number - max(context, 0), 1)
-        end_line = max(line_number + max(context, 0), start_line)
         resolved = self.source_manager._resolve_path(file_path, version)
-        if not resolved or not resolved.exists():
-            return ""
-        text = resolved.read_text(encoding="utf-8", errors="replace")
+        text = ""
+        if resolved is not None and resolved.exists():
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        if not text:
+            # Fallback path for missing/mismatched worktrees: uses SourceManager's
+            # git-object and generated-header fallbacks.
+            text = self.source_manager.get_code_segment(file_path, 1, 1_000_000_000, version)
+        if not text:
+            resolved_s = str(resolved) if resolved is not None else "<unresolved>"
+            return (
+                f"File: {file_path}\n"
+                f"Resolved: {resolved_s}\n"
+                f"Context: line {line_number} (±{context})\n"
+                "Error: unable to read file content."
+            )
         lines = text.splitlines()
         if not lines:
             return ""
-        end_line = min(end_line, len(lines))
+        total = len(lines)
+        target_line = max(1, min(int(line_number), total))
+        start_line = max(target_line - max(context, 0), 1)
+        end_line = min(max(target_line + max(context, 0), start_line), total)
 
         numbered: List[str] = []
         for ln in range(start_line, end_line + 1):
-            prefix = ">>" if ln == line_number else "  "
+            prefix = ">>" if ln == target_line else "  "
             numbered.append(f"{prefix}{ln:6d}: {lines[ln - 1]}")
 
+        resolved_s = str(resolved) if resolved is not None else "<unresolved>"
+        if line_number != target_line:
+            where = f"requested line {line_number}, clamped to {target_line}"
+        else:
+            where = f"line {line_number}"
         return (
             f"File: {file_path}\n"
-            f"Resolved: {resolved}\n"
-            f"Context: line {line_number} (±{context})\n"
+            f"Resolved: {resolved_s}\n"
+            f"Context: {where} (±{context})\n"
             + "\n".join(numbered)
         )
 
