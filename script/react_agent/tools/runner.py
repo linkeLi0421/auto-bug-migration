@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sys
 from typing import Any, Dict, Literal, Optional
 
 from agent_tools import AgentTools
@@ -58,6 +59,17 @@ def _as_bool(value: Any, default: bool) -> bool:
         if lowered in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+def _emit_known_output_warnings(tool: str, output: Any) -> None:
+    """Print actionable warnings for known tool-output failure modes."""
+    if not isinstance(output, dict):
+        return
+    note = str(output.get("note", "") or "").strip()
+    if not note:
+        return
+    if "KB has nodes for" in note and "none produced readable source code" in note:
+        sys.stderr.write(f"[WARNING][{tool}] {note}\n")
 
 
 class ToolRunner:
@@ -492,6 +504,7 @@ class ToolRunner:
                     symbol_name=symbol_name,
                     prefer_definition=prefer_definition,
                 )
+                _emit_known_output_warnings(tool, out)
                 return ToolObservation(
                     True,
                     tool,
