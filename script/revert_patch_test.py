@@ -926,6 +926,24 @@ def parse_arguments():
     parser.add_argument('--auto-select-images', action='store_true',
                         help='Automatically select Docker images based on commit timestamp for collect_trace/collect_crash. '
                              'By default, images are not automatically selected unless this flag is set or --fixed-image is used.')
+    parser.add_argument(
+        '--react-agent-max-steps',
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_STEPS", "200") or 200),
+        help='Max steps for a single ReAct agent run (default: REACT_AGENT_MAX_STEPS or 200).',
+    )
+    parser.add_argument(
+        '--react-agent-max-restarts-per-hunk',
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_RESTARTS_PER_HUNK", "3") or 3),
+        help='Max clean-slate reruns per patch hunk (default: REACT_AGENT_MAX_RESTARTS_PER_HUNK or 3).',
+    )
+    parser.add_argument(
+        '--react-agent-max-multi-agent-rounds',
+        type=int,
+        default=int(os.environ.get("REACT_AGENT_MAX_MULTI_AGENT_ROUNDS", "100") or 100),
+        help='Max iterative multi-agent rounds (default: REACT_AGENT_MAX_MULTI_AGENT_ROUNDS or 100).',
+    )
 
     return parser.parse_args()
 
@@ -2021,14 +2039,14 @@ def call_react_agent(
     v2_src: str,
     sanitizer: str = "address",
     arch: str = "x86_64",
-    max_steps: int = 100,
+    max_steps: int = int(os.environ.get("REACT_AGENT_MAX_STEPS", "200") or 200),
     jobs: int = int(os.environ.get("REACT_AGENT_JOBS", "4")),
     max_groups: int = 100,
-    ossfuzz_loop_max: int = 20,
-    max_restarts_per_hunk: int = 3,
+    ossfuzz_loop_max: int = 40,
+    max_restarts_per_hunk: int = int(os.environ.get("REACT_AGENT_MAX_RESTARTS_PER_HUNK", "3") or 3),
     openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
-    max_multi_agent_rounds: int = 100,
+    max_multi_agent_rounds: int = int(os.environ.get("REACT_AGENT_MAX_MULTI_AGENT_ROUNDS", "100") or 100),
 ) -> dict:
     """Call the multi-agent to fix build errors with iterative rounds.
 
@@ -3444,6 +3462,9 @@ def apply_and_test_patches(
             v2_src=v2_src_path,
             sanitizer=sanitizer,
             arch=arch,
+            max_steps=max(1, int(getattr(args, "react_agent_max_steps", 200) or 200)),
+            max_restarts_per_hunk=max(0, int(getattr(args, "react_agent_max_restarts_per_hunk", 3) or 3)),
+            max_multi_agent_rounds=max(1, int(getattr(args, "react_agent_max_multi_agent_rounds", 100) or 100)),
         )
 
         # If the agent failed to fix all errors, skip copy and verification build

@@ -708,6 +708,71 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
     return "\n".join(out_lines).rstrip("\n") + "\n"
 
 
+def _split_multi_hunk_diff_blocks(patch_text: str) -> str:
+    """Split each multi-hunk `diff --git` block into one block per hunk.
+
+    This keeps each hunk independently addressable in downstream tooling that
+    consumes merged OSS-Fuzz diff artifacts.
+    """
+    raw = str(patch_text or "").rstrip("\n")
+    if not raw.strip():
+        return ""
+
+    lines = raw.splitlines()
+    blocks: list[list[str]] = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("diff --git "):
+            if lines[i].strip():
+                return raw + "\n"
+            i += 1
+            continue
+        start = i
+        i += 1
+        while i < len(lines) and not lines[i].startswith("diff --git "):
+            i += 1
+        block = list(lines[start:i])
+        while block and block[-1] == "":
+            block.pop()
+        if block:
+            blocks.append(block)
+
+    if not blocks:
+        return raw + "\n"
+
+    changed = False
+    out_blocks: list[list[str]] = []
+    for block in blocks:
+        parsed = _parse_diff_block(block)
+        if parsed is None:
+            return raw + "\n"
+        hunks = list(parsed.get("hunks") or [])
+        if len(hunks) <= 1:
+            out_blocks.append(block)
+            continue
+
+        changed = True
+        header_lines = list(parsed.get("header_lines") or [])
+        for hunk in hunks:
+            suffix = str(hunk.get("suffix") or "")
+            single: list[str] = []
+            single.extend(header_lines)
+            single.append(
+                f"@@ -{int(hunk['old_start'])},{int(hunk['old_len'])} +{int(hunk['new_start'])},{int(hunk['new_len'])} @@{suffix}".rstrip()
+            )
+            single.extend(list(hunk.get("body") or []))
+            out_blocks.append(single)
+
+    if not changed:
+        return raw + "\n"
+
+    out_lines: list[str] = []
+    for block in out_blocks:
+        out_lines.extend(block)
+        out_lines.append("")
+    return "\n".join(out_lines).rstrip("\n") + "\n"
+
+
 def _extra_hunk_minus_lines(patch_text: str) -> list[str]:
     """Return raw code lines for all '-' diff lines (excluding '---' headers)."""
     out: list[str] = []
@@ -1670,7 +1735,11 @@ def merge_patch_bundle_with_overrides(
 
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""
     if merged_text:
-        merged_text = _consolidate_same_file_diff_blocks(merged_text)
+        # Keep each hunk in its own block first, then only merge truly overlapping
+        # same-file blocks (to reduce accidental cross-hunk coupling).
+        merged_text = _split_multi_hunk_diff_blocks(merged_text)
+        if not _env_flag("REACT_AGENT_DISABLE_OVERLAP_HUNK_MERGE"):
+            merged_text = _consolidate_same_file_diff_blocks(merged_text)
 
 
     out_name = _safe_filename(str(output_name or "ossfuzz_merged.diff"))
