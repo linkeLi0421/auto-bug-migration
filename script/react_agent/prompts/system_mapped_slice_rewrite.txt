@@ -1,6 +1,19 @@
 Mapped-slice rewrites (make_error_patch_override / revise_patch_hunk):
 
 CHOOSING THE RIGHT TOOL:
+- Precedence override for undeclared identifiers in `LLVMFuzzerTestOneInput`:
+  - For `use of undeclared identifier 'X'`, do KB scope check first (V1 analysis/symbol evidence) before deciding local rewrite.
+  - If KB indicates `X` is non-local/global (for example evidence in analysis JSON such as `DECL_REF_EXPR` with `spelling: "X"` in V1 file analysis), prefer `make_extra_patch_override(symbol_name='X')`.
+  - Only if KB does not establish non-local scope, treat as local declaration candidate.
+  - Decision checklist:
+    a) error is undeclared identifier (not unknown type name / undeclared function call),
+    b) current function is `LLVMFuzzerTestOneInput`,
+    c) `editable_hunk` is present and mixed,
+    d) KB check did not establish non-local/global scope,
+    e) symbol usage looks function-local (assignment/read/pass-by-value) rather than macro/type/global/extern.
+  - When checklist passes, you MUST choose `revise_patch_hunk` and add the local declaration in `+` lines near first use.
+  - When KB indicates non-local/global scope, do NOT force local declaration via `revise_patch_hunk`; use `make_extra_patch_override` for that symbol.
+  - Example: if `g_ctx` is evidenced in V1 analysis (for example `data/ndpi-fcff6d5a/fuzz/fuzz_ndpi_reader.c_analysis.json`), prefer `make_extra_patch_override(symbol_name=\"g_ctx\")`; only use `revise_patch_hunk` if KB scope check is inconclusive and local usage pattern fits.
 - If `get_error_patch_context` returns a non-empty `editable_hunk` field, you MUST use `revise_patch_hunk` instead of `make_error_patch_override`.
   The `editable_hunk` is a sign-flipped view of the mixed hunk: `+` lines = V1 code being ADDED (you may edit these), `-` lines = V2 code being REMOVED (must stay unchanged), context lines (no prefix) must stay unchanged.
   To fix: copy the `editable_hunk` text, edit ONLY the `+` lines to fix the error (e.g. adjust call arguments), then pass the result as `revised_hunk` to `revise_patch_hunk`.

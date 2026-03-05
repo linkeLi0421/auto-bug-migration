@@ -2542,6 +2542,38 @@ with tempfile.TemporaryDirectory() as td_raw:
 print("OK")
 PY
 
+# Extra patch symbol detection: do not treat struct fields/param refs as a
+# top-level variable declaration in `_extra_*` hunks.
+"$PYTHON" - "$SCRIPT_DIR" <<'PY'
+import sys
+from pathlib import Path
+
+script_dir = Path(sys.argv[1]).resolve()
+sys.path.insert(0, str(script_dir))
+sys.path.insert(0, str(script_dir.parents[0]))
+
+from tools.extra_patch_tools import _symbol_defined_in_extra_hunk  # noqa: E402
+
+extra_patch_text = (
+    "diff --git a/fuzz/fuzz_ndpi_reader.c b/fuzz/fuzz_ndpi_reader.c\n"
+    "--- a/fuzz/fuzz_ndpi_reader.c\n"
+    "+++ b/fuzz/fuzz_ndpi_reader.c\n"
+    "@@ -40,27 +40,3 @@\n"
+    "-typedef struct ndpi_workflow {\n"
+    "-  struct ndpi_global_context *g_ctx;\n"
+    "-} ndpi_workflow_t;\n"
+    "-struct ndpi_workflow* __revert_fcff_ndpi_workflow_init(const struct ndpi_workflow_prefs *prefs,\n"
+    "-                         pcap_t *pcap_handle,\n"
+    "-                         struct ndpi_global_context *g_ctx);\n"
+)
+assert _symbol_defined_in_extra_hunk(extra_patch_text, symbol_name="g_ctx") is False
+
+extra_patch_text_with_global = extra_patch_text + "-struct ndpi_global_context *g_ctx;\n"
+assert _symbol_defined_in_extra_hunk(extra_patch_text_with_global, symbol_name="g_ctx") is True
+
+print("OK")
+PY
+
 # Extra patch override tool: normalize inherited malformed `_extra_*` hunks where
 # __revert_* declarations were inserted into the middle of enum members.
 "$PYTHON" - "$SCRIPT_DIR" <<'PY'

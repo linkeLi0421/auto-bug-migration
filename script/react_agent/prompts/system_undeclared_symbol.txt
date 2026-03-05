@@ -2,15 +2,28 @@ Undeclared symbol/type errors (C/C++):
 - Applies to: "use of undeclared identifier 'X'", "call to undeclared function 'X'", "unknown type name 'X'".
 
 Rule:
-- Undeclared identifiers/types/macros should use `make_extra_patch_override` first.
-- Undeclared `__revert_*` functions should use `make_extra_patch_override` (forward declarations).
-- Undeclared non-`__revert_*` function calls should be removed via caller rewrite.
+- Decision precedence (highest first):
+  1) For undeclared identifier `X`, run KB scope check first (V1 analysis / symbol evidence).
+  2) Undeclared `__revert_*` functions => `make_extra_patch_override` (forward declarations).
+  3) If KB does not establish non-local scope and `X` appears function-local in `LLVMFuzzerTestOneInput` mixed hunk => `revise_patch_hunk`.
+  4) Other undeclared identifiers/types/macros => `make_extra_patch_override` first.
+  5) Undeclared non-`__revert_*` function calls => remove via caller rewrite.
 
 1) Undeclared identifiers/types/macros (for example: "use of undeclared identifier 'RANSPR'", "unknown type name 'foo_t'"):
-   - **LOCAL-VAR EXCEPTION (LLVMFuzzerTestOneInput)**: If the diagnostic is "use of undeclared identifier 'X'" inside `LLVMFuzzerTestOneInput`, and `get_error_patch_context` returns non-empty `editable_hunk` (mixed `+`/`-`), treat `X` as a probable local variable first.
-   - In that case, use `revise_patch_hunk` to add the minimal local declaration in `+` lines near first use (for example `type *X = NULL;`) instead of `make_extra_patch_override`.
-   - Only use `make_extra_patch_override` for `X` after confirming `X` is not function-local (for example macro/type/global/extern symbol used beyond local scope).
-   - **PRIORITY**: use `make_extra_patch_override` for `symbol_name='X'` before any function-body rewrite.
+   - **KB-FIRST SCOPE CHECK (required before local-fix decision)**.
+   - Before choosing local declaration rewrite, check KB evidence for `X` in V1 (for example analysis JSON such as `data/<project>-<commit>/<path>_analysis.json`).
+   - If KB shows `X` belongs to translation-unit / non-local scope (for example global/static declaration, or symbol evidence across function boundaries, including `DECL_REF_EXPR` evidence for `spelling: "X"` in V1 analysis), prefer `make_extra_patch_override(symbol_name='X')`.
+   - Example: for `g_ctx`, if V1 KB/analysis (for example `data/ndpi-fcff6d5a/fuzz/fuzz_ndpi_reader.c_analysis.json`) contains evidence for `spelling: "g_ctx"`, treat it as non-local and use `make_extra_patch_override` first.
+   - **LOCAL-VAR FALLBACK (LLVMFuzzerTestOneInput)**.
+   - Decision checklist (all must be true):
+     a) Diagnostic is exactly `use of undeclared identifier 'X'`.
+     b) Error location/function is inside `LLVMFuzzerTestOneInput`.
+     c) `get_error_patch_context` returned non-empty `editable_hunk` (mixed `+`/`-`).
+     d) KB scope check did NOT establish that `X` is non-local/global.
+     e) `X` looks function-local (for example assigned/read/passed in function body) and is NOT a function call target, type name, macro token, or known global/extern symbol.
+   - If all checklist items are true: use `revise_patch_hunk` and add a minimal local declaration in `+` lines near first use (for example `type *X = NULL;`).
+   - If KB indicates non-local/global scope, do NOT force a local declaration via `revise_patch_hunk`; use `make_extra_patch_override(symbol_name='X')` first.
+   - If the checklist is not fully satisfied, fall back to generic priority and use `make_extra_patch_override` for `symbol_name='X'` before broader function-body rewrites.
    - Do not replace/drop the symbol inside the active function as a first step.
    - If the active patch_key is `_extra_*`, follow the `_extra_*` rule below (fix that hunk with `make_error_patch_override` instead of extending `_extra_*` again).
 
