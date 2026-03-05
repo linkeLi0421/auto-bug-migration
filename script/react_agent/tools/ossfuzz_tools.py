@@ -766,6 +766,17 @@ def _split_multi_hunk_diff_blocks(patch_text: str) -> str:
     if not changed:
         return raw + "\n"
 
+    # Re-sort blocks by new_start descending (bottom-up) so that split hunks
+    # from multi-hunk entries land in the correct position among other blocks.
+    def _block_new_start(blk: list[str]) -> int:
+        for ln in blk:
+            m = _HUNK_HEADER_RE.match(ln.strip())
+            if m:
+                return int(m.group("new_start"))
+        return 0
+
+    out_blocks.sort(key=lambda blk: (-_block_new_start(blk), ""))
+
     out_lines: list[str] = []
     for block in out_blocks:
         out_lines.extend(block)
@@ -1317,10 +1328,21 @@ def _find_definition_span(
             for fm in _EXTRA_FUNC_NAME_RE.finditer(stripped):
                 cand = fm.group(1)
                 if cand == name and cand not in _EXTRA_CONTROL_WORDS:
+                    # Walk forward to the `;` that closes the prototype.
                     j = i
                     while j < len(lines) and ";" not in lines[j]:
                         j += 1
-                    return (i, j + 1 if j < len(lines) else j)
+                    # Walk backward to include preceding return-type lines
+                    # (e.g. "ndpi_patricia_tree_t *" on the line before the
+                    # function name).  Stop at blank lines, preprocessor
+                    # directives, semicolons, or closing braces.
+                    start = i
+                    while start > 0:
+                        prev = lines[start - 1].strip()
+                        if not prev or prev.startswith("#") or ";" in prev or prev.endswith("}"):
+                            break
+                        start -= 1
+                    return (start, j + 1 if j < len(lines) else j)
         elif kind == "typedef":
             if stripped.startswith("typedef"):
                 tname = _typedef_declared_name([stripped])

@@ -585,6 +585,135 @@ def _remove_rename_only_hunks_with_arg_errors(
     return removed
 
 
+def _split_extra_patch_keys_in_bundle(patch_path: str, artifacts_root: Path) -> str:
+    """Split multi-hunk ``_extra_*`` entries into per-hunk keys for parallel processing.
+
+    For each ``_extra_*`` key with 2+ non-overlapping hunks, create N new entries
+    keyed ``_extra_<filename>__h<old_start>`` (one per hunk) and remove the original.
+    Writes the modified bundle as ``<base>.split_extra.patch2`` under *artifacts_root*.
+    Returns the new path, or *patch_path* unchanged if no splits were made.
+    """
+    import pickle
+
+    script_dir = Path(__file__).resolve().parents[1]
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from migration_tools.patch_bundle import load_patch_bundle  # type: ignore
+    from migration_tools.tools import _iter_hunks  # type: ignore
+    from migration_tools.types import PatchInfo as _PatchInfo  # type: ignore
+
+    bundle = load_patch_bundle(patch_path, allowed_roots=_allowed_roots_from_env())
+    # Collect keys to split: only _extra_* with 2+ non-overlapping hunks.
+    splits: Dict[str, List[Dict[str, Any]]] = {}  # original_key -> list of parsed hunks
+    for key, patch in bundle.patches.items():
+        if not key.startswith("_extra_"):
+            continue
+        hunks = _iter_hunks(patch.patch_text)
+        if len(hunks) < 2:
+            continue
+        # Check pairwise overlap: [old_start, old_start + old_len)
+        ranges = [(h["old_start"], h["old_start"] + h["old_len"]) for h in hunks]
+        ranges.sort()
+        overlapping = False
+        for i in range(len(ranges) - 1):
+            if ranges[i][1] > ranges[i + 1][0]:
+                overlapping = True
+                break
+        if overlapping:
+            continue
+        splits[key] = hunks
+
+    if not splits:
+        return patch_path
+
+    # Extract diff header lines (everything before the first @@) from patch_text.
+    def _diff_header(patch_text: str) -> str:
+        lines: List[str] = []
+        for line in (patch_text or "").splitlines():
+            if line.startswith("@@"):
+                break
+            lines.append(line)
+        return "\n".join(lines) + "\n" if lines else ""
+
+    # Build new patches dict from existing, applying splits.
+    new_patches: Dict[str, Any] = {}
+    for key, patch in bundle.patches.items():
+        if key not in splits:
+            new_patches[key] = patch
+            continue
+        header = _diff_header(patch.patch_text)
+        for hunk in splits[key]:
+            old_s = hunk["old_start"]
+            old_l = hunk["old_len"]
+            new_s = hunk["new_start"]
+            new_l = hunk["new_len"]
+            hunk_header = f"@@ -{old_s},{old_l} +{new_s},{new_l} @@\n"
+            body = "\n".join(hunk["lines"])
+            single_patch_text = header + hunk_header + body
+            split_key = f"{key}__h{old_s}"
+            new_patches[split_key] = _PatchInfo(
+                file_path_old=patch.file_path_old,
+                file_path_new=patch.file_path_new,
+                patch_text=single_patch_text,
+                file_type=patch.file_type,
+                old_start_line=old_s,
+                old_end_line=old_s + old_l - 1,
+                new_start_line=new_s,
+                new_end_line=new_s + new_l - 1,
+                patch_type=set(patch.patch_type) if patch.patch_type else {"Extra"},
+                old_signature=patch.old_signature,
+                new_signature=patch.new_signature,
+            )
+
+    # Sort by new_start_line descending (bottom-up), matching the convention
+    # in revert_patch_test.py and load_patch_bundle().keys_sorted.
+    # The dict order matters: downstream code iterates the raw dict when
+    # mapping errors to patch hunks.
+    keys_sorted = sorted(
+        new_patches.keys(),
+        key=lambda k: (-int(getattr(new_patches[k], "new_start_line", 0) or 0), str(k)),
+    )
+    sorted_patches: Dict[str, Any] = {k: new_patches[k] for k in keys_sorted}
+
+    # Write the modified bundle.
+    base = _patch_base_name(patch_path)
+    out_path = artifacts_root / f"{base}.split_extra.patch2"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(sorted_patches, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # Also write a corresponding .diff in the same order.
+    diff_path = artifacts_root / f"{base}.split_extra.diff"
+    with open(diff_path, "w", encoding="utf-8") as f:
+        for k in keys_sorted:
+            f.write(sorted_patches[k].patch_text)
+            f.write("\n\n")
+
+    return str(out_path)
+
+
+def _find_split_extra_key(bundle_patches: Dict[str, Any], base_key: str) -> str:
+    """Find a split variant of *base_key* in *bundle_patches*.
+
+    Returns the first (lowest ``__h`` anchor, numerically) split key matching
+    ``<base_key>__h*``, or empty string if none found.
+    """
+    prefix = f"{base_key}__h"
+
+    def _hunk_start(key: str) -> int:
+        suffix = key[len(prefix):]
+        try:
+            return int(suffix)
+        except ValueError:
+            return 10**9
+
+    matches = [k for k in bundle_patches if k.startswith(prefix)]
+    if not matches:
+        return ""
+    matches.sort(key=_hunk_start)
+    return matches[0]
+
+
 def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[str, List[Dict[str, Any]]]:
     bundle, get_error_patch_fn = _load_bundle(patch_path)
     groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -622,7 +751,13 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
             if symbol and symbol.startswith("__revert_"):
                 base_file = Path(fp).name if fp else ""
                 if base_file:
-                    key = f"_extra_{base_file}"
+                    candidate = f"_extra_{base_file}"
+                    if candidate in bundle.patches:
+                        key = candidate
+                    else:
+                        # Check for split variants (_extra_<file>__h*)
+                        split_key = _find_split_extra_key(bundle.patches, candidate)
+                        key = split_key or candidate
             # Broader fallback: for any unmapped linker error, derive the source
             # file from the object path ("libhts.a(hfile.o)" → "hfile.c") and
             # check if _extra_<source_file> exists in the bundle.
@@ -635,6 +770,10 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
                     candidate = f"_extra_{source_file}"
                     if candidate in bundle.patches:
                         key = candidate
+                    else:
+                        split_key = _find_split_extra_key(bundle.patches, candidate)
+                        if split_key:
+                            key = split_key
             if not key:
                 continue
         enriched = dict(err)
@@ -897,25 +1036,6 @@ def main(argv: List[str]) -> int:
         raise ValueError("--ossfuzz-project and --ossfuzz-commit are required (patch-scope agents must test before stopping)")
 
     build_log_text = load_build_log(str(args.build_log))
-    groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=patch_path)
-
-    # NOTE: rename-only hunks with argument-count mismatches are no longer removed.
-    # The agent will attempt to fix them using the existing patch override tools.
-
-    ranked_all = _rank_patch_keys(groups)
-    patch_key_groups_found = len(ranked_all)
-
-    allow_raw = str(args.only_patch_keys or "").strip()
-    allow = {s.strip() for s in allow_raw.split(",") if s.strip()} if allow_raw else set()
-    if allow:
-        ranked_all = [k for k in ranked_all if k in allow]
-    patch_key_groups_after_allowlist = len(ranked_all)
-
-    max_groups_requested = max(0, int(args.max_groups or 0))
-    ranked = ranked_all
-    if max_groups_requested:
-        ranked = ranked[:max_groups_requested]
-    patch_key_groups_selected = len(ranked)
 
     repo_root = Path(__file__).resolve().parents[2]
     agent_script = repo_root / "script" / "react_agent" / "agent_langgraph.py"
@@ -941,6 +1061,30 @@ def main(argv: List[str]) -> int:
                     resumed_by_key[key] = item
 
     artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    # Split multi-hunk _extra_* keys into per-hunk keys for parallel processing.
+    effective_patch_path = _split_extra_patch_keys_in_bundle(patch_path, artifacts_root)
+
+    groups = _group_errors_by_patch_key(build_log_text=build_log_text, patch_path=effective_patch_path)
+
+    # NOTE: rename-only hunks with argument-count mismatches are no longer removed.
+    # The agent will attempt to fix them using the existing patch override tools.
+
+    ranked_all = _rank_patch_keys(groups)
+    patch_key_groups_found = len(ranked_all)
+
+    allow_raw = str(args.only_patch_keys or "").strip()
+    allow = {s.strip() for s in allow_raw.split(",") if s.strip()} if allow_raw else set()
+    if allow:
+        ranked_all = [k for k in ranked_all if k in allow]
+    patch_key_groups_after_allowlist = len(ranked_all)
+
+    max_groups_requested = max(0, int(args.max_groups or 0))
+    ranked = ranked_all
+    if max_groups_requested:
+        ranked = ranked[:max_groups_requested]
+    patch_key_groups_selected = len(ranked)
+
     agent_build_log_path = str(args.build_log)
     if str(args.build_log).strip() == "-":
         out_path = artifacts_root / "build.log"
@@ -1210,7 +1354,7 @@ def main(argv: List[str]) -> int:
             # Write progress showing this key as ongoing before starting
             snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[key])
             _write_progress_json(artifacts_root, snap)
-            _, item = run_one(key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path)
+            _, item = run_one(key, idx, patch_path_for_agent=effective_patch_path, build_log_path_for_agent=agent_build_log_path)
             items[idx] = item
             snap = _report_snapshot(results=[items[i] for i in sorted(items.keys())], ongoing=[])
             _write_progress_json(artifacts_root, snap)
@@ -1223,7 +1367,7 @@ def main(argv: List[str]) -> int:
             for idx, key in to_run:
                 ongoing_keys.add(key)
                 fut = ex.submit(
-                    run_one, key, idx, patch_path_for_agent=patch_path, build_log_path_for_agent=agent_build_log_path
+                    run_one, key, idx, patch_path_for_agent=effective_patch_path, build_log_path_for_agent=agent_build_log_path
                 )
                 futs.append(fut)
                 fut_to_key[fut] = key
@@ -1264,7 +1408,7 @@ def main(argv: List[str]) -> int:
                 }
             )
 
-    overrides = _collect_final_override_diffs(results, patch_path=patch_path)
+    overrides = _collect_final_override_diffs(results, patch_path=effective_patch_path)
     combined_override_paths: List[str] = list(overrides.get("override_paths") or [])
     combined_override_paths_count = len(combined_override_paths)
     merged_patch_bundle_path = ""
@@ -1275,9 +1419,9 @@ def main(argv: List[str]) -> int:
             os.environ["REACT_AGENT_ARTIFACT_ROOT"] = str(artifacts_root)
             from tools.ossfuzz_tools import write_patch_bundle_with_overrides  # type: ignore
 
-            base = _patch_base_name(patch_path)
+            base = _patch_base_name(effective_patch_path)
             out = write_patch_bundle_with_overrides(
-                patch_path=str(patch_path),
+                patch_path=str(effective_patch_path),
                 patch_override_paths=combined_override_paths,
                 output_name=f"{base}.merged_overrides.patch2",
             )
