@@ -1208,6 +1208,16 @@ def get_error_patch_context(
             mixed_slice = body_lines_eh[exp_start:exp_end]
             has_minus = any(l.startswith("-") and not l.startswith("---") for l in mixed_slice)
             has_plus = any(l.startswith("+") for l in mixed_slice)
+            if has_minus and not has_plus:
+                # Func slice is minus-only but the full hunk body may have
+                # both sides.  Fall back to the whole body so the agent can
+                # use revise_patch_hunk on the complete hunk.
+                whole_body = body_lines_eh
+                has_minus_wb = any(l.startswith("-") and not l.startswith("---") for l in whole_body)
+                has_plus_wb = any(l.startswith("+") for l in whole_body)
+                if has_minus_wb and has_plus_wb:
+                    mixed_slice = whole_body
+                    has_plus = True
             if has_minus and has_plus:
                 flipped: List[str] = []
                 for ln in mixed_slice:
@@ -1843,7 +1853,10 @@ def revise_patch_hunk(
     This function validates that V2 lines are preserved, flips signs back,
     replaces the slice in the patch, and recomputes hunk headers.
     """
-    revised_text = _extract_first_code_fence(revised_hunk)
+    raw_revised = str(revised_hunk or "")
+    # Preserve leading indentation for plain-text hunks; stripping indentation
+    # here can cause false context-line mismatch errors.
+    revised_text = _extract_first_code_fence(raw_revised) if "```" in raw_revised else raw_revised
     if not revised_text.strip():
         raise ValueError("revised_hunk must be non-empty")
 
@@ -1907,6 +1920,17 @@ def revise_patch_hunk(
 
     orig_has_minus = any(l.startswith("-") and not l.startswith("---") for l in original_slice)
     orig_has_plus = any(l.startswith("+") for l in original_slice)
+    if orig_has_minus and not orig_has_plus:
+        # Keep behavior consistent with get_error_patch_context: when the
+        # mapped function slice is minus-only, fall back to the whole hunk
+        # body if it is mixed so callers can still revise via editable_hunk.
+        whole_body = body_lines
+        has_minus_wb = any(l.startswith("-") and not l.startswith("---") for l in whole_body)
+        has_plus_wb = any(l.startswith("+") for l in whole_body)
+        if has_minus_wb and has_plus_wb:
+            exp_start, exp_end = 0, len(whole_body)
+            original_slice = whole_body
+            orig_has_plus = True
     if not (orig_has_minus and orig_has_plus):
         return {
             **mapping,
