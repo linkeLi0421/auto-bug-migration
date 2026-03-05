@@ -47,10 +47,25 @@ def _infer_extra_patch_key(*, bundle: Any, file_path: str) -> str:
     if not base:
         return ""
     candidate = f"_extra_{base}"
-    if isinstance(getattr(bundle, "patches", None), dict) and candidate in bundle.patches:
-        return candidate
-    # Fallback: scan for a matching _extra_* entry that targets this file.
     patches = getattr(bundle, "patches", None)
+    if isinstance(patches, dict) and candidate in patches:
+        return candidate
+    # Check for split variants: _extra_<filename>__h<old_start>
+    if isinstance(patches, dict):
+        split_prefix = f"{candidate}__h"
+        split_matches = [k for k in patches if k.startswith(split_prefix)]
+        if split_matches:
+
+            def _hunk_start(key: str) -> int:
+                suffix = key[len(split_prefix):]
+                try:
+                    return int(suffix)
+                except ValueError:
+                    return 10**9
+
+            split_matches.sort(key=_hunk_start)
+            return split_matches[0]
+    # Fallback: scan for a matching _extra_* entry that targets this file.
     if isinstance(patches, dict):
         for key, patch in patches.items():
             if not isinstance(key, str) or not key.startswith("_extra_"):

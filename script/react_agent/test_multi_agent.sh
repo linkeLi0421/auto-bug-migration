@@ -628,4 +628,305 @@ assert multi_errs[0]["symbol"] == "__revert_abc123_ks_resize", multi_errs[0]
 print("  __revert_* linker error fallback to _extra_<file> OK")
 PY
 
+########################################################################
+# Test: _split_extra_patch_keys_in_bundle splits multi-hunk _extra_* entries
+########################################################################
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os, pickle, sys
+from pathlib import Path
+
+tmp = sys.argv[1]
+sys.path.insert(0, str(Path.cwd() / "script"))
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+
+from multi_agent import _split_extra_patch_keys_in_bundle
+from migration_tools.types import PatchInfo
+
+# --- Case 1: multi-hunk, non-overlapping → should split ---
+patches = {}
+patches["some_other_key"] = PatchInfo(
+    file_path_old="foo.c", file_path_new="foo.c",
+    patch_text=(
+        "diff --git a/foo.c b/foo.c\n"
+        "--- a/foo.c\n"
+        "+++ b/foo.c\n"
+        "@@ -10,3 +10,3 @@\n"
+        " context\n"
+    ),
+    file_type="c",
+    old_start_line=10, old_end_line=12,
+    new_start_line=10, new_end_line=12,
+    patch_type={"Modify"},
+)
+patches["_extra_ndpi_main.c"] = PatchInfo(
+    file_path_old="ndpi_main.c", file_path_new="ndpi_main.c",
+    patch_text=(
+        "diff --git a/ndpi_main.c b/ndpi_main.c\n"
+        "--- a/ndpi_main.c\n"
+        "+++ b/ndpi_main.c\n"
+        "@@ -81,4 +81,6 @@\n"
+        " context_line_1\n"
+        "-old_line_at_81\n"
+        "+new_line_at_81a\n"
+        "+new_line_at_81b\n"
+        " context_line_2\n"
+        "@@ -691,3 +693,5 @@\n"
+        " context_line_3\n"
+        "-old_line_at_691\n"
+        "+new_line_at_691a\n"
+        "+new_line_at_691b\n"
+        "+new_line_at_691c\n"
+        " context_line_4\n"
+    ),
+    file_type="c",
+    old_start_line=81, old_end_line=694,
+    new_start_line=81, new_end_line=698,
+    patch_type={"Extra"},
+)
+
+bundle_path = os.path.join(tmp, "test_split.patch2")
+with open(bundle_path, "wb") as f:
+    f.write(pickle.dumps(patches, protocol=pickle.HIGHEST_PROTOCOL))
+
+arts = Path(os.path.join(tmp, "split_arts"))
+arts.mkdir(parents=True, exist_ok=True)
+
+result = _split_extra_patch_keys_in_bundle(bundle_path, arts)
+assert result != bundle_path, f"Expected new path, got original: {result}"
+assert result.endswith(".split_extra.patch2"), result
+
+# Load the split bundle and verify
+with open(result, "rb") as f:
+    split_patches = pickle.load(f)
+
+assert "some_other_key" in split_patches, f"Non-extra key should be preserved: {sorted(split_patches.keys())}"
+assert "_extra_ndpi_main.c" not in split_patches, f"Original multi-hunk key should be removed: {sorted(split_patches.keys())}"
+assert "_extra_ndpi_main.c__h81" in split_patches, f"Expected split key __h81: {sorted(split_patches.keys())}"
+assert "_extra_ndpi_main.c__h691" in split_patches, f"Expected split key __h691: {sorted(split_patches.keys())}"
+
+h81 = split_patches["_extra_ndpi_main.c__h81"]
+assert h81.old_start_line == 81, h81.old_start_line
+assert h81.old_end_line == 84, h81.old_end_line  # 81 + 4 - 1
+assert h81.new_start_line == 81, h81.new_start_line
+assert h81.new_end_line == 86, h81.new_end_line  # 81 + 6 - 1
+assert h81.file_path_old == "ndpi_main.c", h81.file_path_old
+assert "Extra" in h81.patch_type, h81.patch_type
+assert "@@ -81,4 +81,6 @@" in h81.patch_text, h81.patch_text
+assert "@@ -691" not in h81.patch_text, "h81 should not contain hunk 691"
+
+h691 = split_patches["_extra_ndpi_main.c__h691"]
+assert h691.old_start_line == 691, h691.old_start_line
+assert h691.new_start_line == 693, h691.new_start_line
+assert "@@ -691,3 +693,5 @@" in h691.patch_text, h691.patch_text
+assert "@@ -81" not in h691.patch_text, "h691 should not contain hunk 81"
+
+# Verify .diff file was also generated with correct bottom-up ordering
+diff_path = arts / "test_split.split_extra.diff"
+assert diff_path.is_file(), f"Expected .diff file at {diff_path}"
+diff_text = diff_path.read_text()
+pos_691 = diff_text.index("@@ -691,3 +693,5 @@")
+pos_81 = diff_text.index("@@ -81,4 +81,6 @@")
+pos_10 = diff_text.index("@@ -10,3 +10,3 @@")
+assert pos_691 < pos_81, f"h691 should come before h81 (bottom-up ordering)"
+assert pos_81 < pos_10, f"h81 should come before foo.c (bottom-up ordering)"
+
+print("  split multi-hunk _extra_* OK (incl. .diff ordering)")
+
+# --- Case 2: single-hunk _extra_* → no split ---
+patches2 = {}
+patches2["_extra_single.c"] = PatchInfo(
+    file_path_old="single.c", file_path_new="single.c",
+    patch_text=(
+        "diff --git a/single.c b/single.c\n"
+        "--- a/single.c\n"
+        "+++ b/single.c\n"
+        "@@ -10,3 +10,4 @@\n"
+        " context\n"
+        "-old\n"
+        "+new1\n"
+        "+new2\n"
+    ),
+    file_type="c",
+    old_start_line=10, old_end_line=12,
+    new_start_line=10, new_end_line=13,
+    patch_type={"Extra"},
+)
+
+bundle_path2 = os.path.join(tmp, "test_no_split.patch2")
+with open(bundle_path2, "wb") as f:
+    f.write(pickle.dumps(patches2, protocol=pickle.HIGHEST_PROTOCOL))
+
+result2 = _split_extra_patch_keys_in_bundle(bundle_path2, arts)
+assert result2 == bundle_path2, f"Single-hunk should return original path: {result2}"
+
+print("  single-hunk _extra_* no split OK")
+
+# --- Case 3: overlapping hunks → no split ---
+patches3 = {}
+patches3["_extra_overlap.c"] = PatchInfo(
+    file_path_old="overlap.c", file_path_new="overlap.c",
+    patch_text=(
+        "diff --git a/overlap.c b/overlap.c\n"
+        "--- a/overlap.c\n"
+        "+++ b/overlap.c\n"
+        "@@ -10,8 +10,9 @@\n"
+        " ctx\n"
+        "-old\n"
+        "+new\n"
+        "+new2\n"
+        " ctx\n"
+        " ctx\n"
+        " ctx\n"
+        " ctx\n"
+        " ctx\n"
+        "@@ -15,3 +16,4 @@\n"
+        " ctx\n"
+        "-old2\n"
+        "+new3\n"
+        "+new4\n"
+    ),
+    file_type="c",
+    old_start_line=10, old_end_line=17,
+    new_start_line=10, new_end_line=19,
+    patch_type={"Extra"},
+)
+
+bundle_path3 = os.path.join(tmp, "test_overlap.patch2")
+with open(bundle_path3, "wb") as f:
+    f.write(pickle.dumps(patches3, protocol=pickle.HIGHEST_PROTOCOL))
+
+result3 = _split_extra_patch_keys_in_bundle(bundle_path3, arts)
+assert result3 == bundle_path3, f"Overlapping hunks should return original path: {result3}"
+
+print("  overlapping hunks no split OK")
+PY
+
+########################################################################
+# Test: linker error fallback finds split _extra_* keys
+########################################################################
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os, pickle, sys
+from pathlib import Path
+
+tmp = sys.argv[1]
+sys.path.insert(0, str(Path.cwd() / "script"))
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+
+from multi_agent import _group_errors_by_patch_key
+from migration_tools.types import PatchInfo
+
+# Bundle with split keys (no unsplit _extra_hfile.c)
+patches = {}
+patches["_extra_hfile.c__h50"] = PatchInfo(
+    file_path_old="hfile.c", file_path_new="hfile.c",
+    patch_text=(
+        "diff --git a/hfile.c b/hfile.c\n"
+        "--- a/hfile.c\n"
+        "+++ b/hfile.c\n"
+        "@@ -50,3 +50,4 @@\n"
+        " ctx\n"
+        "-old\n"
+        "+new1\n"
+        "+new2\n"
+    ),
+    file_type="c",
+    old_start_line=50, old_end_line=52,
+    new_start_line=50, new_end_line=53,
+    patch_type={"Extra"},
+)
+patches["_extra_hfile.c__h200"] = PatchInfo(
+    file_path_old="hfile.c", file_path_new="hfile.c",
+    patch_text=(
+        "diff --git a/hfile.c b/hfile.c\n"
+        "--- a/hfile.c\n"
+        "+++ b/hfile.c\n"
+        "@@ -200,3 +201,4 @@\n"
+        " ctx\n"
+        "-old\n"
+        "+new1\n"
+        "+new2\n"
+    ),
+    file_type="c",
+    old_start_line=200, old_end_line=202,
+    new_start_line=201, new_end_line=204,
+    patch_type={"Extra"},
+)
+
+bundle_path = os.path.join(tmp, "test_split_linker.patch2")
+with open(bundle_path, "wb") as f:
+    f.write(pickle.dumps(patches, protocol=pickle.HIGHEST_PROTOCOL))
+
+build_log = """\
+/usr/bin/ld: libhts.a(hfile.o): in function `haddextension':
+hfile.c:(.text.haddextension[haddextension]+0x148): undefined reference to `__revert_abc123_ks_resize'
+clang++: error: linker command failed with exit code 1
+"""
+
+groups = _group_errors_by_patch_key(build_log_text=build_log, patch_path=bundle_path)
+
+# Should fall back to the first split key (_extra_hfile.c__h50)
+assert "_extra_hfile.c__h50" in groups, f"Expected _extra_hfile.c__h50, got: {sorted(groups.keys())}"
+assert "_extra_hfile.c" not in groups, f"Unsplit key should not be created: {sorted(groups.keys())}"
+
+print("  linker error fallback to split _extra_* keys OK")
+PY
+
+########################################################################
+# Test: _infer_extra_patch_key finds split variants
+########################################################################
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$tmp_dir" <<'PY'
+import os, pickle, sys
+from pathlib import Path
+from types import SimpleNamespace
+
+tmp = sys.argv[1]
+sys.path.insert(0, str(Path.cwd() / "script"))
+sys.path.insert(0, str(Path.cwd() / "script" / "react_agent"))
+
+from tools.extra_patch_tools import _infer_extra_patch_key
+from migration_tools.types import PatchInfo
+
+# Bundle with split keys only
+patches = {}
+patches["_extra_foo.c__h10"] = PatchInfo(
+    file_path_old="foo.c", file_path_new="foo.c",
+    patch_text="@@ -10,3 +10,4 @@\n ctx\n",
+    file_type="c",
+    old_start_line=10, old_end_line=12,
+    new_start_line=10, new_end_line=13,
+    patch_type={"Extra"},
+)
+patches["_extra_foo.c__h100"] = PatchInfo(
+    file_path_old="foo.c", file_path_new="foo.c",
+    patch_text="@@ -100,3 +101,4 @@\n ctx\n",
+    file_type="c",
+    old_start_line=100, old_end_line=102,
+    new_start_line=101, new_end_line=104,
+    patch_type={"Extra"},
+)
+
+bundle = SimpleNamespace(patches=patches)
+
+result = _infer_extra_patch_key(bundle=bundle, file_path="/src/project/foo.c")
+assert result == "_extra_foo.c__h10", f"Expected _extra_foo.c__h10, got: {result}"
+
+# With unsplit key present, should prefer it
+patches["_extra_bar.c"] = PatchInfo(
+    file_path_old="bar.c", file_path_new="bar.c",
+    patch_text="@@ -5,3 +5,4 @@\n ctx\n",
+    file_type="c",
+    old_start_line=5, old_end_line=7,
+    new_start_line=5, new_end_line=8,
+    patch_type={"Extra"},
+)
+result2 = _infer_extra_patch_key(bundle=bundle, file_path="bar.c")
+assert result2 == "_extra_bar.c", f"Expected _extra_bar.c, got: {result2}"
+
+# With no matching keys, should return synthesized name
+result3 = _infer_extra_patch_key(bundle=bundle, file_path="unknown.c")
+assert result3 == "_extra_unknown.c", f"Expected _extra_unknown.c, got: {result3}"
+
+print("  _infer_extra_patch_key with split variants OK")
+PY
+
 echo "OK"
