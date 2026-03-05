@@ -1059,12 +1059,17 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
         typedef_fn_ptr_pat = re.compile(rf"^typedef\b.*\(\s*\*\s*{want_re}\s*\)")
 
     in_block_comment = False
+    # Track syntactic scope depth from minus-lines only. We only consider a
+    # symbol "already defined" when matched at file scope (depth == 0).
+    brace_depth = 0
+    brace_comment_state = False
     raw_lines = str(patch_text or "").splitlines()
     for idx, raw in enumerate(raw_lines):
         if not raw.startswith("-") or raw.startswith("---"):
             continue
         code = _strip_diff_prefix(raw).rstrip()
         stripped = code.lstrip()
+        at_file_scope = brace_depth == 0
         if not stripped:
             continue
         if in_block_comment:
@@ -1092,7 +1097,7 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
 
         # Tag bodies: treat `struct|union|enum NAME {` (or `{` on the next inserted line) as a definition.
         # Avoid treating `struct NAME;` or `struct NAME *p;` as "already defined".
-        if tag_head_pat.match(stripped):
+        if at_file_scope and tag_head_pat.match(stripped):
             if "{" in stripped:
                 return True
             # Some style puts `{` on the next line: `typedef struct TAG` then `{`.
@@ -1108,19 +1113,19 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
                 break
 
         # Function prototypes/defs at file scope.
-        if not want_is_tag_ref and not stripped.startswith("#"):
+        if at_file_scope and not want_is_tag_ref and not stripped.startswith("#"):
             if fn_pat.search(stripped) and not _looks_like_statement(stripped):
                 if stripped.rstrip().endswith(";") or "{" in stripped:
                     return True
 
         # Typedefs for function pointers (common C style): `typedef <ret> (*NAME)(...);`
-        if not want_is_tag_ref and stripped.startswith("typedef") and stripped.rstrip().endswith(";"):
+        if at_file_scope and not want_is_tag_ref and stripped.startswith("typedef") and stripped.rstrip().endswith(";"):
             if typedef_fn_ptr_pat.match(stripped):
                 return True
 
         # Other file-scope declarations: treat as defined only if NAME appears in a declarator position,
         # not merely as a referenced type inside a prototype/param list.
-        if not want_is_tag_ref and not stripped.startswith("#") and stripped.rstrip().endswith(";"):
+        if at_file_scope and not want_is_tag_ref and not stripped.startswith("#") and stripped.rstrip().endswith(";"):
             # Avoid treating forward tag decls (`struct NAME;`) as a definition; tag bodies require `{`.
             if re.match(rf"^(?:struct|union|enum)\s+{want_re}\b", stripped):
                 continue
@@ -1132,6 +1137,14 @@ def _symbol_defined_in_extra_hunk(patch_text: str, *, symbol_name: str) -> bool:
                 if first_paren >= 0 and m_decl.start() > first_paren:
                     continue
                 return True
+
+        # Keep scope tracking after all checks so `at_file_scope` reflects
+        # this line's entry scope. Ignore preprocessor lines for depth.
+        if not stripped.startswith("#"):
+            delta, brace_comment_state = _brace_delta_ignoring_comments(code, brace_comment_state)
+            brace_depth += delta
+            if brace_depth < 0:
+                brace_depth = 0
 
     return False
 
