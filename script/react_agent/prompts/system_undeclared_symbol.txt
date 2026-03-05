@@ -7,6 +7,9 @@ Rule:
 - Undeclared non-`__revert_*` function calls should be removed via caller rewrite.
 
 1) Undeclared identifiers/types/macros (for example: "use of undeclared identifier 'RANSPR'", "unknown type name 'foo_t'"):
+   - **LOCAL-VAR EXCEPTION (LLVMFuzzerTestOneInput)**: If the diagnostic is "use of undeclared identifier 'X'" inside `LLVMFuzzerTestOneInput`, and `get_error_patch_context` returns non-empty `editable_hunk` (mixed `+`/`-`), treat `X` as a probable local variable first.
+   - In that case, use `revise_patch_hunk` to add the minimal local declaration in `+` lines near first use (for example `type *X = NULL;`) instead of `make_extra_patch_override`.
+   - Only use `make_extra_patch_override` for `X` after confirming `X` is not function-local (for example macro/type/global/extern symbol used beyond local scope).
    - **PRIORITY**: use `make_extra_patch_override` for `symbol_name='X'` before any function-body rewrite.
    - Do not replace/drop the symbol inside the active function as a first step.
    - If the active patch_key is `_extra_*`, follow the `_extra_*` rule below (fix that hunk with `make_error_patch_override` instead of extending `_extra_*` again).
