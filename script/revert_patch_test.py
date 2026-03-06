@@ -1285,42 +1285,68 @@ def is_ancestor(repo_path: str, older_commit: str, newer_commit: str) -> bool:
 
 
 def prepare_transplant(data, repo_path):
+    strong_trigger_statuses = {'1|1', '1|0', '0.5|1'}
+    weak_trigger_statuses = {'0.5|1'}
+
+    def trigger_rank(status):
+        if status in strong_trigger_statuses:
+            return 2
+        if status in weak_trigger_statuses:
+            return 1
+        return 0
+
     # Build commit graph for easy parent/child lookup, and commits stored ordered by time
     max_poc_count = 0
+    max_weak_poc_count = 0
     max_poc_row = None
     
     # Initialize the graph with all commits
     for row in data:
         row['poc_count'] = 0
+        row['weak_poc_count'] = 0
         for bug_id in row['osv_statuses'].keys():
-            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
+            status = row['osv_statuses'][bug_id]
+            if status in strong_trigger_statuses:
                 row['poc_count'] += 1
-        if row['poc_count'] >= max_poc_count:
+            elif status in weak_trigger_statuses:
+                row['weak_poc_count'] += 1
+        if (
+            row['poc_count'] > max_poc_count
+            or (row['poc_count'] == max_poc_count and row['weak_poc_count'] >= max_weak_poc_count)
+        ):
             max_poc_count = row['poc_count']
+            max_weak_poc_count = row['weak_poc_count']
             max_poc_row = row
     
     bug_ids_trigger = set() # do not need to change
     bug_ids_other = set()
     
     for bug_id in max_poc_row['osv_statuses'].keys():
-        if max_poc_row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
+        if max_poc_row['osv_statuses'][bug_id] in strong_trigger_statuses:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
     bugs_need_transplant = dict() # key: bug_id; value: a commit that a poc trigger this bug, this commit should be closest to max_poc_row['commit_id']
+    bug_best_rank = dict()
     bugs_cant_use = set()
     for row in data:
         for bug_id in bug_ids_other:
-            if row['osv_statuses'][bug_id] in {'1|1', '0.5|1', '0.5|0', '1|0'}:
-                if bug_id in bugs_need_transplant:
-                    if is_ancestor(repo_path, bugs_need_transplant[bug_id], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
-                        bugs_need_transplant[bug_id] = row
-                else:
+            status = row['osv_statuses'][bug_id]
+            rank = trigger_rank(status)
+            if rank == 0:
+                continue
+            if rank > bug_best_rank.get(bug_id, 0):
+                bugs_need_transplant[bug_id] = row
+                bug_best_rank[bug_id] = rank
+                continue
+            if rank == bug_best_rank.get(bug_id, 0) and bug_id in bugs_need_transplant:
+                if is_ancestor(repo_path, bugs_need_transplant[bug_id]['commit_id'], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
                     bugs_need_transplant[bug_id] = row
     for bug_id in bug_ids_other:
         if bug_id not in bugs_need_transplant and bug_id != 'poc count':
             bugs_cant_use.add(bug_id)
     logger.info(f'all bugs count: {len(max_poc_row["osv_statuses"])}')
+    logger.info(f'max_poc_row strong/weak poc_count: {max_poc_row["poc_count"]}/{max_poc_row["weak_poc_count"]}')
     logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)} {bug_ids_trigger}')
     logger.info(f'bugs need transplant count: {len(bugs_need_transplant)} {bugs_need_transplant.keys()}')
     logger.info(f'bugs cant use count: {len(bugs_cant_use)} {bugs_cant_use}\n')

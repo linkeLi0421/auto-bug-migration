@@ -39,10 +39,13 @@ Decision precedence (highest first):
 
 3) Undeclared identifiers (for example `use of undeclared identifier 'g_ctx'`):
    - **KB-FIRST SCOPE CHECK (required before local-fix decision)**.
-   - Before choosing a local declaration rewrite, check KB evidence for `X` in V1 (for example analysis JSON such as `data/<project>-<commit>/<path>_analysis.json`).
-   - For identifiers, KB/search is used to infer scope.
+   - Before choosing a local declaration rewrite, check KB evidence for `X` in V1.
+   - **RECLASSIFY when KB reveals a function**: if `search_definition` returns `FUNCTION_DECL` or `FUNCTION_DEFI` for `X`, the symbol is a function, not a variable.
+     Reclassify to path 2 (undeclared non-`__revert_*` function call) and rewrite/remove the call site. Do NOT use `make_extra_patch_override` to insert a declaration or definition.
+   - For non-function identifiers, KB/search is used to infer scope.
    - If KB shows `X` belongs to translation-unit / non-local scope (for example global/static declaration, related `VAR_DECL`, or analysis evidence across function boundaries), prefer `make_extra_patch_override(symbol_name='X')`.
-   - Example: for `g_ctx`, if V1 KB/analysis (for example `data/ndpi-fcff6d5a/fuzz/fuzz_ndpi_reader.c_analysis.json`) shows it as a non-local symbol, use `make_extra_patch_override` first.
+   - Example: for `g_ctx`, if V1 KB/analysis shows it as a non-local variable, use `make_extra_patch_override` first.
+   - Counter-example: for `node_cleanup_walker`, if KB returns `FUNCTION_DEFI`, reclassify to path 2 and remove/adapt the call — do NOT insert a prototype or definition.
    - **LOCAL-VAR FALLBACK (LLVMFuzzerTestOneInput)**.
    - Decision checklist (all must be true):
      a) Diagnostic is exactly `use of undeclared identifier 'X'`.
