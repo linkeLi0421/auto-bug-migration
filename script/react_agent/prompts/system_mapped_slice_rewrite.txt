@@ -1,10 +1,22 @@
 Mapped-slice rewrites (make_error_patch_override / revise_patch_hunk):
 
 CHOOSING THE RIGHT TOOL:
-- Precedence override for undeclared identifiers in `LLVMFuzzerTestOneInput`:
+- Diagnose the error category before choosing a patch tool:
+  - `use of undeclared identifier 'X'` => identifier path.
+  - `unknown type name 'X'` => type path.
+  - `call to undeclared function 'X'` / `implicit declaration of function 'X'` => function-call path.
+  - Do NOT let a `search_definition` hit for a V1 function (`FUNCTION_DECL` / `FUNCTION_DEFI`) override the function-call path rules.
+- Function-call path:
+  - If the undeclared function starts with `__revert_`, use `make_extra_patch_override` to add the missing prototype.
+  - If the undeclared function does NOT start with `__revert_`, do NOT use `make_extra_patch_override`, even if KB says the function existed in V1.
+  - For non-`__revert_*` undeclared function calls, rewrite the caller instead:
+    - if `editable_hunk` is present, use `revise_patch_hunk`;
+    - otherwise use `make_error_patch_override`.
+  - Example: `search_definition("node_cleanup_walker", "v1") -> FUNCTION_DEFI` is informational only; it does NOT justify `make_extra_patch_override(symbol_name="node_cleanup_walker", prefer_definition=true)`.
+- Identifier path in `LLVMFuzzerTestOneInput`:
   - For `use of undeclared identifier 'X'`, do KB scope check first (V1 analysis/symbol evidence) before deciding local rewrite.
-  - If KB indicates `X` is non-local/global (for example evidence in analysis JSON such as `DECL_REF_EXPR` with `spelling: "X"` in V1 file analysis), prefer `make_extra_patch_override(symbol_name='X')`.
-  - Only if KB does not establish non-local scope, treat as local declaration candidate.
+  - If KB indicates `X` is non-local/global, prefer `make_extra_patch_override(symbol_name='X')`.
+  - Only if KB does not establish non-local scope, treat `X` as a local declaration candidate.
   - Decision checklist:
     a) error is undeclared identifier (not unknown type name / undeclared function call),
     b) current function is `LLVMFuzzerTestOneInput`,

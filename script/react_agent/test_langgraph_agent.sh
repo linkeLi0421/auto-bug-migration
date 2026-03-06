@@ -3391,6 +3391,7 @@ sys.path.insert(0, str(script_dir))
 
 from agent_langgraph import (  # noqa: E402
     AgentState,
+    _block_make_extra_patch_override_for_nonrevert_undeclared_function,
     _block_make_extra_patch_override_after_unresolvable_lookup,
     _undeclared_symbol_extra_patch_guardrail_for_override,
 )
@@ -3435,6 +3436,64 @@ forced_rv = _undeclared_symbol_extra_patch_guardrail_for_override(state_rv, deci
 assert forced_rv and forced_rv.get("tool") == "make_extra_patch_override", forced_rv
 assert forced_rv.get("args", {}).get("symbol_name") == "__revert_abc123_xmlRngMutex", forced_rv
 assert forced_rv.get("args", {}).get("file_path") == "/src/libxml2/dict.c", forced_rv
+
+# If the model explicitly asks for make_extra_patch_override on a non-__revert undeclared
+# function call, block it and force a caller rewrite flow instead.
+err_func = "/src/ndpi/fuzz/fuzz_ndpi_reader.c:184:5: error: call to undeclared function 'node_cleanup_walker'"
+state_func = AgentState(
+    build_log_path="build.log",
+    patch_path="bundle.patch2",
+    error_scope="patch",
+    error_line=err_func,
+    snippet="",
+    active_error_func_code_artifact_path="/tmp/base.c",
+)
+state_func.grouped_errors = [{"raw": err_func, "file": "/src/ndpi/fuzz/fuzz_ndpi_reader.c", "line": 184, "col": 5}]
+state_func.steps = [
+    {
+        "decision": {"type": "tool", "tool": "get_error_patch_context", "args": {}},
+        "observation": {
+            "ok": True,
+            "tool": "get_error_patch_context",
+            "args": {},
+            "output": {"patch_key": "p", "error_func_code": {"artifact_path": "/tmp/base.c"}},
+            "error": None,
+        },
+    },
+]
+state_func.step_history = list(state_func.steps)
+
+bad_decision = {
+    "type": "tool",
+    "tool": "make_extra_patch_override",
+    "thought": "restore V1 helper",
+    "args": {
+        "patch_path": "bundle.patch2",
+        "file_path": "/src/ndpi/fuzz/fuzz_ndpi_reader.c",
+        "symbol_name": "node_cleanup_walker",
+        "prefer_definition": True,
+    },
+}
+blocked = _block_make_extra_patch_override_for_nonrevert_undeclared_function(
+    state_func, bad_decision, remaining_steps=10
+)
+assert blocked and blocked.get("tool") == "read_artifact", blocked
+assert state_func.pending_patch and state_func.pending_patch.get("tool") == "make_error_patch_override", state_func.pending_patch
+
+# __revert_* function calls are still allowed through this blocker.
+allowed_revert_func = {
+    "type": "tool",
+    "tool": "make_extra_patch_override",
+    "thought": "add revert prototype",
+    "args": {
+        "patch_path": "bundle.patch2",
+        "file_path": "/src/ndpi/fuzz/fuzz_ndpi_reader.c",
+        "symbol_name": "__revert_deadbeef_node_cleanup_walker",
+    },
+}
+assert _block_make_extra_patch_override_for_nonrevert_undeclared_function(
+    state_func, allowed_revert_func, remaining_steps=10
+) is None
 
 # If a prior make_extra lookup for the same __revert_ symbol reported unreadable source,
 # guardrail should stop forcing make_extra and let model-guided override proceed.

@@ -3911,6 +3911,86 @@ def _block_make_extra_patch_override_after_unresolvable_lookup(
     }
 
 
+def _block_make_extra_patch_override_for_nonrevert_undeclared_function(
+    state: AgentState, decision: Decision, *, remaining_steps: int
+) -> Optional[Decision]:
+    """Block `_extra_*` insertion for ordinary undeclared function calls.
+
+    For non-`__revert_*` undeclared function diagnostics, a V1 `FUNCTION_DECL`/`FUNCTION_DEFI`
+    search hit is informational only. The repair should adapt/remove the caller rather than
+    reintroducing a file-scope prototype/definition via `_extra_*`.
+    """
+    if str(decision.get("type", "")).strip() != "tool":
+        return None
+    if str(decision.get("tool", "")).strip() != "make_extra_patch_override":
+        return None
+    if state.error_scope != "patch" or not state.patch_path:
+        return None
+
+    args = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    symbol = str(args.get("symbol_name", "") or "").strip()
+    if not symbol or symbol.startswith("__revert_"):
+        return None
+
+    active_error = str(state.error_line or state.snippet or "")
+    if not _is_undeclared_function_error(active_error):
+        return None
+
+    prereq = _next_patch_prereq_tool(state)
+    if prereq:
+        return prereq
+
+    if remaining_steps < 3:
+        return None
+
+    artifact_path = (
+        str(getattr(state, "loop_base_func_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_patch_minus_code_artifact_path", "") or "").strip()
+        or str(getattr(state, "active_error_func_code_artifact_path", "") or "").strip()
+        or _last_artifact_path(state, "get_error_patch_context", "patch_minus_code")
+        or _last_artifact_path(state, "get_error_patch_context", "error_func_code")
+        or _last_artifact_path(state, "get_error_patch_context", "excerpt")
+    )
+    if not str(artifact_path or "").strip():
+        file_path, line_number = _first_error_location(state)
+        if not file_path or line_number <= 0:
+            return None
+        return {
+            "type": "tool",
+            "thought": (
+                f"Active diagnostic is a non-__revert undeclared function call for {symbol}. "
+                "Refresh the mapped patch context before rewriting the caller; do not add an _extra_* declaration/definition."
+            ),
+            "tool": "get_error_patch_context",
+            "args": {
+                "patch_path": state.patch_path,
+                "file_path": file_path,
+                "line_number": line_number,
+                "error_text": str(state.error_line or "")[:400],
+                "context_lines": 80,
+                "max_total_lines": 800,
+            },
+        }
+
+    state.pending_patch = {"type": "tool", "tool": "make_error_patch_override", "args": {}}
+    return {
+        "type": "tool",
+        "thought": (
+            f"Active diagnostic is a non-__revert undeclared function call for {symbol}. "
+            "A V1 search hit only confirms the helper existed in V1; rewrite the caller instead of using make_extra_patch_override."
+        ),
+        "tool": "read_artifact",
+        "args": {
+            "artifact_path": artifact_path,
+            "start_line": 1,
+            "query": "",
+            "context_lines": 0,
+            "max_lines": 8000,
+            "max_chars": 200000,
+        },
+    }
+
+
 def _incomplete_type_extra_patch_guardrail_for_override(state: AgentState, decision: Decision) -> Optional[Decision]:
     """Prefer deterministic `_extra_*` type definitions over semantic no-op function rewrites.
 
@@ -6442,6 +6522,14 @@ def _run_langgraph(
             if prereq:
                 _validate_tool_decision(prereq)
                 return {"state": st, "pending": prereq}
+
+        forced_nonrevert_func = _block_make_extra_patch_override_for_nonrevert_undeclared_function(
+            st, decision, remaining_steps=remaining
+        )
+        if forced_nonrevert_func:
+            _debug_guardrail_forced_tool(cfg, original=decision, forced=forced_nonrevert_func)
+            _validate_tool_decision(forced_nonrevert_func)
+            return {"state": st, "pending": forced_nonrevert_func}
 
         forced_extra_block = _block_make_extra_patch_override_for_extra_hunk(
             st, decision, remaining_steps=remaining

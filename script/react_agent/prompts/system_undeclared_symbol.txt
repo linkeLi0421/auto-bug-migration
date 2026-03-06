@@ -1,50 +1,63 @@
-Undeclared symbol/type errors (C/C++):
-- Applies to: "use of undeclared identifier 'X'", "call to undeclared function 'X'", "unknown type name 'X'".
+Undeclared symbol/type/function errors (C/C++):
+- Applies to: `use of undeclared identifier 'X'`, `unknown type name 'X'`, `call to undeclared function 'X'`, `implicit declaration of function 'X'`.
 
-Rule:
-- Decision precedence (highest first):
-  1) For undeclared identifier `X`, run KB scope check first (V1 analysis / symbol evidence).
-  2) Undeclared `__revert_*` functions => `make_extra_patch_override` (forward declarations).
-  3) If KB does not establish non-local scope and `X` appears function-local in `LLVMFuzzerTestOneInput` mixed hunk => `revise_patch_hunk`.
-  4) Other undeclared identifiers/types/macros => `make_extra_patch_override` first.
-  5) Undeclared non-`__revert_*` function calls => remove via caller rewrite.
+FIRST CLASSIFY THE DIAGNOSTIC:
+- `use of undeclared identifier 'X'` => identifier path.
+- `unknown type name 'X'` => type path.
+- `call to undeclared function 'X'` or `implicit declaration of function 'X'` => function-call path.
+- Do NOT mix these paths.
+- In particular: KB/search results for a V1 function (`FUNCTION_DECL` / `FUNCTION_DEFI`) are NOT scope evidence for variable handling, and they do NOT justify `make_extra_patch_override` for an ordinary non-`__revert_*` undeclared function call.
 
-1) Undeclared identifiers/types/macros (for example: "use of undeclared identifier 'RANSPR'", "unknown type name 'foo_t'"):
+Decision precedence (highest first):
+1) Undeclared `__revert_*` function call => `make_extra_patch_override` (forward declaration/prototype handling).
+2) Undeclared non-`__revert_*` function call => rewrite the caller; do NOT revive the function via `_extra_*`.
+3) Undeclared identifier `X` => run KB scope check first, then choose file-scope insertion vs local declaration.
+4) Unknown type name `X` / missing macro-like symbol => `make_extra_patch_override` first.
+
+1) Undeclared function calls starting with `__revert_`:
+   - `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
+   - ALWAYS use `make_extra_patch_override` to add the forward declaration, even if `editable_hunk` is present.
+   - Do NOT use `revise_patch_hunk` to revert the call back to the original function.
+   - Workflow:
+     a) Derive `func` by stripping the `__revert_<commit>_` prefix.
+     b) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
+     c) If the active patch_key is NOT `_extra_*`: call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>")`.
+        Do NOT set `prefer_definition` here — only a prototype is needed.
+        If the active patch_key IS `_extra_*`: insert the prototype into the hunk via `make_error_patch_override`.
+   - Sanity check: the inserted code must be a prototype ending with `;`, not a macro or statement.
+
+2) Undeclared function calls NOT starting with `__revert_`:
+   - Treat the symbol as a function, not a variable.
+   - These calls should be removed/adapted at the caller. Do NOT use `make_extra_patch_override`.
+   - Do NOT insert a prototype, extern declaration, or full function definition.
+   - If `editable_hunk` is present, use `revise_patch_hunk` to remove/adapt the call in `+` lines.
+   - Otherwise use `make_error_patch_override` to rewrite the caller slice and remove/adapt the call.
+   - You may use `search_definition(symbol_name="X", version="v1")` only to understand what the old helper did.
+     A V1 `FUNCTION_DECL` / `FUNCTION_DEFI` result means only that `X` existed in V1.
+     It does NOT authorize `make_extra_patch_override(symbol_name="X", prefer_definition=true)`.
+   - Example: if `search_definition("node_cleanup_walker", "v1")` returns `FUNCTION_DEFI`, you still MUST rewrite the caller and MUST NOT call `make_extra_patch_override(symbol_name="node_cleanup_walker", prefer_definition=true)`.
+
+3) Undeclared identifiers (for example `use of undeclared identifier 'g_ctx'`):
    - **KB-FIRST SCOPE CHECK (required before local-fix decision)**.
-   - Before choosing local declaration rewrite, check KB evidence for `X` in V1 (for example analysis JSON such as `data/<project>-<commit>/<path>_analysis.json`).
-   - If KB shows `X` belongs to translation-unit / non-local scope (for example global/static declaration, or symbol evidence across function boundaries, including `DECL_REF_EXPR` evidence for `spelling: "X"` in V1 analysis), prefer `make_extra_patch_override(symbol_name='X')`.
-   - Example: for `g_ctx`, if V1 KB/analysis (for example `data/ndpi-fcff6d5a/fuzz/fuzz_ndpi_reader.c_analysis.json`) contains evidence for `spelling: "g_ctx"`, treat it as non-local and use `make_extra_patch_override` first.
+   - Before choosing a local declaration rewrite, check KB evidence for `X` in V1 (for example analysis JSON such as `data/<project>-<commit>/<path>_analysis.json`).
+   - For identifiers, KB/search is used to infer scope.
+   - If KB shows `X` belongs to translation-unit / non-local scope (for example global/static declaration, related `VAR_DECL`, or analysis evidence across function boundaries), prefer `make_extra_patch_override(symbol_name='X')`.
+   - Example: for `g_ctx`, if V1 KB/analysis (for example `data/ndpi-fcff6d5a/fuzz/fuzz_ndpi_reader.c_analysis.json`) shows it as a non-local symbol, use `make_extra_patch_override` first.
    - **LOCAL-VAR FALLBACK (LLVMFuzzerTestOneInput)**.
    - Decision checklist (all must be true):
      a) Diagnostic is exactly `use of undeclared identifier 'X'`.
      b) Error location/function is inside `LLVMFuzzerTestOneInput`.
      c) `get_error_patch_context` returned non-empty `editable_hunk` (mixed `+`/`-`).
      d) KB scope check did NOT establish that `X` is non-local/global.
-     e) `X` looks function-local (for example assigned/read/passed in function body) and is NOT a function call target, type name, macro token, or known global/extern symbol.
-   - If all checklist items are true: use `revise_patch_hunk` and add a minimal local declaration in `+` lines near first use (for example `type *X = NULL;`).
+     e) `X` looks function-local (assigned/read/passed in function body) and is NOT a function call target, type name, macro token, or known global/extern symbol.
+   - If all checklist items are true: use `revise_patch_hunk` and add a minimal local declaration in `+` lines near first use.
    - If KB indicates non-local/global scope, do NOT force a local declaration via `revise_patch_hunk`; use `make_extra_patch_override(symbol_name='X')` first.
-   - If the checklist is not fully satisfied, fall back to generic priority and use `make_extra_patch_override` for `symbol_name='X'` before broader function-body rewrites.
-   - Do not replace/drop the symbol inside the active function as a first step.
-   - If the active patch_key is `_extra_*`, follow the `_extra_*` rule below (fix that hunk with `make_error_patch_override` instead of extending `_extra_*` again).
+   - If the checklist is not fully satisfied, fall back to generic identifier/type priority and use `make_extra_patch_override` before broader function-body rewrites.
+   - Do not replace/drop the identifier inside the active function as a first step.
 
-2) Undeclared functions starting with `__revert_`:
-   - `__revert_*` wrappers are expected. Do NOT remove/replace calls to them.
-   - **PRIORITY**: When the error is an undeclared `__revert_*` function, ALWAYS use `make_extra_patch_override` to add the forward declaration, even if `editable_hunk` is present.
-     Do NOT use `revise_patch_hunk` to revert the call back to the original function - this defeats the purpose of the revert wrapper.
-   - Workflow to add a forward declaration for `__revert_<commit>_<func>`:
-     a) Derive `func` by stripping the `__revert_<commit>_` prefix.
-     b) `search_definition(symbol_name="func", version="v1")` to confirm the signature.
-     c) If the active patch_key is NOT `_extra_*`: call `make_extra_patch_override(symbol_name="__revert_<commit>_<func>")`.
-        Do NOT set prefer_definition — only a forward declaration (prototype) is needed here, not a full function body.
-        If the active patch_key IS `_extra_*`: insert the prototype into the hunk via `make_error_patch_override`.
-   - Sanity check: the inserted code must be a prototype (ends with `;`) and must not be a macro/statement.
-     If not, use `make_error_patch_override` to insert the correct prototype text based on the v1 signature.
-
-3) Undeclared functions NOT starting with `__revert_`:
-   - These are V1-only helpers removed in V2. They have NO definition in V2.
-   - Do NOT use `make_extra_patch_override` — adding a forward declaration only defers the failure to a linker error.
-   - Do NOT insert a prototype or extern declaration.
-   - Use `make_error_patch_override` to rewrite the caller slice and REMOVE the call to the function.
+4) Unknown type name / missing macro-like symbol:
+   - Prefer `make_extra_patch_override(symbol_name='X')` first.
+   - Do not treat `unknown type name` as a local-variable declaration problem.
 
 CRITICAL: when the active patch_key is `_extra_*`:
 - Never call `make_extra_patch_override` while fixing an `_extra_*` hunk (it would extend the same hunk and can cascade).
