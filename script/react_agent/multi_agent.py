@@ -43,15 +43,14 @@ def _safe_patch_key_dirname(name: str, *, max_len: int = 160) -> str:
 
 
 def _redact_cmd_for_log(cmd: List[str]) -> str:
+    """Build a copy-pasteable command string, stripping secret flags entirely."""
     redacted: List[str] = []
     skip_next = False
     for token in cmd:
         if skip_next:
-            redacted.append("REDACTED")
             skip_next = False
             continue
         if token == "--openai-api-key":
-            redacted.append(token)
             skip_next = True
             continue
         redacted.append(token)
