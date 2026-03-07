@@ -944,6 +944,11 @@ def parse_arguments():
         default=int(os.environ.get("REACT_AGENT_MAX_MULTI_AGENT_ROUNDS", "100") or 100),
         help='Max iterative multi-agent rounds (default: REACT_AGENT_MAX_MULTI_AGENT_ROUNDS or 100).',
     )
+    parser.add_argument(
+        '--ignore-crash-leaks',
+        action='store_true',
+        help='Pass --ignore-leaks to fuzz_helper collect_crash so LeakSanitizer does not fail crash collection.',
+    )
 
     return parser.parse_args()
 
@@ -1042,6 +1047,7 @@ def get_crash_stack(
     target_repo_path: str = None,
     fixed_builder_digest: Optional[str] = None,
     auto_select_images: bool = False,
+    ignore_crash_leaks: bool = False,
 ) -> str:
     """
     Ensure the crash log for the given commit/input exists, invoking the helper script if needed.
@@ -1069,6 +1075,8 @@ def get_crash_stack(
         '--architecture',
         arch,
     ]
+    if ignore_crash_leaks:
+        collect_crash_cmd.append('--ignore-leaks')
 
     # Add Docker image selection based on flags
     # collect_crash uses base-builder image
@@ -4001,6 +4009,7 @@ def revert_patch_test(args):
             target_repo_path=target_repo_path,
             fixed_builder_digest=fixed_builder_digest,
             auto_select_images=args.auto_select_images,
+            ignore_crash_leaks=args.ignore_crash_leaks,
         )
         
         trace1 = extract_function_calls(trace_path1)
@@ -4182,6 +4191,15 @@ def revert_patch_test(args):
                 logger.info(f"Saved cache with {len(patches_without_contexts)} bug results to {cache_file}")
             except Exception as e:
                 logger.warning(f"Failed to save cache for bug {bug_id}: {e}")
+
+            # Save min_patch JSON incrementally so results survive interruptions
+            try:
+                os.makedirs(os.path.dirname(min_patch_file_path), exist_ok=True)
+                with open(min_patch_file_path, 'w') as f:
+                    json.dump(min_path_dict, f, indent=4)
+                logger.info(f"Saved min_patch with {len(min_path_dict)} entries to {min_patch_file_path}")
+            except Exception as e:
+                logger.warning(f"Failed to save min_patch for bug {bug_id}: {e}")
         else:
             logger.info(f"Bug {bug_id} not triggered correctly (result={result}), skipping cache save")
 
@@ -4218,6 +4236,7 @@ def revert_patch_test(args):
                 target_repo_path=target_repo_path,
                 fixed_builder_digest=fixed_builder_digest,
                 auto_select_images=args.auto_select_images,
+                ignore_crash_leaks=args.ignore_crash_leaks,
             )
             break  # all transitions share the same next_commit for a given target
 
@@ -4267,6 +4286,7 @@ def revert_patch_test(args):
                 target_repo_path=target_repo_path,
                 fixed_builder_digest=fixed_builder_digest,
                 auto_select_images=args.auto_select_images,
+                ignore_crash_leaks=args.ignore_crash_leaks,
             )
             signature_file_trigger = os.path.join(
                 data_path,
