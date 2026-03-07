@@ -596,6 +596,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='test_input name')
   collect_crash_parser.add_argument('--patch',
                             help='patch file to apply in the builder')
+  collect_crash_parser.add_argument('--ignore-leaks',
+                            action='store_true',
+                            help='disable LeakSanitizer during crash collection by adding ASAN_OPTIONS=detect_leaks=0')
   collect_crash_parser.add_argument('--runner-image',
                             help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
                             default=None)
@@ -2188,8 +2191,10 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
     # Checkout buggy commit and set up environment
+    cd /src/{args.project.name};
     git checkout -f {commit};
     {_strict_reverse_patch_apply_snippet() if args.patch and apply_patch else ''} 
+    cd -;
     
     # Compile and collect trace
     compile;
@@ -2799,6 +2804,9 @@ def collect_crash(args):
 
   if args.e:
     env += args.e
+
+  if getattr(args, 'ignore_leaks', False) and not any(v.startswith('ASAN_OPTIONS=') for v in env):
+    env.append('ASAN_OPTIONS=detect_leaks=0')
 
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
