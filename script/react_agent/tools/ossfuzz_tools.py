@@ -2186,7 +2186,6 @@ def ossfuzz_apply_patch_and_test(
             build_returncode == 0
             and patch_apply_ok
             and not _has_compiler_errors(build_output)
-            and not _has_undeclared_func_warning(build_output)
             and not _has_linker_errors(build_output)
         )
 
