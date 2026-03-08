@@ -377,6 +377,8 @@ class ToolRunner:
                 file_path = str(args.get("file_path", "")).strip()
                 line_number = _as_int(args.get("line_number"), 0)
                 new_func_code = str(args.get("new_func_code", ""))
+                _old_code = str(args.get("old_code", ""))
+                _new_code_replace = str(args.get("new_code_replace", ""))
                 context_lines = _as_int(args.get("context_lines"), 0)
                 max_lines = _as_int(args.get("max_lines"), 2000)
                 max_chars = _as_int(args.get("max_chars"), 200000)
@@ -386,13 +388,16 @@ class ToolRunner:
                     return ToolObservation(False, tool, args, output="", error="Missing arg: file_path")
                 if line_number <= 0:
                     return ToolObservation(False, tool, args, output="", error="Invalid arg: line_number")
-                if not str(new_func_code).strip():
-                    return ToolObservation(False, tool, args, output="", error="Missing arg: new_func_code")
+                partial_mode = bool(_old_code.strip())
+                if not partial_mode and not str(new_func_code).strip():
+                    return ToolObservation(False, tool, args, output="", error="Missing arg: new_func_code (or use old_code + new_code_replace for partial mode)")
                 out = make_error_patch_override_tool(
                     patch_path=patch_path,
                     file_path=file_path,
                     line_number=line_number,
                     new_func_code=new_func_code,
+                    old_code=_old_code,
+                    new_code_replace=_new_code_replace,
                     context_lines=context_lines,
                     max_lines=max_lines,
                     max_chars=max_chars,

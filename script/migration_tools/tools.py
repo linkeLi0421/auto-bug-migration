@@ -1644,7 +1644,9 @@ def make_error_patch_override(
     patch_path: str,
     file_path: str,
     line_number: int,
-    new_func_code: str,
+    new_func_code: str = "",
+    old_code: str = "",
+    new_code_replace: str = "",
     context_lines: int = 0,
     max_lines: int = 2000,
     max_chars: int = 200000,
@@ -1656,11 +1658,28 @@ def make_error_patch_override(
     to locate the rewriteable `-` slice and rewrites the underlying patch text by replacing
     those `-` lines with `new_func_code` (each line prefixed with `-`).
 
+    **Partial mode** (for large functions): when *old_code* and *new_code_replace* are both
+    provided, the tool performs a targeted search-and-replace within the function's ``-``
+    lines instead of replacing the entire slice.  *new_func_code* is ignored in this mode.
+
     The tool is read-only: it returns the updated patch text but does not apply it.
     """
-    new_code = _extract_first_code_fence(new_func_code)
-    if not new_code.strip():
-        raise ValueError("new_func_code must be non-empty")
+    # Determine mode: partial (search-and-replace) vs full (replace entire slice)
+    _old_code_raw = _extract_first_code_fence(old_code).strip()
+    _new_code_replace_raw = _extract_first_code_fence(new_code_replace)
+    # Fallback: if old_code is provided but new_code_replace is empty and new_func_code
+    # is provided, treat new_func_code as the replacement text (common agent mistake).
+    if _old_code_raw and not _new_code_replace_raw and new_func_code:
+        _new_code_replace_raw = _extract_first_code_fence(new_func_code)
+    partial_mode = bool(_old_code_raw)
+
+    if partial_mode:
+        # In partial mode, new_code_replace may be empty (deletion).
+        new_code = ""  # not used in partial mode
+    else:
+        new_code = _extract_first_code_fence(new_func_code)
+    if not partial_mode and not new_code.strip():
+        raise ValueError("new_func_code must be non-empty (or use old_code + new_code_replace for partial mode)")
 
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
     mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
@@ -1726,6 +1745,106 @@ def make_error_patch_override(
     slice_lines = patch_lines[slice_start:slice_end]
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
+
+    # --- Partial mode: search-and-replace within the '-' lines ---
+    if partial_mode:
+        old_snip = _old_code_raw.replace("\r\n", "\n").replace("\r", "\n")
+        new_snip = _new_code_replace_raw.replace("\r\n", "\n").replace("\r", "\n")
+        if old_snip not in old_func_code_full:
+            # Try whitespace-normalized match
+            def _ws_norm(s: str) -> str:
+                return "\n".join(l.strip() for l in s.splitlines())
+            ws_old = _ws_norm(old_snip)
+            ws_full = _ws_norm(old_func_code_full)
+            if ws_old not in ws_full:
+                return {
+                    **mapping,
+                    "old_func_code": "",
+                    "old_func_code_truncated": False,
+                    "patch_text": "",
+                    "patch_text_truncated": False,
+                    "note": (
+                        f"old_code snippet not found in the mapped function slice ({len(old_func_lines)} '-' lines). "
+                        f"Provide the exact lines as they appear in the error_func_code artifact."
+                    ),
+                }
+            # Whitespace-normalized match: rebuild with original indentation
+            old_lines_list = old_func_code_full.splitlines()
+            ws_old_lines = old_snip.splitlines()
+            # Find match start by stripped comparison
+            match_start = -1
+            for si in range(len(old_lines_list) - len(ws_old_lines) + 1):
+                if all(old_lines_list[si + j].strip() == ws_old_lines[j].strip() for j in range(len(ws_old_lines))):
+                    match_start = si
+                    break
+            if match_start < 0:
+                return {
+                    **mapping,
+                    "old_func_code": "",
+                    "old_func_code_truncated": False,
+                    "patch_text": "",
+                    "patch_text_truncated": False,
+                    "note": "old_code snippet not found (whitespace-normalized match also failed).",
+                }
+            # Replace the matched range with new_snip lines
+            match_end = match_start + len(ws_old_lines)
+            replaced_lines = old_lines_list[:match_start] + new_snip.splitlines() + old_lines_list[match_end:]
+            replaced_code = "\n".join(replaced_lines)
+        else:
+            replaced_code = old_func_code_full.replace(old_snip, new_snip, 1)
+
+        new_code_norm = replaced_code
+        new_func_lines_partial = new_code_norm.splitlines()
+        new_minus_lines = [f"-{line}" for line in new_func_lines_partial]
+        new_len = len(new_func_lines_partial)
+
+        rewritten_slice: List[str] = []
+        inserted = False
+        for line in slice_lines:
+            if line.startswith("-"):
+                if not inserted:
+                    rewritten_slice.extend(new_minus_lines)
+                    inserted = True
+                continue
+            rewritten_slice.append(line)
+        if not inserted:
+            return {
+                **mapping,
+                "old_func_code": "",
+                "old_func_code_truncated": False,
+                "patch_text": "",
+                "patch_text_truncated": False,
+                "note": "No '-' lines found in the mapped patch slice; cannot rewrite patch.",
+            }
+
+        delta = len(rewritten_slice) - len(slice_lines)
+        patch_lines[slice_start:slice_end] = rewritten_slice
+
+        hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, func_end_n, delta)
+        _recompute_hunk_headers(patch_lines, reverse_apply=str(patch_key or "").startswith("_extra_"))
+
+        patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
+        old_func_code_text, old_func_code_truncated, _, _ = _truncate_text(
+            text=old_func_code_full, max_lines=200, max_chars=12000,
+        )
+
+        out: Dict[str, Any] = {
+            **mapping,
+            "file_path_patch": rel_file,
+            "old_func_code": old_func_code_text,
+            "old_func_code_truncated": old_func_code_truncated,
+            "new_func_code_lines": new_len,
+            "patch_text": patch_text_full,
+            "patch_text_truncated": False,
+            "patch_text_lines_total": len(patch_lines),
+            "note": (
+                f"Partial rewrite: replaced old_code snippet ({len(old_snip.splitlines())} lines) "
+                f"with new_code_replace ({len(new_snip.splitlines())} lines) within the mapped slice."
+            ),
+        }
+        return out
+
+    # --- Full mode: replace entire '-' slice ---
 
     # Validate that new_func_code preserves the function name by parsing it from the actual '-' lines.
     # This is more reliable than using metadata (old_signature/new_signature) which may be missing or incorrect.
