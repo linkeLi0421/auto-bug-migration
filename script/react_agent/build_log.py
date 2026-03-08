@@ -260,6 +260,13 @@ def iter_compiler_errors(build_log: str, *, snippet_lines: int = 2) -> List[Dict
             starts.append((idx, "warning", m_warn))
             continue
 
+    # If there are no actual errors (only warnings), don't promote warnings to
+    # actionable items.  Warnings are only relevant when they cause downstream
+    # errors; if the build has no errors the warnings are harmless.
+    has_any_error = any(level == "error" for _, level, _ in starts)
+    if not has_any_error:
+        return errors  # empty list — warnings-only build is OK
+
     # Check if there are any undeclared function warnings in the build log.
     # If so, we filter out "static declaration follows non-static declaration" errors
     # because they're a symptom of the undeclared function, not a root cause.

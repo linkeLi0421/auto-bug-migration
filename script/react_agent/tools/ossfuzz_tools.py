@@ -17,7 +17,7 @@ _DIFF_GIT_RE = re.compile(r"^diff --git a/(?P<old>\S+) b/(?P<new>\S+)$")
 _HUNK_HEADER_RE = re.compile(
     r"^@@\s+-(?P<old_start>\d+)(?:,(?P<old_len>\d+))?\s+\+(?P<new_start>\d+)(?:,(?P<new_len>\d+))?\s+@@(?P<suffix>.*)$"
 )
-_MAX_OVERLAP_MERGE_SPAN = 12
+_MAX_OVERLAP_MERGE_SPAN = 1500
 _PATCH_APPLY_ERROR_PATTERNS = [
     re.compile(r"^error:\s+corrupt patch(?:\s+at\s+line\s+\d+)?\s*$", re.IGNORECASE),
     re.compile(r"^error:\s+patch failed:\s+.*$", re.IGNORECASE),
@@ -627,6 +627,21 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
             return False
         return max(s1, s2) < min(e1, e2)
 
+    def _reverse_apply_would_conflict(h1: Dict[str, Any], h2: Dict[str, Any]) -> bool:
+        """Check if two blocks would conflict when reverse-applied separately.
+
+        In ``patch -R`` mode the forward ``+`` (new) side becomes the "match"
+        side.  If two blocks' new-side ranges overlap, the first one processed
+        corrupts the context that the second one expects.
+        """
+        s1 = int(h1.get("new_start", 0) or 0)
+        e1 = s1 + int(h1.get("new_len", 0) or 0)
+        s2 = int(h2.get("new_start", 0) or 0)
+        e2 = s2 + int(h2.get("new_len", 0) or 0)
+        if e1 <= s1 or e2 <= s2:
+            return False
+        return max(s1, s2) < min(e1, e2)
+
     file_to_indices: Dict[str, list[int]] = {}
     for idx, entry in enumerate(parsed_blocks):
         key = str(entry.get("file_key") or "")
@@ -644,22 +659,34 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
         j = 0
         while j < len(idxs) - 1:
             i1 = idxs[j]
-            i2 = idxs[j + 1]
-            if i1 in removed_indices or i2 in removed_indices:
+            if i1 in removed_indices:
                 j += 1
                 continue
+            # Find the next non-removed partner.
+            k = j + 1
+            while k < len(idxs) and idxs[k] in removed_indices:
+                k += 1
+            if k >= len(idxs):
+                break
+            i2 = idxs[k]
             cur = replaced_blocks.get(i1, parsed_blocks[i1])
             nxt = replaced_blocks.get(i2, parsed_blocks[i2])
             cur_hunks = list(cur["parsed"].get("hunks") or [])
             nxt_hunks = list(nxt["parsed"].get("hunks") or [])
             if len(cur_hunks) != 1 or len(nxt_hunks) != 1:
-                j += 1
+                j = k
                 continue
 
             h1 = dict(cur_hunks[0])
             h2 = dict(nxt_hunks[0])
             if not _old_ranges_overlap(h1, h2):
-                j += 1
+                j = k
+                continue
+
+            # Only merge if reverse-applying them separately would conflict.
+            # In -R mode, overlapping new-side ranges corrupt each other's context.
+            if not _reverse_apply_would_conflict(h1, h2):
+                j = k
                 continue
 
             h1["_order"] = 0
@@ -668,7 +695,7 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
             if merged is None:
                 merged = _merge_overlapping_hunk_cluster_via_reverse([h1, h2])
             if merged is None:
-                j += 1
+                j = k
                 continue
 
             header_lines = list(cur["parsed"].get("header_lines") or [])
@@ -681,7 +708,7 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
             merged_lines.extend(list(merged.get("body") or []))
             reparsed = _parse_diff_block(merged_lines)
             if reparsed is None:
-                j += 1
+                j = k
                 continue
 
             replaced_blocks[i1] = {
@@ -1752,7 +1779,15 @@ def merge_patch_bundle_with_overrides(
     for key in keys_sorted:
         patch_text = overrides.get(key, bundle.patches[key].patch_text or "")
         patch_text = str(patch_text or "").rstrip("\n")
-        if patch_text:
+        if not patch_text:
+            continue
+        # Skip context-only hunks (no actual changes) — patch(1) rejects them as malformed.
+        has_change = any(
+            ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+            for ln in patch_text.splitlines()
+            if ln and not ln.startswith("diff --git ") and not ln.startswith("@@")
+        )
+        if has_change:
             parts.append(patch_text)
 
     merged_text = ("\n\n".join(parts).rstrip("\n") + "\n") if parts else ""

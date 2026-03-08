@@ -34,7 +34,19 @@ CHOOSING THE RIGHT TOOL:
   To fix: copy the `editable_hunk` text, edit ONLY the `+` lines to fix the error (e.g. adjust call arguments), then pass the result as `revised_hunk` to `revise_patch_hunk`.
 - If `editable_hunk` is empty or absent, use `make_error_patch_override` as described below.
 
-CRITICAL - FUNCTION SIGNATURE PRESERVATION (make_error_patch_override only):
+CHOOSING FULL vs PARTIAL mode for make_error_patch_override:
+- **FULL mode** (default): provide `new_func_code` with the complete rewritten function body.
+  Use when the error_func_code is small enough to paste in full (typically < 100 lines).
+- **PARTIAL mode**: provide `old_code` (exact snippet from error_func_code) and `new_code_replace` (replacement).
+  Use when error_func_code is large (> 100 lines) and only a small part needs changing.
+  The tool finds `old_code` within the function's `-` lines and replaces just that portion.
+  Example: to replace `NDPI_PROTOCOL_NATS` with `NDPI_PROTOCOL_UNKNOWN` in an 877-line function:
+    old_code: "NDPI_PROTOCOL_NATS, 0 /* can_have_a_subprotocol */,"
+    new_code_replace: "NDPI_PROTOCOL_UNKNOWN, 0 /* can_have_a_subprotocol */,"
+  Partial mode skips the function-name guardrail, so you don't need to paste the full signature.
+  The `old_code` must match exactly as it appears in the error_func_code artifact.
+
+CRITICAL - FUNCTION SIGNATURE PRESERVATION (make_error_patch_override FULL mode only):
 - NEVER change the function signature (return type, function name, or parameters).
 - NEVER widen/narrow parameter types in the signature (e.g., `enum foo` -> `int`, `T *` -> `void *`).
 - The `error_func_code` / `focus_error_func_snippet` from get_error_patch_context shows the EXACT function signature you must use.
@@ -51,5 +63,5 @@ General rules:
 - Do NOT rename the function being overridden (keep the same function name/signature as the BASE slice; only edit the body).
 - Do NOT change function call targets by introducing new `__revert_*` wrapper/helper names (keep call-site function names stable).
 - Keep existing `__revert_*` symbol names from the BASE slice unless the active diagnostic requires changing one; do NOT mass-rename `__revert_*` helpers to unprefixed symbols.
-- Do NOT use placeholders like "... unchanged ..." or omit large chunks; you must paste the full BASE slice and apply minimal edits.
+- In FULL mode: do NOT use placeholders like "... unchanged ..." or omit large chunks; you must paste the full BASE slice and apply minimal edits.
 - make_error_patch_override.new_func_code MUST rewrite ONLY the mapped slice for the active function. Do NOT include other functions and do NOT paste unified-diff headers (`diff --git`, `@@`, `---`, `+++`).
