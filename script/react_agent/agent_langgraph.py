@@ -2781,6 +2781,14 @@ def _force_read_base_slice_for_shrunk_override(state: AgentState) -> Optional[De
     }
 
 
+def _is_partial_mode_override(decision: Decision) -> bool:
+    """Return True if the decision uses partial mode (old_code + new_code_replace) instead of full mode (new_func_code)."""
+    args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
+    old_code = str(args_obj.get("old_code", "") or "").strip()
+    new_func = str(args_obj.get("new_func_code", "") or "").strip()
+    return bool(old_code and not new_func)
+
+
 def _override_preserve_base_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
     """Return an error message if new_func_code drops too much of the mapped '-' slice baseline.
 
@@ -2823,6 +2831,8 @@ def _override_preserve_base_guardrail_error(state: AgentState, decision: Decisio
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     base_lines = [ln.rstrip() for ln in base_text.replace("\r\n", "\n").replace("\r", "\n").splitlines()]
@@ -2918,6 +2928,8 @@ def _override_preserve_revert_symbols_guardrail_error(state: AgentState, decisio
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     base_syms = _extract_revert_symbol_names(base_text)
@@ -2980,6 +2992,8 @@ def _override_no_new_revert_symbols_guardrail_error(state: AgentState, decision:
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     base_syms = _extract_revert_symbol_names(base_text)
@@ -3040,6 +3054,8 @@ def _override_no_local_revert_prototypes_guardrail_error(state: AgentState, deci
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     base_protos = _extract_local_revert_prototype_names(base_text)
@@ -3097,6 +3113,8 @@ def _override_single_function_guardrail_error(state: AgentState, decision: Decis
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     # Reject unified-diff content: make_error_patch_override expects raw code, not a diff.
@@ -3196,6 +3214,8 @@ def _override_preserve_function_name_guardrail_error(state: AgentState, decision
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     actual = _extract_first_top_level_function_name(new_text)
@@ -3268,6 +3288,8 @@ def _override_preserve_function_signature_guardrail_error(state: AgentState, dec
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     base_sig = _extract_first_top_level_function_signature(base_text)
@@ -3449,6 +3471,8 @@ def _override_complete_function_guardrail_error(state: AgentState, decision: Dec
     new_raw = str(args_obj.get("new_func_code", "") or "")
     new_text = _extract_first_code_fence(new_raw).replace("\r\n", "\n").replace("\r", "\n")
     if not new_text.strip():
+        if _is_partial_mode_override(decision):
+            return None  # partial mode uses old_code + new_code_replace; new_func_code not needed
         return "new_func_code is empty."
 
     new_bodies, _ = _count_top_level_bodies(new_text)
@@ -5679,6 +5703,20 @@ def _run_langgraph(
             file_path, line_number = _active_override_location(st)
             base_text = _last_read_artifact_text(st)
             base_lines = len(base_text.splitlines()) if base_text else 0
+            # For large hunks (>50 lines), instruct the agent to use partial mode
+            # to avoid full-mode guardrail rejection.
+            if base_lines > 50:
+                mode_hint = (
+                    "- The BASE slice is too large for a full rewrite. Use PARTIAL mode:\n"
+                    "  args.old_code=<exact lines to change>\n"
+                    "  args.new_code_replace=<replacement lines>\n"
+                    "  (leave args.new_func_code empty)\n"
+                )
+            else:
+                mode_hint = (
+                    "- args.new_func_code=<the BASE slice with minimal edits only; "
+                    "do NOT drop unrelated lines or omit the tail>\n"
+                )
             messages.append(
                 {
                     "role": "user",
@@ -5690,7 +5728,7 @@ def _run_langgraph(
                         f'- args.patch_path="{st.patch_path}"\n'
                         f'- args.file_path="{file_path}"\n'
                         f"- args.line_number={line_number}\n"
-                        "- args.new_func_code=<the BASE slice with minimal edits only; do NOT drop unrelated lines or omit the tail>\n"
+                        f"{mode_hint}"
                         "Return exactly one JSON tool object."
                     ),
                 }
@@ -5761,15 +5799,31 @@ def _run_langgraph(
             args_ok = False
             if must_patch:
                 args = decision.get("args") or {}
+                has_full = bool(str(args.get("new_func_code", "") or "").strip())
+                has_partial = bool(str(args.get("old_code", "") or "").strip())
                 args_ok = (
                     isinstance(args, dict)
                     and str(args.get("patch_path", "")).strip() == str(st.patch_path).strip()
                     and str(args.get("file_path", "")).strip() == str(file_path).strip()
                     and int(args.get("line_number", 0) or 0) == int(line_number or 0)
-                    and str(args.get("new_func_code", "") or "").strip()
+                    and (has_full or has_partial)
                 )
 
             if not args_ok:
+                base_text_check = _last_read_artifact_text(st)
+                base_lines_check = len(base_text_check.splitlines()) if base_text_check else 0
+                if base_lines_check > 50:
+                    retry_mode_hint = (
+                        "- The BASE slice is too large for a full rewrite. Use PARTIAL mode:\n"
+                        "  args.old_code=<exact lines to change>\n"
+                        "  args.new_code_replace=<replacement lines>\n"
+                        "  (leave args.new_func_code empty)\n"
+                    )
+                else:
+                    retry_mode_hint = (
+                        "- args.new_func_code=<the BASE slice with minimal edits only; "
+                        "do NOT drop unrelated lines or omit the tail>\n"
+                    )
                 base_rewrite_messages = list(messages)
                 base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
                 base_rewrite_messages.append(
@@ -5783,7 +5837,7 @@ def _run_langgraph(
                             f'- args.patch_path="{st.patch_path}"\n'
                             f'- args.file_path="{file_path}"\n'
                             f"- args.line_number={line_number}\n"
-                            "- args.new_func_code=<the BASE slice with minimal edits only; do NOT drop unrelated lines or omit the tail>\n"
+                            f"{retry_mode_hint}"
                             "Do not include any extra text."
                         ),
                     }
@@ -5954,6 +6008,20 @@ def _run_langgraph(
                 # We just read the mapped slice; require the model to emit a patch-generation tool call next.
                 base_rewrite_messages = list(messages)
                 base_rewrite_messages.append({"role": "assistant", "content": json.dumps(decision, ensure_ascii=False)})
+                force_base_text = _last_read_artifact_text(st)
+                force_base_lines = len(force_base_text.splitlines()) if force_base_text else 0
+                if force_base_lines > 50:
+                    force_mode_hint = (
+                        "- The BASE slice is too large for a full rewrite. Use PARTIAL mode:\n"
+                        "  args.old_code=<exact lines to change>\n"
+                        "  args.new_code_replace=<replacement lines>\n"
+                        "  (leave args.new_func_code empty)\n"
+                    )
+                else:
+                    force_mode_hint = (
+                        "- args.new_func_code=<the full replacement mapped '-' slice as a JSON string with \\\\n escapes>\n"
+                        "For call-site/argument-fix hunks, this should be only the call-site line(s), not an unrelated full caller function.\n"
+                    )
                 base_rewrite_messages.append(
                     {
                         "role": "user",
@@ -5965,8 +6033,7 @@ def _run_langgraph(
                             f'- args.patch_path="{st.patch_path}"\n'
                             f'- args.file_path="{file_path}"\n'
                             f"- args.line_number={line_number}\n"
-                            "- args.new_func_code=<the full replacement mapped '-' slice as a JSON string with \\\\n escapes>\n"
-                            "For call-site/argument-fix hunks, this should be only the call-site line(s), not an unrelated full caller function.\n"
+                            f"{force_mode_hint}"
                             "Do not include any extra text."
                         ),
                     }
@@ -6620,6 +6687,20 @@ def _run_langgraph(
             args_obj["patch_path"] = str(st.patch_path)
 
         args = dict(decision.get("args", {}))
+
+        # Guardrail: override ossfuzz_apply_patch_and_test parameters with
+        # known-correct values from state.  The LLM sometimes passes the
+        # patch_key as the ``commit`` value instead of the git commit hash.
+        if tool == "ossfuzz_apply_patch_and_test":
+            if st.ossfuzz_project:
+                args["project"] = st.ossfuzz_project
+            if st.ossfuzz_commit:
+                args["commit"] = st.ossfuzz_commit
+            if st.patch_path:
+                args["patch_path"] = str(st.patch_path)
+            if st.ossfuzz_build_csv:
+                args["build_csv"] = st.ossfuzz_build_csv
+
         obs = runner.call(tool, args)
         obs = _enforce_patch_key_scope(st, obs)
 

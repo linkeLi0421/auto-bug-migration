@@ -15,6 +15,10 @@ _HUNK_RE = re.compile(r"^@@ -(?P<old_start>\d+)(?:,(?P<old_len>\d+))? \+(?P<new_
 _REVERT_FUNC_RE = re.compile(r"^__revert_[A-Za-z0-9]+_(?P<base>[A-Za-z_][A-Za-z0-9_]*)$")
 _C_CONTROL_NAMES = {"if", "for", "while", "switch"}
 
+# Maximum number of '-' lines in a mapped slice before full-mode make_error_patch_override
+# is rejected.  Slices larger than this must use partial mode (old_code + new_code_replace).
+FULL_MODE_MAX_MINUS_LINES = 50
+
 
 def _strip_revert_prefix(name: str) -> str:
     raw = str(name or "").strip()
@@ -1845,6 +1849,18 @@ def make_error_patch_override(
         return out
 
     # --- Full mode: replace entire '-' slice ---
+
+    # Guardrail: reject full-mode rewrites on large Recreated-function hunks.
+    # The agent is unlikely to reproduce 50+ lines of '-' code correctly; force partial mode.
+    old_minus_count_full = len(old_func_lines)
+    if old_minus_count_full > FULL_MODE_MAX_MINUS_LINES:
+        raise ValueError(
+            f"Full-mode rewrite rejected: the mapped slice has {old_minus_count_full} '-' lines, "
+            f"which exceeds the {FULL_MODE_MAX_MINUS_LINES}-line limit for full rewrites. "
+            f"Use partial mode instead: pass old_code with the exact lines to change "
+            f"and new_code_replace with their replacement. "
+            f"This avoids reproducing all {old_minus_count_full} lines and prevents accidental truncation."
+        )
 
     # Validate that new_func_code preserves the function name by parsing it from the actual '-' lines.
     # This is more reliable than using metadata (old_signature/new_signature) which may be missing or incorrect.
