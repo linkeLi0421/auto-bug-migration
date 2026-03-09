@@ -159,17 +159,26 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
     """
     Fast heuristic: try removing one patch at a time (left-to-right),
     keep the removal if test_fn still returns True. Repeat until stable.
+
+    Uses a separate dict for each trial to prevent failed/partial trials
+    from overwriting correct entries in patches_without_context.
     """
     cur = list(patches)
     changed = True
     cache: Dict[Tuple[int, ...], bool] = {}
+    # Save the initial patches (from the full-set call) as fallback
+    last_successful_patches: Dict[str, Any] = dict(patches_without_context)
 
     def cached_test(items: List[Any]) -> bool:
+        nonlocal last_successful_patches
         key = tuple(id(x) for x in items)  # identity-based; avoids equals() surprises
         if key not in cache:
             items_copy = copy.deepcopy(items)
             ctx_copy   = copy.deepcopy(inmutable_args)
-            cache[key] = test_fn(items_copy, [], patches_without_context, *mutable_args, *ctx_copy)
+            trial_patches: Dict[str, Any] = {}
+            cache[key] = test_fn(items_copy, [], trial_patches, *mutable_args, *ctx_copy)
+            if cache[key] == 'trigger_and_fuzzer_build':
+                last_successful_patches = trial_patches
         return cache[key]
 
     while changed:
@@ -184,6 +193,10 @@ def minimize_greedy(patches: List[Any], test_fn: TestFn, patches_without_context
                 # do not increment i; the next element shifted into position i
             else:
                 i += 1
+
+    # Update patches_without_context with the last successful trial's patches
+    patches_without_context.clear()
+    patches_without_context.update(last_successful_patches)
     return cur
 
 
@@ -191,18 +204,26 @@ def minimize_func_list_greedy(func_list: List[Any], patch_pair_list: List[Any], 
     """
     Variant of minimize_greedy that shrinks func_list while keeping patch_pair_list fixed.
     Tests subsets of func_list with test_fn until no further removals keep the desired result.
+
+    Uses a separate dict for each trial to prevent failed/partial trials
+    from overwriting correct entries in patches_without_context.
     """
     cur_funcs = list(func_list)
     cache: Dict[Tuple[int, ...], bool] = {}
     baseline_patches = copy.deepcopy(patch_pair_list)
+    last_successful_patches: Dict[str, Any] = dict(patches_without_context)
 
     def cached_test(func_subset: List[Any]) -> bool:
+        nonlocal last_successful_patches
         key = tuple(id(x) for x in func_subset)
         if key not in cache:
             funcs_copy = copy.deepcopy(func_subset)
             patches_copy = copy.deepcopy(baseline_patches)
             ctx_copy = copy.deepcopy(inmutable_args)
-            cache[key] = test_fn(patches_copy, funcs_copy, patches_without_context, *mutable_args, *ctx_copy)
+            trial_patches: Dict[str, Any] = {}
+            cache[key] = test_fn(patches_copy, funcs_copy, trial_patches, *mutable_args, *ctx_copy)
+            if cache[key] == 'trigger_and_fuzzer_build':
+                last_successful_patches = trial_patches
         return cache[key]
 
     changed = True
@@ -217,6 +238,8 @@ def minimize_func_list_greedy(func_list: List[Any], patch_pair_list: List[Any], 
                 break  # restart after successful removal
             i += 1
 
+    patches_without_context.clear()
+    patches_without_context.update(last_successful_patches)
     return cur_funcs
 
 
