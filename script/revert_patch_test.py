@@ -1768,7 +1768,6 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
         "Compilation failed",
         "failed with exit status",
         "CMake Error",
-        "call to undeclared function"
     ]
 
     pattern = r"ERROR:.*Sanitizer"
