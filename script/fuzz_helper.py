@@ -2038,17 +2038,17 @@ def build_version(args):
                 args.commit, oss_fuzz_commit)
           break
 
+  # Fall back to current OSS-Fuzz HEAD if no CSV mapping found
+  if not oss_fuzz_commit:
+    result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+                          cwd=OSS_FUZZ_DIR,
+                          capture_output=True,
+                          text=True)
+    oss_fuzz_commit = result.stdout.strip()
+    logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
+
   # Apply Docker image pinning if builder_digest is specified
   if builder_digest:
-    if not oss_fuzz_commit:
-      # If no specific OSS-Fuzz commit from CSV, use current HEAD
-      import subprocess
-      result = subprocess.run(['git', 'rev-parse', 'HEAD'],
-                            cwd=OSS_FUZZ_DIR,
-                            capture_output=True,
-                            text=True)
-      oss_fuzz_commit = result.stdout.strip()
-      logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   else:
     prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
@@ -2128,7 +2128,10 @@ def build_version(args):
     cd -;
     apt-get update && apt-get install -y bear;
     apt install libclang-18-dev -y;
+    apt install -y python3-pip;
     pip install libclang==18.*;
+    export PYTHONPATH=$(pip show libclang | grep Location | cut -d' ' -f2):$PYTHONPATH;
+    /bin/bash;
     bear compile;
     python3 /script/libclang.py;
     # Remove existing output directory if it already exists
@@ -2372,10 +2375,12 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
       logger.info('Base-builder already pinned to %s, preserving it', 
                   already_pinned.group(0))
     else:
-      # Not pinned yet - pin it with the provided digest
-      updated_content = updated_content.replace(
-        'gcr.io/oss-fuzz-base/base-builder',
-        f'gcr.io/oss-fuzz-base/base-builder@{builder_image_digest}'
+      # Not pinned yet - pin it with the provided digest.
+      # Replace tagged variants (e.g., base-builder:ubuntu-24-04) and plain base-builder.
+      updated_content = re.sub(
+        r'gcr\.io/oss-fuzz-base/base-builder(:[a-zA-Z0-9._-]+)?',
+        f'gcr.io/oss-fuzz-base/base-builder@{builder_image_digest}',
+        updated_content
       )
       logger.info('Pinned base-builder to %s', builder_image_digest)
 
