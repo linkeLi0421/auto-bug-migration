@@ -2742,7 +2742,17 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             os.chdir(target_repo_path)
             subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            with open(os.path.join(target_repo_path, file_path), 'r', encoding="latin-1") as f:
+            source_file = os.path.join(target_repo_path, file_path)
+            if not os.path.exists(source_file) and file_path.endswith('.h'):
+                # Try .h.in template (e.g. CMake configure_file generates .h from .h.in)
+                source_file_in = source_file + '.in'
+                if os.path.exists(source_file_in):
+                    logger.debug(f"Using template {source_file_in} instead of missing {source_file}")
+                    source_file = source_file_in
+            if not os.path.exists(source_file):
+                logger.debug(f"Source file {source_file} not found at commit {next_commit}, skipping trace function {fname}")
+                continue
+            with open(source_file, 'r', encoding="latin-1") as f:
                 content = f.readlines()
                 function_lines = content[old_line_begin-1:old_line_end]
             # Build list of recreated functions visible to this file

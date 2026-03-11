@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import json
 from clang.cindex import Index, CursorKind, Config, Diagnostic
