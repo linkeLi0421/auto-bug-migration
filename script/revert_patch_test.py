@@ -2019,6 +2019,182 @@ def _run_single_multi_agent_round(
     }
 
 
+def _run_proactive_revert_declarations(
+    *,
+    patch_path: str,
+    v1_json_dir: str,
+    v2_json_dir: str,
+    v1_src: str,
+    v2_src: str,
+) -> dict:
+    """Round 0: scan the patch bundle and add forward declarations for all __revert_* functions.
+
+    Returns a dict with: total_symbols, declared, skipped, updated_patch_path, details.
+    """
+    result: Dict[str, Any] = {
+        "total_symbols": 0,
+        "declared": 0,
+        "skipped": 0,
+        "updated_patch_path": "",
+        "details": [],
+    }
+
+    react_agent_dir = os.path.join(current_file_path, "react_agent")
+    if react_agent_dir not in sys.path:
+        sys.path.insert(0, react_agent_dir)
+    if current_file_path not in sys.path:
+        sys.path.insert(0, current_file_path)
+
+    try:
+        from tools.extra_patch_tools import (
+            _enumerate_revert_symbols_by_file,
+            _infer_extra_patch_key,
+            _symbol_defined_in_extra_hunk,
+            make_extra_patch_override,
+        )
+        from migration_tools.patch_bundle import load_patch_bundle as _lpb
+    except Exception as exc:
+        logger.warning(f"Round 0: import error, skipping proactive declarations: {exc}")
+        return result
+
+    # Enumerate all __revert_* references in non-_extra_* patches.
+    try:
+        symbols = _enumerate_revert_symbols_by_file(patch_path)
+    except Exception as exc:
+        logger.warning(f"Round 0: failed to enumerate symbols: {exc}")
+        return result
+
+    if not symbols:
+        return result
+
+    # Filter out symbols already declared in the bundle.
+    try:
+        pre_bundle = _lpb(patch_path)
+        filtered = []
+        for sym, file_path, source_key in symbols:
+            ek = _infer_extra_patch_key(bundle=pre_bundle, file_path=file_path)
+            if ek:
+                ep = (pre_bundle.patches or {}).get(ek)
+                existing_text = str(getattr(ep, "patch_text", "") or "") if ep else ""
+                if existing_text and _symbol_defined_in_extra_hunk(existing_text, symbol_name=sym):
+                    continue
+            filtered.append((sym, file_path, source_key))
+        result["skipped"] = len(symbols) - len(filtered)
+        symbols = filtered
+    except Exception as exc:
+        logger.warning(f"Round 0: pre-filter failed ({exc}), processing all")
+
+    result["total_symbols"] = len(symbols) + result["skipped"]
+    if not symbols:
+        return result
+
+    # Build AgentTools for KB-backed prototype extraction.
+    agent_tools = None
+    try:
+        from agent_tools import AgentTools, KbIndex, SourceManager
+        if v1_json_dir and v2_json_dir and v1_src and v2_src:
+            kb = KbIndex(v1_json_dir, v2_json_dir)
+            sm = SourceManager(v1_src, v2_src)
+            agent_tools = AgentTools(kb, sm)
+    except Exception as exc:
+        logger.warning(f"Round 0: AgentTools unavailable ({exc}), proceeding without KB")
+
+    current_patch_path = patch_path
+    declared = 0
+
+    for sym, file_path, _source_key in symbols:
+        try:
+            res = make_extra_patch_override(
+                agent_tools,
+                patch_path=current_patch_path,
+                file_path=file_path,
+                symbol_name=sym,
+            )
+        except Exception as exc:
+            logger.warning(f"Round 0: make_extra_patch_override failed for {sym}: {exc}")
+            result["details"].append({"symbol": sym, "file": file_path, "status": "error", "error": str(exc)})
+            continue
+
+        extra_key = str(res.get("patch_key", "") or "").strip()
+        patch_text = ""
+        pt = res.get("patch_text")
+        if isinstance(pt, dict):
+            pt_path = str(pt.get("artifact_path", "") or "").strip()
+            if pt_path:
+                try:
+                    patch_text = Path(pt_path).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
+        elif isinstance(pt, str):
+            patch_text = pt
+
+        if not extra_key or not patch_text.strip():
+            result["details"].append({
+                "symbol": sym, "file": file_path, "status": "no_patch",
+                "note": res.get("note", ""),
+            })
+            continue
+
+        # Write updated bundle with the new declaration.
+        try:
+            from migration_tools.types import PatchInfo as _PatchInfo
+            bundle = _lpb(current_patch_path)
+            patches = bundle.patches if isinstance(getattr(bundle, "patches", None), dict) else {}
+
+            if extra_key not in patches:
+                fp_old = fp_new = ""
+                for line in patch_text.splitlines():
+                    if line.startswith("--- "):
+                        fp_old = line[4:].strip()
+                        if fp_old.startswith("a/"):
+                            fp_old = fp_old[2:]
+                    elif line.startswith("+++ "):
+                        fp_new = line[4:].strip()
+                        if fp_new.startswith("b/"):
+                            fp_new = fp_new[2:]
+                    if fp_old and fp_new:
+                        break
+                fp_new = fp_new or file_path
+                fp_old = fp_old or fp_new
+                suffix = Path(fp_new).suffix.lower()
+                file_type = suffix.lstrip(".") if suffix else "unknown"
+                patches[extra_key] = _PatchInfo(
+                    file_path_old=fp_old,
+                    file_path_new=fp_new,
+                    patch_text="",
+                    file_type=file_type,
+                    old_start_line=1, old_end_line=1,
+                    new_start_line=1, new_end_line=1,
+                    patch_type={"Extra"},
+                    old_signature="",
+                    dependent_func=set(),
+                    hiden_func_dict={},
+                )
+
+            patches[extra_key].patch_text = patch_text.rstrip("\n") + "\n"
+
+            # Always write to the same file to avoid name explosion.
+            base_stem = Path(patch_path).stem or "bundle"
+            # Strip any prior suffixes like .split_extra, .proactive_decls, .effective, etc.
+            base_stem = re.sub(r'\.(split_extra|proactive_decls|effective|merged_overrides)(\.\d+)?$', '', base_stem)
+            out_path = Path(patch_path).parent / f"{base_stem}.proactive_decls.patch2"
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "wb") as f:
+                pickle.dump(dict(patches), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            current_patch_path = str(out_path)
+            declared += 1
+            result["details"].append({"symbol": sym, "file": file_path, "extra_key": extra_key, "status": "ok"})
+        except Exception as exc:
+            logger.warning(f"Round 0: failed to write bundle for {sym}: {exc}")
+            result["details"].append({"symbol": sym, "file": file_path, "status": "error", "error": str(exc)})
+
+    result["declared"] = declared
+    if declared > 0:
+        result["updated_patch_path"] = current_patch_path
+    return result
+
+
 def call_react_agent(
     build_log_path: str,
     patch_path: str,
@@ -2041,6 +2217,11 @@ def call_react_agent(
     openai_model: str = "gpt-5-mini",
     openai_max_tokens: int = 64000,
     max_multi_agent_rounds: int = int(os.environ.get("REACT_AGENT_MAX_MULTI_AGENT_ROUNDS", "100") or 100),
+    # Extra params needed for rebuild after round 0
+    bug_id: str = "",
+    patch_file_path: str = "",
+    runner_image: str = "auto",
+    commit_date: str = "",
 ) -> dict:
     """Call the multi-agent to fix build errors with iterative rounds.
 
@@ -2056,6 +2237,93 @@ def call_react_agent(
     rounds = []
     final_result = None
     agent_succeeded = False  # True only when the final build actually passed
+
+    # --- Round 0: Proactive forward declarations for __revert_* functions ---
+    # Scan the patch bundle for __revert_* calls and add forward declarations
+    # into _extra_* hunks before any agent runs.  No build log needed.
+    round0_ts = time.strftime("%Y%m%d_%H%M%S")
+    round0_dir = os.path.join(data_path, "react_agent_artifacts", f"round0_{round0_ts}")
+    os.makedirs(round0_dir, exist_ok=True)
+
+    round0_result = _run_proactive_revert_declarations(
+        patch_path=current_patch,
+        v1_json_dir=v1_json_dir,
+        v2_json_dir=v2_json_dir,
+        v1_src=v1_src,
+        v2_src=v2_src,
+    )
+    round0_result["round"] = 0
+    round0_result["artifacts_dir"] = round0_dir
+
+    updated_patch = round0_result.get("updated_patch_path", "")
+    if updated_patch and os.path.isfile(updated_patch):
+        current_patch = updated_patch
+        declared = round0_result.get("declared", 0)
+        total = round0_result.get("total_symbols", 0)
+        logger.info(f"Round 0: {declared}/{total} forward declarations added -> {current_patch}")
+
+        # Regenerate .diff from updated bundle and rebuild to get fresh build log.
+        if patch_file_path and bug_id:
+            try:
+                updated_patches = load_patches_pickle(current_patch)
+                with open(patch_file_path, "w") as f:
+                    for key in sorted(
+                        updated_patches.keys(),
+                        key=lambda k: getattr(updated_patches[k], "new_start_line", 0),
+                        reverse=True,
+                    ):
+                        f.write(updated_patches[key].patch_text)
+                        f.write("\n\n")
+                logger.info(f"Round 0: regenerated {patch_file_path} from updated bundle")
+
+                # Rebuild to get fresh error lines
+                logger.info("Round 0: rebuilding to get updated build log...")
+                build_ok, new_error_log = build_fuzzer(
+                    project, new_commit, sanitizer, bug_id,
+                    patch_file_path, fuzz_target, build_csv, arch,
+                    runner_image=runner_image, commit_date=commit_date,
+                )
+                round0_result["build_success"] = build_ok
+
+                if build_ok:
+                    logger.info("Round 0: build succeeded after proactive declarations!")
+                    agent_succeeded = True
+                else:
+                    # Write fresh build log
+                    fresh_log = os.path.join(round0_dir, "build_output.log")
+                    with open(fresh_log, "w") as f:
+                        f.write(new_error_log)
+                    current_build_log = fresh_log
+                    round0_result["build_log"] = fresh_log
+                    logger.info(f"Round 0: build still fails, updated build log -> {fresh_log}")
+            except Exception as exc:
+                logger.warning(f"Round 0: rebuild failed ({exc}), keeping original build log")
+        else:
+            logger.info("Round 0: no patch_file_path/bug_id, skipping rebuild")
+    else:
+        logger.info(f"Round 0: no declarations needed (symbols={round0_result.get('total_symbols', 0)})")
+
+    # Save round 0 summary
+    try:
+        import json as _json
+        with open(os.path.join(round0_dir, "summary.json"), "w") as f:
+            _json.dump(round0_result, f, indent=2, default=str)
+    except Exception:
+        pass
+
+    rounds.append(round0_result)
+
+    if agent_succeeded:
+        # Round 0 alone fixed the build — return early
+        return {
+            "success": True,
+            "output": round0_result,
+            "returncode": 0,
+            "merged_diff_path": patch_file_path,
+            "merged_patch_bundle_path": current_patch,
+            "artifacts_dir": round0_dir,
+            "rounds": rounds,
+        }
 
     for round_num in range(1, max_multi_agent_rounds + 1):
         logger.info(f"=== Multi-agent round {round_num}/{max_multi_agent_rounds} ===")
@@ -3479,6 +3747,10 @@ def apply_and_test_patches(
             max_steps=max(1, int(getattr(args, "react_agent_max_steps", 200) or 200)),
             max_restarts_per_hunk=max(0, int(getattr(args, "react_agent_max_restarts_per_hunk", 3) or 3)),
             max_multi_agent_rounds=max(1, int(getattr(args, "react_agent_max_multi_agent_rounds", 100) or 100)),
+            bug_id=bug_id,
+            patch_file_path=patch_file_path,
+            runner_image=runner_image or "auto",
+            commit_date=commit_date or "",
         )
 
         # If the agent failed to fix all errors, skip copy and verification build

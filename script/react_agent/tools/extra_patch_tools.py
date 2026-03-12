@@ -833,6 +833,41 @@ def _skip_past_macro_continuation(lines: List[str], idx: int) -> int:
     return min(idx, len(lines))
 
 
+def _earliest_bundle_hunk_start(*, bundle: Any, file_path: str) -> Optional[int]:
+    """Return the 0-based earliest old_start_line of non-_extra_* hunks for *file_path*.
+
+    Returns ``None`` when no non-_extra_* hunks target this file.
+    """
+    if bundle is None:
+        return None
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return None
+    base = Path(str(file_path or "").strip()).name
+    if not base:
+        return None
+
+    earliest: Optional[int] = None
+    for key, patch in patches.items():
+        if str(key or "").startswith("_extra_"):
+            continue
+        fp_new = str(getattr(patch, "file_path_new", "") or "").strip()
+        fp_old = str(getattr(patch, "file_path_old", "") or "").strip()
+        if Path(fp_new).name != base and Path(fp_old).name != base:
+            continue
+        pt = str(getattr(patch, "patch_text", "") or "")
+        for line in pt.splitlines():
+            m = _HUNK_RE.match(line)
+            if m:
+                old_start = int(m.group("old_start") or 0)
+                if old_start > 0:
+                    idx = old_start - 1  # 0-based
+                    if earliest is None or idx < earliest:
+                        earliest = idx
+                break
+    return earliest
+
+
 def _new_extra_patch_skeleton(
     agent_tools: Any,
     *,
@@ -860,9 +895,20 @@ def _new_extra_patch_skeleton(
         agent_tools, file_path=str(file_path or "").strip(), version=version_used, symbol_name=str(symbol_name or "").strip(),
         bundle=bundle, force_tier1=bool(force_tier1),
     )
+    # Compute the earliest non-_extra_* hunk start for this file as a ceiling.
+    # The _extra_ anchor must be before all function-body hunks.
+    _hunk_ceiling = _earliest_bundle_hunk_start(bundle=bundle, file_path=str(file_path or "").strip())
+
     if insert_line > 0:
         # We insert before the context line at insert_line; index is 0-based.
         idx = insert_line - 1
+        # Clamp to before the earliest non-_extra_* hunk for this file.
+        # If the AST anchor falls inside/after a hunk range, the backward walk
+        # below will find a safe file-scope boundary from the clamped position.
+        _was_clamped = False
+        if _hunk_ceiling is not None and idx >= _hunk_ceiling:
+            idx = max(_hunk_ceiling - 1, 0)
+            _was_clamped = True
         if 0 <= idx < len(lines):
             # Walk backwards in V2 source to find a safe insertion boundary.
             # Two-pass approach:
@@ -878,8 +924,14 @@ def _new_extra_patch_skeleton(
                         idx = back_i + 1
                         found_boundary = True
                         break
-                # Pass 2: header-file fallback (no col-0 braces)
-                if not found_boundary:
+                # When clamped by a hunk ceiling and Pass 1 found no column-0 '}',
+                # the region before the hunk is inside a function body.  Fall through
+                # to _find_file_scope_insertion_index instead of Pass 2 (which would
+                # pick a blank line or ';' still inside the function body).
+                if _was_clamped and not found_boundary:
+                    idx = -1  # signal: use _find_file_scope_insertion_index
+                # Pass 2: header-file fallback (no col-0 braces) — only when NOT clamped
+                elif not found_boundary:
                     for back_i in range(idx - 1, -1, -1):
                         bl = lines[back_i].rstrip()
                         bls = bl.lstrip()
@@ -987,6 +1039,12 @@ def _new_extra_patch_skeleton(
                 insert_at = ceiling
 
     insert_at = _skip_out_of_if0_block(lines, insert_at)
+
+    # Final safety: if insert_at still overlaps a non-_extra_* hunk after all
+    # the above adjustments, clamp again (the header-guard or skip logic may
+    # have pushed it forward).
+    if _hunk_ceiling is not None and insert_at >= _hunk_ceiling:
+        insert_at = max(_hunk_ceiling - 1, 0)
 
     start_line = insert_at + 1
     ctx = lines[insert_at : insert_at + max(1, int(context_lines or 0))]
@@ -1444,7 +1502,7 @@ def _rewrite_existing_opaque_var_decl_in_extra_hunk(agent_tools: Any, *, patch_t
     return "\n".join(updated).rstrip("\n") + "\n"
 
 
-_ALL_CAPS_ATTR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\b")
+_ALL_CAPS_ATTR_RE = re.compile(r"\b[A-Z][A-Z0-9_]{2,}\s*(?:\([^)]*\))?")
 
 
 def _strip_attribute_macros_from_prototype(lines: List[str], *, func_name: str) -> List[str]:
@@ -3298,18 +3356,15 @@ def make_extra_patch_override(
         Returns (lines, insert_kind) or ([], "") if not found.
         """
         if agent_tools is None:
-            sys.stderr.write(f"[_extract_type_definition_from_kb] agent_tools is None\n")
             return [], ""
         kb_index = getattr(agent_tools, "kb_index", None)
         source_manager = getattr(agent_tools, "source_manager", None)
-        sys.stderr.write(f"[_extract_type_definition_from_kb] type_name={type_name}, ver={ver}, kb_index={kb_index is not None}, source_manager={source_manager is not None}\n")
         if kb_index is None or source_manager is None:
             return [], ""
-        
+
         # Try to find ENUM_DECL, STRUCT_DECL, or UNION_DECL for this type
         for query_name in [type_name, f"enum {type_name}", f"struct {type_name}", f"union {type_name}"]:
             nodes = (kb_index.query_all(query_name) or {}).get(ver, [])
-            sys.stderr.write(f"[_extract_type_definition_from_kb] query_name={query_name}, found {len(nodes)} nodes\n")
             for node in nodes:
                 if not isinstance(node, dict):
                     continue
@@ -3345,11 +3400,8 @@ def make_extra_patch_override(
             if type_lines:
                 inserted_lines = type_lines
                 insert_kind = type_insert_kind
-                sys.stderr.write(f"[make_extra_patch_override] Found full {type_kind} definition for {type_name} from {ver}\n")
                 break
         if not inserted_lines:
-            # Fallback to forward declaration
-            sys.stderr.write(f"[make_extra_patch_override] KB lookup failed for {type_kind} {type_name}; falling back to forward declaration\n")
             inserted_lines = [f"{type_kind} {type_name};"]
             insert_kind = "forward_tag_declaration"
 
@@ -3369,7 +3421,6 @@ def make_extra_patch_override(
                 insert_kind = "function_prototype_from_bundle"
 
     # 2) Fallback to KB/JSON: locate underlying symbol code and synthesize a declaration.
-    sys.stderr.write(f"[make_extra_patch_override] Step 2: inserted_lines={bool(inserted_lines)}, agent_tools={agent_tools is not None}\n")
     if not inserted_lines and agent_tools is not None:
         requested = str(version or "v1").strip().lower()
         if requested not in {"v1", "v2"}:
@@ -3378,7 +3429,6 @@ def make_extra_patch_override(
         query = underlying or symbol
         for ver in versions_to_try:
             chosen = _kb_pick_insertable_node(agent_tools, symbol=query, version=ver)
-            sys.stderr.write(f"[make_extra_patch_override] _kb_pick_insertable_node for query={query}, ver={ver} returned {chosen is not None}\n")
             if chosen is None:
                 continue
             chosen_kind = str(chosen.get("kind", "") or "").strip()
@@ -3417,25 +3467,19 @@ def make_extra_patch_override(
 
     # If KB lookup failed for a type name, try harder to extract full enum/struct/union definition
     # This handles cases where the type is defined in a different file (e.g., header file)
-    sys.stderr.write(f"[make_extra_patch_override] Checking fallback for type extraction. inserted_lines={bool(inserted_lines)}, agent_tools={agent_tools is not None}\n")
     if not inserted_lines and agent_tools is not None:
         requested = str(version or "v1").strip().lower()
         if requested not in {"v1", "v2"}:
             requested = "v1"
-        sys.stderr.write(f"[make_extra_patch_override] Trying type extraction fallback for symbol={symbol}, underlying={underlying}, requested={requested}\n")
-        # Try both versions
         for ver in [requested, ("v2" if requested == "v1" else "v1")]:
             type_lines, type_kind = _extract_type_definition_from_kb(symbol, ver)
-            sys.stderr.write(f"[make_extra_patch_override] Tried {ver} for symbol={symbol}, got {len(type_lines)} lines\n")
             if type_lines:
                 inserted_lines = type_lines
                 insert_kind = type_kind
                 break
-        # Also try with underlying name for revert functions that use enum/struct parameters
         if not inserted_lines and underlying:
             for ver in [requested, ("v2" if requested == "v1" else "v1")]:
                 type_lines, type_kind = _extract_type_definition_from_kb(underlying, ver)
-                sys.stderr.write(f"[make_extra_patch_override] Tried {ver} for underlying={underlying}, got {len(type_lines)} lines\n")
                 if type_lines:
                     inserted_lines = type_lines
                     insert_kind = type_kind
@@ -3646,3 +3690,62 @@ def make_extra_patch_override(
     if serialized_enum_overrides:
         result["enum_rename_overrides"] = serialized_enum_overrides
     return result
+
+
+# ---------------------------------------------------------------------------
+# Proactive forward declarations for ALL __revert_* functions
+# ---------------------------------------------------------------------------
+
+_REVERT_CALL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(__revert_[A-Za-z0-9]+_[A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+
+
+def _enumerate_revert_symbols_by_file(
+    patch_path: str,
+) -> List[Tuple[str, str, str]]:
+    """Scan the patch bundle for __revert_* function references in non-_extra_ patches.
+
+    Returns [(symbol_name, file_path, patch_key), ...] deduplicated by (symbol, file).
+    ``file_path`` is derived from the patch's ``file_path_new`` (or ``file_path_old``).
+    """
+    from migration_tools.patch_bundle import load_patch_bundle  # type: ignore
+
+    bundle = load_patch_bundle(
+        str(patch_path), allowed_roots=_allowed_patch_roots_from_env()
+    )
+    patches = getattr(bundle, "patches", None)
+    if not isinstance(patches, dict):
+        return []
+
+    seen: set = set()
+    results: List[Tuple[str, str, str]] = []
+
+    for key, patch in patches.items():
+        key_s = str(key or "")
+        # Skip _extra_* hunks – those are the destination, not the source.
+        if key_s.startswith("_extra_"):
+            continue
+        patch_text = str(getattr(patch, "patch_text", "") or "")
+        if not patch_text:
+            continue
+
+        # Derive file path from patch metadata.
+        fp_new = str(getattr(patch, "file_path_new", "") or "").strip()
+        fp_old = str(getattr(patch, "file_path_old", "") or "").strip()
+        file_path = fp_new or fp_old
+        if not file_path:
+            continue
+
+        for line in patch_text.splitlines():
+            # Only look at '-' lines (code being added in reverse-apply semantics).
+            if not line.startswith("-") or line.startswith("---"):
+                continue
+            for m in _REVERT_CALL_RE.finditer(line):
+                sym = m.group(1)
+                pair = (sym, file_path)
+                if pair not in seen:
+                    seen.add(pair)
+                    results.append((sym, file_path, key_s))
+
+    return results
