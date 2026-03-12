@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 
 from buildAndtest import (
     checkout_latest_commit,
-    get_commit_timestamp,
     get_latest_images_before_year,
     resolve_commit_hash,
 )
@@ -1043,13 +1042,9 @@ def get_crash_stack(
     if fixed_builder_digest:
         # Use the single fixed builder image digest for all commits
         collect_crash_cmd.extend(['--runner-image', fixed_builder_digest])
-    elif auto_select_images and target_repo_path:
-        # Add automatic Docker image selection based on commit date (no upper bound)
-        try:
-            commit_timestamp = get_commit_timestamp(target_repo_path, commit_id)
-            collect_crash_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
-        except Exception as e:
-            logger.warning(f"Could not get commit timestamp for {commit_id}: {e}")
+    else:
+        # fuzz_helper.py will auto-derive commit_date from oss_fuzz_commit in builds.csv
+        collect_crash_cmd.extend(['--runner-image', 'auto'])
 
     collect_crash_cmd.extend([
         '--testcases',
@@ -1696,11 +1691,17 @@ def clean_log(text: str) -> str:
     return re.sub(r'\n{3,}', '\n\n', text)
 
 
-def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch):
+def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch,
+                 runner_image='auto', commit_date=None):
     cmd = [
         "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
-        "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch , target
+        "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch
     ]
+    if runner_image:
+        cmd.extend(['--runner-image', str(runner_image)])
+    if commit_date:
+        cmd.extend(['--commit-date', str(commit_date)])
+    cmd.append(target)
 
     cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
@@ -3219,6 +3220,8 @@ def build_with_cached_extras(
     fuzzer: str,
     build_csv: str,
     arch: str,
+    runner_image: Optional[str] = None,
+    commit_date: Optional[int] = None,
 ) -> Tuple[bool, str]:
     """Build with a subset of patches, including cached extra patches."""
     combined_patches = {}
@@ -3246,7 +3249,8 @@ def build_with_cached_extras(
 
     return build_fuzzer(
         target, next_commit_id, sanitizer, bug_id,
-        patch_file_path, fuzzer, build_csv, arch
+        patch_file_path, fuzzer, build_csv, arch,
+        runner_image=runner_image, commit_date=commit_date
     )
 
 
@@ -3263,6 +3267,8 @@ def minimize_with_trace_and_cached_extras(
     fuzzer: str,
     build_csv: str,
     arch: str,
+    runner_image: Optional[str] = None,
+    commit_date: Optional[int] = None,
 ) -> Tuple[List[Tuple[str, ...]], Dict[str, Any]]:
     """Minimize patches using trace-based filtering with cached extra patches."""
 
@@ -3294,7 +3300,8 @@ def minimize_with_trace_and_cached_extras(
     success, _ = build_with_cached_extras(
         filtered_flat, diff_results, extra_patches_cache,
         target, next_commit['commit_id'], sanitizer, bug_id,
-        fuzzer, build_csv, arch
+        fuzzer, build_csv, arch,
+        runner_image=runner_image, commit_date=commit_date
     )
 
     if success:
@@ -3313,7 +3320,8 @@ def minimize_with_trace_and_cached_extras(
         ok, _ = build_with_cached_extras(
             keys, diff_results, extra_patches_cache,
             target, next_commit['commit_id'], sanitizer, bug_id,
-            fuzzer, build_csv, arch
+            fuzzer, build_csv, arch,
+            runner_image=runner_image, commit_date=commit_date
         )
         return ok
 
@@ -3353,6 +3361,8 @@ def apply_and_test_patches(
     depen_graph,
     v1_repo_path,
     v2_repo_path,
+    runner_image=None,
+    commit_date=None,
     ):
     if not patch_pair_list:
         logger.error("No patch pairs to apply")
@@ -3423,7 +3433,8 @@ def apply_and_test_patches(
         or 'will not be visible' in error_log
     ):
         count += 1
-        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch,
+                                                runner_image=runner_image, commit_date=commit_date)
         if build_success:
             break
 
@@ -3498,7 +3509,8 @@ def apply_and_test_patches(
                     patch_file.write('\n\n')
             logger.info(f"Regenerated {patch_file_path} from updated patch bundle (fallback)")
         # Rebuild to verify
-        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch)
+        build_success, error_log = build_fuzzer(target, next_commit['commit_id'], sanitizer, bug_id, patch_file_path, fuzzer, args.build_csv, arch,
+                                                runner_image=runner_image, commit_date=commit_date)
         if build_success:
             logger.info("React multi-agent successfully fixed build errors")
             break
@@ -3566,7 +3578,8 @@ def apply_and_test_patches(
         return 'build_fail'
 
 
-def test_fuzzer(args, bug_id, target, commit_id, patch_path, need_build = True):
+def test_fuzzer(args, bug_id, target, commit_id, patch_path, need_build = True,
+                runner_image=None, commit_date=None):
     # Run the fuzzer to test if the bug is reproduced
     bug_info_path = args.bug_info
     testcases_env = os.getenv('TESTCASES', '')
@@ -3578,7 +3591,8 @@ def test_fuzzer(args, bug_id, target, commit_id, patch_path, need_build = True):
     arch = 'i386' if 'i386' in bug_info['reproduce']['job_type'] else 'x86_64'
     
     if need_build:
-        build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch)
+        build_fuzzer(target, commit_id, sanitizer, bug_id, patch_path, fuzzer, args.build_csv, arch,
+                     runner_image=runner_image, commit_date=commit_date)
     
     testcase_path = os.path.join(testcases_env, 'testcase-' + bug_id)
     reproduce_cmd = [
@@ -3740,7 +3754,10 @@ def revert_patch_test(args):
                 logger.info(f"Found {len(existing_patches)} existing patch files for local bug test")
                 # Run self-trigger test so cached bugs appear in the summary
                 last_patch = get_patched_traces[bug_id][-1]
-                result, _ = test_fuzzer(args, bug_id, target, next_commit['commit_id'], last_patch, need_build=True)
+                # Determine Docker image for test_fuzzer
+                _test_runner_image = fixed_builder_digest if fixed_builder_digest else 'auto'
+                result, _ = test_fuzzer(args, bug_id, target, next_commit['commit_id'], last_patch, need_build=True,
+                                        runner_image=_test_runner_image)
                 if 'trigger' in result and 'not trigger' not in result:
                     revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
                     logger.info(f"Cached bug {bug_id} self-trigger test passed")
@@ -3776,35 +3793,23 @@ def revert_patch_test(args):
             short_n = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
             logger.info(f"Processing transition for bug {bug_id} from commit {short_c} to {short_n}")
 
-        # Get commit timestamps for automatic Docker image selection (only if needed)
-        commit_timestamp = None
-        next_commit_timestamp = None
-        if args.auto_select_images:
-            try:
-                commit_timestamp = get_commit_timestamp(target_repo_path, commit['commit_id'])
-                next_commit_timestamp = get_commit_timestamp(target_repo_path, next_commit['commit_id'])
-            except Exception as e:
-                logger.warning(f"Could not get commit timestamps: {e}")
-
         if bug_id in get_patched_traces:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
             # Add Docker image selection based on flags
-            # collect_trace uses base-builder image
             if fixed_builder_digest:
                 collect_trace_cmd.extend(['--runner-image', fixed_builder_digest])
-            elif args.auto_select_images and next_commit_timestamp:
-                collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
+            else:
+                collect_trace_cmd.extend(['--runner-image', 'auto'])
             collect_trace_cmd.extend(['--patch', get_patched_traces[bug_id][-1]])
         else:
             collect_trace_cmd = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
             # Add Docker image selection based on flags
-            # collect_trace uses base-builder image
             if fixed_builder_digest:
                 collect_trace_cmd.extend(['--runner-image', fixed_builder_digest])
-            elif args.auto_select_images and commit_timestamp:
-                collect_trace_cmd.extend(['--runner-image', 'auto', '--commit-date', str(commit_timestamp)])
+            else:
+                collect_trace_cmd.extend(['--runner-image', 'auto'])
         collect_trace_cmd.extend(['--testcases', testcases_env])
 
         collect_trace_cmd.extend(['--build_csv', args.build_csv])
@@ -3831,11 +3836,10 @@ def revert_patch_test(args):
             collect_trace_cmd_2 = [py3, f'{current_file_path}/fuzz_helper.py', 'collect_trace', '--commit', next_commit['commit_id'], '--sanitizer', sanitizer,
                                 '--build_csv', args.build_csv, '--architecture', arch]
             # Add Docker image selection based on flags
-            # collect_trace uses base-builder image
             if fixed_builder_digest:
                 collect_trace_cmd_2.extend(['--runner-image', fixed_builder_digest])
-            elif args.auto_select_images and next_commit_timestamp:
-                collect_trace_cmd_2.extend(['--runner-image', 'auto', '--commit-date', str(next_commit_timestamp)])
+            else:
+                collect_trace_cmd_2.extend(['--runner-image', 'auto'])
             collect_trace_cmd_2.extend(['--testcases', testcases_env])
             collect_trace_cmd_2.extend(['--build_csv', args.build_csv])
             collect_trace_cmd_2.extend(['--test_input', crash_test_input])
@@ -3972,9 +3976,16 @@ def revert_patch_test(args):
 
         depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
 
+        # Determine Docker image selection for builds
+        # Default to 'auto' so fuzz_helper.py derives the image from builds.csv
+        build_runner_image = 'auto'
+        build_commit_date = None
+        if fixed_builder_digest:
+            build_runner_image = fixed_builder_digest
+
         inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
             sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
-            v1_repo_path, v2_repo_path)
+            v1_repo_path, v2_repo_path, build_runner_image, build_commit_date)
         signature_change_list = []
         mutable_args = (get_patched_traces, transitions, signature_change_list)
         patch_by_func = dict()
@@ -4113,6 +4124,8 @@ def revert_patch_test(args):
             trigger_san = bug_info_dataset[bug_id_trigger]['reproduce']['sanitizer'].split(' ')[0]
             need_build = (trigger_san != last_sanitizer)
             last_sanitizer = trigger_san
+            # Determine Docker image for test_fuzzer
+            _tf_runner_image = fixed_builder_digest if fixed_builder_digest else 'auto'
             result, crash_output = test_fuzzer(
                 args,
                 bug_id_trigger,
@@ -4120,6 +4133,7 @@ def revert_patch_test(args):
                 next_commit['commit_id'],
                 patch_file_path,
                 need_build=need_build,
+                runner_image=_tf_runner_image,
             )
             if result == 'not trigger':
                 logger.info(f'\t{bug_id} not trigger local bug {bug_id_trigger}')

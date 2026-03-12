@@ -2015,28 +2015,9 @@ def clean(args, out_dir):
 
 def build_version(args):
   """Build in a specific commit."""
-  # Determine builder image digest from runner-image args
-  builder_digest = _get_builder_image_digest(
-    getattr(args, 'runner_image', None),
-    getattr(args, 'commit_date', None)
-  )
-
-  oss_fuzz_commit = None
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s',
-                args.commit, oss_fuzz_commit)
-          break
+  # Read oss_fuzz_commit from builds.csv
+  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+    getattr(args, 'build_csv', None), args.project.name, args.commit)
 
   # Fall back to current OSS-Fuzz HEAD if no CSV mapping found
   if not oss_fuzz_commit:
@@ -2046,6 +2027,16 @@ def build_version(args):
                           text=True)
     oss_fuzz_commit = result.stdout.strip()
     logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
+
+  # Determine builder image digest from runner-image args
+  # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
+  runner_image = getattr(args, 'runner_image', None)
+  commit_date = getattr(args, 'commit_date', None)
+  if runner_image == 'auto' and not commit_date:
+    commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit)
+    if commit_date:
+      logger.info('Auto-derived commit_date=%s from oss_fuzz_commit %s', commit_date, oss_fuzz_commit)
+  builder_digest = _get_builder_image_digest(runner_image, commit_date)
 
   # Apply Docker image pinning if builder_digest is specified
   if builder_digest:
@@ -2131,7 +2122,6 @@ def build_version(args):
     apt install -y python3-pip;
     pip install libclang==18.*;
     export PYTHONPATH=$(pip show libclang | grep Location | cut -d' ' -f2):$PYTHONPATH;
-    /bin/bash;
     bear compile;
     python3 /script/libclang.py;
     # Remove existing output directory if it already exists
@@ -2238,22 +2228,22 @@ def get_runfuzzer_bash(args, allowlist_type):
     allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > /allowlist.txt;'
   bash_runfuzzer = f'''
     # Fuzz with base commit
-    mkdir -p /tmpfolder; 
+    mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
-    
+
     cd /src/{args.project.name};
-    git checkout -f {args.base_commit}; 
-    cd -;
+    git checkout -f {args.base_commit};
     {allowlist_cmd}
     python3 /script/add_revert_entries.py --commit {short_bc1} /allowlist.txt -o /allowlist.txt;
     {_strict_reverse_patch_apply_snippet() if args.patch else ''}
-    
+    cd /src;
+
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
-    
+
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
-    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1[:8]}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog; 
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit1[:8]}-{args.test_input}.txt {args.fuzzer_name} &> /data/fuzz_result/{args.test_input}-{allowlist_type}-fuzzlog;
   '''
   return bash_runfuzzer
 
@@ -2318,12 +2308,47 @@ def build_llvm_from_source():
   return bash_commands
 
 
+def _read_oss_fuzz_commit_from_csv(build_csv, project_name, target_commit):
+  """Read oss_fuzz_commit from builds.csv for a given project and commit.
+
+  Returns:
+    (oss_fuzz_commit, matched) tuple. matched is True if an exact match was found.
+  """
+  if not build_csv:
+    return None, False
+  with open(build_csv, 'r') as csvfile:
+    csv_lines = csvfile.readlines()
+  oss_fuzz_commit = None
+  for line in csv_lines:
+    parts = line.strip().split(',')
+    if len(parts) == 4 and parts[0] == project_name:
+      oss_fuzz_commit = parts[2]
+      if parts[1] in target_commit or target_commit in parts[1]:
+        logger.info('Found matching commit for base_commit in CSV: %s -> %s',
+              target_commit, oss_fuzz_commit)
+        return oss_fuzz_commit, True
+  return oss_fuzz_commit, False
+
+
+def _get_oss_fuzz_commit_timestamp(oss_fuzz_commit):
+  """Get the unix timestamp of an oss-fuzz commit."""
+  try:
+    result = subprocess.run(
+      ['git', 'show', '-s', '--format=%ct', oss_fuzz_commit],
+      cwd=OSS_FUZZ_DIR, capture_output=True, text=True)
+    if result.returncode == 0:
+      return int(result.stdout.strip())
+  except (ValueError, OSError) as e:
+    logger.warning('Could not get timestamp for oss-fuzz commit %s: %s', oss_fuzz_commit, e)
+  return None
+
+
 def _get_builder_image_digest(runner_image, commit_date):
   """Helper to get base-builder image digest from runner-image args.
 
   Args:
     runner_image: Value from --runner-image argument
-    commit_date: Value from --commit-date argument
+    commit_date: Value from --commit-date argument (unix timestamp)
 
   Returns:
     Builder image digest string or None
@@ -2400,8 +2425,6 @@ def get_poc_for_new_version(args):
   Accept signature_change_list from analysis between two versions' differences to transplant
   allowlist.txt form old version to new version.
   The new version will be apply a patch that reverts some patches to trigger the bug."""
-  if not build_image_impl(args.project):
-    return False
 
   dict_path = os.path.join(HOME_DIR, 'data', 'fuzz.dict')
   if not os.path.exists(dict_path):
@@ -2427,7 +2450,51 @@ def get_poc_for_new_version(args):
   else:
     image_project = 'oss-fuzz'
     out_dir = args.project.out
-    
+
+  script_folder = os.path.join(HOME_DIR, 'script')
+  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
+  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
+  result_dir = os.path.join(HOME_DIR, 'data')
+
+  # Read oss-fuzz commit mappings from CSV
+  oss_fuzz_commit_buggy = None
+  oss_fuzz_commit_target = None
+  if args.build_csv:
+    # Read the CSV file
+    with open(args.build_csv, 'r') as csvfile:
+      csv_lines = csvfile.readlines()
+
+    for line in csv_lines:
+      parts = line.strip().split(',')
+      if len(parts) == 4 and parts[0] == args.project.name:
+        target_project_commit = parts[1]
+        oss_fuzz_commit = parts[2]
+
+        if args.buggy_commit in target_project_commit or target_project_commit in args.buggy_commit:
+          logger.info('Found matching commit for buggy_commit in CSV: %s -> %s',
+          args.buggy_commit, oss_fuzz_commit)
+          oss_fuzz_commit_buggy = oss_fuzz_commit
+
+        if args.target_commit in target_project_commit or target_project_commit in args.target_commit:
+          logger.info('Found matching commit for target_commit in CSV: %s -> %s',
+          args.target_commit, oss_fuzz_commit)
+          oss_fuzz_commit_target = oss_fuzz_commit
+
+  # Use target commit's oss-fuzz commit to prepare repository and build image
+  # with the correct historical Docker base image
+  builder_digest = None
+  oss_fuzz_commit_for_image = oss_fuzz_commit_target or oss_fuzz_commit_buggy
+  if oss_fuzz_commit_for_image:
+    commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit_for_image)
+    builder_digest = _get_builder_image_digest('auto', commit_date) if commit_date else None
+    if builder_digest:
+      prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_for_image, args.project.name, builder_digest)
+    else:
+      prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_for_image, args.project.name)
+
+  if not build_image_impl(args.project):
+    return False
+
   run_args = _env_to_docker_args(env)
   if args.source_path:
     workdir = _workdir_from_dockerfile(args.project)
@@ -2445,31 +2512,6 @@ def get_poc_for_new_version(args):
   else:
     logger.error('Testcase path %s does not exist.', args.testcases)
     return False
-  
-  script_folder = os.path.join(HOME_DIR, 'script')
-  Function_instrument = os.path.join(HOME_DIR, 'Function_instrument')
-  LLVM_PROJECT = os.path.join(HOME_DIR, 'llvm-project')
-  result_dir = os.path.join(HOME_DIR, 'data')
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-      
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_project_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if args.buggy_commit in target_project_commit or target_project_commit in args.buggy_commit:
-          logger.info('Found matching commit for buggy_commit in CSV: %s -> %s',
-          args.buggy_commit, oss_fuzz_commit)
-          oss_fuzz_commit_buggy = oss_fuzz_commit
-
-        if args.target_commit in target_project_commit or target_project_commit in args.target_commit:
-          logger.info('Found matching commit for target_commit in CSV: %s -> %s',
-          args.target_commit, oss_fuzz_commit)
-          oss_fuzz_commit_target = oss_fuzz_commit
   
   if args.patch:
     run_args.extend([
@@ -2515,7 +2557,7 @@ def get_poc_for_new_version(args):
   if not os.path.exists(f'{result_dir}/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt'):
     run_args.extend([get_crash_log_bash(args.buggy_commit, args)])
     clean(args, out_dir)
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_buggy, args.project.name, None)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_buggy, args.project.name, builder_digest)
     docker_run(run_args, architecture=args.architecture)
     run_args.pop()
     
@@ -2537,7 +2579,7 @@ def get_poc_for_new_version(args):
 
   # Get the function trace in the target commit with patch that reverts some patches
   if not os.path.exists(f"{result_dir}/target_trace-{args.target_commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch else ''}.txt"):
-    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, None)
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, builder_digest)
     run_args.extend([get_trace_log_bash(args.target_commit, args, apply_patch = True)])
     clean(args, out_dir)
     docker_run(run_args, architecture=args.architecture)
@@ -2547,21 +2589,21 @@ def get_poc_for_new_version(args):
     short_bc = args.buggy_commit[:8] if len(args.buggy_commit) > 8 else args.buggy_commit
     bash_fuzz = f'''
     # Fuzz with target commit
-    mkdir -p /tmpfolder; 
+    mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
-    
+
     cd /src/{args.project.name};
-    git checkout -f {args.target_commit}; 
-    cd -;
+    git checkout -f {args.target_commit};
     cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
     {_strict_reverse_patch_apply_snippet() if args.patch else ''}
+    cd /src;
 
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
 
     compile &> /dev/null;
     mkdir -p /data/fuzz_result;
-    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog; 
+    python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog;
     '''
     return bash_fuzz
 
@@ -2580,7 +2622,7 @@ def get_poc_for_new_version(args):
       '/bin/bash', '-c', get_target_fuzzing_bash(args)
   ])
   clean(args, out_dir)
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, None)
+  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit_target, args.project.name, builder_digest)
   docker_run(run_fuzzer_args, architecture=args.architecture)
 
   return True
@@ -2588,6 +2630,17 @@ def get_poc_for_new_version(args):
 
 def get_dict(args):
   """get fuzzing dict using afl"""
+  # Read oss-fuzz commit from CSV and pin historical Docker image
+  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+    getattr(args, 'build_csv', None), args.project.name, args.commit)
+  if oss_fuzz_commit:
+    commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit)
+    builder_digest = _get_builder_image_digest('auto', commit_date) if commit_date else None
+    if builder_digest:
+      prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
+    else:
+      prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
+
   if not build_image_impl(args.project):
     return False
 
@@ -2606,21 +2659,6 @@ def get_dict(args):
 
   if args.e:
     env += args.e
-
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-      
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
-                args.commit, oss_fuzz_commit)
 
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
@@ -2643,7 +2681,9 @@ def get_dict(args):
 
   bash_getdict = f'''
     # Using afl to get fuzzing dictionary
-    git checkout -f {args.commit}; 
+    cd /src/{args.project.name};
+    git checkout -f {args.commit};
+    cd /src;
     compile;
   '''
 
@@ -2655,7 +2695,6 @@ def get_dict(args):
       'gcr.io/%s/%s' % (image_project, args.project.name),
       '/bin/bash', '-c', bash_getdict
   ])
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, None)
   docker_run(run_args, architecture=args.architecture)
   return True
 
@@ -2666,28 +2705,22 @@ def collect_trace(args):
     logger.error('collect_trace requires --commit to be specified.')
     return False
 
+  # Read oss_fuzz_commit from builds.csv
+  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+    getattr(args, 'build_csv', None), args.project.name, args.commit)
+  if not oss_fuzz_commit:
+    oss_fuzz_commit = args.commit
+
   # Determine builder image digest from runner-image args
-  builder_digest = _get_builder_image_digest(
-    getattr(args, 'runner_image', None),
-    getattr(args, 'commit_date', None)
-  )
+  # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
+  runner_image = getattr(args, 'runner_image', None)
+  commit_date = getattr(args, 'commit_date', None)
+  if runner_image == 'auto' and not commit_date:
+    commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit)
+    if commit_date:
+      logger.info('Auto-derived commit_date=%s from oss_fuzz_commit %s', commit_date, oss_fuzz_commit)
+  builder_digest = _get_builder_image_digest(runner_image, commit_date)
 
-  oss_fuzz_commit = args.commit
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s',
-                args.commit, oss_fuzz_commit)
-          break
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   if not build_image_impl(args.project):
     return False
@@ -2770,28 +2803,21 @@ def collect_crash(args):
     logger.error('collect_crash requires both --testcases and --test_input.')
     return False
 
-  # Determine builder image digest from runner-image args
-  builder_digest = _get_builder_image_digest(
-    getattr(args, 'runner_image', None),
-    getattr(args, 'commit_date', None)
-  )
+  # Read oss_fuzz_commit from builds.csv
+  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+    getattr(args, 'build_csv', None), args.project.name, args.commit)
+  if not oss_fuzz_commit:
+    oss_fuzz_commit = args.commit
 
-  oss_fuzz_commit = args.commit
-  if args.build_csv:
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info(
-              'Found matching commit for base_commit in CSV: %s -> %s',
-              args.commit,
-              oss_fuzz_commit,
-          )
-          break
+  # Determine builder image digest from runner-image args
+  # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
+  runner_image = getattr(args, 'runner_image', None)
+  commit_date = getattr(args, 'commit_date', None)
+  if runner_image == 'auto' and not commit_date:
+    commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit)
+    if commit_date:
+      logger.info('Auto-derived commit_date=%s from oss_fuzz_commit %s', commit_date, oss_fuzz_commit)
+  builder_digest = _get_builder_image_digest(runner_image, commit_date)
 
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
   if not build_image_impl(args.project):
@@ -2868,24 +2894,20 @@ def collect_crash(args):
 
 
 def get_cfg(args):
-  if args.build_csv:
-    # Read the CSV file
-    with open(args.build_csv, 'r') as csvfile:
-      csv_lines = csvfile.readlines()
-      
-    for line in csv_lines:
-      parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
-        target_commit = parts[1]
-        oss_fuzz_commit = parts[2]
-
-        if target_commit in args.commit or args.commit in target_commit:
-          logger.info('Found matching commit for base_commit in CSV: %s -> %s', 
-                args.commit, oss_fuzz_commit)
-          break
-  else:
+  if not args.build_csv:
     logger.error('Need a build_csv')
-  prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, None)
+    return False
+  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+    args.build_csv, args.project.name, args.commit)
+  if not oss_fuzz_commit:
+    logger.error('No matching commit found in build_csv for %s', args.commit)
+    return False
+  commit_date = _get_oss_fuzz_commit_timestamp(oss_fuzz_commit)
+  builder_digest = _get_builder_image_digest('auto', commit_date) if commit_date else None
+  if builder_digest:
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
+  else:
+    prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name)
   if not build_image_impl(args.project):
     return False
 
