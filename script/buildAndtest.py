@@ -809,7 +809,7 @@ def get_commits_for_bug_windows(repo_path, bug_ids, bug_infos):
     """
     Collect all commits that lie between each bug's introduced and fixed commits.
 
-    Returns a chronologically sorted list with duplicates removed.
+    Returns a reverse-chronologically sorted list (newest first) with duplicates removed.
     """
     repo = git.Repo(repo_path)
     commit_times = {}
@@ -839,7 +839,7 @@ def get_commits_for_bug_windows(repo_path, bug_ids, bug_infos):
             if sha not in commit_times:
                 commit_times[sha] = repo.commit(sha).committed_datetime
 
-    commits = [sha for sha, _ in sorted(commit_times.items(), key=lambda item: item[1])]
+    commits = [sha for sha, _ in sorted(commit_times.items(), key=lambda item: item[1], reverse=True)]
     return commits
 
 
