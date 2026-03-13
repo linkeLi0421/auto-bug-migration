@@ -1180,11 +1180,9 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
     top_match = frames_match(top_baseline, top_current)
     if not top_match:
         logger.info(
-            "Crash stack top frame mismatch: baseline '%s' vs current '%s'.\nBaseline: %s\nCurrent: %s",
+            "Crash stack top frame mismatch: baseline '%s' vs current '%s'.",
             top_baseline,
             top_current,
-            baseline_stack,
-            current_stack,
         )
         # Fall through to LCS check instead of rejecting immediately.
         # Inlining, partial inlining, and version-specific refactors can
@@ -1223,11 +1221,9 @@ def crashes_match(test_output: str, baseline_path: str, signature_file: Optional
         return True
 
     logger.info(
-        "Crash stack mismatch (ratio %.2f < %.2f).\nBaseline: %s\nCurrent: %s\nApp frames baseline: %s\nApp frames current: %s",
+        "Crash stack mismatch (ratio %.2f < %.2f).\nBaseline: %s\nCurrent: %s",
         match_ratio,
         STACK_MATCH_THRESHOLD,
-        baseline_stack,
-        current_stack,
         baseline_app,
         current_app,
     )
@@ -3671,7 +3667,51 @@ def apply_and_test_patches(
     # Only save patches for keys in current patch_key_list (avoid stale entries from previous attempts)
     current_patches = {key: patches_without_context[key] for key in patch_key_list}
     save_patches_pickle(current_patches, patch_file_binary)
-    
+
+    # --- Proactive forward declarations for __revert_* functions ---
+    # Must run before the first build so that even successful builds
+    # include correct prototypes (avoids implicit-declaration pointer truncation).
+    _v1_sha = commit['commit_id'][:8] if len(commit['commit_id']) > 8 else commit['commit_id']
+    _v2_sha = next_commit['commit_id'][:8] if len(next_commit['commit_id']) > 8 else next_commit['commit_id']
+    _v1_json_dir = os.path.join(data_path, f"{target}-{_v1_sha}")
+    _v2_json_dir = os.path.join(data_path, f"{target}-{_v2_sha}")
+    _v1_src_path, _v2_src_path = "", ""
+    try:
+        _v1_src_path, _v2_src_path = prepare_v1_v2_repos(
+            source_repo_path=target_repo_path,
+            v1_repo_base=v1_repo_path,
+            v2_repo_base=v2_repo_path,
+            target=target,
+            v1_commit=commit['commit_id'],
+            v2_commit=next_commit['commit_id'],
+        )
+    except Exception as exc:
+        logger.warning(f"Proactive decls: prepare_v1_v2_repos failed ({exc}), skipping")
+
+    round0_result = _run_proactive_revert_declarations(
+        patch_path=patch_file_binary,
+        v1_json_dir=_v1_json_dir,
+        v2_json_dir=_v2_json_dir,
+        v1_src=_v1_src_path,
+        v2_src=_v2_src_path,
+    )
+    _r0_updated = round0_result.get("updated_patch_path", "")
+    if _r0_updated and os.path.isfile(_r0_updated):
+        # Reload updated bundle and regenerate the .diff
+        _r0_patches = load_patches_pickle(_r0_updated)
+        patches_without_context.update(_r0_patches)
+        patch_file_binary = _r0_updated  # use updated bundle for subsequent builds
+        with open(patch_file_path, 'w') as f:
+            for key in sorted(
+                _r0_patches.keys(),
+                key=lambda k: getattr(_r0_patches[k], "new_start_line", 0),
+                reverse=True,
+            ):
+                f.write(_r0_patches[key].patch_text)
+                f.write('\n\n')
+        logger.info(f"Proactive decls: {round0_result.get('declared', 0)} declarations added, "
+                     f"regenerated {patch_file_path}")
+
     #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
     func_decl_to_add = dict() # key: file path, value: set of function declarations
