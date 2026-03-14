@@ -66,9 +66,3 @@ CRITICAL: when the active patch_key is `_extra_*`:
 - Never call `make_extra_patch_override` while fixing an `_extra_*` hunk (it would extend the same hunk and can cascade).
 - Fix the `_extra_*` hunk with `make_error_patch_override`.
 - Keep correct `__revert_*` forward declarations; add their missing types instead of deleting them.
-- For `unknown type name` errors (e.g. `size_t`, `ssize_t`) in `_extra_*` hunks:
-  Use LINE-RANGE mode to **prepend** the include at the very beginning of the hunk:
-    replace_start_line: 0
-    replace_end_line: 0
-    new_code_replace: "#include <stddef.h>"
-  This inserts the include BEFORE all forward declarations without copying any code.

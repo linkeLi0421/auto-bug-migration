@@ -125,9 +125,8 @@ TOOL_SPECS: list[Dict[str, Any]] = [
             "file_path": "string",
             "line_number": "int",
             "new_func_code": "string?",
+            "old_code": "string?",
             "new_code_replace": "string?",
-            "replace_start_line": "int?",
-            "replace_end_line": "int?",
             "context_lines": "int?",
             "max_lines": "int?",
             "max_chars": "int?",
@@ -135,11 +134,9 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         "description": (
             "Rewrite the mapped patch slice in the patch bundle by replacing its '-' lines with the provided code (each line stored as '-...') "
             "and recomputing hunk lengths. IMPORTANT: file_path/line_number must be the build-log /src/... error location (not pre_patch_*). "
-            "Two modes (use EXACTLY ONE, never both): "
-            "(1) FULL mode: provide ONLY new_func_code with the complete rewritten function — use for small functions (< 50 lines). Do NOT set replace_start_line/replace_end_line. "
-            "(2) LINE-RANGE mode: provide ONLY replace_start_line + replace_end_line (1-based line numbers within error_func_code) + new_code_replace. Do NOT set new_func_code. "
-            "Replaces only those lines — no text copying needed. "
-            "Use replace_start_line=0, replace_end_line=0 to prepend new_code_replace before line 1 (e.g. to add #include). "
+            "Two modes: (1) FULL mode: provide new_func_code with the complete rewritten function — use for small functions. "
+            "(2) PARTIAL mode: provide old_code (exact snippet from error_func_code to find) and new_code_replace (replacement text) — "
+            "use for large functions where pasting the entire body is impractical. In partial mode, new_func_code is ignored. "
             "patch_text is always returned in full to avoid corrupt override patches."
         ),
     },
