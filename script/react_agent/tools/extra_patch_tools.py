@@ -425,6 +425,13 @@ def _skip_out_of_preprocessor_block(lines: List[str], idx: int) -> int:
 
     This is for non-header files where declarations inside conditional regions
     may not be visible for all build configurations.
+
+    Exception: file-level feature guards (``#ifndef MRB_NO_FLOAT`` wrapping
+    the entire file) are NOT skipped — they are intentional wrappers, not
+    conditional sections that should be avoided.  A guard is detected when the
+    enclosing ``#if*`` starts near the top of the file (within the first 10
+    non-blank, non-comment, non-include lines) and its matching ``#endif`` is
+    within the last 5 lines of the file.
     """
     if not lines:
         return 0
@@ -433,18 +440,55 @@ def _skip_out_of_preprocessor_block(lines: List[str], idx: int) -> int:
     if nesting <= 0:
         return idx
 
+    # Find the matching #endif for the enclosing block.
+    scan_nesting = nesting
+    endif_idx = -1
     for i in range(idx, len(lines)):
         stripped = str(lines[i] or "").lstrip()
         if _PP_IF_RE.match(stripped):
-            nesting += 1
+            scan_nesting += 1
             continue
         if _PP_ENDIF_RE.match(stripped):
-            nesting = max(nesting - 1, 0)
-            if nesting == 0:
-                return min(i + 1, len(lines))
+            scan_nesting -= 1
+            if scan_nesting <= 0:
+                endif_idx = i
+                break
 
-    # Unterminated conditional block: keep original insertion point.
-    return idx
+    if endif_idx < 0:
+        # Unterminated conditional block: keep original insertion point.
+        return idx
+
+    # Detect file-level feature guard: the outermost #if* that encloses idx
+    # starts near the top and the #endif is near the bottom.
+    # Walk backward from idx to find the opening #if* at nesting level 1.
+    open_idx = -1
+    back_nesting = nesting
+    for i in range(idx - 1, -1, -1):
+        stripped = str(lines[i] or "").lstrip()
+        if _PP_ENDIF_RE.match(stripped):
+            back_nesting += 1
+        elif _PP_IF_RE.match(stripped):
+            back_nesting -= 1
+            if back_nesting <= 0:
+                open_idx = i
+                break
+
+    if open_idx >= 0:
+        # Count non-trivial lines before the opening #if* (comments, blanks,
+        # includes, and preprocessor lines don't count).
+        substantive_before = 0
+        for i in range(open_idx):
+            s = str(lines[i] or "").lstrip()
+            if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*") or s.startswith("#"):
+                continue
+            substantive_before += 1
+        lines_after_endif = len(lines) - 1 - endif_idx
+        if substantive_before <= 2 and lines_after_endif <= 5:
+            # This is a file-level guard — stay inside it.
+            return idx
+
+    # Not a file-level guard — skip past the #endif.
+    return min(endif_idx + 1, len(lines))
 
 
 def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
