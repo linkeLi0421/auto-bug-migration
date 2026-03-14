@@ -3576,10 +3576,12 @@ def make_extra_patch_override(
         and ("function_definition_" in str(insert_kind or ""))
     )
 
-    # Strip V1-only ALL_CAPS attribute macros (e.g. HTS_OPT3) from prototypes.
-    # For full function-definition insertion, keep the body unchanged.
-    if inserted_lines and kind == "revert_function" and not is_function_definition_insert:
-        inserted_lines = _strip_attribute_macros_from_prototype(inserted_lines, func_name=symbol)
+    # NOTE: we intentionally do NOT strip ALL_CAPS macros (e.g. MRB_INLINE)
+    # from prototypes.  The old _strip_attribute_macros_from_prototype was too
+    # aggressive and removed storage-class macros like MRB_INLINE (= static
+    # inline), causing linkage mismatches.  If a V1-only attribute macro is
+    # missing in V2, the agent will see a clear "unknown identifier" error and
+    # can fix it in a later round.
 
     # For revert functions being inserted into header files, wrap in extern "C"
     # to ensure C++ code can link against the C-defined functions.
