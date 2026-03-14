@@ -2596,12 +2596,12 @@ def get_poc_for_new_version(args):
     git checkout -f {args.target_commit};
     cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
     {_strict_reverse_patch_apply_snippet() if args.patch else ''}
-    cd /src;
+    cd -;
 
     export CFLAGS="${{CFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -fno-inline-functions -fsanitize-coverage-allowlist=/allowlist.txt -Wno-error";
 
-    compile &> /dev/null;
+    compile;
     mkdir -p /data/fuzz_result;
     python3 /script/monitor_crash.py /data/crash/target_crash-{args.buggy_commit[:8]}-{args.test_input}.txt {args.fuzzer_name} --signature-changes /data/signature_change_list/{args.signature_changes} --run_times 1 &> /data/fuzz_result/{args.test_input}-target-fuzzlog;
     '''
