@@ -34,17 +34,19 @@ CHOOSING THE RIGHT TOOL:
   To fix: copy the `editable_hunk` text, edit ONLY the `+` lines to fix the error (e.g. adjust call arguments), then pass the result as `revised_hunk` to `revise_patch_hunk`.
 - If `editable_hunk` is empty or absent, use `make_error_patch_override` as described below.
 
-CHOOSING FULL vs PARTIAL mode for make_error_patch_override:
+CHOOSING FULL vs LINE-RANGE mode for make_error_patch_override:
 - **FULL mode** (default): provide `new_func_code` with the complete rewritten function body.
   Use when the error_func_code is small enough to paste in full (typically < 100 lines).
-- **PARTIAL mode**: provide `old_code` (exact snippet from error_func_code) and `new_code_replace` (replacement).
+- **LINE-RANGE mode**: provide `replace_start_line` and `replace_end_line` (1-based line numbers
+  within error_func_code) plus `new_code_replace` with the replacement text.
   Use when error_func_code is large (> 100 lines) and only a small part needs changing.
-  The tool finds `old_code` within the function's `-` lines and replaces just that portion.
-  Example: to replace `NDPI_PROTOCOL_NATS` with `NDPI_PROTOCOL_UNKNOWN` in an 877-line function:
-    old_code: "NDPI_PROTOCOL_NATS, 0 /* can_have_a_subprotocol */,"
+  The tool replaces only those lines — no text copying/matching needed.
+  To **prepend** text (e.g. add #include), use replace_start_line=0, replace_end_line=0.
+  Example: to replace line 42 in a large function:
+    replace_start_line: 42
+    replace_end_line: 42
     new_code_replace: "NDPI_PROTOCOL_UNKNOWN, 0 /* can_have_a_subprotocol */,"
-  Partial mode skips the function-name guardrail, so you don't need to paste the full signature.
-  The `old_code` must match exactly as it appears in the error_func_code artifact.
+  Line-range mode skips the function-name guardrail, so you don't need to paste the full signature.
 
 CRITICAL - FUNCTION SIGNATURE PRESERVATION (make_error_patch_override FULL mode only):
 - NEVER change the function signature (return type, function name, or parameters).

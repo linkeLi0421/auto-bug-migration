@@ -614,6 +614,61 @@ def find_macro_block(file_content, start_line):
     return None
 
 
+def _extract_function_code_from_node(ast_node, target_repo_path, file_path):
+    '''Extract function code from a single AST node. Returns (func_code, func_length, start_line) or None.'''
+    src_path = os.path.join(target_repo_path, ast_node["extent"]["start"]["file"])
+    with open(src_path, "r", encoding="utf-8", errors="strict") as f:
+        file_content = f.readlines()
+
+    start_line = ast_node["extent"]["start"]["line"]
+    end_line = ast_node["extent"]["end"]["line"]
+
+    # -------- #if / #endif balancing logic --------
+    block_depth = 0
+    min_depth = 0
+    for line in file_content[start_line - 1:end_line]:
+        stripped = line.lstrip()
+        if stripped.startswith(("#if", "#ifdef", "#ifndef")):
+            block_depth += 1
+        elif stripped.startswith("#endif"):
+            block_depth -= 1
+        min_depth = min(min_depth, block_depth)
+
+    if min_depth < 0:
+        unmatched = -min_depth
+        for idx in range(start_line - 2, -1, -1):
+            stripped = file_content[idx].lstrip()
+            if stripped.startswith("#endif"):
+                unmatched += 1
+            elif stripped.startswith(("#if", "#ifdef", "#ifndef")):
+                unmatched -= 1
+                if unmatched == 0:
+                    start_line = idx + 1
+                    break
+
+    func_code = "".join(file_content[start_line - 1:end_line])
+
+    # -------- handle macro-generated "functions" --------
+    if not looks_like_real_function(func_code):
+        macro_block = find_macro_block(file_content, start_line)
+        if macro_block is not None:
+            block_start, block_end = macro_block
+            func_code = "".join(file_content[block_start - 1:block_end])
+            start_line = block_start
+            end_line = block_end
+
+    # Only try to rewrite the header if this really looks like a function.
+    if looks_like_real_function(func_code):
+        func_code = replace_function_header(func_code, ast_node["signature"], file_path=file_path)
+
+    # Compute length
+    func_length = func_code.count("\n")
+    if func_code and func_code[-1] != "\n":
+        func_length += 1
+
+    return func_code, func_length, start_line
+
+
 def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_path, func_sig):
     os.chdir(target_repo_path)
     subprocess.run(["git", "clean", "-fdx"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -629,68 +684,57 @@ def get_function_code_from_old_commit(target_repo_path, commit, data_path, file_
     with open(parsing_path, "r") as f:
         ast_nodes = json.load(f)
 
+    # Collect all matching AST nodes — the analysis JSON may contain duplicate
+    # entries from different preprocessing contexts with overlapping extents.
+    func_name = func_sig.split('(')[0].split()[-1] if '(' in func_sig else ''
+    candidates = []
     for ast_node in ast_nodes:
         if ast_node.get("kind") not in {"FUNCTION_DEFI", "CXX_METHOD", "FUNCTION_TEMPLATE"}:
             continue
-
         if not compare_function_signatures(ast_node["signature"], func_sig, True):
             continue
+        candidates.append(ast_node)
 
-        src_path = os.path.join(target_repo_path, ast_node["extent"]["start"]["file"])
-        with open(src_path, "r", encoding="utf-8", errors="strict") as f:
-            file_content = f.readlines()
+    if not candidates:
+        return None, 0, 0
 
-        start_line = ast_node["extent"]["start"]["line"]
-        end_line = ast_node["extent"]["end"]["line"]
+    # Among multiple matching nodes, prefer the one whose RAW source code
+    # (before replace_function_header) already contains the function name
+    # before the first '{'.  Duplicate AST entries with wrong extents often
+    # include a *different* function's definition first, causing
+    # replace_function_header to silently overwrite the wrong header.
+    if len(candidates) > 1 and func_name:
+        name_pat = re.compile(r'\b' + re.escape(func_name) + r'\b')
+        preferred = []
+        fallback = []
+        for node in candidates:
+            # Read raw source to check header BEFORE replace_function_header
+            src_path = os.path.join(target_repo_path, node["extent"]["start"]["file"])
+            try:
+                with open(src_path, "r", encoding="utf-8", errors="strict") as f:
+                    raw_lines = f.readlines()
+                raw_code = "".join(raw_lines[node["extent"]["start"]["line"] - 1 : node["extent"]["end"]["line"]])
+            except (OSError, IndexError):
+                fallback.append(node)
+                continue
+            brace_idx = raw_code.find('{')
+            header = raw_code[:brace_idx] if brace_idx != -1 else raw_code
+            if name_pat.search(header):
+                preferred.append(node)
+            else:
+                fallback.append(node)
+        pick = preferred[0] if preferred else (fallback[0] if fallback else None)
+        if pick is None:
+            return None, 0, 0
+        result = _extract_function_code_from_node(pick, target_repo_path, file_path)
+        if result is not None:
+            return result
+        return None, 0, 0
 
-        # -------- original #if / #endif balancing logic --------
-        block_depth = 0
-        min_depth = 0
-        for line in file_content[start_line - 1:end_line]:
-            stripped = line.lstrip()
-            if stripped.startswith(("#if", "#ifdef", "#ifndef")):
-                block_depth += 1
-            elif stripped.startswith("#endif"):
-                block_depth -= 1
-            min_depth = min(min_depth, block_depth)
-
-        if min_depth < 0:
-            unmatched = -min_depth
-            for idx in range(start_line - 2, -1, -1):
-                stripped = file_content[idx].lstrip()
-                if stripped.startswith("#endif"):
-                    unmatched += 1
-                elif stripped.startswith(("#if", "#ifdef", "#ifndef")):
-                    unmatched -= 1
-                    if unmatched == 0:
-                        start_line = idx + 1
-                        break
-
-        func_code = "".join(file_content[start_line - 1:end_line])
-
-        # -------- NEW: handle macro-generated “functions” --------
-        # If the extracted code doesn't look like a real function AND
-        # the reported line is inside a '#define XML_OP' / '#undef XML_OP' block,
-        # grab that whole macro block instead.
-        if not looks_like_real_function(func_code):
-            macro_block = find_macro_block(file_content, start_line)
-            if macro_block is not None:
-                block_start, block_end = macro_block
-                func_code = "".join(file_content[block_start - 1:block_end])
-                start_line = block_start
-                end_line = block_end
-
-        # Only try to rewrite the header if this really looks like a function.
-        if looks_like_real_function(func_code):
-            func_code = replace_function_header(func_code, ast_node["signature"], file_path=file_path)
-
-        # Compute length
-        func_length = func_code.count("\n")
-        if func_code and func_code[-1] != "\n":
-            func_length += 1
-
-        return func_code, func_length, start_line
-
+    # Single candidate — fast path
+    result = _extract_function_code_from_node(candidates[0], target_repo_path, file_path)
+    if result is not None:
+        return result
     return None, 0, 0
 
 
@@ -2258,11 +2302,13 @@ def call_react_agent(
         total = round0_result.get("total_symbols", 0)
         logger.info(f"Round 0: {declared}/{total} forward declarations added -> {current_patch}")
 
-        # Regenerate .diff from updated bundle and rebuild to get fresh build log.
+        # Regenerate .diff from updated bundle to a separate round0 file
+        # so that the original patch_file_path is preserved for debugging.
         if patch_file_path and bug_id:
             try:
                 updated_patches = load_patches_pickle(current_patch)
-                with open(patch_file_path, "w") as f:
+                round0_diff_path = patch_file_path.replace('.diff', '_round0.diff') if patch_file_path.endswith('.diff') else patch_file_path + '_round0'
+                with open(round0_diff_path, "w") as f:
                     for key in sorted(
                         updated_patches.keys(),
                         key=lambda k: getattr(updated_patches[k], "new_start_line", 0),
@@ -2270,7 +2316,8 @@ def call_react_agent(
                     ):
                         f.write(updated_patches[key].patch_text)
                         f.write("\n\n")
-                logger.info(f"Round 0: regenerated {patch_file_path} from updated bundle")
+                patch_file_path = round0_diff_path
+                logger.info(f"Round 0: regenerated {patch_file_path} from updated bundle (original preserved)")
 
                 # Rebuild to get fresh error lines
                 logger.info("Round 0: rebuilding to get updated build log...")
@@ -3456,12 +3503,22 @@ def get_full_funsig(patch, target, commit, version:str):
     parsing_path = os.path.join(data_path, f'{target}-{short_commit}', f'{patch_file_path}_analysis.json')
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
+    midpoint = (patch_start_line + patch_end_line) / 2
+    # Collect all matching nodes — the AST JSON may have duplicate entries from
+    # different preprocessing contexts with overlapping extents.  Pick the
+    # tightest (smallest) extent to avoid including code from adjacent functions.
+    best = None
+    best_span = float('inf')
     for node in ast_nodes:
         if node.get('kind') not in {'FUNCTION_DEFI', 'CXX_METHOD', 'FUNCTION_TEMPLATE'}:
             continue
-        if node['extent']['start']['file'] == patch_file_path and node['extent']['start']['line'] <= (patch_start_line + patch_end_line)/2 <= node['extent']['end']['line']:
-            # Found the function definition
-            return node['signature'], node['extent']['start']['line'], node['extent']['end']['line']
+        if node['extent']['start']['file'] == patch_file_path and node['extent']['start']['line'] <= midpoint <= node['extent']['end']['line']:
+            span = node['extent']['end']['line'] - node['extent']['start']['line']
+            if span < best_span:
+                best = node
+                best_span = span
+    if best is not None:
+        return best['signature'], best['extent']['start']['line'], best['extent']['end']['line']
     return None, 0, 0
 
 
@@ -3697,11 +3754,13 @@ def apply_and_test_patches(
     )
     _r0_updated = round0_result.get("updated_patch_path", "")
     if _r0_updated and os.path.isfile(_r0_updated):
-        # Reload updated bundle and regenerate the .diff
+        # Reload updated bundle and regenerate .diff to a separate round0 file
+        # so that the original patch_file_path is preserved for debugging.
         _r0_patches = load_patches_pickle(_r0_updated)
         patches_without_context.update(_r0_patches)
         patch_file_binary = _r0_updated  # use updated bundle for subsequent builds
-        with open(patch_file_path, 'w') as f:
+        _r0_diff_path = patch_file_path.replace('.diff', '_round0.diff')
+        with open(_r0_diff_path, 'w') as f:
             for key in sorted(
                 _r0_patches.keys(),
                 key=lambda k: getattr(_r0_patches[k], "new_start_line", 0),
@@ -3709,8 +3768,9 @@ def apply_and_test_patches(
             ):
                 f.write(_r0_patches[key].patch_text)
                 f.write('\n\n')
+        patch_file_path = _r0_diff_path
         logger.info(f"Proactive decls: {round0_result.get('declared', 0)} declarations added, "
-                     f"regenerated {patch_file_path}")
+                     f"regenerated {patch_file_path} (original preserved)")
 
     #TODO: update the comments
     con_to_add = dict() # key: file path, value: set of enum/macro locations (use key in dict to achieve ordered set)
@@ -4024,7 +4084,38 @@ def revert_patch_test(args):
         commit['commit_id'] = row['commit_id']
         next_commit['commit_id'] = max_poc_row['commit_id']
         transitions.append((commit, next_commit, bug_id))
-    
+
+    # Sort transitions by diff_results size (smallest first) so that
+    # bugs with fewer diffs (simpler transplants) are attempted first.
+    def _diff_results_size(transition):
+        _commit, _next_commit, _bug_id = transition
+        diff_path = os.path.join(
+            data_path, 'diff',
+            f'revert_patch_{_bug_id}_{_commit["commit_id"]}_to_{_next_commit["commit_id"]}.diff',
+        )
+        if os.path.exists(diff_path):
+            try:
+                cached = load_patches_pickle(diff_path)
+                return len(cached)
+            except Exception:
+                pass
+        # Uncached bugs: compute diff on-the-fly to determine size
+        try:
+            _diffs = get_diff_unified(target_repo_path, _commit['commit_id'], _next_commit['commit_id'], '')
+            _dr = analyze_diffindex(_diffs, target_repo_path, _next_commit['commit_id'], _commit['commit_id'], target, [])
+            # Cache for later reuse
+            os.makedirs(os.path.dirname(diff_path), exist_ok=True)
+            try:
+                save_patches_pickle(_dr, diff_path)
+            except OSError:
+                pass
+            return len(_dr)
+        except Exception:
+            return float('inf')
+
+    transitions.sort(key=_diff_results_size)
+    logger.info(f"Sorted {len(transitions)} transitions by diff size (smallest first)")
+
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
@@ -4326,10 +4417,11 @@ def revert_patch_test(args):
                 # Save patch file for later fuzzing (get_poc_for_new_version)
                 get_patched_traces_ref = mutable_args[0]
                 suffix = len(get_patched_traces_ref[bug_id]) if bug_id in get_patched_traces_ref else ''
-                src_patch = os.path.join(
-                    os.path.abspath(os.path.join(current_file_path, '..', 'patch')),
-                    f"{bug_id}_{next_commit['commit_id']}_patches{suffix}.diff"
-                )
+                patch_dir = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+                # Prefer round0 diff (with proactive declarations) over original
+                src_patch_round0 = os.path.join(patch_dir, f"{bug_id}_{next_commit['commit_id']}_patches{suffix}_round0.diff")
+                src_patch_orig = os.path.join(patch_dir, f"{bug_id}_{next_commit['commit_id']}_patches{suffix}.diff")
+                src_patch = src_patch_round0 if os.path.exists(src_patch_round0) else src_patch_orig
                 if os.path.exists(src_patch):
                     save_dir = os.path.join(data_path, 'build_success_patches')
                     os.makedirs(save_dir, exist_ok=True)

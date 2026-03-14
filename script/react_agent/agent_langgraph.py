@@ -2782,11 +2782,13 @@ def _force_read_base_slice_for_shrunk_override(state: AgentState) -> Optional[De
 
 
 def _is_partial_mode_override(decision: Decision) -> bool:
-    """Return True if the decision uses partial mode (old_code + new_code_replace) instead of full mode (new_func_code)."""
+    """Return True if the decision uses partial/line-range mode instead of full mode (new_func_code)."""
     args_obj = decision.get("args") if isinstance(decision.get("args"), dict) else {}
     old_code = str(args_obj.get("old_code", "") or "").strip()
     new_func = str(args_obj.get("new_func_code", "") or "").strip()
-    return bool(old_code and not new_func)
+    # Check if line-range keys are explicitly present (0 is a valid value for prepend)
+    has_line_range = "replace_start_line" in args_obj or "replace_end_line" in args_obj
+    return bool((old_code or has_line_range) and not new_func)
 
 
 def _override_preserve_base_guardrail_error(state: AgentState, decision: Decision) -> Optional[str]:
@@ -5707,10 +5709,11 @@ def _run_langgraph(
             # to avoid full-mode guardrail rejection.
             if base_lines > 50:
                 mode_hint = (
-                    "- The BASE slice is too large for a full rewrite. Use PARTIAL mode:\n"
-                    "  args.old_code=<exact lines to change>\n"
+                    "- The BASE slice is too large for a full rewrite. Use LINE-RANGE mode:\n"
+                    "  args.replace_start_line=<1-based start line in error_func_code>\n"
+                    "  args.replace_end_line=<1-based end line in error_func_code>\n"
                     "  args.new_code_replace=<replacement lines>\n"
-                    "  (leave args.new_func_code empty)\n"
+                    "  (use replace_start_line=0, replace_end_line=0 to prepend)\n"
                 )
             else:
                 mode_hint = (
@@ -5800,7 +5803,7 @@ def _run_langgraph(
             if must_patch:
                 args = decision.get("args") or {}
                 has_full = bool(str(args.get("new_func_code", "") or "").strip())
-                has_partial = bool(str(args.get("old_code", "") or "").strip())
+                has_partial = bool(str(args.get("old_code", "") or "").strip()) or "replace_start_line" in args or "replace_end_line" in args
                 args_ok = (
                     isinstance(args, dict)
                     and str(args.get("patch_path", "")).strip() == str(st.patch_path).strip()
