@@ -1651,8 +1651,6 @@ def make_error_patch_override(
     new_func_code: str = "",
     old_code: str = "",
     new_code_replace: str = "",
-    replace_start_line: int = 0,
-    replace_end_line: int = 0,
     context_lines: int = 0,
     max_lines: int = 2000,
     max_chars: int = 200000,
@@ -1668,36 +1666,24 @@ def make_error_patch_override(
     provided, the tool performs a targeted search-and-replace within the function's ``-``
     lines instead of replacing the entire slice.  *new_func_code* is ignored in this mode.
 
-    **Line-range mode**: when *replace_start_line* and *replace_end_line* are provided
-    (1-based line numbers within the error_func_code), replaces only those lines with
-    *new_code_replace* (or inserts if start == end+1).  No text matching needed.
-    Use replace_start_line=0, replace_end_line=0 with new_code_replace to **prepend** text.
-
     The tool is read-only: it returns the updated patch text but does not apply it.
     """
-    # Determine mode: line-range vs partial (search-and-replace) vs full (replace entire slice)
+    # Determine mode: partial (search-and-replace) vs full (replace entire slice)
     _old_code_raw = _extract_first_code_fence(old_code).strip()
     _new_code_replace_raw = _extract_first_code_fence(new_code_replace)
     # Fallback: if old_code is provided but new_code_replace is empty and new_func_code
     # is provided, treat new_func_code as the replacement text (common agent mistake).
     if _old_code_raw and not _new_code_replace_raw and new_func_code:
         _new_code_replace_raw = _extract_first_code_fence(new_func_code)
-    # Line-range mode: explicit line numbers > 0, OR prepend mode (0,0) when
-    # new_code_replace is provided without old_code.
-    line_range_mode = (
-        (replace_start_line > 0 or replace_end_line > 0)
-        or (replace_start_line == 0 and replace_end_line == 0
-            and bool(_new_code_replace_raw) and not _old_code_raw)
-    )
-    partial_mode = bool(_old_code_raw) and not line_range_mode
+    partial_mode = bool(_old_code_raw)
 
-    if partial_mode or line_range_mode:
-        # In partial/line-range mode, new_code_replace is used instead of new_func_code.
-        new_code = ""  # not used in partial/line-range mode
+    if partial_mode:
+        # In partial mode, new_code_replace may be empty (deletion).
+        new_code = ""  # not used in partial mode
     else:
         new_code = _extract_first_code_fence(new_func_code)
-    if not partial_mode and not line_range_mode and not new_code.strip():
-        raise ValueError("new_func_code must be non-empty (or use replace_start_line/replace_end_line + new_code_replace for line-range mode)")
+    if not partial_mode and not new_code.strip():
+        raise ValueError("new_func_code must be non-empty (or use old_code + new_code_replace for partial mode)")
 
     bundle = load_patch_bundle(patch_path, allowed_roots=allowed_roots)
     mapping = _get_error_patch_from_bundle(bundle, patch_path=patch_path, file_path=file_path, line_number=line_number)
@@ -1763,72 +1749,6 @@ def make_error_patch_override(
     slice_lines = patch_lines[slice_start:slice_end]
     old_func_lines = [line[1:] for line in slice_lines if line.startswith("-")]
     old_func_code_full = "\n".join(old_func_lines).rstrip("\n")
-
-    # --- Line-range mode: replace lines by index (no text matching) ---
-    if line_range_mode:
-        insert_text = _new_code_replace_raw or _extract_first_code_fence(new_func_code)
-        if not insert_text and not insert_text.strip():
-            raise ValueError("new_code_replace (or new_func_code) must be non-empty in line-range mode")
-        insert_text = insert_text.replace("\r\n", "\n").replace("\r", "\n")
-        insert_lines = insert_text.splitlines()
-
-        # Convert 1-based line numbers to 0-based indices into old_func_lines
-        # replace_start_line=0, replace_end_line=0 means prepend (insert before line 1)
-        rs = max(0, replace_start_line - 1)  # 0-based start
-        re_end = max(rs, replace_end_line)    # 1-based end → 0-based exclusive end
-        if rs > len(old_func_lines):
-            rs = len(old_func_lines)
-        if re_end > len(old_func_lines):
-            re_end = len(old_func_lines)
-
-        new_func_lines_ranged = old_func_lines[:rs] + insert_lines + old_func_lines[re_end:]
-        new_minus_lines = [f"-{line}" for line in new_func_lines_ranged]
-
-        rewritten_slice: List[str] = []
-        inserted = False
-        for line in slice_lines:
-            if line.startswith("-"):
-                if not inserted:
-                    rewritten_slice.extend(new_minus_lines)
-                    inserted = True
-                continue
-            rewritten_slice.append(line)
-        if not inserted:
-            return {
-                **mapping,
-                "old_func_code": "",
-                "old_func_code_truncated": False,
-                "patch_text": "",
-                "patch_text_truncated": False,
-                "note": "No '-' lines found in the mapped patch slice; cannot rewrite patch.",
-            }
-
-        delta = len(rewritten_slice) - len(slice_lines)
-        patch_lines[slice_start:slice_end] = rewritten_slice
-
-        hiden_func_dict_updated, patch_hiden_note = _update_hiden_func_dict(patch, func_end_n, delta)
-        _recompute_hunk_headers(patch_lines, reverse_apply=str(patch_key or "").startswith("_extra_"))
-
-        patch_text_full = ("\n".join(patch_lines).rstrip("\n") + "\n") if patch_lines else ""
-        replaced_count = re_end - rs
-        old_func_code_text, old_func_code_truncated, _, _ = _truncate_text(
-            text=old_func_code_full, max_lines=200, max_chars=12000,
-        )
-        out: Dict[str, Any] = {
-            **mapping,
-            "file_path_patch": rel_file,
-            "old_func_code": old_func_code_text,
-            "old_func_code_truncated": old_func_code_truncated,
-            "new_func_code_lines": len(new_func_lines_ranged),
-            "patch_text": patch_text_full,
-            "patch_text_truncated": False,
-            "patch_text_lines_total": len(patch_lines),
-            "note": (
-                f"Line-range rewrite: replaced lines {replace_start_line}-{replace_end_line} "
-                f"({replaced_count} lines) with {len(insert_lines)} new lines."
-            ),
-        }
-        return out
 
     # --- Partial mode: search-and-replace within the '-' lines ---
     if partial_mode:

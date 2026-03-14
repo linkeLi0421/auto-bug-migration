@@ -627,12 +627,36 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
             return False
         return max(s1, s2) < min(e1, e2)
 
+    def _old_side_deletion_span(h: Dict[str, Any]) -> tuple[int, int]:
+        """Return the old-side line range covered by ``-`` lines in the hunk."""
+        pos = int(h.get("old_start", 0) or 0)
+        first: Optional[int] = None
+        last = pos
+        for line in (h.get("body") or []):
+            if str(line).startswith("-"):
+                if first is None:
+                    first = pos
+                last = pos + 1
+                pos += 1
+            elif str(line).startswith("+"):
+                pass  # ``+`` lines don't consume old-side positions
+            else:
+                pos += 1
+        if first is None:
+            return (0, 0)
+        return (first, last)
+
     def _reverse_apply_would_conflict(h1: Dict[str, Any], h2: Dict[str, Any]) -> bool:
         """Check if two blocks would conflict when reverse-applied separately.
 
         In ``patch -R`` mode the forward ``+`` (new) side becomes the "match"
         side.  If two blocks' new-side ranges overlap, the first one processed
         corrupts the context that the second one expects.
+
+        Exception: when both hunks are deletion-only (no ``+`` lines) and their
+        actual deletion ranges do not overlap (only shared context), they are
+        safe to apply separately in bottom-up order.  Merging them risks
+        dropping original file content from the context between deletion sites.
         """
         s1 = int(h1.get("new_start", 0) or 0)
         e1 = s1 + int(h1.get("new_len", 0) or 0)
@@ -640,7 +664,21 @@ def _consolidate_same_file_diff_blocks(patch_text: str) -> str:
         e2 = s2 + int(h2.get("new_len", 0) or 0)
         if e1 <= s1 or e2 <= s2:
             return False
-        return max(s1, s2) < min(e1, e2)
+        if not (max(s1, s2) < min(e1, e2)):
+            return False  # new-side ranges don't overlap at all
+
+        # New-side ranges overlap.  If both hunks are deletion-only and
+        # their actual ``-`` line ranges don't overlap, the overlap is
+        # purely in context lines — safe to apply separately.
+        h1_has_plus = any(str(l).startswith("+") for l in (h1.get("body") or []))
+        h2_has_plus = any(str(l).startswith("+") for l in (h2.get("body") or []))
+        if not h1_has_plus and not h2_has_plus:
+            ds1, de1 = _old_side_deletion_span(h1)
+            ds2, de2 = _old_side_deletion_span(h2)
+            if ds1 < de1 and ds2 < de2 and not (max(ds1, ds2) < min(de1, de2)):
+                return False  # context-only overlap, safe separately
+
+        return True
 
     file_to_indices: Dict[str, list[int]] = {}
     for idx, entry in enumerate(parsed_blocks):
