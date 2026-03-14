@@ -1026,8 +1026,12 @@ def _new_extra_patch_skeleton(
     # Do not place inserted declarations inside dead-code regions.
     # Backward boundary selection can otherwise jump to a `}` under `#if 0`.
     insert_at = _skip_out_of_if0_block(lines, insert_at)
-    if not _is_header_path(str(file_path or "")):
-        insert_at = _skip_out_of_preprocessor_block(lines, insert_at)
+    # NOTE: we intentionally do NOT call _skip_out_of_preprocessor_block here.
+    # The backward walk already ensures file-scope placement (after a column-0
+    # `}`).  Being inside a feature-guard #ifdef (e.g. #ifndef MRB_NO_FLOAT)
+    # at file scope is correct — the declaration should live in the same
+    # conditional as its callers.  Skipping out would jump past large sections
+    # of the file, landing far from the intended location.
 
     # Find the last #include line in the initial header section to ensure we don't insert before type definitions
     # Stop tracking includes once we've seen actual code (to avoid late includes in the file)
@@ -1051,8 +1055,6 @@ def _new_extra_patch_skeleton(
     # advance past the macro to avoid splitting it.
     insert_at = _skip_past_macro_continuation(lines, insert_at)
     insert_at = _skip_out_of_if0_block(lines, insert_at)
-    if not _is_header_path(str(file_path or "")):
-        insert_at = _skip_out_of_preprocessor_block(lines, insert_at)
 
     # For header files with include guards, clamp insert_at to stay inside the guard
     # AND inside any trailing `extern "C" { ... }` block.
