@@ -960,7 +960,10 @@ def _new_extra_patch_skeleton(
             # Pass 2 (header fallback): if no col-0 '}' found, look for
             #         indented '}', semicolon-terminated decl, or blank line.
             raw_at = lines[idx].rstrip()
-            if raw_at and raw_at.lstrip() not in ("}", ""):
+            # When clamped by a hunk ceiling, always walk backward — the
+            # clamped position may be a blank line or '}' inside a function
+            # body, not a true file-scope boundary.
+            if _was_clamped or (raw_at and raw_at.lstrip() not in ("}", "")):
                 found_boundary = False
                 # Pass 1: column-0 '}'
                 for back_i in range(idx - 1, -1, -1):
