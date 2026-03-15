@@ -4353,13 +4353,18 @@ def _should_use_make_extra_for_undeclared_symbol(symbol: str, error_text: str) -
     # __revert_* symbols always get deterministic _extra_* overrides.
     if sym.startswith("__revert_"):
         return True
-    # ALL_CAPS identifiers (e.g. GROW_PARSE_ATT_VALUE_INTERNAL) are very
-    # likely C macros.  Unlike function forward declarations, a #define is
-    # self-contained — importing it from V1 via the _extra_* hunk carries
-    # no linker-error risk.  The caller may extract the symbol from a
-    # companion "implicit declaration of function" warning (whose text may
-    # not be in error_text), so checking ALL_CAPS alone is sufficient —
-    # pure ALL_CAPS function names are extremely rare in C.
+    # "implicit declaration of function" warnings indicate a missing
+    # function/macro that exists in V1.  Importing the definition from V1
+    # via make_extra_patch_override is preferred over rewriting the caller,
+    # because the function/macro body carries the original semantics.
+    # If the symbol is a macro (#define), the import is self-contained.
+    # If it is a function, make_extra_patch_override imports the full
+    # definition (prefer_definition=True path); if not found in KB, the
+    # tool fails gracefully and the agent falls back to caller rewrite.
+    if "implicit declaration of function" in str(error_text or "").lower():
+        return True
+    # ALL_CAPS identifiers are very likely C macros even outside the
+    # "implicit declaration" context (e.g. unknown type name).
     if _MACRO_LIKE_IDENT_RE.match(sym):
         return True
     return False
@@ -4489,10 +4494,10 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
                 if sym:
                     return sym
 
-    # Missing-macro heuristic: when the active error is "expected ';' after
-    # expression" (a hallmark of a macro invocation without a #define), look
-    # for companion "implicit declaration of function 'X'" warnings at the
-    # same file:line for an ALL_CAPS (macro-like) symbol.
+    # Missing-function/macro heuristic: when the active error is "expected
+    # ';' after expression" (a hallmark of a macro invocation without a
+    # #define), look for companion "implicit declaration of function 'X'"
+    # warnings at the same file:line.
     if active_only:
         active_err = str(state.error_line or "").strip()
         if "expected ';' after expression" in active_err:
@@ -4511,7 +4516,7 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
                         m = _UNDECLARED_SYMBOL_RE.search(raw)
                         if m:
                             sym = str(m.group("symbol") or "").strip()
-                            if sym and _MACRO_LIKE_IDENT_RE.match(sym):
+                            if sym:
                                 return sym
     return ""
 
