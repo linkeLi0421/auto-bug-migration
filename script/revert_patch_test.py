@@ -1298,12 +1298,15 @@ def prepare_transplant(data, repo_path):
             return 1
         return 0
 
-    # Build commit graph for easy parent/child lookup, and commits stored ordered by time
-    max_poc_count = 0
-    max_weak_poc_count = 0
-    max_poc_row = None
-    
-    # Initialize the graph with all commits
+    # Target = latest commit in CSV.
+    # Determine ordering by checking if first commit is ancestor of last.
+    if is_ancestor(repo_path, data[0]['commit_id'], data[-1]['commit_id']):
+        target_row = data[-1]  # CSV is old-to-new
+    else:
+        target_row = data[0]   # CSV is new-to-old
+    logger.info(f'target commit (latest in CSV): {target_row["commit_id"][:12]}')
+
+    # Count poc stats for the target row
     for row in data:
         row['poc_count'] = 0
         row['weak_poc_count'] = 0
@@ -1313,23 +1316,19 @@ def prepare_transplant(data, repo_path):
                 row['poc_count'] += 1
             elif status in weak_trigger_statuses:
                 row['weak_poc_count'] += 1
-        if (
-            row['poc_count'] > max_poc_count
-            or (row['poc_count'] == max_poc_count and row['weak_poc_count'] >= max_weak_poc_count)
-        ):
-            max_poc_count = row['poc_count']
-            max_weak_poc_count = row['weak_poc_count']
-            max_poc_row = row
-    
-    bug_ids_trigger = set() # do not need to change
+
+    bug_ids_trigger = set()  # already trigger at target, no transplant needed
     bug_ids_other = set()
-    
-    for bug_id in max_poc_row['osv_statuses'].keys():
-        if max_poc_row['osv_statuses'][bug_id] in strong_trigger_statuses:
+
+    for bug_id in target_row['osv_statuses'].keys():
+        if target_row['osv_statuses'][bug_id] in strong_trigger_statuses:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
-    bugs_need_transplant = dict() # key: bug_id; value: a commit that a poc trigger this bug, this commit should be closest to max_poc_row['commit_id']
+
+    # For each bug not triggering at target, find the closest commit
+    # (latest ancestor of target) where it triggers.
+    bugs_need_transplant = dict()  # key: bug_id; value: row closest to target where bug triggers
     bug_best_rank = dict()
     bugs_cant_use = set()
     for row in data:
@@ -1342,19 +1341,20 @@ def prepare_transplant(data, repo_path):
                 bugs_need_transplant[bug_id] = row
                 bug_best_rank[bug_id] = rank
                 continue
+            # Same rank: prefer the later commit (closer to target)
             if rank == bug_best_rank.get(bug_id, 0) and bug_id in bugs_need_transplant:
-                if is_ancestor(repo_path, bugs_need_transplant[bug_id]['commit_id'], row['commit_id']) == is_ancestor(repo_path, max_poc_row['commit_id'], row['commit_id']):
+                if is_ancestor(repo_path, bugs_need_transplant[bug_id]['commit_id'], row['commit_id']):
                     bugs_need_transplant[bug_id] = row
     for bug_id in bug_ids_other:
         if bug_id not in bugs_need_transplant and bug_id != 'poc count':
             bugs_cant_use.add(bug_id)
-    logger.info(f'all bugs count: {len(max_poc_row["osv_statuses"])}')
-    logger.info(f'max_poc_row strong/weak poc_count: {max_poc_row["poc_count"]}/{max_poc_row["weak_poc_count"]}')
+    logger.info(f'all bugs count: {len(target_row["osv_statuses"])}')
+    logger.info(f'target_row (latest) strong/weak poc_count: {target_row["poc_count"]}/{target_row["weak_poc_count"]}')
     logger.info(f'bug_ids_trigger: {len(bug_ids_trigger)} {bug_ids_trigger}')
     logger.info(f'bugs need transplant count: {len(bugs_need_transplant)} {bugs_need_transplant.keys()}')
     logger.info(f'bugs cant use count: {len(bugs_cant_use)} {bugs_cant_use}\n')
-    
-    return bug_ids_trigger, bugs_need_transplant, max_poc_row
+
+    return bug_ids_trigger, bugs_need_transplant, target_row
 
 
 def extract_revert_patch(h, line_start, line_end, version):
@@ -4068,7 +4068,7 @@ def revert_patch_test(args):
         logger.info(f"  collect_trace/collect_crash will use base-builder")
         logger.info(f"  reproduce will use base-runner")
 
-    bug_ids_trigger, bugs_need_transplant, max_poc_row = prepare_transplant(parsed_data, target_repo_path)
+    bug_ids_trigger, bugs_need_transplant, target_row = prepare_transplant(parsed_data, target_repo_path)
     
     get_patched_traces = dict()
     previous_bug = ''
@@ -4082,11 +4082,28 @@ def revert_patch_test(args):
         # Store full commit IDs to avoid ambiguity in git commands
         # Short IDs (for display/filenames) will be generated on-the-fly
         commit['commit_id'] = row['commit_id']
-        next_commit['commit_id'] = max_poc_row['commit_id']
+        next_commit['commit_id'] = target_row['commit_id']
         transitions.append((commit, next_commit, bug_id))
 
-    # Sort transitions by diff_results size (smallest first) so that
+    # Pre-generate compile_commands (AST analysis JSONs) for all unique
+    # commits so that analyze_diffindex in the sorting step can find them.
+    _cc_commits_done = set()
+    for _commit, _next_commit, _bug_id in transitions:
+        for _cid in (_commit['commit_id'], _next_commit['commit_id']):
+            if _cid in _cc_commits_done:
+                continue
+            _cc_commits_done.add(_cid)
+            _bug_info = bug_info_dataset.get(_bug_id, {})
+            _reproduce = _bug_info.get('reproduce', {})
+            _sanitizer = _reproduce.get('sanitizer', 'address').split(' ')[0]
+            _job_type = _reproduce.get('job_type', '')
+            _arch = _job_type.split('_')[2] if len(_job_type.split('_')) > 3 else 'x86_64'
+            get_compile_commands(target, _cid, _sanitizer, args.build_csv, _arch)
+
+    # Sort transitions by diff size (smallest first) so that
     # bugs with fewer diffs (simpler transplants) are attempted first.
+    # Use cached analyze_diffindex results when available, otherwise
+    # fall back to raw git diff line count (fast, avoids expensive AST analysis).
     def _diff_results_size(transition):
         _commit, _next_commit, _bug_id = transition
         diff_path = os.path.join(
@@ -4096,20 +4113,14 @@ def revert_patch_test(args):
         if os.path.exists(diff_path):
             try:
                 cached = load_patches_pickle(diff_path)
-                return len(cached)
+                if len(cached) > 0:
+                    return len(cached)
             except Exception:
                 pass
-        # Uncached bugs: compute diff on-the-fly to determine size
+        # Uncached bugs: use raw diff line count as a fast proxy
         try:
             _diffs = get_diff_unified(target_repo_path, _commit['commit_id'], _next_commit['commit_id'], '')
-            _dr = analyze_diffindex(_diffs, target_repo_path, _next_commit['commit_id'], _commit['commit_id'], target, [])
-            # Cache for later reuse
-            os.makedirs(os.path.dirname(diff_path), exist_ok=True)
-            try:
-                save_patches_pickle(_dr, diff_path)
-            except OSError:
-                pass
-            return len(_dr)
+            return len(_diffs.splitlines())
         except Exception:
             return float('inf')
 
