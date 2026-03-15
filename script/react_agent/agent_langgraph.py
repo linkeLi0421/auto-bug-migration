@@ -3938,11 +3938,15 @@ def _block_make_extra_patch_override_after_unresolvable_lookup(
 def _block_make_extra_patch_override_for_nonrevert_undeclared_function(
     state: AgentState, decision: Decision, *, remaining_steps: int
 ) -> Optional[Decision]:
-    """Block `_extra_*` insertion for ordinary undeclared function calls.
+    """Block ``_extra_*`` insertion for ``call to undeclared function`` errors.
 
-    For non-`__revert_*` undeclared function diagnostics, a V1 `FUNCTION_DECL`/`FUNCTION_DEFI`
-    search hit is informational only. The repair should adapt/remove the caller rather than
-    reintroducing a file-scope prototype/definition via `_extra_*`.
+    For ``call to undeclared function`` diagnostics with non-``__revert_*``
+    symbols, a V1 search hit is informational only — the caller should be
+    rewritten.
+
+    ``implicit declaration of function`` warnings are NOT blocked here:
+    these indicate a missing function/macro from V1 that should be imported
+    via ``make_extra_patch_override`` first.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -3958,6 +3962,10 @@ def _block_make_extra_patch_override_for_nonrevert_undeclared_function(
 
     active_error = str(state.error_line or state.snippet or "")
     if not _is_undeclared_function_error(active_error):
+        return None
+    # "implicit declaration of function" warnings should try
+    # make_extra_patch_override first — do NOT block them.
+    if "implicit declaration of function" in active_error.lower():
         return None
 
     prereq = _next_patch_prereq_tool(state)

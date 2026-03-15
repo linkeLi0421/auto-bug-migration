@@ -4,15 +4,19 @@ CHOOSING THE RIGHT TOOL:
 - Diagnose the error category before choosing a patch tool:
   - `use of undeclared identifier 'X'` => identifier path.
   - `unknown type name 'X'` => type path.
-  - `call to undeclared function 'X'` / `implicit declaration of function 'X'` => function-call path.
-  - Do NOT let a `search_definition` hit for a V1 function (`FUNCTION_DECL` / `FUNCTION_DEFI`) override the function-call path rules.
-- Function-call path:
-  - If the undeclared function starts with `__revert_`, use `make_extra_patch_override` to add the missing prototype.
-  - If the undeclared function does NOT start with `__revert_`, do NOT use `make_extra_patch_override`, even if KB says the function existed in V1.
+  - `implicit declaration of function 'X'` => implicit-declaration path (try importing from V1 first).
+  - `call to undeclared function 'X'` => undeclared-function path (rewrite the caller).
+  - Do NOT let a `search_definition` hit for a V1 function (`FUNCTION_DECL` / `FUNCTION_DEFI`) override the undeclared-function path rules.
+- Implicit-declaration path (`implicit declaration of function 'X'`):
+  - If `X` starts with `__revert_`, use `make_extra_patch_override` to add the missing prototype.
+  - If `X` does NOT start with `__revert_`, FIRST try `make_extra_patch_override(symbol_name="X", prefer_definition=true)`
+    to import the function/macro definition from V1. Fall back to caller rewrite only if KB has no match.
+- Undeclared-function path (`call to undeclared function 'X'`):
+  - If `X` starts with `__revert_`, use `make_extra_patch_override` to add the missing prototype.
+  - If `X` does NOT start with `__revert_`, do NOT use `make_extra_patch_override`.
   - For non-`__revert_*` undeclared function calls, rewrite the caller instead:
     - if `editable_hunk` is present, use `revise_patch_hunk`;
     - otherwise use `make_error_patch_override`.
-  - Example: `search_definition("node_cleanup_walker", "v1") -> FUNCTION_DEFI` is informational only; it does NOT justify `make_extra_patch_override(symbol_name="node_cleanup_walker", prefer_definition=true)`.
 - Identifier path — reclassify when KB reveals a function:
   - If `search_definition` for identifier `X` returns `FUNCTION_DECL` or `FUNCTION_DEFI`, the symbol is a function.
     Reclassify to the function-call path above: rewrite/remove the call site. Do NOT use `make_extra_patch_override`.
