@@ -4324,6 +4324,7 @@ _VISIBILITY_DECL_RE = re.compile(
     r"declaration of '(?P<tag>(?:struct|union|enum)\s+\w+)' will not be visible"
 )
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_MACRO_LIKE_IDENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 # Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
 _LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
@@ -4349,11 +4350,19 @@ def _should_use_make_extra_for_undeclared_symbol(symbol: str, error_text: str) -
     sym = str(symbol or "").strip()
     if not sym:
         return False
-    # Only __revert_* symbols get deterministic _extra_* overrides.
-    # Non-__revert_* symbols don't exist in V2; a forward declaration
-    # alone won't provide an implementation and causes linker errors.
-    # Let the model handle these via rewrite or patch-level fixes.
-    return sym.startswith("__revert_")
+    # __revert_* symbols always get deterministic _extra_* overrides.
+    if sym.startswith("__revert_"):
+        return True
+    # ALL_CAPS identifiers (e.g. GROW_PARSE_ATT_VALUE_INTERNAL) are very
+    # likely C macros.  Unlike function forward declarations, a #define is
+    # self-contained — importing it from V1 via the _extra_* hunk carries
+    # no linker-error risk.  The caller may extract the symbol from a
+    # companion "implicit declaration of function" warning (whose text may
+    # not be in error_text), so checking ALL_CAPS alone is sufficient —
+    # pure ALL_CAPS function names are extremely rare in C.
+    if _MACRO_LIKE_IDENT_RE.match(sym):
+        return True
+    return False
 
 
 def _extract_file_path_from_diff_hunk_text(text: str) -> str:
@@ -4479,6 +4488,31 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
                 sym = str(m.group("symbol") or "").strip()
                 if sym:
                     return sym
+
+    # Missing-macro heuristic: when the active error is "expected ';' after
+    # expression" (a hallmark of a macro invocation without a #define), look
+    # for companion "implicit declaration of function 'X'" warnings at the
+    # same file:line for an ALL_CAPS (macro-like) symbol.
+    if active_only:
+        active_err = str(state.error_line or "").strip()
+        if "expected ';' after expression" in active_err:
+            active_loc = _ERROR_LOC_RE.match(active_err)
+            if active_loc:
+                a_file = active_loc.group("file")
+                a_line = active_loc.group("line")
+                for e in state.grouped_errors or []:
+                    if not isinstance(e, dict):
+                        continue
+                    raw = str(e.get("raw", "") or "").strip()
+                    if "implicit declaration of function" not in raw:
+                        continue
+                    loc = _ERROR_LOC_RE.match(raw)
+                    if loc and loc.group("file") == a_file and loc.group("line") == a_line:
+                        m = _UNDECLARED_SYMBOL_RE.search(raw)
+                        if m:
+                            sym = str(m.group("symbol") or "").strip()
+                            if sym and _MACRO_LIKE_IDENT_RE.match(sym):
+                                return sym
     return ""
 
 
@@ -4486,9 +4520,11 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
     """Return [(symbol_name, file_path), ...] for undeclared symbols to fix via make_extra_patch_override.
 
     Eligibility:
-    - Only ``__revert_*`` symbols (forward declaration/definition via _extra_*).
-    - Non-``__revert_*`` symbols are excluded: they don't exist in V2, so a forward
-      declaration alone can't provide an implementation and leads to linker errors.
+    - ``__revert_*`` symbols (forward declaration/definition via _extra_*).
+    - ALL_CAPS macro-like symbols from ``implicit declaration of function``
+      warnings — a ``#define`` is self-contained (no linker-error risk).
+    - Other non-``__revert_*`` symbols are excluded: a forward declaration
+      alone can't provide an implementation and leads to linker errors.
     """
     result: List[tuple] = []
     seen: set = set()
@@ -4504,8 +4540,7 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
         sym = str(m.group("symbol") or "").strip()
         if not sym or not _C_IDENT_RE.match(sym):
             continue
-        # Only __revert_* symbols are eligible for deterministic _extra_* overrides.
-        if not sym.startswith("__revert_"):
+        if not _should_use_make_extra_for_undeclared_symbol(sym, raw):
             continue
         if sym in seen:
             continue

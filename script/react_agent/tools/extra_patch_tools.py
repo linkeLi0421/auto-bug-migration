@@ -420,75 +420,124 @@ def _preprocessor_nesting_before_index(lines: List[str], idx: int) -> int:
     return nesting
 
 
-def _skip_out_of_preprocessor_block(lines: List[str], idx: int) -> int:
-    """Move insertion index out of active #if/#ifdef/#ifndef blocks.
-
-    This is for non-header files where declarations inside conditional regions
-    may not be visible for all build configurations.
-
-    Exception: file-level feature guards (``#ifndef MRB_NO_FLOAT`` wrapping
-    the entire file) are NOT skipped — they are intentional wrappers, not
-    conditional sections that should be avoided.  A guard is detected when the
-    enclosing ``#if*`` starts near the top of the file (within the first 10
-    non-blank, non-comment, non-include lines) and its matching ``#endif`` is
-    within the last 5 lines of the file.
-    """
+def _find_innermost_pp_block(lines: List[str], idx: int) -> Optional[Tuple[int, int]]:
+    """Return ``(open_idx, endif_idx)`` for the innermost ``#if*`` enclosing *idx*, or ``None``."""
     if not lines:
-        return 0
+        return None
     idx = max(0, min(int(idx), len(lines)))
-    nesting = _preprocessor_nesting_before_index(lines, idx)
-    if nesting <= 0:
-        return idx
 
-    # Find the matching #endif for the enclosing block.
-    scan_nesting = nesting
+    # Walk backward to find the immediately enclosing #if*.
+    open_idx = -1
+    depth = 0
+    for i in range(idx - 1, -1, -1):
+        stripped = str(lines[i] or "").lstrip()
+        if _PP_ENDIF_RE.match(stripped):
+            depth += 1
+        elif _PP_IF_RE.match(stripped):
+            if depth == 0:
+                open_idx = i
+                break
+            depth -= 1
+
+    if open_idx < 0:
+        return None
+
+    # Walk forward from open_idx to find its matching #endif.
     endif_idx = -1
-    for i in range(idx, len(lines)):
+    depth = 0
+    for i in range(open_idx, len(lines)):
         stripped = str(lines[i] or "").lstrip()
         if _PP_IF_RE.match(stripped):
-            scan_nesting += 1
-            continue
-        if _PP_ENDIF_RE.match(stripped):
-            scan_nesting -= 1
-            if scan_nesting <= 0:
+            depth += 1
+        elif _PP_ENDIF_RE.match(stripped):
+            depth -= 1
+            if depth == 0:
                 endif_idx = i
                 break
 
     if endif_idx < 0:
-        # Unterminated conditional block: keep original insertion point.
-        return idx
+        return None
+    return (open_idx, endif_idx)
 
-    # Detect file-level feature guard: the outermost #if* that encloses idx
-    # starts near the top and the #endif is near the bottom.
-    # Walk backward from idx to find the opening #if* at nesting level 1.
-    open_idx = -1
-    back_nesting = nesting
-    for i in range(idx - 1, -1, -1):
-        stripped = str(lines[i] or "").lstrip()
-        if _PP_ENDIF_RE.match(stripped):
-            back_nesting += 1
-        elif _PP_IF_RE.match(stripped):
-            back_nesting -= 1
-            if back_nesting <= 0:
-                open_idx = i
-                break
 
-    if open_idx >= 0:
-        # Count non-trivial lines before the opening #if* (comments, blanks,
-        # includes, and preprocessor lines don't count).
-        substantive_before = 0
-        for i in range(open_idx):
-            s = str(lines[i] or "").lstrip()
-            if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*") or s.startswith("#"):
-                continue
-            substantive_before += 1
-        lines_after_endif = len(lines) - 1 - endif_idx
-        if substantive_before <= 2 and lines_after_endif <= 5:
-            # This is a file-level guard — stay inside it.
-            return idx
+def _skip_out_of_preprocessor_block(lines: List[str], idx: int) -> int:
+    """Move insertion index out of active #if/#ifdef/#ifndef blocks.
 
-    # Not a file-level guard — skip past the #endif.
-    return min(endif_idx + 1, len(lines))
+    Iteratively escapes each nesting level (innermost first) by skipping
+    past the ``#endif``.  File-level feature guards are preserved.
+    """
+    if not lines:
+        return 0
+    idx = max(0, min(int(idx), len(lines)))
+
+    # Peel off preprocessor layers from innermost to outermost.
+    for _ in range(50):  # safety bound
+        block = _find_innermost_pp_block(lines, idx)
+        if block is None:
+            break
+        open_idx, endif_idx = block
+        if _is_file_level_guard(lines, open_idx, endif_idx):
+            break  # stay inside file-level guards
+        idx = min(endif_idx + 1, len(lines))
+    return idx
+
+
+def _is_file_level_guard(lines: List[str], open_idx: int, endif_idx: int) -> bool:
+    """Return True if the ``#if*`` at *open_idx* / ``#endif`` at *endif_idx* is a file-level guard.
+
+    A file-level guard wraps the entire file: there is no substantive code
+    before the ``#if*`` or after the ``#endif``.  We allow a small number of
+    trivial trailing lines (blank, comment, preprocessor) but NOT function
+    definitions or other real code.
+    """
+    # Count non-trivial lines before the opening #if*.
+    substantive_before = 0
+    for i in range(open_idx):
+        s = str(lines[i] or "").lstrip()
+        if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*") or s.startswith("#"):
+            continue
+        substantive_before += 1
+    if substantive_before > 2:
+        return False
+
+    # Count substantive lines after the #endif — if there are function
+    # definitions or other real code the #if* is a section guard, not a
+    # file-level guard.
+    lines_after_endif = len(lines) - 1 - endif_idx
+    if lines_after_endif > 5:
+        return False
+    substantive_after = 0
+    for i in range(endif_idx + 1, len(lines)):
+        s = str(lines[i] or "").lstrip()
+        if not s or s.startswith("//") or s.startswith("/*") or s.startswith("*") or s.startswith("#"):
+            continue
+        substantive_after += 1
+    return substantive_after == 0
+
+
+def _skip_before_preprocessor_block(lines: List[str], idx: int) -> int:
+    """Move insertion index *backward*, before the enclosing ``#if*`` block.
+
+    Like :func:`_skip_out_of_preprocessor_block` but moves toward the
+    beginning of the file instead of the end.  This is useful when the
+    forward skip would cross a hunk-ceiling boundary.
+
+    Iteratively escapes each nesting level (innermost first).
+    File-level feature guards are preserved (returns *idx* unchanged).
+    """
+    if not lines:
+        return 0
+    idx = max(0, min(int(idx), len(lines)))
+
+    for _ in range(50):  # safety bound
+        block = _find_innermost_pp_block(lines, idx)
+        if block is None:
+            break
+        open_idx, endif_idx = block
+        if _is_file_level_guard(lines, open_idx, endif_idx):
+            break
+        idx = open_idx
+    return idx
 
 
 def _normalize_signature(sig: str) -> Tuple[str, str, Tuple[str, ...]]:
@@ -1026,12 +1075,19 @@ def _new_extra_patch_skeleton(
     # Do not place inserted declarations inside dead-code regions.
     # Backward boundary selection can otherwise jump to a `}` under `#if 0`.
     insert_at = _skip_out_of_if0_block(lines, insert_at)
-    # NOTE: we intentionally do NOT call _skip_out_of_preprocessor_block here.
-    # The backward walk already ensures file-scope placement (after a column-0
-    # `}`).  Being inside a feature-guard #ifdef (e.g. #ifndef MRB_NO_FLOAT)
-    # at file scope is correct — the declaration should live in the same
-    # conditional as its callers.  Skipping out would jump past large sections
-    # of the file, landing far from the intended location.
+    # Escape non-file-level preprocessor conditionals.  The backward walk may
+    # land inside a section-specific #ifdef (e.g. #ifdef LIBXML_FTP_ENABLED)
+    # whose condition is unrelated to the declarations we're inserting.
+    # File-level feature guards (#ifndef MRB_NO_FLOAT wrapping the whole file)
+    # are preserved by both helpers.
+    _escaped_fwd = _skip_out_of_preprocessor_block(lines, insert_at)
+    if _escaped_fwd != insert_at:
+        # Forward skip succeeded — use it unless it crosses the hunk ceiling.
+        if _hunk_ceiling is None or _escaped_fwd < _hunk_ceiling:
+            insert_at = _escaped_fwd
+        else:
+            # Forward skip would cross the hunk ceiling; go backward instead.
+            insert_at = _skip_before_preprocessor_block(lines, insert_at)
 
     # Find the last #include line in the initial header section to ensure we don't insert before type definitions
     # Stop tracking includes once we've seen actual code (to avoid late includes in the file)

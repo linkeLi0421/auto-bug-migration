@@ -2191,7 +2191,7 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     
     # Compile and collect trace
     compile;
-    /out/{args.fuzzer_name} /corpus/{args.test_input};
+    timeout 120 /out/{args.fuzzer_name} /corpus/{args.test_input};
     python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt &> /dev/null; 
   '''
   return bash_trace
