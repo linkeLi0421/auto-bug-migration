@@ -994,6 +994,10 @@ def parse_arguments():
         action='store_true',
         help='Only revert functions that appear in the crash stack (instead of the full execution trace).',
     )
+    parser.add_argument(
+        '--target-commit',
+        help='Override the target commit to migrate bugs to (default: latest commit in CSV).',
+    )
     return parser.parse_args()
 
 
@@ -1302,13 +1306,25 @@ def prepare_transplant(data, repo_path):
             return 1
         return 0
 
-    # Target = latest commit in CSV.
-    # Determine ordering by checking if first commit is ancestor of last.
-    if is_ancestor(repo_path, data[0]['commit_id'], data[-1]['commit_id']):
-        target_row = data[-1]  # CSV is old-to-new
+    # Target = user-specified commit, or latest commit in CSV.
+    target_commit_override = getattr(args, 'target_commit', None)
+    if target_commit_override:
+        target_row = None
+        for row in data:
+            if row['commit_id'].startswith(target_commit_override):
+                target_row = row
+                break
+        if target_row is None:
+            logger.error(f'--target-commit {target_commit_override} not found in CSV')
+            return {}, {}
+        logger.info(f'target commit (user-specified): {target_row["commit_id"][:12]}')
     else:
-        target_row = data[0]   # CSV is new-to-old
-    logger.info(f'target commit (latest in CSV): {target_row["commit_id"][:12]}')
+        # Determine ordering by checking if first commit is ancestor of last.
+        if is_ancestor(repo_path, data[0]['commit_id'], data[-1]['commit_id']):
+            target_row = data[-1]  # CSV is old-to-new
+        else:
+            target_row = data[0]   # CSV is new-to-old
+        logger.info(f'target commit (latest in CSV): {target_row["commit_id"][:12]}')
 
     # Count poc stats for the target row
     for row in data:
