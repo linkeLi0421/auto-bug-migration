@@ -995,13 +995,13 @@ def parse_arguments():
     )
     parser.add_argument(
         '--trace-strategy',
-        choices=['crash-stack', 'crash-stack+callees', 'full-trace'],
+        choices=['crash-stack', 'crash-stack-callees', 'full-trace'],
         default=None,
         help='Function selection strategy: '
              'crash-stack = only crash stack functions (minimal); '
-             'crash-stack+callees = crash stack + their direct callees from the trace (middle); '
+             'crash-stack-callees = crash stack + their direct callees from the trace (middle); '
              'full-trace = all functions from the execution trace (maximal). '
-             'Default: escalate automatically (crash-stack -> crash-stack+callees -> full-trace).',
+             'Default: escalate automatically (crash-stack -> crash-stack-callees -> full-trace).',
     )
     parser.add_argument(
         '--target-commit',
@@ -4388,7 +4388,7 @@ def revert_patch_test(args):
 
                 if trace_strategy == 'crash-stack':
                     trace_layers = [layer1]
-                elif trace_strategy == 'crash-stack+callees':
+                elif trace_strategy == 'crash-stack-callees':
                     trace_layers = [layer2]
                 elif trace_strategy == 'full-trace':
                     trace_layers = [trace_func_list]
@@ -4397,7 +4397,7 @@ def revert_patch_test(args):
                     trace_layers = [layer1, layer2, trace_func_list]
             else:
                 logger.warning(f"Crash stack empty from {crash_log_path}, using full trace")
-        elif trace_strategy in ('crash-stack', 'crash-stack+callees'):
+        elif trace_strategy in ('crash-stack', 'crash-stack-callees'):
             logger.warning(f"No crash log available, falling back to full trace")
 
         # trace_layers[0] is the initial (smallest) layer; escalation tries
