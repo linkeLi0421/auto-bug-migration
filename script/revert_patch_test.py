@@ -1799,16 +1799,18 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     fuzzer_exists = os.path.exists(fuzzer_path)
     has_build_error = any(p in stdout for p in build_error_patterns)
     patch_label = os.path.basename(patch_file_path)
-    if ((not sanitizer_error_seen and not fuzzer_exists) or has_build_error or
-            result.returncode != 0):
-        if sanitizer_error_seen:
-            logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
-            return True, ''
-        logger.info(f"Build failed after patch reversion for {patch_label}\n")
-        return False, stdout
-
-    logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
-    return True, ''
+    # If the fuzz target binary exists, the build succeeded even if there are
+    # non-fatal errors elsewhere (e.g. sample link failures in unicorn).
+    if fuzzer_exists:
+        if has_build_error:
+            logger.info(f"Build warnings/non-fatal errors present but fuzzer binary exists for {patch_label}")
+        logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
+        return True, ''
+    if sanitizer_error_seen:
+        logger.info(f"Successfully built fuzzer after reverting patch {patch_label}")
+        return True, ''
+    logger.info(f"Build failed after patch reversion for {patch_label}\n")
+    return False, stdout
 
 
 def prepare_v1_v2_repos(
