@@ -2165,7 +2165,7 @@ def get_crash_log_bash(commit:str, args):
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-error";
     mkdir -p /data/crash;
     
-    compile &> /dev/null;
+    compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
   '''
   return bash_crash
@@ -2191,7 +2191,7 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     
     # Compile and collect trace
     compile;
-    timeout 120 /out/{args.fuzzer_name} /corpus/{args.test_input};
+    timeout 1000 /out/{args.fuzzer_name} /corpus/{args.test_input};
     python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt &> /dev/null; 
   '''
   return bash_trace
@@ -2417,6 +2417,17 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
       build_content = build_file.read()
   if target == 'opensc':
     build_content = build_content.replace('./configure', './configure --disable-strict')
+  # Tolerate sample/test link failures in projects that build non-essential
+  # targets alongside the library (e.g. unicorn's make.sh builds samples
+  # that fail with undefined sanitizer due to missing compiler-rt symbols).
+  # Replace bare `./make.sh` with `./make.sh || true` so the fuzz targets
+  # (built separately in build.sh) can still be compiled.
+  build_content = re.sub(
+      r'^(\./make\.sh)\s*$',
+      r'\1 || true',
+      build_content,
+      flags=re.MULTILINE,
+  )
   with open(build_script, 'w') as build_file:
       build_file.write(build_content)
 
