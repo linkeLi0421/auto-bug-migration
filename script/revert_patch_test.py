@@ -989,6 +989,17 @@ def parse_arguments():
         action='store_true',
         help='Pass --ignore-leaks to fuzz_helper collect_crash so LeakSanitizer does not fail crash collection.',
     )
+    parser.add_argument(
+        '--crash-stack-only',
+        action='store_true',
+        help='Only revert functions that appear in the crash stack (instead of the full execution trace).',
+    )
+    parser.add_argument(
+        '--allow-multiple-definition',
+        action='store_true',
+        help='Pass -Wl,--allow-multiple-definition to linker (needed for projects that compile the same '
+             'source file into multiple libraries, e.g. unicorn/qemu).',
+    )
 
     return parser.parse_args()
 
@@ -1742,6 +1753,9 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     if commit_date:
         cmd.extend(['--commit-date', str(commit_date)])
     cmd.append(target)
+    if os.environ.get('ALLOW_MULTIPLE_DEFINITION'):
+        cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
+                    '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
 
     cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
@@ -4327,6 +4341,16 @@ def revert_patch_test(args):
             func_dict[func] = func.split(' ')[0].split('(')[0]
             trace_func_list.append((func_dict[func], func_loc))
             
+        # --crash-stack-only: filter trace_func_list to only functions in the crash stack
+        if getattr(args, 'crash_stack_only', False) and crash_log_path and os.path.exists(crash_log_path):
+            crash_stack_funcs = set(extract_function_stack(crash_log_path, apply_signatures=False))
+            if crash_stack_funcs:
+                filtered = [(fn, loc) for fn, loc in trace_func_list if fn.split('(')[0] in crash_stack_funcs]
+                logger.info(f"Crash-stack-only: {len(trace_func_list)} trace funcs -> {len(filtered)} crash-stack funcs (crash stack: {crash_stack_funcs})")
+                trace_func_list = filtered
+            else:
+                logger.warning(f"Crash stack empty from {crash_log_path}, using full trace")
+
         logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         logger.info(f"Total diff results: {len(diff_results)}")
         if not trace_func_list:
@@ -4615,6 +4639,8 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
 
 if __name__ == "__main__":
     args = parse_arguments()
+    if getattr(args, 'allow_multiple_definition', False):
+        os.environ['ALLOW_MULTIPLE_DEFINITION'] = '1'
     # Note: Cache loading/saving is now handled incrementally inside revert_patch_test()
     # The function loads existing cache at start and saves after each bug completes
     patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)
