@@ -64,7 +64,8 @@ sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
 
 # Optional flags:
 #   --target-commit <sha>     Override target commit (default: latest in CSV)
-#   --crash-stack-only        Only revert functions from crash stack (not full trace)
+#   --trace-strategy <s>      Function selection: crash-stack | crash-stack+callees | full-trace
+#                             Default: auto-escalate (crash-stack -> +callees -> full-trace)
 #   --bug_id <id>             Process a single bug
 #   --buggy_commit <sha>      Process a single buggy commit
 ```

@@ -24,8 +24,7 @@ from buildAndtest import (
     resolve_commit_hash,
 )
 from run_fuzz_test import read_json_file, py3
-from compare_trace import extract_function_calls
-from compare_trace import compare_traces
+from compare_trace import extract_function_calls, compare_traces, extract_call_graph
 from monitor_crash import (
     extract_function_stack,
     build_stack_patterns,
@@ -992,7 +991,17 @@ def parse_arguments():
     parser.add_argument(
         '--crash-stack-only',
         action='store_true',
-        help='Only revert functions that appear in the crash stack (instead of the full execution trace).',
+        help='(Deprecated, use --trace-strategy crash-stack) Only revert functions from the crash stack.',
+    )
+    parser.add_argument(
+        '--trace-strategy',
+        choices=['crash-stack', 'crash-stack+callees', 'full-trace'],
+        default=None,
+        help='Function selection strategy: '
+             'crash-stack = only crash stack functions (minimal); '
+             'crash-stack+callees = crash stack + their direct callees from the trace (middle); '
+             'full-trace = all functions from the execution trace (maximal). '
+             'Default: escalate automatically (crash-stack -> crash-stack+callees -> full-trace).',
     )
     parser.add_argument(
         '--target-commit',
@@ -4351,15 +4360,50 @@ def revert_patch_test(args):
             func_dict[func] = func.split(' ')[0].split('(')[0]
             trace_func_list.append((func_dict[func], func_loc))
             
-        # --crash-stack-only: filter trace_func_list to only functions in the crash stack
-        if getattr(args, 'crash_stack_only', False) and crash_log_path and os.path.exists(crash_log_path):
+        # Build three-layer trace function lists for escalation.
+        # Layer 1: crash-stack only  (minimal)
+        # Layer 2: crash-stack + direct callees  (middle)
+        # Layer 3: full trace  (maximal)
+        trace_layers = [trace_func_list]  # default: just full trace
+        trace_strategy = getattr(args, 'trace_strategy', None)
+        if getattr(args, 'crash_stack_only', False) and not trace_strategy:
+            trace_strategy = 'crash-stack'  # backwards compat
+
+        if crash_log_path and os.path.exists(crash_log_path):
             crash_stack_funcs = set(extract_function_stack(crash_log_path, apply_signatures=False))
             if crash_stack_funcs:
-                filtered = [(fn, loc) for fn, loc in trace_func_list if fn.split('(')[0] in crash_stack_funcs]
-                logger.info(f"Crash-stack-only: {len(trace_func_list)} trace funcs -> {len(filtered)} crash-stack funcs (crash stack: {crash_stack_funcs})")
-                trace_func_list = filtered
+                # Layer 1: crash stack only
+                layer1 = [(fn, loc) for fn, loc in trace_func_list if fn.split('(')[0] in crash_stack_funcs]
+
+                # Layer 2: crash stack + direct callees
+                call_graph = extract_call_graph(trace_path1)
+                callee_funcs = set()
+                for cs_func in crash_stack_funcs:
+                    callee_funcs.update(call_graph.get(cs_func, set()))
+                layer2_funcs = crash_stack_funcs | callee_funcs
+                layer2 = [(fn, loc) for fn, loc in trace_func_list if fn.split('(')[0] in layer2_funcs]
+
+                # Layer 3: full trace (already trace_func_list)
+                logger.info(f"Trace layers: L1(crash-stack)={len(layer1)}, L2(+callees)={len(layer2)}, L3(full)={len(trace_func_list)}")
+
+                if trace_strategy == 'crash-stack':
+                    trace_layers = [layer1]
+                elif trace_strategy == 'crash-stack+callees':
+                    trace_layers = [layer2]
+                elif trace_strategy == 'full-trace':
+                    trace_layers = [trace_func_list]
+                else:
+                    # Auto-escalation: try each layer, escalate if bug not triggered
+                    trace_layers = [layer1, layer2, trace_func_list]
             else:
                 logger.warning(f"Crash stack empty from {crash_log_path}, using full trace")
+        elif trace_strategy in ('crash-stack', 'crash-stack+callees'):
+            logger.warning(f"No crash log available, falling back to full trace")
+
+        # trace_layers[0] is the initial (smallest) layer; escalation tries
+        # subsequent layers if the bug is not triggered.
+        trace_func_list = trace_layers[0]
+        _trace_layers_remaining = trace_layers[1:]  # layers to escalate to
 
         logger.info(f"Trace function set: {len(trace_func_list)} {trace_func_list}")
         logger.info(f"Total diff results: {len(diff_results)}")
@@ -4455,6 +4499,60 @@ def revert_patch_test(args):
         patches_without_context = dict()
         tmp = copy.deepcopy(inmutable_args)
         result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+
+        # Trace-layer escalation: if bug not triggered and more layers available,
+        # re-match with a larger set of trace functions and retry.
+        while (
+            result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}
+            and _trace_layers_remaining
+        ):
+            next_layer = _trace_layers_remaining.pop(0)
+            if len(next_layer) <= len(trace_func_list):
+                continue  # skip if not actually larger
+            logger.info(f"Escalating trace layer: {len(trace_func_list)} -> {len(next_layer)} functions")
+            trace_func_list = next_layer
+
+            # Re-match trace functions against diff results
+            patch_to_apply = []
+            for key, diff_result in diff_results.items():
+                if diff_result.new_signature:
+                    patch_func_new = diff_result.new_function_name
+                elif diff_result.old_signature:
+                    patch_func_old = diff_result.old_function_name
+                else:
+                    continue
+                patch_func_old = getattr(diff_result, 'old_function_name', '')
+                patch_func_new = getattr(diff_result, 'new_function_name', '')
+                patch_file_path_esc = diff_result.file_path_old or diff_result.file_path_new
+                patch_filename = os.path.basename(patch_file_path_esc) if patch_file_path_esc else ''
+                for trace_func, func_loc in trace_func_list:
+                    func_loc_filename = os.path.basename(func_loc.split(':')[0])
+                    trace_func_name = trace_func.split('(')[0]
+                    if patch_filename == func_loc_filename and (trace_func_name == patch_func_old or trace_func_name == patch_func_new):
+                        if not diff_result.old_signature:
+                            diff_result.old_signature, diff_result.old_function_start_line, diff_result.old_function_end_line = get_full_funsig(diff_result, target, commit['commit_id'], 'old')
+                        if not diff_result.new_signature and diff_result.file_path_new != '/dev/null':
+                            diff_result.new_signature, _, _ = get_full_funsig(diff_result, target, next_commit['commit_id'], 'new')
+                        if diff_result.old_signature:
+                            patch_to_apply.append(key)
+                        break
+
+            depen_graph, patch_to_apply = build_dependency_graph(diff_results, patch_to_apply, target_repo_path, commit['commit_id'], trace1)
+            patch_by_func = dict()
+            for key in patch_to_apply:
+                sig = diff_results[key].new_signature or diff_results[key].old_signature
+                if sig:
+                    patch_by_func.setdefault(sig, []).append(key)
+            patch_pair_list = [tuple(v) for v in patch_by_func.values()]
+            logger.info(f"Escalated: {len(patch_to_apply)} patches, {len(patch_pair_list)} groups")
+
+            inmutable_args = (diff_results, trace1, target_repo_path, commit, next_commit, target,
+                sanitizer, bug_id, fuzzer, args, arch, file_path_pairs, data_path, depen_graph,
+                v1_repo_path, v2_repo_path, build_runner_image, build_commit_date)
+            patches_without_context = dict()
+            tmp = copy.deepcopy(inmutable_args)
+            result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
+
         if result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}:
             revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
             if result == 'not_trigger' or result == 'crash_mismatch':
