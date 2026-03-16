@@ -186,9 +186,7 @@ TOOL_SPECS: list[Dict[str, Any]] = [
         },
         "description": (
             "Deterministically extend a file's `_extra_*` hunk to provide a missing declaration/define/typedef. "
-            "Use for undeclared function/type/macro issues (including 'implicit declaration of function ...' warnings). "
-            "For 'implicit declaration of function' with non-__revert_* symbols, set prefer_definition=true "
-            "to import the full function/macro definition from V1. "
+            "Use for undeclared function/type/macro issues (including warning-level diagnostics like 'call to undeclared function ...'). "
             "For unresolved `__revert_*` helpers (e.g. undefined reference / undefined-internal), set prefer_definition=true "
             "to insert a full function definition into the using file's `_extra_*` hunk. "
             "The tool infers the `_extra_<file>` patch_key from file_path and returns a full override diff (never truncated)."
