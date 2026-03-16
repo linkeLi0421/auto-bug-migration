@@ -71,11 +71,12 @@ class FunctionInfo:
     """
     A hashable dataclass to store function metadata including signature, name, and special keywords.
     """
-    name: str
+    name: str          # V1 function name (used in __revert_ prefix)
     signature: str
     file_path_old: str
     func_used_file: str
     keywords: tuple[str, ...] = ()
+    v2_name: str = ""  # V2 function name (used to find call sites in V2 code)
     
     def __post_init__(self):
         """Ensure keywords is always a tuple (for immutability)."""
@@ -2541,11 +2542,14 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 function_declarations.add(patch.old_signature.replace(fname, f'__revert_{commit}_{fname}')) # do not use rename_func here, because it only change line starting with '-'
                 patch.patch_text = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
+                # Caller patches contain V2 code, so search for V2 function name
+                dep_search_name = patch.new_function_name or fname
+                dep_replacement = f"__revert_{commit}_{fname}"
                 for dep_key in dependence_graph.get(key, []):
-                    modified_lines = rename_func(diff_results[dep_key].patch_text, fname, commit)
+                    modified_lines = rename_func(diff_results[dep_key].patch_text, dep_search_name, commit, replacement_string=dep_replacement)
                     diff_results[dep_key].patch_text = '\n'.join(modified_lines)
                 new_patch_to_apply.append(key)
-                recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, func_used_file=patch.file_path_new, file_path_old=patch.file_path_old, keywords=['static'] if is_function_static(patch.patch_text) else []))
+                recreated_functions.add(FunctionInfo(name=fname, signature=patch.old_signature, func_used_file=patch.file_path_new, file_path_old=patch.file_path_old, keywords=['static'] if is_function_static(patch.patch_text) else [], v2_name=patch.new_function_name or fname))
                 key_to_newkey[key] = key
             
             elif patch.old_signature:
@@ -2587,7 +2591,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                     new_key = stable_hash(artificial_patch.patch_text)
                     return artificial_patch, new_key
                 artificial_patch, new_key = create_artificial_patch_data(patch, fname, artificial_patch_insert_point, func_length, func_code, func_loc)
-                recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch.old_signature, file_path_old=artificial_patch.file_path_old, func_used_file=patch.file_path_new, keywords=['static'] if is_function_static(func_code) else []))
+                recreated_functions.add(FunctionInfo(name=fname, signature=artificial_patch.old_signature, file_path_old=artificial_patch.file_path_old, func_used_file=patch.file_path_new, keywords=['static'] if is_function_static(func_code) else [], v2_name=patch.new_function_name or fname))
                 diff_results[new_key] = artificial_patch
                 function_declarations.add(patch.old_signature.replace(fname, f'__revert_{commit}_{fname}'))
                 new_patch_to_apply.append(new_key)
@@ -2608,6 +2612,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         # would miss all call sites.  The replacement string still uses the V1
         # name so it matches the reverted definition (__revert_<commit>_<v1name>).
         search_name = patch.new_function_name or fname
+        logger.info(f'patch.new_function_name: {patch.new_function_name}, search_name: {search_name}')
         replacement = f"__revert_{commit}_{fname}"
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
@@ -3115,7 +3120,8 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             # functions appear in the same multi-line call.
             covered_lines = set()
             for func_info in visible_recreated:
-                recreated_fname = func_info.name
+                # Search V2 source code using the V2 name (the name used in call sites)
+                recreated_fname = func_info.v2_name or func_info.name
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
                     if '{' in line:
@@ -3178,8 +3184,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         for cl in call_lines:
                             ml = '-' + cl.rstrip('\n')
                             for rf in visible_recreated:
-                                if re.search(r'(?<![\w.])' + re.escape(rf.name) + r'(?!\w)', cl):
-                                    ml = rename_func(ml, rf.name, commit)[0]
+                                rf_search = rf.v2_name or rf.name
+                                if re.search(r'(?<![\w.])' + re.escape(rf_search) + r'(?!\w)', cl):
+                                    ml = rename_func(ml, rf_search, commit, replacement_string=f"__revert_{commit}_{rf.name}")[0]
                             minus_lines.append(ml)
                             plus_lines.append('+' + cl.rstrip('\n'))
                         patch_body = '\n'.join(minus_lines + plus_lines)
@@ -3427,8 +3434,13 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             continue
         
         # Check if this call is within the LLVMFuzzerTestOneInput function and references a recreated function
-        if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and any(node['spelling'] == func_info.name for func_info in recreated_functions):
-            
+        # node['spelling'] is the V2 name from AST; match against both V1 name and V2 name
+        _matched_fi = next((fi for fi in recreated_functions if node['spelling'] in (fi.name, fi.v2_name)), None)
+        if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and _matched_fi:
+            # V2 name for searching, V1 name for replacement
+            _v2_search = node['spelling']
+            _v1_replacement = f"__revert_{commit}_{_matched_fi.name}"
+
             # Track whether this call is already covered by an existing patch
             Inpatch_flag = False
             
@@ -3446,9 +3458,9 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                     i = 0
                     while i < len(lines):
                         line = lines[i]
-                        if line and line[0] not in {'-', '+', '@', 'd'} and re.search(r'(?<![\w.])' + re.escape(node['spelling']) + r'(?!\w)', line) is not None:
+                        if line and line[0] not in {'-', '+', '@', 'd'} and re.search(r'(?<![\w.])' + re.escape(_v2_search) + r'(?!\w)', line) is not None:
                             # Found the function name on a context line — convert it and continuations
-                            rm_line = rename_func(f'-{line[1:]}', node['spelling'], commit)[0]
+                            rm_line = rename_func(f'-{line[1:]}', _v2_search, commit, replacement_string=_v1_replacement)[0]
                             add_line = f'+{line[1:]}'
                             new_lines.append(rm_line)
                             new_lines.append(add_line)
@@ -3497,7 +3509,7 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                 minus_lines = []
                 plus_lines = []
                 for cl in call_lines:
-                    minus_lines.append(rename_func(f'-{cl}', node['spelling'], commit)[0])
+                    minus_lines.append(rename_func(f'-{cl}', _v2_search, commit, replacement_string=_v1_replacement)[0])
                     plus_lines.append('+' + cl.rstrip('\n'))
                 patch_body = '\n'.join(minus_lines + plus_lines)
 
