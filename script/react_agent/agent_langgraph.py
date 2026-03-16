@@ -3938,15 +3938,12 @@ def _block_make_extra_patch_override_after_unresolvable_lookup(
 def _block_make_extra_patch_override_for_nonrevert_undeclared_function(
     state: AgentState, decision: Decision, *, remaining_steps: int
 ) -> Optional[Decision]:
-    """Block ``_extra_*`` insertion for ``call to undeclared function`` errors.
+    """Block ``_extra_*`` insertion for non-``__revert_*`` undeclared function calls.
 
-    For ``call to undeclared function`` diagnostics with non-``__revert_*``
-    symbols, a V1 search hit is informational only — the caller should be
-    rewritten.
-
-    ``implicit declaration of function`` warnings are NOT blocked here:
-    these indicate a missing function/macro from V1 that should be imported
-    via ``make_extra_patch_override`` first.
+    For both ``call to undeclared function`` and ``implicit declaration of
+    function`` diagnostics with non-``__revert_*`` symbols, a V1 search hit
+    is informational only.  The repair should rewrite the caller to
+    remove/adapt the call site rather than importing a V1 definition.
     """
     if str(decision.get("type", "")).strip() != "tool":
         return None
@@ -3962,10 +3959,6 @@ def _block_make_extra_patch_override_for_nonrevert_undeclared_function(
 
     active_error = str(state.error_line or state.snippet or "")
     if not _is_undeclared_function_error(active_error):
-        return None
-    # "implicit declaration of function" warnings should try
-    # make_extra_patch_override first — do NOT block them.
-    if "implicit declaration of function" in active_error.lower():
         return None
 
     prereq = _next_patch_prereq_tool(state)
@@ -4332,7 +4325,6 @@ _VISIBILITY_DECL_RE = re.compile(
     r"declaration of '(?P<tag>(?:struct|union|enum)\s+\w+)' will not be visible"
 )
 _C_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_MACRO_LIKE_IDENT_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 # Linker error patterns: "file.c:(.text.func+0x...): undefined reference to `symbol'"
 _LINK_IN_FUNCTION_RE = re.compile(r"in function\s*[`'](?P<func>[^`']+)[`']")
 _LINK_UNDEF_SECTION_LOC_RE = re.compile(r"(?P<file>[^:\s]+\.(?:c|cpp|cc|cxx)):\([^)]*\.(?P<func>[A-Za-z_][A-Za-z0-9_]*)")
@@ -4358,24 +4350,11 @@ def _should_use_make_extra_for_undeclared_symbol(symbol: str, error_text: str) -
     sym = str(symbol or "").strip()
     if not sym:
         return False
-    # __revert_* symbols always get deterministic _extra_* overrides.
-    if sym.startswith("__revert_"):
-        return True
-    # "implicit declaration of function" warnings indicate a missing
-    # function/macro that exists in V1.  Importing the definition from V1
-    # via make_extra_patch_override is preferred over rewriting the caller,
-    # because the function/macro body carries the original semantics.
-    # If the symbol is a macro (#define), the import is self-contained.
-    # If it is a function, make_extra_patch_override imports the full
-    # definition (prefer_definition=True path); if not found in KB, the
-    # tool fails gracefully and the agent falls back to caller rewrite.
-    if "implicit declaration of function" in str(error_text or "").lower():
-        return True
-    # ALL_CAPS identifiers are very likely C macros even outside the
-    # "implicit declaration" context (e.g. unknown type name).
-    if _MACRO_LIKE_IDENT_RE.match(sym):
-        return True
-    return False
+    # Only __revert_* symbols get deterministic _extra_* overrides.
+    # Non-__revert_* undeclared functions (including "implicit declaration
+    # of function") should be fixed by rewriting the caller to remove the
+    # call site — not by importing the function/macro from V1.
+    return sym.startswith("__revert_")
 
 
 def _extract_file_path_from_diff_hunk_text(text: str) -> str:
@@ -4501,31 +4480,6 @@ def _extract_undeclared_symbol_name(state: AgentState, *, active_only: bool = Fa
                 sym = str(m.group("symbol") or "").strip()
                 if sym:
                     return sym
-
-    # Missing-function/macro heuristic: when the active error is "expected
-    # ';' after expression" (a hallmark of a macro invocation without a
-    # #define), look for companion "implicit declaration of function 'X'"
-    # warnings at the same file:line.
-    if active_only:
-        active_err = str(state.error_line or "").strip()
-        if "expected ';' after expression" in active_err:
-            active_loc = _ERROR_LOC_RE.match(active_err)
-            if active_loc:
-                a_file = active_loc.group("file")
-                a_line = active_loc.group("line")
-                for e in state.grouped_errors or []:
-                    if not isinstance(e, dict):
-                        continue
-                    raw = str(e.get("raw", "") or "").strip()
-                    if "implicit declaration of function" not in raw:
-                        continue
-                    loc = _ERROR_LOC_RE.match(raw)
-                    if loc and loc.group("file") == a_file and loc.group("line") == a_line:
-                        m = _UNDECLARED_SYMBOL_RE.search(raw)
-                        if m:
-                            sym = str(m.group("symbol") or "").strip()
-                            if sym:
-                                return sym
     return ""
 
 
@@ -4533,11 +4487,9 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
     """Return [(symbol_name, file_path), ...] for undeclared symbols to fix via make_extra_patch_override.
 
     Eligibility:
-    - ``__revert_*`` symbols (forward declaration/definition via _extra_*).
-    - ALL_CAPS macro-like symbols from ``implicit declaration of function``
-      warnings — a ``#define`` is self-contained (no linker-error risk).
-    - Other non-``__revert_*`` symbols are excluded: a forward declaration
-      alone can't provide an implementation and leads to linker errors.
+    - Only ``__revert_*`` symbols (forward declaration/definition via _extra_*).
+    - Non-``__revert_*`` symbols are excluded: they should be fixed by
+      rewriting the caller to remove/adapt the call site.
     """
     result: List[tuple] = []
     seen: set = set()
@@ -4553,7 +4505,8 @@ def _iter_unfixed_undeclared_symbols_from_grouped(state: AgentState) -> List[tup
         sym = str(m.group("symbol") or "").strip()
         if not sym or not _C_IDENT_RE.match(sym):
             continue
-        if not _should_use_make_extra_for_undeclared_symbol(sym, raw):
+        # Only __revert_* symbols are eligible for deterministic _extra_* overrides.
+        if not sym.startswith("__revert_"):
             continue
         if sym in seen:
             continue
