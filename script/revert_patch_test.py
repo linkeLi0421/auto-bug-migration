@@ -1762,8 +1762,8 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     if commit_date:
         cmd.extend(['--commit-date', str(commit_date)])
     cmd.append(target)
-    cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
-                '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
+    cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition -Wno-unused-command-line-argument',
+                '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition -Wno-unused-command-line-argument'])
 
     cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
