@@ -994,13 +994,6 @@ def parse_arguments():
         action='store_true',
         help='Only revert functions that appear in the crash stack (instead of the full execution trace).',
     )
-    parser.add_argument(
-        '--allow-multiple-definition',
-        action='store_true',
-        help='Pass -Wl,--allow-multiple-definition to linker (needed for projects that compile the same '
-             'source file into multiple libraries, e.g. unicorn/qemu).',
-    )
-
     return parser.parse_args()
 
 
@@ -1753,9 +1746,8 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     if commit_date:
         cmd.extend(['--commit-date', str(commit_date)])
     cmd.append(target)
-    if os.environ.get('ALLOW_MULTIPLE_DEFINITION'):
-        cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
-                    '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
+    cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
+                '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
 
     cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
@@ -4639,8 +4631,6 @@ def get_compile_commands(target, commit_id, sanitizer, build_csv, arch):
 
 if __name__ == "__main__":
     args = parse_arguments()
-    if getattr(args, 'allow_multiple_definition', False):
-        os.environ['ALLOW_MULTIPLE_DEFINITION'] = '1'
     # Note: Cache loading/saving is now handled incrementally inside revert_patch_test()
     # The function loads existing cache at start and saves after each bug completes
     patches_without_contexts, test_local_bug_after_patch = revert_patch_test(args)

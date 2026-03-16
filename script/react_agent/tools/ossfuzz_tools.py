@@ -2210,9 +2210,8 @@ def ossfuzz_apply_patch_and_test(
     if build_csv_path:
         build_cmd += ["--build_csv", build_csv_path]
     build_cmd.append(project_name)
-    if os.environ.get('ALLOW_MULTIPLE_DEFINITION'):
-        build_cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
-                          '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
+    build_cmd.extend(['-e', 'CFLAGS=-Wl,--allow-multiple-definition',
+                      '-e', 'CXXFLAGS=-Wl,--allow-multiple-definition'])
     build_cmd = _maybe_prefix_sudo(build_cmd, use_sudo=use_sudo)
 
     with _FileLock(lock_path, wait_message=wait_message):
