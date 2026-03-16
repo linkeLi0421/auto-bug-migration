@@ -108,6 +108,8 @@ End-to-end pipeline for selective code migration. Given a target project and a s
 | `--target` | Yes | Target project name (e.g., `opensc`, `libxml2`) |
 | `--bug_id` | No | Process only this specific bug ID (e.g., `OSV-2020-525`) |
 | `--buggy_commit` | No | Override the buggy commit to process |
+| `--target-commit` | No | Override the target commit to migrate bugs to (default: latest commit in CSV) |
+| `--crash-stack-only` | No | Only revert functions that appear in the crash stack (instead of the full execution trace) |
 | `--debug-artifact-dir` | No | Skip patch generation and reuse pre-generated patches from this artifact directory |
 | `--auto-select-images` | No | Automatically select Docker images based on commit timestamp |
 | `--fixed-image YEAR` | No | Pin Docker images to latest versions before the given year (e.g., `2022`) |
@@ -140,6 +142,15 @@ sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
   --target opensc \
   --auto-select-images \
   --bug_id OSV-2020-525
+
+# Migrate bugs to a specific commit, using only crash-stack functions
+sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
+  --bug_info osv_testcases_summary.json \
+  --build_csv ~/log/opensc_builds.csv \
+  --target opensc \
+  --auto-select-images \
+  --target-commit 2192a2 \
+  --crash-stack-only
 
 # Reuse patches from a previous multi-agent run (skip patch generation)
 sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \

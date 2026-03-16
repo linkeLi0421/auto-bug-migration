@@ -61,6 +61,12 @@ sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
   --bug_info osv_testcases_summary.json \
   --build_csv ~/log/<project>_builds.csv \
   --target <project> --auto-select-images
+
+# Optional flags:
+#   --target-commit <sha>     Override target commit (default: latest in CSV)
+#   --crash-stack-only        Only revert functions from crash stack (not full trace)
+#   --bug_id <id>             Process a single bug
+#   --buggy_commit <sha>      Process a single buggy commit
 ```
 
 ### List available agent tools
