@@ -25,6 +25,7 @@ from buildAndtest import (
 )
 from run_fuzz_test import read_json_file, py3
 from compare_trace import extract_function_calls, compare_traces, extract_call_graph
+from project_config import strip_function_suffix
 from monitor_crash import (
     extract_function_stack,
     build_stack_patterns,
@@ -116,6 +117,7 @@ def is_function_static(source_code: str) -> bool:
             return True
         if '{' in line:
             return False
+
 
 
 def rename_func(patch_text, fname, commit, replacement_string=None):
@@ -2543,7 +2545,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
                 patch.patch_text = '\n'.join(modified_lines)
                 # iterate through the dependent functions and rename them
                 # Caller patches contain V2 code, so search for V2 function name
-                dep_search_name = patch.new_function_name or fname
+                dep_search_name = strip_function_suffix(patch.new_function_name or fname, target)
                 dep_replacement = f"__revert_{commit}_{fname}"
                 for dep_key in dependence_graph.get(key, []):
                     modified_lines = rename_func(diff_results[dep_key].patch_text, dep_search_name, commit, replacement_string=dep_replacement)
@@ -2611,8 +2613,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         # (e.g. load_reg_var_arm -> load_reg_var), searching for the old name
         # would miss all call sites.  The replacement string still uses the V1
         # name so it matches the reverted definition (__revert_<commit>_<v1name>).
-        search_name = patch.new_function_name or fname
-        logger.info(f'patch.new_function_name: {patch.new_function_name}, search_name: {search_name}')
+        search_name = strip_function_suffix(patch.new_function_name or fname, target)
         replacement = f"__revert_{commit}_{fname}"
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
@@ -3120,8 +3121,9 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
             # functions appear in the same multi-line call.
             covered_lines = set()
             for func_info in visible_recreated:
-                # Search V2 source code using the V2 name (the name used in call sites)
-                recreated_fname = func_info.v2_name or func_info.name
+                # Search V2 source code using the V2 name (the name used in call sites).
+                # Strip architecture suffix (e.g. _arm) since source code uses bare names.
+                recreated_fname = strip_function_suffix(func_info.v2_name or func_info.name, target)
                 function_head_flag = False
                 for i, line in enumerate(function_lines):
                     if '{' in line:
@@ -3184,7 +3186,7 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                         for cl in call_lines:
                             ml = '-' + cl.rstrip('\n')
                             for rf in visible_recreated:
-                                rf_search = rf.v2_name or rf.name
+                                rf_search = strip_function_suffix(rf.v2_name or rf.name, target)
                                 if re.search(r'(?<![\w.])' + re.escape(rf_search) + r'(?!\w)', cl):
                                     ml = rename_func(ml, rf_search, commit, replacement_string=f"__revert_{commit}_{rf.name}")[0]
                             minus_lines.append(ml)
@@ -3437,8 +3439,8 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
         # node['spelling'] is the V2 name from AST; match against both V1 name and V2 name
         _matched_fi = next((fi for fi in recreated_functions if node['spelling'] in (fi.name, fi.v2_name)), None)
         if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and _matched_fi:
-            # V2 name for searching, V1 name for replacement
-            _v2_search = node['spelling']
+            # V2 name for searching source code (strip arch suffix), V1 name for replacement
+            _v2_search = strip_function_suffix(node['spelling'], target)
             _v1_replacement = f"__revert_{commit}_{_matched_fi.name}"
 
             # Track whether this call is already covered by an existing patch
