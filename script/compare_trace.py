@@ -1,4 +1,33 @@
 import argparse
+import re
+
+
+def extract_call_graph(file_path):
+    """Extract caller→callee mappings from the Call Relation Summary in a trace file.
+
+    Returns a dict: {caller_func_name: set(callee_func_names)}.
+    """
+    caller_re = re.compile(r"^Caller:\s+\('([^']+)'")
+    callee_re = re.compile(r"^\s+->\s+Callee:\s+\('([^']+)'")
+    graph = {}
+    current_caller = None
+    try:
+        with open(file_path, 'r', errors='replace') as f:
+            for line in f:
+                if line.startswith("Entering function"):
+                    break  # End of Call Relation Summary
+                m = caller_re.match(line)
+                if m:
+                    current_caller = m.group(1)
+                    graph.setdefault(current_caller, set())
+                    continue
+                m = callee_re.match(line)
+                if m and current_caller:
+                    graph[current_caller].add(m.group(1))
+    except FileNotFoundError:
+        pass
+    return graph
+
 
 def extract_function_calls(file_path):
     """Extract 'Entering function' lines with their positions from the given file, keeping only one adjacent same function."""

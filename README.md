@@ -109,7 +109,8 @@ End-to-end pipeline for selective code migration. Given a target project and a s
 | `--bug_id` | No | Process only this specific bug ID (e.g., `OSV-2020-525`) |
 | `--buggy_commit` | No | Override the buggy commit to process |
 | `--target-commit` | No | Override the target commit to migrate bugs to (default: latest commit in CSV) |
-| `--crash-stack-only` | No | Only revert functions that appear in the crash stack (instead of the full execution trace) |
+| `--trace-strategy` | No | Function selection: `crash-stack` (minimal), `crash-stack+callees` (middle), `full-trace` (maximal). Default: auto-escalate through all three layers |
+| `--crash-stack-only` | No | (Deprecated) Alias for `--trace-strategy crash-stack` |
 | `--debug-artifact-dir` | No | Skip patch generation and reuse pre-generated patches from this artifact directory |
 | `--auto-select-images` | No | Automatically select Docker images based on commit timestamp |
 | `--fixed-image YEAR` | No | Pin Docker images to latest versions before the given year (e.g., `2022`) |
