@@ -2602,6 +2602,13 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         patch = diff_results[key]
         artificial_patch = diff_results[key_to_newkey[key]]
         fname = patch.old_function_name
+        # The caller's patch text contains V2 code, so search for the V2 name
+        # (new_function_name).  When the function was renamed between V1 and V2
+        # (e.g. load_reg_var_arm -> load_reg_var), searching for the old name
+        # would miss all call sites.  The replacement string still uses the V1
+        # name so it matches the reverted definition (__revert_<commit>_<v1name>).
+        search_name = patch.new_function_name or fname
+        replacement = f"__revert_{commit}_{fname}"
         for caller_key in dependence_graph.get(key, []):
             # rename functions in patches that depend on (call) this function
             caller_key = key_to_newkey.get(caller_key, caller_key)
@@ -2611,7 +2618,7 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
             if 'Static Function' in artificial_patch.patch_type and artificial_patch.file_path_old != diff_results[caller_key].file_path_old:
                 # If recreate function is static, it is only seen to that file
                 continue
-            modified_lines = rename_func(diff_results[caller_key].patch_text, fname, commit)
+            modified_lines = rename_func(diff_results[caller_key].patch_text, search_name, commit, replacement_string=replacement)
             diff_results[caller_key].patch_text = '\n'.join(modified_lines)
     
     # Remove patches that are not needed anymore
