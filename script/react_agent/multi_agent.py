@@ -323,6 +323,8 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
         # Some runs store overrides at:
         #   <artifacts_dir>/<patch_key>/_extra_<file>/override_*.diff
         # so we scan both direct children and one nested level.
+        # Additionally, collect rename overrides (enum/macro) for regular hunks stored at:
+        #   <artifacts_dir>/<patch_key>/override_<hunk_key>_*_rename.diff
         try:
             roots: List[Path] = [artifacts_dir]
             for child in artifacts_dir.iterdir():
@@ -331,6 +333,31 @@ def _collect_final_override_diffs(results: List[Dict[str, Any]], *, patch_path: 
 
             seen_extra_dirs: set[str] = set()
             for root in roots:
+                # Scan override*.diff files in non-root child dirs (e.g. patch_key subdir).
+                # These are rename overrides (enum/macro) for regular hunks written by
+                # agent_langgraph.py when processing make_extra_patch_override results.
+                if root != artifacts_dir:
+                    latest_child_override = _latest_override_diff(root)
+                    if latest_child_override is not None:
+                        # Infer the target patch_key from the override filename:
+                        # override_<patch_key>_<rename_label>.diff
+                        child_name = latest_child_override.name
+                        inferred_key = root.name
+                        # Try to extract the target patch_key from the filename pattern
+                        # "override_<key>_enum_rename.diff" or "override_<key>_macro_rename.diff"
+                        _m = re.match(r"override_(.+?)_(?:enum|macro)_rename\.diff$", child_name)
+                        if _m:
+                            inferred_key = _m.group(1)
+                        candidates.append(
+                            {
+                                "patch_key": inferred_key,
+                                "override_diff": str(latest_child_override.resolve()),
+                                "method": "glob_latest_nested_rename_override",
+                                "origin_patch_key": patch_key,
+                            }
+                        )
+                        found_any = True
+
                 for child in root.iterdir():
                     if not child.is_dir():
                         continue
