@@ -2386,6 +2386,15 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
   updated_content = dockerfile_content.replace('--depth 1', '')
   updated_content = updated_content.replace('--depth=1', '')
 
+  # Fix old pip that cannot parse modern pyproject.toml (e.g., ninja package).
+  # Insert 'pip3 install --upgrade pip' before any 'pip3 install' in the Dockerfile.
+  if 'pip3 install' in updated_content and 'pip3 install --upgrade pip' not in updated_content:
+    updated_content = updated_content.replace(
+      'pip3 install',
+      'pip3 install --upgrade pip && \\\n    pip3 install',
+      1  # only the first occurrence
+    )
+
   # Optionally pin base-builder image to specific digest for reproducibility
   if builder_image_digest:
     if not builder_image_digest.startswith('sha256:'):
