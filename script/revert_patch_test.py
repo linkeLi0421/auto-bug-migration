@@ -1318,7 +1318,18 @@ def prepare_transplant(data, repo_path):
             return 1
         return 0
 
-    # Target = user-specified commit, or latest commit in CSV.
+    # Count poc stats for all rows (needed before target selection).
+    for row in data:
+        row['poc_count'] = 0
+        row['weak_poc_count'] = 0
+        for bug_id in row['osv_statuses'].keys():
+            status = row['osv_statuses'][bug_id]
+            if status in strong_trigger_statuses:
+                row['poc_count'] += 1
+            elif status in weak_trigger_statuses:
+                row['weak_poc_count'] += 1
+
+    # Target = user-specified commit, or commit with the most bugs.
     target_commit_override = getattr(args, 'target_commit', None)
     if target_commit_override:
         target_row = None
@@ -1331,23 +1342,9 @@ def prepare_transplant(data, repo_path):
             return {}, {}
         logger.info(f'target commit (user-specified): {target_row["commit_id"][:12]}')
     else:
-        # Determine ordering by checking if first commit is ancestor of last.
-        if is_ancestor(repo_path, data[0]['commit_id'], data[-1]['commit_id']):
-            target_row = data[-1]  # CSV is old-to-new
-        else:
-            target_row = data[0]   # CSV is new-to-old
-        logger.info(f'target commit (latest in CSV): {target_row["commit_id"][:12]}')
-
-    # Count poc stats for the target row
-    for row in data:
-        row['poc_count'] = 0
-        row['weak_poc_count'] = 0
-        for bug_id in row['osv_statuses'].keys():
-            status = row['osv_statuses'][bug_id]
-            if status in strong_trigger_statuses:
-                row['poc_count'] += 1
-            elif status in weak_trigger_statuses:
-                row['weak_poc_count'] += 1
+        # Pick the commit that triggers the most bugs.
+        target_row = max(data, key=lambda r: (r['poc_count'], r['weak_poc_count']))
+        logger.info(f'target commit (most bugs, poc_count={target_row["poc_count"]}): {target_row["commit_id"][:12]}')
 
     bug_ids_trigger = set()  # already trigger at target, no transplant needed
     bug_ids_other = set()
@@ -2500,7 +2497,7 @@ def call_react_agent(
     }
 
 
-def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit, next_commit, target_repo_path):
+def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit, next_commit, target_repo_path, target=''):
     # Create artificial patch for function signature change or function removed
     new_patch_to_apply = []
     handle_func_signature_change = set()
@@ -3740,8 +3737,8 @@ def apply_and_test_patches(
     commit_date=None,
     ):
     if not patch_pair_list:
-        logger.error("No patch pairs to apply")
-        return
+        logger.debug("No patch pairs to apply (empty set during minimization)")
+        return 'build_fail'
     
     patch_key_list = [key for keys in patch_pair_list for key in keys]
     patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
@@ -3750,7 +3747,7 @@ def apply_and_test_patches(
     logger.info(f'Patch_pair_list: {patch_pair_list}')
     logger.info(f'Applying and testing {len(patch_pair_list)} {[diff_results[key].old_signature for key in patch_key_list]} ')
     
-    patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path)
+    patch_to_apply, function_declarations, recreated_functions = patch_patcher(diff_results, patch_key_list, depen_graph, commit['commit_id'], next_commit['commit_id'], target_repo_path, target=target)
     update_function_mappings(recreated_functions, signature_change_list, commit['commit_id'])
     patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{len(get_patched_traces[bug_id]) if bug_id in get_patched_traces else ''}.diff")
     patch_key_list = list(set(patch_to_apply))
@@ -4206,33 +4203,27 @@ def revert_patch_test(args):
         )
         if bug_already_cached:
             logger.info(f"Bug {bug_id} (commit {short_commit}, fuzzer {fuzzer}) already cached, skipping patch generation...")
-            # Reconstruct get_patched_traces from existing patch files so
-            # the local bug test section below can still run.
-            patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
-            prefix = f"{bug_id}_{next_commit['commit_id']}_patches"
-            existing_patches = sorted(
-                (p for p in os.listdir(patch_folder)
-                 if p.startswith(prefix) and p.endswith('.diff')),
-                key=lambda p: int(p[len(prefix):].split('.')[0]) if p[len(prefix):].split('.')[0].isdigit() else 0,
+            # Regenerate .diff from cached patch data in pkl.gz so we don't
+            # depend on stale .diff files left on disk from prior runs.
+            cached_patches = next(
+                v for k, v in patches_without_contexts.items()
+                if k[:3] == bug_partial_key
             )
-            if existing_patches:
-                get_patched_traces[bug_id] = [
-                    os.path.join(patch_folder, p) for p in existing_patches
-                ]
-                logger.info(f"Found {len(existing_patches)} existing patch files for local bug test")
-                # Run self-trigger test so cached bugs appear in the summary
-                last_patch = get_patched_traces[bug_id][-1]
-                # Determine Docker image for test_fuzzer
-                _test_runner_image = fixed_builder_digest if fixed_builder_digest else 'auto'
-                result, _ = test_fuzzer(args, bug_id, target, next_commit['commit_id'], last_patch, need_build=True,
-                                        runner_image=_test_runner_image)
-                if 'trigger' in result and 'not trigger' not in result:
-                    revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-                    logger.info(f"Cached bug {bug_id} self-trigger test passed")
-                else:
-                    revert_and_trigger_fail_set.add((bug_id, next_commit['commit_id'], fuzzer))
-                    build_success_no_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
-                    logger.info(f"Cached bug {bug_id} self-trigger test: {result}")
+            patch_folder = os.path.abspath(os.path.join(current_file_path, '..', 'patch'))
+            cached_diff_path = os.path.join(
+                patch_folder,
+                f"{bug_id}_{next_commit['commit_id']}_patches_cached.diff",
+            )
+            with open(cached_diff_path, 'w') as f:
+                for key in cached_patches:
+                    f.write(cached_patches[key].patch_text)
+                    f.write('\n\n')
+            logger.info(f"Regenerated cached diff ({len(cached_patches)} patches) -> {cached_diff_path}")
+            get_patched_traces[bug_id] = [cached_diff_path]
+            # Bug was only cached because it triggered, so mark it directly
+            # without rebuilding.  The local bug test section will build once
+            # per sanitizer and run all reproduces.
+            revert_and_trigger_set.add((bug_id, next_commit['commit_id'], fuzzer))
             # Skip expensive patch generation / build / minimize
             continue
 
@@ -4684,8 +4675,7 @@ def revert_patch_test(args):
             continue
         logger.info('-' * 20)
         # Only test the final patch (last entry in the list), not all intermediate variants
-        i = len(get_patched_traces[bug_id]) - 1
-        patch_file_path = os.path.join(patch_folder, f"{bug_id}_{next_commit['commit_id']}_patches{i if i != 0 else ''}.diff")
+        patch_file_path = get_patched_traces[bug_id][-1]
         last_sanitizer = None
         count = 0
         for bug_id_trigger in bug_ids_trigger:
