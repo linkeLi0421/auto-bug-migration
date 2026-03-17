@@ -3761,6 +3761,33 @@ def make_extra_patch_override(
             inserted_lines = [rewritten]
             insert_kind = (insert_kind + ":opaque_by_value_rewritten_to_ptr").strip(":")
 
+    # Detect reintroduced #define macros and rename them to avoid conflicts
+    # with V2 code that may reuse the macro name (e.g. as a local variable).
+    # Same pattern as enum renaming: rename in the inserted block and in all
+    # reverted function bodies in the same file.
+    macro_rename_map: Dict[str, str] = {}
+    macro_rename_overrides: List[Dict[str, Any]] = []
+    if inserted_lines:
+        for line in inserted_lines:
+            m = re.match(r'^#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)\b', line.strip())
+            if m:
+                macro_name = m.group(1)
+                macro_rename_map[macro_name] = f"_revert_{macro_name}"
+
+    if macro_rename_map:
+        renamed = []
+        for line in inserted_lines:
+            new_line = line
+            for old, new in sorted(macro_rename_map.items(), key=lambda x: len(x[0]), reverse=True):
+                new_line = re.sub(
+                    rf"(?<![A-Za-z0-9_]){re.escape(old)}(?![A-Za-z0-9_])",
+                    new, new_line,
+                )
+            renamed.append(new_line)
+        inserted_lines = renamed
+        insert_kind = (insert_kind + ":macro_renamed").strip(":")
+        macro_rename_overrides = _rename_enum_refs_in_bundle(bundle, file_path_s, macro_rename_map)
+
     # Ensure a blank line separator before the inserted block for readability.
     block_lines = [""] + [l.rstrip() for l in inserted_lines if l is not None]
 
@@ -3776,6 +3803,11 @@ def make_extra_patch_override(
     if enum_rename_overrides and rename_map:
         updated_text = _apply_rename_map_to_minus_lines(updated_text, rename_map)
 
+    # Rename macro refs in the _extra_* hunk: other declarations may reference
+    # the original macro name and need to use the renamed version.
+    if macro_rename_map:
+        updated_text = _apply_rename_map_to_minus_lines(updated_text, macro_rename_map)
+
     # Persist the override diff under the *extra patch_key* directory so patch_key inference works later.
     store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
     ref = store.write_text(
@@ -3786,6 +3818,7 @@ def make_extra_patch_override(
 
     # Persist enum rename overrides for regular hunks as artifacts.
     serialized_enum_overrides = _serialize_enum_rename_overrides(enum_rename_overrides)
+    serialized_macro_overrides = _serialize_enum_rename_overrides(macro_rename_overrides)
     inserted_mode = "definition" if "function_definition_" in str(insert_kind or "") else "declaration"
 
     result: Dict[str, Any] = {
@@ -3807,6 +3840,8 @@ def make_extra_patch_override(
     }
     if serialized_enum_overrides:
         result["enum_rename_overrides"] = serialized_enum_overrides
+    if serialized_macro_overrides:
+        result["macro_rename_overrides"] = serialized_macro_overrides
     return result
 
 

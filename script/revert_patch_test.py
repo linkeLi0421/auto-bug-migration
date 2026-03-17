@@ -2246,6 +2246,16 @@ def _run_proactive_revert_declarations(
 
             patches[extra_key].patch_text = patch_text.rstrip("\n") + "\n"
 
+            # Apply rename overrides (enum and macro) to regular hunks in the bundle.
+            # These overrides rename V1 symbols (enum constants, macro names) in the
+            # `-` lines of regular hunks so they match the renamed versions in _extra_* hunks.
+            for _override_key in ("enum_rename_overrides", "macro_rename_overrides"):
+                for ov in (res.get(_override_key) or []):
+                    ov_pk = str(ov.get("patch_key", "") if isinstance(ov, dict) else "").strip()
+                    ov_pt = str(ov.get("patch_text", "") if isinstance(ov, dict) else "").strip()
+                    if ov_pk and ov_pt and ov_pk in patches:
+                        patches[ov_pk].patch_text = ov_pt
+
             # Always write to the same file to avoid name explosion.
             base_stem = Path(patch_path).stem or "bundle"
             # Strip any prior suffixes like .split_extra, .proactive_decls, .effective, etc.
@@ -3552,6 +3562,9 @@ def get_full_funsig(patch, target, commit, version:str):
     # Use short commit hash (6 chars) for directory name to match fuzz_helper.py
     short_commit = commit[:8] if len(commit) > 8 else commit
     parsing_path = os.path.join(data_path, f'{target}-{short_commit}', f'{patch_file_path}_analysis.json')
+    if not os.path.exists(parsing_path):
+        logger.warning(f"get_full_funsig: analysis JSON not found: {parsing_path}")
+        return None, 0, 0
     with open(parsing_path, 'r') as f:
         ast_nodes = json.load(f)
     midpoint = (patch_start_line + patch_end_line) / 2
@@ -4512,10 +4525,10 @@ def revert_patch_test(args):
         tmp = copy.deepcopy(inmutable_args)
         result = apply_and_test_patches(patch_pair_list, [], patches_without_context, *mutable_args, *tmp)
 
-        # Trace-layer escalation: if bug not triggered and more layers available,
-        # re-match with a larger set of trace functions and retry.
+        # Trace-layer escalation: escalate when the bug wasn't triggered, or
+        # when no patches matched the trace (build_fail with empty patch list).
         while (
-            result not in {'trigger_but_fuzzer_build_fail', 'trigger_and_fuzzer_build'}
+            result in {'not_trigger', 'crash_mismatch', 'build_fail'}
             and _trace_layers_remaining
         ):
             next_layer = _trace_layers_remaining.pop(0)
