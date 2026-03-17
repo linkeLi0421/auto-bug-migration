@@ -358,7 +358,7 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
 
 def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer,
                   fixed_builder=None, fixed_runner=None, fixed_ossfuzz_commit=None,
-                  max_retry_months=7, retry_month_step=1):
+                  max_retry_months=24, retry_month_step=6):
     '''
     Run helper.py build_image and build_fuzzers
     '''
@@ -938,11 +938,13 @@ if __name__ == "__main__":
         # Save build information to CSV
         build_csv_path = os.path.join(log_path, f"{target}_builds.csv")
         
-        with open(build_csv_path, mode='w', newline='') as build_csv_file:
+        file_exists = os.path.exists(build_csv_path) and os.path.getsize(build_csv_path) > 0
+        with open(build_csv_path, mode='a', newline='') as build_csv_file:
             build_writer = csv.writer(build_csv_file)
-            
-            # Write header if file doesn't exist
-            build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
+
+            # Write header only if file is new or empty
+            if not file_exists:
+                build_writer.writerow(['target', 'commit_id', 'oss_fuzz_commit', 'sanitizer'])
             for commit in commits:  # from latest to old
                 do_bug_build(repo_path, filter_bug_ids, bug_infos, commit, 1, build_writer,
                              fixed_builder=fixed_builder, fixed_runner=fixed_runner,
