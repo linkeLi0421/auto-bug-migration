@@ -3384,6 +3384,11 @@ def make_extra_patch_override(
                     existing = renamed_existing
                     normalized_actions.append("prefix_conflicting_enum_constants")
                     enum_rename_overrides = _rename_enum_refs_in_bundle(bundle, file_path_s, rename_map)
+                    # Also rename enum refs in the _extra_* hunk itself — forward
+                    # declarations added earlier still use the original type names
+                    # (e.g. uc_err) and need to match the renamed enum (_revert_uc_err).
+                    existing = _apply_rename_map_to_minus_lines(existing, rename_map)
+                    normalized_actions.append("rename_enum_refs_in_extra_hunk")
 
         # Existing enum blocks may already be present but anchored too late
         # (e.g. inherited _extra_* hunk). Re-anchor the whole hunk to Tier 1.
@@ -3764,6 +3769,12 @@ def make_extra_patch_override(
         insert_lines=block_lines,
         prefer_prepend=_should_prepend_extra_hunk_insertion(insert_kind=insert_kind, inserted_lines=inserted_lines),
     )
+
+    # Rename enum refs in the _extra_* hunk: forward declarations added earlier
+    # still use the original type names (e.g. uc_err) and need to match the
+    # renamed enum (e.g. _revert_uc_err).
+    if enum_rename_overrides and rename_map:
+        updated_text = _apply_rename_map_to_minus_lines(updated_text, rename_map)
 
     # Persist the override diff under the *extra patch_key* directory so patch_key inference works later.
     store = ArtifactStore(_artifact_root() / extra_key, overwrite=False)
