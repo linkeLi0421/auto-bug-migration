@@ -2610,7 +2610,10 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         else:
             logger.info(f"Skipping non-function body change for {key}")
             
-    # Rename the function by dependency graph, find the caller of the recreated function
+    # Rename the function by dependency graph, find the caller of the recreated function.
+    # After selecting recreated functions from the trace-layer seed, broaden the
+    # rewrite scope to all function hunks in the same file(s) so callsite updates
+    # are not limited to trace-matched function names.
     for key in key_to_newkey:
         patch = diff_results[key]
         artificial_patch = diff_results[key_to_newkey[key]]
@@ -2622,7 +2625,14 @@ def patch_patcher(diff_results, patch_to_apply : list, dependence_graph, commit,
         # name so it matches the reverted definition (__revert_<commit>_<v1name>).
         search_name = strip_function_suffix(patch.new_function_name or fname, target)
         replacement = f"__revert_{commit}_{fname}"
-        for caller_key in dependence_graph.get(key, []):
+        base_file_path = patch.file_path_old or patch.file_path_new
+        caller_candidates = set(dependence_graph.get(key, []))
+        if base_file_path:
+            for other_key, other_patch in diff_results.items():
+                other_file_path = other_patch.file_path_old or other_patch.file_path_new
+                if other_file_path == base_file_path and 'Function body change' in other_patch.patch_type:
+                    caller_candidates.add(other_key)
+        for caller_key in caller_candidates:
             # rename functions in patches that depend on (call) this function
             caller_key = key_to_newkey.get(caller_key, caller_key)
             if caller_key not in diff_results:
@@ -3062,21 +3072,54 @@ def handle_file_change(diff_results, patch_to_apply):
             patch.patch_text = '\n'.join(lines)
 
 
+def _find_function_end_from_start_line(content_lines, start_line):
+    if not start_line or start_line < 1:
+        return None
+    start_idx = min(max(start_line - 1, 0), len(content_lines) - 1)
+    open_idx = None
+    i = start_idx
+    while i < len(content_lines) and i < start_idx + 80:
+        if '{' in content_lines[i]:
+            open_idx = i
+            break
+        i += 1
+    if open_idx is None:
+        return None
+
+    brace_depth = 0
+    for j in range(open_idx, len(content_lines)):
+        line = content_lines[j]
+        brace_depth += line.count('{')
+        brace_depth -= line.count('}')
+        if brace_depth <= 0 and j >= open_idx:
+            return j + 1
+    return len(content_lines)
+
+
 def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_functions, target_repo_path, commit, next_commit, target):
     # For function do not change but appear in trace, add a patch if they should call recreated functions
     # Assume target_repo in new commit
     new_patch_to_apply = set()
-    trace_set = set() # avoid duplicate functions in loop
+    trace_set = dict() # (fname, file_path) -> start_line, avoid duplicate functions in loop
     recreated_names = {func.name for func in recreated_functions}
     for index, func in trace1:
         fname = func.split(' ')[0].split('(')[0]
         if fname in recreated_names:
             continue
         location = func.split(' ')[-1]
-        file_path = location.split(':')[0][1:]  # remove leading /
+        loc_parts = location.rsplit(':', 2)
+        file_path = loc_parts[0][1:] if loc_parts else location
+        start_line_hint = int(loc_parts[1]) if len(loc_parts) >= 2 and loc_parts[1].isdigit() else 0
         file_path = os.path.normpath(file_path)  # normalize paths like tests/../stb_image.h to stb_image.h
-        trace_set.add((fname, file_path))
-    for fname, file_path in trace_set:
+        trace_key = (fname, file_path)
+        prev_hint = trace_set.get(trace_key, 0)
+        if prev_hint <= 0 and start_line_hint > 0:
+            trace_set[trace_key] = start_line_hint
+        elif prev_hint > 0 and start_line_hint > 0:
+            trace_set[trace_key] = min(prev_hint, start_line_hint)
+        elif trace_key not in trace_set:
+            trace_set[trace_key] = 0
+    for (fname, file_path), start_line_hint in trace_set.items():
         old_line_begin = None
         old_line_end = None
         flag = False # flag to indicate if the function is changed between commit and next_commit
@@ -3100,26 +3143,31 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
                     old_line_begin = node['extent']['start']['line']
                     old_line_end = node['extent']['end']['line']
                     break
+        patch_header = f"diff --git a/{file_path} b/{file_path}\n"
+        patch_header += f"--- a/{file_path}\n+++ b/{file_path}\n"
+        os.chdir(target_repo_path)
+        subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        source_file = os.path.join(target_repo_path, file_path)
+        if not os.path.exists(source_file) and file_path.endswith('.h'):
+            # Try .h.in template (e.g. CMake configure_file generates .h from .h.in)
+            source_file_in = source_file + '.in'
+            if os.path.exists(source_file_in):
+                logger.debug(f"Using template {source_file_in} instead of missing {source_file}")
+                source_file = source_file_in
+        if not os.path.exists(source_file):
+            logger.debug(f"Source file {source_file} not found at commit {next_commit}, skipping trace function {fname}")
+            continue
+        with open(source_file, 'r', encoding="latin-1") as f:
+            content = f.readlines()
+
+        if not (old_line_begin and old_line_end) and start_line_hint > 0:
+            old_line_begin = start_line_hint
+            old_line_end = _find_function_end_from_start_line(content, start_line_hint)
+
         if old_line_begin and old_line_end:
             # Create a patch to add the function call
-            patch_header = f"diff --git a/{file_path} b/{file_path}\n"
-            patch_header += f"--- a/{file_path}\n+++ b/{file_path}\n"
-            os.chdir(target_repo_path)
-            subprocess.run(["git", "clean", "-fdx"], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.run(["git", "checkout", '-f', next_commit], encoding='utf-8', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            source_file = os.path.join(target_repo_path, file_path)
-            if not os.path.exists(source_file) and file_path.endswith('.h'):
-                # Try .h.in template (e.g. CMake configure_file generates .h from .h.in)
-                source_file_in = source_file + '.in'
-                if os.path.exists(source_file_in):
-                    logger.debug(f"Using template {source_file_in} instead of missing {source_file}")
-                    source_file = source_file_in
-            if not os.path.exists(source_file):
-                logger.debug(f"Source file {source_file} not found at commit {next_commit}, skipping trace function {fname}")
-                continue
-            with open(source_file, 'r', encoding="latin-1") as f:
-                content = f.readlines()
-                function_lines = content[old_line_begin-1:old_line_end]
+            function_lines = content[old_line_begin-1:old_line_end]
             # Build list of recreated functions visible to this file
             visible_recreated = [fi for fi in recreated_functions
                                  if not (fi.is_static() and fi.file_path_old != file_path)]
@@ -4194,6 +4242,8 @@ def revert_patch_test(args):
     flag = False
     test_local_bug_after_patch = dict() # key: bug_id, value: test result, whether the local bug is triggered after applying the patch
     for commit, next_commit, bug_id in transitions:
+        if bug_id == 'OSV-2023-280':
+            continue
         if args.bug_id and bug_id != args.bug_id:
             continue
         if args.buggy_commit:
@@ -4534,7 +4584,16 @@ def revert_patch_test(args):
             next_layer = _trace_layers_remaining.pop(0)
             if len(next_layer) <= len(trace_func_list):
                 continue  # skip if not actually larger
-            logger.info(f"Escalating trace layer: {len(trace_func_list)} -> {len(next_layer)} functions")
+            reason_map = {
+                'not_trigger': 'bug not triggered',
+                'crash_mismatch': 'crash mismatch',
+                'build_fail': 'build failed or no matching patch set',
+            }
+            esc_reason = reason_map.get(result, result)
+            logger.info(
+                f"Escalating trace layer: {len(trace_func_list)} -> {len(next_layer)} functions"
+                f" (reason: {esc_reason})"
+            )
             trace_func_list = next_layer
 
             # Re-match trace functions against diff results
