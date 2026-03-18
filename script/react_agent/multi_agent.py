@@ -747,6 +747,21 @@ def _group_errors_by_patch_key(*, build_log_text: str, patch_path: str) -> Dict[
         mapping = get_error_patch_fn(bundle, patch_path=patch_path, file_path=err["file"], line_number=err["line"])
         key = str(mapping.get("patch_key") or "").strip()
         if not key:
+            # Fallback: compiler errors outside any patch hunk but in a file that
+            # has an _extra_* hunk.  These are typically missing forward declarations
+            # or conflicting types for __revert_* functions.  Route them to the
+            # _extra_<file> hunk so the agent can add the missing declaration.
+            base_file = Path(err["file"]).name if err.get("file") else ""
+            if base_file:
+                candidate = f"_extra_{base_file}"
+                patches = getattr(bundle, "patches", {}) or {}
+                if candidate in patches:
+                    key = candidate
+                else:
+                    split_key = _find_split_extra_key(patches, candidate)
+                    if split_key:
+                        key = split_key
+        if not key:
             continue
         enriched = dict(err)
         enriched["patch_key"] = key

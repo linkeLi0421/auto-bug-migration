@@ -401,6 +401,20 @@ def _file_matches(patch_file: str, file_path: str) -> bool:
     return False
 
 
+def _file_matches_strict(patch_file: str, file_path: str) -> bool:
+    """Strict file match: require exact equality between the normalized patch
+    file path and one of the candidates derived from *file_path*.  This avoids
+    false positives such as ``src/class.c`` matching
+    ``mrbgems/mruby-class-ext/src/class.c`` via suffix."""
+    pf = _norm_path(patch_file).strip().lstrip("./").strip("/")
+    if not pf:
+        return False
+    for c in _file_candidates(file_path):
+        if pf == c:
+            return True
+    return False
+
+
 def _patch_summary(key: str, patch: PatchInfo) -> Dict[str, Any]:
     return {
         "key": key,
@@ -518,21 +532,35 @@ def _get_error_patch_from_bundle(bundle: PatchBundle, *, patch_path: str, file_p
     # then scanned in reverse while adjusting offsets.
     # De-duplicate equivalent hunks for the same file: _extra_* entries can mirror a normal patch hunk and
     # would otherwise double-apply add_num shifts.
+    #
+    # Two-phase file matching: first try strict (exact path equality) to avoid
+    # false positives like ``src/class.c`` matching
+    # ``mrbgems/mruby-class-ext/src/class.c``.  Fall back to loose suffix
+    # matching only when strict yields no entries.
     file_entries: List[Tuple[str, PatchInfo, Tuple[int, int, int, int]]] = []
     non_extra_hunks: set[Tuple[int, int, int, int]] = set()
-    for key in reversed(bundle.keys_sorted):
-        patch = bundle.patches[key]
-        if not _file_matches(patch.file_path_new, file_path):
-            continue
-        hunk = _parse_first_hunk(patch.patch_text) or (
-            int(patch.old_start_line or 0),
-            max(int((patch.old_end_line or 0) - (patch.old_start_line or 0)), 0),
-            int(patch.new_start_line or 0),
-            max(int((patch.new_end_line or 0) - (patch.new_start_line or 0)), 0),
-        )
-        file_entries.append((key, patch, hunk))
-        if "Extra" not in (patch.patch_type or set()):
-            non_extra_hunks.add(hunk)
+
+    def _collect_file_entries(match_fn):
+        entries: List[Tuple[str, PatchInfo, Tuple[int, int, int, int]]] = []
+        ne_hunks: set[Tuple[int, int, int, int]] = set()
+        for key in reversed(bundle.keys_sorted):
+            patch = bundle.patches[key]
+            if not match_fn(patch.file_path_new, file_path):
+                continue
+            hunk = _parse_first_hunk(patch.patch_text) or (
+                int(patch.old_start_line or 0),
+                max(int((patch.old_end_line or 0) - (patch.old_start_line or 0)), 0),
+                int(patch.new_start_line or 0),
+                max(int((patch.new_end_line or 0) - (patch.new_start_line or 0)), 0),
+            )
+            entries.append((key, patch, hunk))
+            if "Extra" not in (patch.patch_type or set()):
+                ne_hunks.add(hunk)
+        return entries, ne_hunks
+
+    file_entries, non_extra_hunks = _collect_file_entries(_file_matches_strict)
+    if not file_entries:
+        file_entries, non_extra_hunks = _collect_file_entries(_file_matches)
 
     seen_hunks: set[Tuple[int, int, int, int]] = set()
     for key, patch, hunk in file_entries:
@@ -979,7 +1007,24 @@ def _get_link_error_patch_from_bundle(
         body = patch_lines[body_start:] if body_start < len(patch_lines) else []
         hit_idx = locate_hit_index(body)
         if hit_idx >= 0:
-            score += 5
+            # Check if this hit is a function DEFINITION (has body with '{')
+            # vs a forward DECLARATION (ends with ';').
+            # Linker errors originate from definitions, not declarations.
+            hit_line = body[hit_idx].lstrip("-").rstrip()
+            is_definition = "{" in hit_line
+            if not is_definition:
+                # Check subsequent '-' lines for opening brace
+                for j in range(hit_idx + 1, min(hit_idx + 4, len(body))):
+                    subsequent = body[j].lstrip("-").strip()
+                    if subsequent.startswith("{"):
+                        is_definition = True
+                        break
+                    if subsequent.endswith(";") or not subsequent:
+                        break  # declaration or blank — not a definition
+            if is_definition:
+                score += 25  # strong: this hunk DEFINES the function
+            else:
+                score += 2   # weak: only a declaration/reference
 
         # Tiebreaker: prefer hunks that contain the undefined symbol from the error.
         if undef_symbol and undef_symbol in text:
