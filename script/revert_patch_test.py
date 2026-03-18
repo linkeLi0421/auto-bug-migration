@@ -1763,7 +1763,7 @@ def clean_log(text: str) -> str:
 def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, build_csv, arch,
                  runner_image='auto', commit_date=None):
     cmd = [
-        "python3", f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
+        sys.executable, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer,
         "--patch", patch_file_path, '--build_csv', build_csv, '--architecture', arch
     ]
     if runner_image:
@@ -1777,7 +1777,7 @@ def build_fuzzer(target, commit_id, sanitizer, bug_id, patch_file_path, fuzzer, 
     cmd = [str(x) for x in cmd]
     logger.info(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True, text=True)
-    stdout = clean_log(result.stdout)
+    stdout = clean_log(result.stdout + result.stderr)
 
     build_error_patterns = [
         "Building fuzzers failed",
@@ -2670,7 +2670,8 @@ def normalize_signature(signature):
     signature = re.sub(r'\s+', ' ', signature.strip())
 
     # Match return type, function name, and argument list
-    match = re.match(r'(.+?)\s+(\w+)\s*\((.*?)\)', signature)
+    # Also handle C++ operator overloads like "operator^=", "operator<<", "operator()"
+    match = re.match(r'(.+?)\s+(operator\s*[^\w\s(]+(?:\s*\(\s*\))?|\w+(?:::\w+)*)\s*\((.*?)\)', signature)
     if not match:
         raise ValueError(f"Invalid function signature: {signature}")
 
@@ -3120,6 +3121,12 @@ def add_patch_for_trace_funcs(diff_results, final_patches, trace1, recreated_fun
         elif trace_key not in trace_set:
             trace_set[trace_key] = 0
     for (fname, file_path), start_line_hint in trace_set.items():
+        if fname == 'LLVMFuzzerTestOneInput':
+            # The fuzzer body is handled separately in
+            # llvm_fuzzer_test_one_input_patch_update(). Generating generic
+            # trace patches here creates overlapping call-site hunks that later
+            # merge into duplicate V2 lines.
+            continue
         old_line_begin = None
         old_line_end = None
         flag = False # flag to indicate if the function is changed between commit and next_commit
@@ -3479,6 +3486,33 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             fuzzer_new_signature = node['signature']
             fuzzer_old_signature = node['signature']
             break
+
+    if not fuzzer_keys:
+        # Some patch objects lose old/new signatures after patch_patcher().
+        # Fall back to line overlap within LLVMFuzzerTestOneInput so we can
+        # still update existing fuzzer hunks in place.
+        for key in patch_to_apply:
+            patch = diff_results[key]
+            if patch.file_path_new != fuzzer_file_path:
+                continue
+            lines = patch.patch_text.split('\n')
+            if len(lines) < 4 or not lines[3].startswith('@@'):
+                continue
+            try:
+                new_hunk = lines[3].split('@@')[-2].strip().split('+')[1]
+                if ',' in new_hunk:
+                    hunk_start_str, hunk_len_str = new_hunk.split(',', 1)
+                    hunk_start = int(hunk_start_str)
+                    hunk_len = int(hunk_len_str)
+                else:
+                    hunk_start = int(new_hunk)
+                    hunk_len = 1
+            except (IndexError, ValueError):
+                continue
+            hunk_end = hunk_start + max(hunk_len, 1) - 1
+            if not (hunk_end < fuzzer_start_line or hunk_start > fuzzer_end_line):
+                fuzzer_keys.add(key)
+    logger.info(f'fuzzer_keys debug: {sorted(fuzzer_keys)}')
     
     # Use the actual source path from analysis for patch generation
     fuzzer_file_path = actual_fuzzer_path
@@ -3494,6 +3528,9 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
         # node['spelling'] is the V2 name from AST; match against both V1 name and V2 name
         _matched_fi = next((fi for fi in recreated_functions if node['spelling'] in (fi.name, fi.v2_name)), None)
         if node['location']['file'] == fuzzer_file_path and fuzzer_start_line <= node['location']['line'] <= fuzzer_end_line and _matched_fi:
+            debug_destroy_call = node['spelling'] in {'hb_buffer_destroy', 'hb_font_destroy', 'hb_face_destroy', 'hb_blob_destroy'}
+            if debug_destroy_call:
+                logger.info(f"debug call {node['spelling']} line={node['location']['line']} matched={_matched_fi.name}")
             # V2 name for searching source code (strip arch suffix), V1 name for replacement
             _v2_search = strip_function_suffix(node['spelling'], target)
             _v1_replacement = f"__revert_{commit}_{_matched_fi.name}"
@@ -3505,39 +3542,110 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
             for key in fuzzer_keys:
                 patch = diff_results[key]
                 lines = patch.patch_text.split('\n')
-                new_lines = []
+                if len(lines) < 5:
+                    continue
                 new_start_line = int(lines[3].split('@@')[-2].strip().split('+')[1].split(',')[0])
                 new_offset = int(lines[3].split('@@')[-2].strip().split(',')[-1])
                 if new_start_line <= node['location']['line'] < new_start_line + new_offset:
-                    # This call is within a patch, we need to update the patch.
-                    # For multi-line calls, also convert continuation context lines to -/+ pairs.
-                    Inpatch_flag = True
-                    i = 0
+                    if debug_destroy_call:
+                        logger.info(f'debug range match key={key} start={new_start_line} offset={new_offset}')
+                    # Only treat the call as in-patch if we can map the exact
+                    # context line to this AST location. Relying on hunk range
+                    # alone can create a duplicate synthetic 1-line patch for a
+                    # call that is already present in the existing hunk body.
+                    new_lines = lines[:4]
+                    current_new_line = new_start_line
+                    i = 4
+                    patch_updated = False
+                    already_covered = False
                     while i < len(lines):
                         line = lines[i]
-                        if line and line[0] not in {'-', '+', '@', 'd'} and re.search(r'(?<![\w.])' + re.escape(_v2_search) + r'(?!\w)', line) is not None:
-                            # Found the function name on a context line — convert it and continuations
+                        line_new_line = current_new_line if line and line[0] in {' ', '+'} else None
+                        line_matches_call = (
+                            line_new_line == node['location']['line']
+                            and re.search(r'(?<![\w.])' + re.escape(_v2_search) + r'(?!\w)', line) is not None
+                        )
+                        if line_matches_call and line.startswith(' '):
+                            if debug_destroy_call:
+                                logger.info(f"debug exact context match key={key} line={line!r}")
                             rm_line = rename_func(f'-{line[1:]}', _v2_search, commit, replacement_string=_v1_replacement)[0]
                             add_line = f'+{line[1:]}'
                             new_lines.append(rm_line)
                             new_lines.append(add_line)
-                            # Use paren counting to find how many continuation lines belong
-                            # to this call (AST extent may only cover the function name).
+                            patch_updated = True
+                            already_covered = True
                             paren_depth = line.count('(') - line.count(')')
+                            current_new_line += 1
                             k = 1
                             while paren_depth > 0 and i + k < len(lines):
                                 next_line = lines[i + k]
-                                if not next_line or next_line[0] != ' ':
+                                if not next_line.startswith(' '):
                                     break
                                 new_lines.append(f'-{next_line[1:]}')
                                 new_lines.append(f'+{next_line[1:]}')
                                 paren_depth += next_line.count('(') - next_line.count(')')
+                                current_new_line += 1
                                 k += 1
                             i += k
-                        else:
-                            new_lines.append(line)
-                            i += 1
-                    patch.patch_text = '\n'.join(new_lines)
+                            continue
+                        if line_matches_call and line.startswith('+'):
+                            if debug_destroy_call:
+                                logger.info(f"debug already covered key={key} line={line!r}")
+                            already_covered = True
+                            break
+
+                        new_lines.append(line)
+                        if line and line[0] in {' ', '+'}:
+                            current_new_line += 1
+                        i += 1
+
+                    if not patch_updated and not already_covered:
+                        fallback_matches = [
+                            idx for idx in range(4, len(lines))
+                            if lines[idx].startswith(' ')
+                            and re.search(r'(?<![\w.])' + re.escape(_v2_search) + r'(?!\w)', lines[idx]) is not None
+                        ]
+                        if len(fallback_matches) == 1:
+                            match_idx = fallback_matches[0]
+                            if debug_destroy_call:
+                                logger.info(f"debug fallback match key={key} line={lines[match_idx]!r}")
+                            new_lines = lines[:4]
+                            i = 4
+                            while i < len(lines):
+                                line = lines[i]
+                                if i == match_idx:
+                                    rm_line = rename_func(f'-{line[1:]}', _v2_search, commit, replacement_string=_v1_replacement)[0]
+                                    add_line = f'+{line[1:]}'
+                                    new_lines.append(rm_line)
+                                    new_lines.append(add_line)
+                                    patch_updated = True
+                                    already_covered = True
+                                    paren_depth = line.count('(') - line.count(')')
+                                    k = 1
+                                    while paren_depth > 0 and i + k < len(lines):
+                                        next_line = lines[i + k]
+                                        if not next_line.startswith(' '):
+                                            break
+                                        new_lines.append(f'-{next_line[1:]}')
+                                        new_lines.append(f'+{next_line[1:]}')
+                                        paren_depth += next_line.count('(') - next_line.count(')')
+                                        k += 1
+                                    i += k
+                                    continue
+                                new_lines.append(line)
+                                i += 1
+
+                    if patch_updated:
+                        if debug_destroy_call:
+                            logger.info(f'debug patched in place key={key}')
+                        patch.patch_text = '\n'.join(new_lines)
+                        Inpatch_flag = True
+                        break
+                    if already_covered:
+                        if debug_destroy_call:
+                            logger.info(f'debug treated as already covered key={key}')
+                        Inpatch_flag = True
+                        break
             
             # Step 3b: Create new patch for calls not covered by existing patches
             if not Inpatch_flag:
@@ -3594,6 +3702,79 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
                 new_key = f'{fuzzer_file_path}{fuzzer_file_path}-{call_start},{num_lines}+{call_start},{num_lines}'
                 diff_results[new_key] = patch
                 patch_to_apply.append(new_key)
+
+    # Step 4: fold redundant 1-line fuzzer patches back into existing
+    # multi-line fuzzer hunks. This keeps in-hunk call rewrites aligned with
+    # the real LLVMFuzzerTestOneInput patch instead of emitting extra hunks.
+    def _parse_new_hunk_range(patch_text):
+        lines = patch_text.split('\n')
+        if len(lines) < 4 or not lines[3].startswith('@@'):
+            return None, None
+        try:
+            new_hunk = lines[3].split('@@')[-2].strip().split('+')[1]
+            if ',' in new_hunk:
+                start_str, len_str = new_hunk.split(',', 1)
+                return int(start_str), int(len_str)
+            return int(new_hunk), 1
+        except (IndexError, ValueError):
+            return None, None
+
+    fuzzer_patch_keys = [
+        key for key in patch_to_apply
+        if key in diff_results and diff_results[key].file_path_new == fuzzer_file_path
+    ]
+    covering_hunks = []
+    one_line_hunks = []
+    for key in fuzzer_patch_keys:
+        start, length = _parse_new_hunk_range(diff_results[key].patch_text)
+        if start is None or length is None:
+            continue
+        if length > 1:
+            covering_hunks.append((key, start, length))
+        elif length == 1:
+            one_line_hunks.append((key, start))
+
+    for key, line_no in one_line_hunks:
+        covering = next(
+            ((cover_key, cover_start, cover_len) for cover_key, cover_start, cover_len in covering_hunks
+             if cover_start <= line_no < cover_start + cover_len),
+            None,
+        )
+        if not covering:
+            continue
+
+        cover_key, cover_start, _cover_len = covering
+        one_line_patch = diff_results[key]
+        patch_lines = one_line_patch.patch_text.split('\n')
+        minus_line = next((line for line in patch_lines[4:] if line.startswith('-')), None)
+        plus_line = next((line for line in patch_lines[4:] if line.startswith('+')), None)
+        if not minus_line or not plus_line:
+            continue
+
+        cover_patch = diff_results[cover_key]
+        cover_lines = cover_patch.patch_text.split('\n')
+        new_lines = cover_lines[:4]
+        current_new_line = cover_start
+        merged = False
+        for line in cover_lines[4:]:
+            line_new_line = current_new_line if line and line[0] in {' ', '+'} else None
+            if line_new_line == line_no:
+                if line.startswith(' '):
+                    new_lines.append(minus_line)
+                    new_lines.append(plus_line)
+                    merged = True
+                    current_new_line += 1
+                    continue
+                if line.startswith('+') and line == plus_line:
+                    merged = True
+            new_lines.append(line)
+            if line and line[0] in {' ', '+'}:
+                current_new_line += 1
+
+        if merged:
+            cover_patch.patch_text = '\n'.join(new_lines)
+            if key in patch_to_apply:
+                patch_to_apply.remove(key)
 
 
 def update_function_mappings(recreated_functions, signature_change_list, commit: str):
