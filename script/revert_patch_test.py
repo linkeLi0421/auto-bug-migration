@@ -1728,8 +1728,6 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                         if patch_old.old_function_name != patch_new.new_function_name:
                             signature_change_list.append((patch_old.old_function_name, patch_new.new_function_name))
                         patch_old.new_signature = patch_new.new_signature
-                        patch_old.new_start_line = patch_new.new_start_line
-                        patch_old.new_end_line = patch_new.new_end_line
                         del results[k_new]
 
     for patch in results.values():
