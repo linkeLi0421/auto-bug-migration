@@ -2092,6 +2092,20 @@ def build_version(args):
   build_bash = f'''
   export CFLAGS="-fdiagnostics-absolute-paths -ferror-limit=0 $CFLAGS";
   export CFLAGS="-Wno-error $CFLAGS";
+  export CXXFLAGS="-Wno-error ${{CXXFLAGS:-}}";
+
+  # Disable -Werror at the build-system level so injected __revert_* functions
+  # don't fail on -Wunused-function etc.  Stripping it from CFLAGS alone is not
+  # enough because meson/cmake add -Werror independently via their own config.
+  find /src -maxdepth 3 -name meson.build -exec \
+    sed -i "s/werror[[:space:]]*=[[:space:]]*true/werror=false/g; s/'-Werror'//g; s/\"-Werror\"//g" {{}} + 2>/dev/null || true;
+  find /src -maxdepth 3 -name meson_options.txt -exec \
+    sed -i "s/werror[[:space:]]*=[[:space:]]*true/werror=false/g" {{}} + 2>/dev/null || true;
+  find /src -maxdepth 3 -name CMakeLists.txt -exec \
+    sed -i "s/-Werror//g" {{}} + 2>/dev/null || true;
+  find /src -maxdepth 3 -name configure.ac -o -name Makefile.am -o -name Makefile.in | \
+    xargs sed -i "s/-Werror//g" 2>/dev/null || true;
+
   cd /src/{args.project.name};
   git checkout -f {args.commit};
   '''

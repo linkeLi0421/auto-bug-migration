@@ -2636,6 +2636,9 @@ def _kb_enum_decl_candidates_from_enum_constant_refs(
         return []
 
     enum_names: set[str] = set()
+    # Collect file:line locations of ENUM_CONSTANT_DECL nodes so we can fall back
+    # to a spatial lookup when USR/type_ref are missing.
+    enum_const_locations: List[Tuple[str, int]] = []
     for n in list(nodes or [])[: max(0, int(max_nodes or 0))]:
         if not isinstance(n, dict):
             continue
@@ -2644,6 +2647,14 @@ def _kb_enum_decl_candidates_from_enum_constant_refs(
             enum_name = _enum_name_from_enum_constant_usr(str(n.get("usr", "") or ""))
             if enum_name:
                 enum_names.add(enum_name)
+            else:
+                # Record location for spatial fallback below
+                loc = n.get("location", {}) if isinstance(n.get("location"), dict) else {}
+                ext = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
+                fp = str(loc.get("file", "") or ext.get("start", {}).get("file", "") or "").strip()
+                ln = int(ext.get("start", {}).get("line", 0) or loc.get("line", 0) or 0)
+                if fp and ln > 0:
+                    enum_const_locations.append((fp, ln))
         type_ref = n.get("type_ref", {}) if isinstance(n.get("type_ref"), dict) else {}
         if str(type_ref.get("target_kind", "") or "").strip() == "ENUM_CONSTANT_DECL":
             enum_name = _enum_name_from_enum_constant_usr(str(type_ref.get("usr", "") or ""))
@@ -2668,6 +2679,43 @@ def _kb_enum_decl_candidates_from_enum_constant_refs(
                     continue
                 seen.add(k)
                 derived.append(n)
+
+    # Spatial fallback: when ENUM_CONSTANT_DECL nodes have no USR (so enum_names
+    # is empty), find ENUM_DECL nodes in the same file whose extent range contains
+    # the constant's line number.
+    if not derived and enum_const_locations:
+        file_index = getattr(kb_index, "file_index", None)
+        if isinstance(file_index, dict) and ver in file_index:
+            ver_index = file_index[ver] if isinstance(file_index[ver], dict) else {}
+            checked_files: set[str] = set()
+            for fp, const_line in enum_const_locations:
+                base = Path(fp).name
+                if base in checked_files:
+                    continue
+                checked_files.add(base)
+                file_nodes = ver_index.get(base)
+                if not isinstance(file_nodes, list):
+                    for key in ver_index:
+                        if Path(key).name == base:
+                            file_nodes = ver_index[key]
+                            break
+                if not isinstance(file_nodes, list):
+                    continue
+                for n in file_nodes:
+                    if not isinstance(n, dict):
+                        continue
+                    if str(n.get("kind", "") or "").strip() != "ENUM_DECL":
+                        continue
+                    ext = n.get("extent", {}) if isinstance(n.get("extent"), dict) else {}
+                    start_ln = int(ext.get("start", {}).get("line", 0) or 0)
+                    end_ln = int(ext.get("end", {}).get("line", 0) or 0)
+                    if start_ln <= const_line <= end_ln:
+                        k = _kb_node_key(n)
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        derived.append(n)
+
     return derived
 
 
@@ -2950,8 +2998,10 @@ def _extract_enum_constant_names(code: str) -> List[str]:
         tail = stripped
         if "}" in tail:
             tail = tail[:tail.index("}")]
-        # Extract NAME tokens before '=', ',', '}', or at end of line
-        for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:=|,|}|$)", tail):
+        # Extract NAME tokens before '=', ',', '}', or at end of line.
+        # Use a negative lookbehind to skip hex-literal suffixes like
+        # ``0x00000000u`` where ``x00000000u`` would otherwise match.
+        for m in re.finditer(r"(?<![0-9a-fA-FxX])([A-Za-z_]\w*)\s*(?:=|,|}|$)", tail):
             name = m.group(1)
             if name not in ("enum", "typedef", "struct", "union"):
                 if name not in names:
@@ -2993,9 +3043,20 @@ def _check_v2_enum_tag_conflict(kb_index: Any, tag_name: str) -> bool:
 
 
 def _extract_enum_tag_from_code(code: str) -> str:
-    """Extract the enum tag name from C enum source, or ``''`` if anonymous."""
-    m = re.search(r"(?:typedef\s+)?enum\s+([A-Za-z_]\w*)", str(code or ""))
-    return m.group(1) if m else ""
+    """Extract the enum tag name from C enum source, or ``''`` if anonymous.
+
+    Handles both ``enum NAME { ... }`` and ``typedef enum { ... } NAME;``.
+    """
+    s = str(code or "")
+    # Named enum: ``enum NAME {``
+    m = re.search(r"(?:typedef\s+)?enum\s+([A-Za-z_]\w*)\s*\{", s)
+    if m:
+        return m.group(1)
+    # Trailing typedef: ``typedef enum { ... } NAME;``
+    m = re.search(r"\}\s*([A-Za-z_]\w*)\s*;", s)
+    if m:
+        return m.group(1)
+    return ""
 
 
 def _prefix_enum_source(code: str, enum_names: List[str], prefix: str, tag_rename_map: Optional[Dict[str, str]] = None) -> Tuple[str, Dict[str, str]]:
@@ -3446,14 +3507,9 @@ def make_extra_patch_override(
                 payload["enum_rename_overrides"] = serialized_enum_overrides
             return payload
 
-        return {
-            "patch_path": str(Path(patch_path_s).expanduser().resolve()),
-            "file_path": file_path_s,
-            "symbol_name": symbol,
-            "patch_key": extra_key,
-            "patch_text": existing,
-            "note": "Symbol already present in extra hunk; no change.",
-        }
+        # Fall through to normal insertion logic — the existing declaration
+        # may be incomplete (e.g. forward typedef without the struct body),
+        # so allow re-insertion of a fuller definition.
 
     inserted_lines: List[str] = []
     insert_kind = ""
