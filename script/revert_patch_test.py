@@ -3462,13 +3462,18 @@ def llvm_fuzzer_test_one_input_patch_update(diff_results, patch_to_apply, recrea
     fuzzer_keys = set()
     
     # Step 0: Get harness file path
+    fuzzer_file_path = None
     for _, trace in trace1:
         if 'LLVMFuzzerTestOneInput' in trace:
             location = trace.split(' ')[1]
             fuzzer_file_path = location.split(':')[0][1:]  # remove leading /
             fuzzer_file_path = os.path.normpath(fuzzer_file_path)  # normalize paths like tests/../file.h
             break
-    
+
+    if fuzzer_file_path is None:
+        # LLVMFuzzerTestOneInput not found in trace, nothing to update
+        return
+
     # Step 1: Identify all patches that affect LLVMFuzzerTestOneInput function
     for key in patch_to_apply:
         patch = diff_results[key]
