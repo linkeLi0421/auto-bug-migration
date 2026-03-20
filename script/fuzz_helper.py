@@ -2466,6 +2466,10 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
       dockerfile.write(updated_content)
 
   build_script = f'{oss_fuzz_dir}/projects/{target}/build.sh'
+  if not os.path.exists(build_script):
+    logger.info('No OSS-Fuzz build.sh for %s, skipping build script rewrites.',
+                target)
+    return
   with open(build_script, 'r') as build_file:
       build_content = build_file.read()
   if target == 'opensc':

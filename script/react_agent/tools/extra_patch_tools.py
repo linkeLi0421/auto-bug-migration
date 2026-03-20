@@ -3705,12 +3705,13 @@ def make_extra_patch_override(
     # missing in V2, the agent will see a clear "unknown identifier" error and
     # can fix it in a later round.
 
-    # For revert functions being inserted into header files, wrap in extern "C"
-    # to ensure C++ code can link against the C-defined functions.
+    # For revert functions being inserted into C++ files (headers or sources),
+    # wrap in extern "C" to ensure C++ code can link against the C-defined functions.
     # Use conditional compilation so C files don't see the C++-specific syntax.
+    _CPP_EXTS = (".h", ".hpp", ".hxx", ".cc", ".cpp", ".cxx", ".c++", ".C")
     if inserted_lines and kind == "revert_function" and not is_function_definition_insert:
         target_file = str(file_path_s or "").strip()
-        if target_file.endswith(".h") or target_file.endswith(".hpp"):
+        if target_file.endswith(_CPP_EXTS):
             # Check if already wrapped
             text_to_insert = "\n".join(inserted_lines)
             if 'extern "C"' not in text_to_insert:
