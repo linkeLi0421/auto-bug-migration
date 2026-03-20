@@ -516,6 +516,12 @@ def main():
     # Pre-compute project mappings for files directly in /src/
     file_to_project = get_project_dir_mappings(compile_db)
     
+    # Clean any leftover analysis files from previous runs to prevent
+    # appending to already-wrapped JSON (which creates invalid ][{ sequences)
+    import glob as _glob
+    for old in _glob.glob('/data/**/*_analysis.json', recursive=True):
+        os.remove(old)
+
     out_path_set = set()
     defs_by_usr = dict()
     for src_file in compile_db:
