@@ -2143,6 +2143,36 @@ def build_version(args):
         rm -rf "/data/{args.project.name}-{args.commit[:8]}"
     fi
     mv /data/{args.project.name} /data/{args.project.name}-{args.commit[:8]};
+    # Move analysis results for non-project directories found in compile_commands.json
+    # (e.g. fuzz harnesses compiled from /src/ directly)
+    python3 -c "
+import json, os, shutil
+dst = '/data/{args.project.name}-{args.commit[:8]}'
+cc = json.load(open('compile_commands.json'))
+dirs = set()
+for e in cc:
+    d = e['directory']
+    # Skip the main project directory
+    if d.startswith('/src/{args.project.name}'):
+        continue
+    # Map /src -> /data/src, /src/other -> /data/other, etc.
+    if d.startswith('/src'):
+        rel = d[len('/src'):]  # '' for /src, '/other' for /src/other
+        data_dir = '/data' + rel if rel else '/data/src'
+        dirs.add(data_dir)
+for d in dirs:
+    if os.path.isdir(d):
+        # Compute relative path from /data/
+        rel = os.path.relpath(d, '/data')
+        target = os.path.join(dst, rel)
+        os.makedirs(target, exist_ok=True)
+        for f in os.listdir(d):
+            src_f = os.path.join(d, f)
+            dst_f = os.path.join(target, f)
+            shutil.move(src_f, dst_f)
+        os.rmdir(d)
+        print(f'Moved {{d}} -> {{target}}')
+";
     '''
   else:
     build_bash += '''
@@ -2194,8 +2224,8 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
     export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
-    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
     
     # Checkout buggy commit and set up environment
     cd /src/{args.project.name};
@@ -2205,7 +2235,7 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     
     # Compile and collect trace
     compile;
-    timeout 10 /out/{args.fuzzer_name} /corpus/{args.test_input};
+    timeout 100 /out/{args.fuzzer_name} /corpus/{args.test_input};
     python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
   '''
   return bash_trace
