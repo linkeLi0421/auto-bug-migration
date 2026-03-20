@@ -1686,8 +1686,21 @@ def analyze_diffindex(diff_text, target_repo_path: str, new_commit: str, old_com
                                 old_line_start = old_line_cursor = diff_result_begin-1
                                 new_line_start = new_line_cursor = new_end_i
                             # <= because line_start and line_cursor may be the same then subpatch only contains '+' or only '-'
-                            if (max(old_start_i, old_line_start) <= min(old_end_i, old_line_cursor) and
-                                max(new_start_i, new_line_start) <= min(new_end_i, new_line_cursor)):
+                            strict_overlap = (max(old_start_i, old_line_start) <= min(old_end_i, old_line_cursor) and
+                                max(new_start_i, new_line_start) <= min(new_end_i, new_line_cursor))
+                            # Fallback: merge same-function entries that are adjacent but
+                            # don't strictly overlap.  This happens when extract_revert_patch
+                            # splits a function's V1→V2 change into a pure-remove entry
+                            # (only '-' lines) and a pure-add entry (only '+' lines) with
+                            # a small context gap between them (e.g. #ifdef __cplusplus).
+                            if not strict_overlap and signature:
+                                _MAX_MERGE_GAP = 20  # lines
+                                same_func = (v.new_signature == signature or v.old_signature == signature)
+                                old_gap = max(old_start_i, old_line_start) - min(old_end_i, old_line_cursor)
+                                new_gap = max(new_start_i, new_line_start) - min(new_end_i, new_line_cursor)
+                                if same_func and old_gap <= _MAX_MERGE_GAP and new_gap <= _MAX_MERGE_GAP:
+                                    strict_overlap = True
+                            if strict_overlap:
                                 # update the boundaries: take min start and max end for both old and new
                                 old_start = min(old_start_i, old_line_start)
                                 old_end = max(old_end_i, old_line_cursor)
