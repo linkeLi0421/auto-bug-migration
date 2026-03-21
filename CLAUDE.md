@@ -4,165 +4,167 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This repository implements automated fuzzing workflows for OSS-Fuzz projects. The system selectively migrates bug-triggering code between versions of C/C++ projects, using an LLM-based ReAct agent to fix compilation failures that arise from the migration.
+This repository implements automated fuzzing workflows for OSS-Fuzz projects. The system transplants bug-triggering conditions from old (buggy) commits into current code versions, then merges all per-bug patches into a single version that triggers all bugs simultaneously.
 
-The end-to-end pipeline is: `revert_patch_test.py` generates revert patches from bug-introducing commits, calls `multi_agent.py` (which fans out to `agent_langgraph.py` per hunk) to iteratively fix build errors via LLM-generated override diffs, then verifies the patched code still triggers the original bug.
+There are two pipelines:
+
+**New pipeline (Claude Code agent):** `bug_transplant_batch.py` iterates over bugs, `bug_transplant.py` runs Claude Code inside an OSS-Fuzz Docker container to semantically transplant each bug, and `bug_transplant_merge.py` merges per-bug diffs into one version with conflict resolution.
+
+**Legacy pipeline (ReAct agent):** `revert_patch_test.py` generates revert patches, calls `multi_agent.py` (which fans out to `agent_langgraph.py` per hunk) to fix build errors via LLM-generated override diffs. Still present in codebase but being replaced.
 
 ## Key Commands
 
-### Install dependencies
-```bash
-python3 -m pip install -r script/react_agent/requirements.txt
-```
-
-### Run tests
-```bash
-# Main agent regression tests (offline, fast)
-bash script/react_agent/test_langgraph_agent.sh
-
-# Multi-agent orchestration tests (offline)
-bash script/react_agent/test_multi_agent.sh
-
-# Migration tools tests (patch bundle loading, error parsing)
-bash script/migration_tools/test_migration_tools.sh
-
-# Symbol tools smoke test (KB indexing, source resolution)
-bash script/react_agent/test_symbol_tools.sh
-```
-
-All test scripts are self-contained bash scripts that embed Python tests via heredocs. They run offline without API calls or Docker.
-
-### Run the agent (offline stub mode)
-```bash
-python3 script/react_agent/agent_langgraph.py --model stub --tools fake --max-steps 3 <artifact_dir>
-```
-
-### Run the agent (real mode with OpenAI)
-```bash
-export OPENAI_API_KEY=...
-python3 script/react_agent/agent_langgraph.py \
-  --model openai --tools real --max-steps 8 --error-scope patch <artifact_dir> \
-  --patch-path data/tmp_patch/<project>.patch2 \
-  --ossfuzz-project <project> --ossfuzz-commit <sha> \
-  --openai-model gpt-5-mini
-```
-
-### Multi-hunk agent (one agent per patch key)
-```bash
-python3 script/react_agent/multi_agent.py <build_log> \
-  --patch-path data/tmp_patch/<project>.patch2 \
-  --model openai --tools real --max-steps 8 --jobs 4
-```
-
-### End-to-end pipeline
+### Environment setup
 ```bash
 source script/setenv.sh
+```
+Sets: `TESTCASES`, `REPO_PATH`, `BUGINFO_PATH`, `REACT_AGENT_JOBS`
+
+### New Pipeline: Bug Transplant via Claude Code
+
+#### Step 1: Batch transplant (one Claude Code session per bug)
+```bash
+# Dry run — see what would execute
+python3 script/bug_transplant_batch.py ~/log/<project>.csv \
+  --bug_info osv_testcases_summary.json \
+  --build_csv ~/log/<project>_builds.csv \
+  --target <project> --dry-run
+
+# Run all bugs
+sudo -E python3 script/bug_transplant_batch.py ~/log/<project>.csv \
+  --bug_info osv_testcases_summary.json \
+  --build_csv ~/log/<project>_builds.csv \
+  --target <project>
+
+# Single bug, skip data collection, keep container for debugging
+sudo -E python3 script/bug_transplant_batch.py ~/log/<project>.csv \
+  --bug_info osv_testcases_summary.json \
+  --build_csv ~/log/<project>_builds.csv \
+  --target <project> --bug_id OSV-XXXX --skip-collect --keep-containers
+
+# Resume after interruption (skips completed bugs)
+sudo -E python3 script/bug_transplant_batch.py ~/log/<project>.csv \
+  --bug_info osv_testcases_summary.json \
+  --build_csv ~/log/<project>_builds.csv \
+  --target <project> --resume
+```
+
+#### Step 2: Merge per-bug diffs into one version
+```bash
+# Dry run — show merge order and detect file conflicts
+python3 script/bug_transplant_merge.py \
+  --summary data/bug_transplant/batch_<project>_<commit>/summary.json \
+  --bug_info osv_testcases_summary.json \
+  --target <project> \
+  --local-bugs OSV-XXXX OSV-YYYY --dry-run
+
+# Run merge with conflict resolution
+sudo -E python3 script/bug_transplant_merge.py \
+  --summary data/bug_transplant/batch_<project>_<commit>/summary.json \
+  --bug_info osv_testcases_summary.json \
+  --target <project> \
+  --local-bugs OSV-XXXX OSV-YYYY
+```
+
+#### Single bug (standalone)
+```bash
+sudo -E python3 script/bug_transplant.py <project> \
+  --buggy-commit <sha> --target-commit <sha> \
+  --bug-id OSV-XXXX --fuzzer-name <fuzzer> \
+  --testcase testcase-OSV-XXXX --skip-collect
+```
+
+### Data Collection (shared by both pipelines)
+```bash
+# Collect crash log
+sudo -E python3 script/fuzz_helper.py collect_crash <project> <fuzzer> \
+  --commit <buggy_sha> --testcases $TESTCASES --test_input testcase-OSV-XXXX
+
+# Collect function trace
+sudo -E python3 script/fuzz_helper.py collect_trace <project> <fuzzer> \
+  --commit <buggy_sha> --testcases $TESTCASES --test_input testcase-OSV-XXXX
+
+# Build at a specific commit
+sudo -E python3 script/fuzz_helper.py build_version --commit <sha> \
+  --build_csv ~/log/<project>_builds.csv <project>
+
+# Reproduce a bug
+sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
+  $TESTCASES/testcase-OSV-XXXX -e ASAN_OPTIONS=detect_leaks=0
+```
+
+### Legacy Pipeline (ReAct agent)
+```bash
+# End-to-end (generates patches, fixes build errors, verifies)
 sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
   --bug_info osv_testcases_summary.json \
   --build_csv ~/log/<project>_builds.csv \
   --target <project> --auto-select-images
-
-# Optional flags:
-#   --target-commit <sha>     Override target commit (default: latest in CSV)
-#   --trace-strategy <s>      Function selection: crash-stack | crash-stack-callees | full-trace
-#                             Default: auto-escalate (crash-stack -> +callees -> full-trace)
-#   --bug_id <id>             Process a single bug
-#   --buggy_commit <sha>      Process a single buggy commit
 ```
 
-### List available agent tools
+### Run tests
 ```bash
-python3 script/react_agent/agent_langgraph.py --list-tools --output-format json-pretty
-```
-
-### Debug LLM I/O
-```bash
-# Print full request/response to stderr
-python3 script/react_agent/agent_langgraph.py --debug-llm ...
-
-# Also write llm_call_XXXX_{request,response}.json files
-python3 script/react_agent/agent_langgraph.py --debug-llm-dir <dir> ...
+bash script/react_agent/test_langgraph_agent.sh
+bash script/react_agent/test_multi_agent.sh
+bash script/migration_tools/test_migration_tools.sh
 ```
 
 ## Architecture
 
-### Pipeline Layers (top-down)
+### New Pipeline (top-down)
 
-1. **`script/revert_patch_test.py`** (~3200 lines): End-to-end orchestrator. For each bug: generates revert patches, calls `multi_agent.py` in rounds to fix build errors, merges overrides, verifies crash reproduction. Caches results to `data/patches/<target>_patches.pkl.gz`.
+1. **`script/bug_transplant_batch.py`**: Batch orchestrator. Reads CSV/JSON data, selects target commit, resolves per-bug metadata (fuzzer, sanitizer, testcase), calls `bug_transplant.py` per bug. Outputs per-bug diffs to `data/bug_transplant/<project>_<bug_id>/`.
 
-2. **`script/react_agent/multi_agent.py`** (~1260 lines): Groups build errors by `patch_key`, spawns one `agent_langgraph.py` subprocess per hunk (with `--jobs N` parallelism). Selects best override diff per hunk, writes merged patch bundle, optionally runs a final combined OSS-Fuzz build. Artifacts go to `data/react_agent_artifacts/multi_<run_id>/`.
+2. **`script/bug_transplant.py`**: Single-bug launcher. Builds Claude-layered Docker image on OSS-Fuzz project image, starts persistent container, runs Claude Code with transplant prompt. Claude Code reads crash stack + trace, identifies bug fixes, surgically reverts them, minimizes the patch.
 
-3. **`script/react_agent/agent_langgraph.py`**: Single-hunk ReAct agent loop. Constructs prompts (via `prompting.py`), calls LLM (via `models.py`), dispatches tool calls (via `tools/runner.py`), applies guardrails. Iterates until the hunk is fixed or budget exhausted.
+3. **`script/bug_transplant_merge.py`**: Merge orchestrator. Applies per-bug diffs incrementally, builds per-sanitizer (ASAN in main container, MSAN/UBSAN in ephemeral containers), verifies all bugs after each step, resolves conflicts via Claude Code, outputs combined diff.
 
-### Tools (`script/react_agent/tools/`)
+4. **`script/bug_transplant_prompt.md`**: Prompt template with the transplant methodology (categorize changes as A/B/C, iterative apply, mandatory minimization).
 
-- **`registry.py`** + **`runner.py`**: Tool spec registry and execution dispatcher.
-- **`ossfuzz_tools.py`**: OSS-Fuzz Docker build/test integration (`ossfuzz_apply_patch_and_test`).
-- **`extra_patch_tools.py`**: Patch bundle manipulation (`list_patch_bundle`, `get_patch`, `search_patches`, `get_error_patch_context`, `make_error_patch_override`).
-- **`symbol_tools.py`**: Symbol/code inspection via static analysis KB (`search_definition`, `read_file_context`).
-- **`migration_tools.py`**: Linker error mapping to patch bundles.
+5. **`script/bug_transplant_claude.md`**: CLAUDE.md mounted inside the container for persistent agent guidance.
 
-### Migration Tools (`script/migration_tools/`)
+### Data Infrastructure (shared)
 
-Core patch processing library imported by the agent tools:
-- **`tools.py`**: Error parsing, patch extraction, context lookup, override diff generation.
-- **`patch_bundle.py`**: Pickle-based patch bundle I/O with allowlist security checks.
-- **`build_errors.py`**: Compiler/linker error detection patterns.
-- **`types.py`**: Data classes (`PatchInfo`, `FunctionLocation`).
+- **`script/fuzz_helper.py`**: Docker-based build/fuzz/reproduce/trace operations. Supports `--runner-image auto` for historical Docker image pinning.
+- **`script/buildAndtest.py`**: Generates CSV files by building/testing across commit ranges.
+- **`script/symbolizer.py`**, **`script/read_func_trace.py`**, **`script/compare_trace.py`**: Trace collection and analysis.
+- **`script/monitor_crash.py`**: Crash detection and stack extraction.
 
-### Static Analysis KB (`script/react_agent/core/`)
+### Legacy Pipeline (being replaced)
 
-- **`kb_index.py`**: `KbIndex` loads `*_analysis.json` from V1/V2 directories into in-memory indices for symbol lookup.
-- **`source_manager.py`**: `SourceManager` resolves `/src/...` JSON paths to local checkouts and reads code by extent.
-
-### Fuzzing Infrastructure
-
-- **`script/fuzz_helper.py`**: Docker-based build/fuzz/reproduce/trace operations. Supports `--runner-image auto --commit-date <timestamp>` for historical Docker image pinning via `prepare_repository()`.
-- **`script/buildAndtest.py`**: Orchestrates builds/tests across commit ranges. Contains `BASE_BUILDER_IMAGES` and `BASE_RUNNER_IMAGES` lists with historical Docker image digests (2019-2022).
+- **`script/revert_patch_test.py`**: End-to-end orchestrator with AST-based diff splitting.
+- **`script/react_agent/`**: LangGraph ReAct agent, prompt system, tool registry.
+- **`script/migration_tools/`**: Patch bundle processing library.
 
 ## Key Concepts
 
-### Patch Bundle Format
-Patch bundles (`*.patch2`) are pickled dictionaries keyed by `patch_key`. In patch-aware runs:
-- Build-log locations `/src/...:line` refer to migrated code
-- Patch bundles use `git apply --reverse` semantics: `-` lines become **additions**
-- Override diffs rewrite specific function slices within hunks
+### Bug Transplant Methodology
+Changes between buggy and current versions fall into three categories:
+- **A) Direct bug fixes** (revert `calloc`→`malloc`, remove `memset`, etc.) — **MUST revert**
+- **B) New validation checks** that reject the testcase before reaching the bug — **MUST remove**
+- **C) Refactoring/unrelated changes** — **LEAVE ALONE**
 
-### Patch-Aware Workflow (Agent Tool Order)
-`parse_build_errors` → `get_error_patch_context` → `read_artifact` (BASE slice) → `make_error_patch_override` → `ossfuzz_apply_patch_and_test`
+Category B is most commonly missed. After triggering, minimize via single-change elimination.
+See `data/feedback_bug_transplant.md` for the full methodology with examples.
 
-### Error Scope Modes
-- `--error-scope first`: Process only the first error
-- `--error-scope patch`: Group errors by patch_key and process all errors for a hunk
-
-### Error Types and Hunk Status
-- **Compiler errors**: `file:line:col: error:` patterns. Determine hunk "fixed" status.
-- **Linker errors**: `undefined reference to` patterns. Grouped by patch_key alongside compiler errors.
-- **Hunk fixed**: All **original** compiler errors (matching `target_errors` messages) in the active patch_key are resolved. New errors at the same lines but with different messages are tracked separately (`new_errors_in_active_patch_key`) and do not block the "fixed" verdict.
-
-### Pre-Build Batch Fix
-Before forcing `ossfuzz_apply_patch_and_test`, the agent checks `grouped_errors` for all undeclared identifier errors (matching `_UNDECLARED_SYMBOL_RE`) not yet handled by `make_extra_patch_override`. It forces `make_extra_patch_override` for each unfixed symbol before building. This allows fixing multiple undeclared identifiers in a single build pass, even with `ossfuzz-loop-max=1`.
+### Multi-Sanitizer Builds
+MSAN permanently taints system libraries (libc++), so the merge script builds MSAN/UBSAN in **ephemeral containers** to keep the main container ASAN-clean for incremental merge steps.
 
 ### Environment Setup
-`source script/setenv.sh` sets paths used by `revert_patch_test.py`:
-- `REPO_PATH`, `V1_REPO_PATH`, `V2_REPO_PATH`: Git checkout directories for target project
+`source script/setenv.sh` sets:
 - `TESTCASES`: Directory containing PoC testcase files
-- `OPENAI_API_KEY`: Required for LLM agent
-- `REACT_AGENT_JOBS`: Parallel agent count (default 4)
+- `REPO_PATH`: Git repo directory for target projects
+- `BUGINFO_PATH`: Path to `osv_testcases_summary.json`
+- `ANTHROPIC_API_KEY`: Required for Claude Code agent
 
-### Other Environment Variables
-- `REACT_AGENT_ARTIFACT_ROOT`: Custom artifact directory root
-- `REACT_AGENT_PATCH_ALLOWED_ROOTS`: Colon-separated allowed patch bundle directories
-- `REACT_AGENT_PROMPT_DEBUG=1`: Show prompt section names in output
-- `REACT_AGENT_TIMEOUT`: Per-agent subprocess timeout in seconds (default 1800)
+### Data Sources
+- **`~/log/<project>.csv`**: Commit x bug status matrix (from `buildAndtest.py`)
+- **`osv_testcases_summary.json`**: Per-bug metadata (fuzzer, sanitizer, crash type)
+- **`~/log/<project>_builds.csv`**: Commit → OSS-Fuzz Docker image mapping
 
 ### Artifacts
-- Single-agent: `data/react_agent_artifacts/<run_id>/`
-- Multi-agent: `data/react_agent_artifacts/multi_<run_id>/<patch_key>/` plus `summary.json` and `progress.json`
-- Pipeline cache: `data/patches/<target>_patches.pkl.gz`
-
-## Related Files
-
-- `script/react_agent/AGENTS.md`: Detailed development notes and implementation details
-- `script/react_agent/tasks/TASKS.md`: Completed and in-progress development tasks
-- `script/react_agent/README.md`: Usage examples and CLI reference
+- Per-bug: `data/bug_transplant/<project>_<bug_id>/bug_transplant.diff`
+- Batch: `data/bug_transplant/batch_<project>_<commit>/summary.json`
+- Merge: `data/bug_transplant/merge_<project>_<commit>/combined.diff`
+- Traces: `data/target_trace-<commit>-<testcase>.txt`
+- Crash logs: `data/crash/target_crash-<commit>-<testcase>.txt`

@@ -1,235 +1,173 @@
-# OSS-Fuzz for Select
+# OSS-Fuzz Bug Transplant
 
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/linkeLi0421/auto-bug-migration)
 
-This repository contains scripts and examples used to explore automated fuzzing workflows.  It is focused on building and testing fuzzing harnesses for specific open-source projects.
+Automated bug transplant pipeline for OSS-Fuzz projects. Given a project with historical bugs, the system transplants bug-triggering conditions from old commits into the current codebase, producing a single version that triggers all bugs simultaneously.
+
+## How it works
+
+1. **Batch transplant** — For each bug, Claude Code runs inside an OSS-Fuzz Docker container. It reads the crash stack and function trace, identifies what code changes fixed the bug, surgically reverts those changes, and minimizes the patch.
+2. **Merge** — Per-bug diffs are applied incrementally. Conflicts between overlapping diffs are resolved automatically by Claude Code. After each step, all previously-applied bugs are verified for regressions.
+
+## Quick start
+
+```bash
+# 1. Setup
+source script/setenv.sh
+export ANTHROPIC_API_KEY=...
+
+# 2. See what bugs need transplanting (dry run)
+python3 script/bug_transplant_batch.py ~/log/wavpack.csv \
+  --bug_info $BUGINFO_PATH \
+  --build_csv ~/log/wavpack_builds.csv \
+  --target wavpack --dry-run
+
+# 3. Run batch transplant (one Claude Code session per bug)
+sudo -E python3 script/bug_transplant_batch.py ~/log/wavpack.csv \
+  --bug_info $BUGINFO_PATH \
+  --build_csv ~/log/wavpack_builds.csv \
+  --target wavpack
+
+# 4. Merge all per-bug diffs into one version
+sudo -E python3 script/bug_transplant_merge.py \
+  --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \
+  --bug_info $BUGINFO_PATH \
+  --target wavpack \
+  --local-bugs OSV-2025-105 OSV-2025-107 OSV-2025-108 OSV-2025-127
+```
+
+**Output:**
+```
+RESULT:  8 / 8 bugs triggering
+
+  Local bugs:           4/4 verified
+  Transplanted bugs:    4/4 triggering
+  Combined diff:        data/bug_transplant/merge_wavpack_0b99613e/combined.diff
+```
 
 ## Repository structure
-- `Function_instrument/` – simple instrumentation example with a `Makefile` and `trace.c`.
-- `script/` – assorted Python utilities for building targets, running fuzzers and analysing bug data.
-- `cfg-clang/` and `oss-fuzz/` – configuration and data directories used by the scripts.
+
+| Directory | Purpose |
+|---|---|
+| `script/bug_transplant.py` | Single-bug transplant launcher (runs Claude Code in Docker) |
+| `script/bug_transplant_batch.py` | Batch orchestrator (iterates all bugs for a project) |
+| `script/bug_transplant_merge.py` | Merge per-bug diffs + verify + resolve conflicts |
+| `script/bug_transplant_prompt.md` | Prompt template for Claude Code transplant task |
+| `script/bug_transplant_claude.md` | CLAUDE.md mounted inside the container |
+| `script/fuzz_helper.py` | Docker-based build/fuzz/reproduce/trace operations |
+| `script/buildAndtest.py` | Generate CSV files across commit ranges |
+| `data/feedback_bug_transplant.md` | Bug transplant methodology (categorize, revert, minimize) |
+| `script/react_agent/` | Legacy ReAct agent pipeline (being replaced) |
+| `script/revert_patch_test.py` | Legacy end-to-end orchestrator |
+| `Function_instrument/` | Trace instrumentation library |
+| `oss-fuzz/` | OSS-Fuzz framework checkout |
 
 ## Requirements
-- Python 3.8+
-- Clang/LLVM toolchain
-- git
 
-## Usage
-Most functionality lives in the `script` directory.
+- Python 3.10+
+- Docker
+- Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
+- `ANTHROPIC_API_KEY` environment variable
+- OSS-Fuzz project images (built automatically)
 
-### buildAndtest.py
-Build and test fuzzing targets across commit ranges:
-```bash
-python script/buildAndtest.py --help
-```
+## Pipeline details
 
-### fuzz_helper.py get_dict
-Retrieve the fuzzer dictionary for a project. This must be run before `get_poc_for_new_version`.
+### Step 1: Batch transplant (`bug_transplant_batch.py`)
 
-```bash
-sudo python3 script/fuzz_helper.py get_dict <project> \
-  --commit <base_commit> \
-  --build_csv <builds_csv>
-```
+Reads the same CSV/JSON data as the legacy pipeline:
+- `~/log/<project>.csv` — commit x bug status matrix
+- `osv_testcases_summary.json` — fuzzer name, sanitizer, crash type per bug
+- `~/log/<project>_builds.csv` — commit → Docker image mapping
 
-**Example:**
-```bash
-sudo python3 script/fuzz_helper.py get_dict wasm3 \
-  --commit bc32ee \
-  --build_csv ~/log/wasm3_builds.csv
-```
+For each bug needing transplant:
+1. Collects crash log and function trace (via `fuzz_helper.py`)
+2. Builds a Claude Code Docker image layered on the project image
+3. Starts a container at the target commit
+4. Claude Code: reads crash stack → diffs buggy vs current → categorizes changes → reverts bug fixes → removes validation blockers → builds → tests → minimizes
+5. Saves `bug_transplant.diff`
 
-### fuzz_helper.py get_poc_for_new_version
-Generate a PoC for a new version given an old version PoC. Builds the target at `--target_commit` with the revert `--patch` applied, collects execution traces and an allowlist from the buggy commit, then fuzzes with coverage guidance to find a crash matching the original bug signature.
+**Key flags:**
+- `--dry-run` — show plan without executing
+- `--resume` — skip already-completed bugs
+- `--bug_id OSV-XXXX` — process single bug
+- `--skip-collect` — skip crash/trace collection
+- `--keep-containers` — keep Docker containers for debugging
+- `--jobs N` — parallel execution
 
-**Arguments:**
-| Argument | Required | Description |
+### Step 2: Merge (`bug_transplant_merge.py`)
+
+Merges per-bug diffs incrementally:
+1. Orders diffs by independence (fewest file overlaps first)
+2. Builds per-sanitizer (ASAN in main container, MSAN/UBSAN in ephemeral containers)
+3. For each diff:
+   - `git apply --check` → clean apply
+   - Conflict → `git apply --3way` (3-way merge)
+   - Still fails → Claude Code resolves manually
+4. After each apply: verify ALL previous bugs still trigger
+5. Outputs combined diff
+
+**Key flags:**
+- `--local-bugs OSV-XXXX ...` — bugs already triggering at target commit
+- `--dry-run` — show merge order and potential conflicts
+- `--keep-container` — keep container alive for debugging
+
+### Bug transplant methodology
+
+Claude Code follows a semantic approach (not mechanical function copy):
+
+| Category | Action | Example |
 |---|---|---|
-| `project` | Yes | Project name |
-| `fuzzer_name` | Yes | Name of the fuzzer |
-| `--buggy_commit` | Yes | Commit hash where the bug originally exists |
-| `--target_commit` | Yes | Commit hash to generate the PoC for |
-| `--testcases` | Yes | Path to directory containing seed testcases |
-| `--test_input` | Yes | Testcase filename (e.g., `testcase-OSV-2021-660`) |
-| `--build_csv` | Yes | CSV mapping project commits to OSS-Fuzz commit IDs |
-| `--patch` | No | Revert patch to apply at target commit |
-| `--signature_changes` | Yes (for transplant bugs) | Filename of the JSON signature mapping in `data/signature_change_list/` (e.g., `OSV-2021-1787_e14064.json`). Required when the bug is transplanted to a different commit, so that renamed functions in the crash stack can be matched. |
-| `--sanitizer` | No | Sanitizer to use (default: `address`) |
+| **A) Direct bug fixes** | **REVERT** | `malloc`→`calloc`, added `memset`, added bounds check |
+| **B) New validation checks** | **REMOVE** | Input validation that rejects testcase before reaching bug |
+| **C) Refactoring/unrelated** | **LEAVE ALONE** | API renames, threading support, code reorganization |
 
-**Example:**
+After triggering, minimize via single-change elimination. See `data/feedback_bug_transplant.md`.
+
+## Data collection
+
+Crash/trace data is collected before the transplant step:
+
 ```bash
-# 1. Generate the dictionary first
-sudo python3 script/fuzz_helper.py get_dict wasm3 \
-  --commit bc32ee \
-  --build_csv ~/log/wasm3_builds.csv
+# Collect crash log
+sudo -E python3 script/fuzz_helper.py collect_crash <project> <fuzzer> \
+  --commit <buggy_sha> --testcases $TESTCASES --test_input testcase-OSV-XXXX
 
-# 2. Run PoC generation with fuzzing
-sudo python3 script/fuzz_helper.py get_poc_for_new_version \
-  --buggy_commit 715a8d \
-  --target_commit bc32ee \
-  --testcases ~/oss-fuzz-for-select/pocs/tmp \
-  --test_input testcase-OSV-2021-660 \
-  --build_csv ~/log/wasm3_builds.csv \
-  --patch patch/OSV-2021-660_bc32ee_patches.diff \
-  --signature_changes OSV-2021-660_bc32ee.json \
-  --sanitizer address \
-  -e ASAN_OPTIONS=detect_leaks=0 \
-  wasm3 fuzzer
+# Collect function trace
+sudo -E python3 script/fuzz_helper.py collect_trace <project> <fuzzer> \
+  --commit <buggy_sha> --testcases $TESTCASES --test_input testcase-OSV-XXXX
 
-# Example for stb project
-sudo python3 script/fuzz_helper.py get_poc_for_new_version \
-  --buggy_commit b1826c \
-  --target_commit e14064 \
-  --testcases ~/oss-fuzz-for-select/pocs/tmp \
-  --test_input testcase-OSV-2021-1787 \
-  --build_csv ~/log/stb_builds.csv \
-  --patch patch/OSV-2021-1787_e14064_patches.diff \
-  --signature_changes OSV-2021-1787_e14064.json \
-  --sanitizer address \
-  -e ASAN_OPTIONS=detect_leaks=0 \
-  stb stbi_read_fuzzer
+# Build at specific commit
+sudo -E python3 script/fuzz_helper.py build_version --commit <sha> \
+  --build_csv ~/log/<project>_builds.csv <project>
+
+# Reproduce a bug
+sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
+  $TESTCASES/testcase-OSV-XXXX -e ASAN_OPTIONS=detect_leaks=0
 ```
 
-**What it does:**
-1. Collects the crash log at the buggy commit using the seed testcase
-2. Collects an execution trace at the buggy commit and generates a coverage allowlist
-3. Collects a trace at the target commit with the revert patch applied
-4. Fuzzes at the target commit with the allowlist-filtered coverage to find a matching crash
+## Legacy pipeline
 
-### revert_patch_test.py
-End-to-end pipeline for selective code migration. Given a target project and a set of bug-introducing commits, it generates revert patches, fixes build errors using the LLM-based multi-agent (`multi_agent.py`), and verifies that the patched code still triggers the original bug.
+The original pipeline uses a LangGraph ReAct agent with OpenAI models:
 
-**Arguments:**
-| Argument | Required | Description |
-|---|---|---|
-| `target_test_result` | Yes (positional) | CSV file containing PoC test results across all commits of the target project |
-| `--bug_info` | Yes | JSON file with full bug details (project, fuzz_target, sanitizer, etc.) |
-| `--build_csv` | Yes | CSV file mapping project commits to OSS-Fuzz build commit IDs |
-| `--target` | Yes | Target project name (e.g., `opensc`, `libxml2`) |
-| `--bug_id` | No | Process only this specific bug ID (e.g., `OSV-2020-525`) |
-| `--buggy_commit` | No | Override the buggy commit to process |
-| `--target-commit` | No | Override the target commit to migrate bugs to (default: latest commit in CSV) |
-| `--trace-strategy` | No | Function selection: `crash-stack` (minimal), `crash-stack-callees` (middle), `full-trace` (maximal). Default: auto-escalate through all three layers |
-| `--crash-stack-only` | No | (Deprecated) Alias for `--trace-strategy crash-stack` |
-| `--debug-artifact-dir` | No | Skip patch generation and reuse pre-generated patches from this artifact directory |
-| `--auto-select-images` | No | Automatically select Docker images based on commit timestamp |
-| `--fixed-image YEAR` | No | Pin Docker images to latest versions before the given year (e.g., `2022`) |
-
-**Environment variables:**
-| Variable | Required | Description |
-|---|---|---|
-| `REPO_PATH` | Yes | Path to the directory containing the target project git repo |
-| `V1_REPO_PATH` | Yes | Path for old version (V1) source checkout used by the react agent |
-| `V2_REPO_PATH` | Yes | Path for new version (V2) source checkout used by the react agent |
-| `TESTCASES` | Yes | Path to the directory containing testcase files |
-| `OPENAI_API_KEY` | Yes | API key for the LLM used by the react agent |
-| `REACT_AGENT_JOBS` | No | Number of parallel agent jobs (default: `4`) |
-
-**Example:**
 ```bash
-source script/setenv.sh
-
-# Process all bugs for the opensc project
-sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
+# End-to-end (generates patches, fixes build errors via LLM, verifies)
+sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
   --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/opensc_builds.csv \
-  --target opensc \
-  --auto-select-images
-
-# Process a single bug
-sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
-  --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/opensc_builds.csv \
-  --target opensc \
-  --auto-select-images \
-  --bug_id OSV-2020-525
-
-# Migrate bugs to a specific commit, using only crash-stack functions
-sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
-  --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/opensc_builds.csv \
-  --target opensc \
-  --auto-select-images \
-  --target-commit 2192a2 \
-  --crash-stack-only
-
-# Reuse patches from a previous multi-agent run (skip patch generation)
-sudo -E python3 script/revert_patch_test.py ~/log/opensc.csv \
-  --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/opensc_builds.csv \
-  --target opensc \
-  --debug-artifact-dir data/react_agent_artifacts/multi_20260206_181042_305401_f923ac9f
+  --build_csv ~/log/<project>_builds.csv \
+  --target <project> --auto-select-images
 ```
 
-**What it does:**
-1. Parses the CSV to identify bug-introducing commits that need transplant
-2. For each bug, diffs the buggy commit against the target commit and extracts revert patches
-3. Builds the project with the revert patches applied and collects build errors
-4. Calls the react multi-agent (`multi_agent.py`) in iterative rounds to fix build errors using LLM-generated override diffs
-5. Merges all override diffs into a final patch bundle and runs a final OSS-Fuzz build
-6. Verifies the patched build still triggers the original bug (crash reproduction)
-7. Caches results incrementally to `data/patches/<target>_patches.pkl.gz` for resumability
+This pipeline is being replaced by the Claude Code approach. Key differences:
 
-### patch_merge.py
-Merge compatible patches from multiple bugs into a single unified patch. Loads patch sets produced by `revert_patch_test`, builds a compatibility graph, detects fully compatible groups (cliques), and optionally refreshes stale patches and verifies the merged result.
-
-**Arguments:**
-| Argument | Required | Description |
+| | Legacy (ReAct agent) | New (Claude Code) |
 |---|---|---|
-| `cache_file` | Yes (positional) | Pickled patch dictionary (`*.pkl.gz`) from `revert_patch_test` |
-| `--bug_distribution_csv` | Yes | CSV describing bug trigger status per commit (same format as `revert_patch_test`) |
-| `--graphviz_output` | No | DOT file path for visualizing the compatibility graph |
-| `--fuzz_target` | No | Fuzzer target name for post-merge build and verification |
-| `--target_commit` | No | Commit hash used as the base when restoring context to merged patches |
-| `--revert_bug_info` | No | JSON file with bug details (forwarded to `revert_patch_test` for patch refresh) |
-| `--revert_build_csv` | No | Build CSV (forwarded to `revert_patch_test`) |
-| `--revert_target` | No | Target project name (forwarded to `revert_patch_test`) |
-| `--revert_output_dir` | No | Directory to capture `revert_patch_test` stdout/stderr logs |
-
-**Environment variables:** Same as `revert_patch_test.py` (`REPO_PATH`, `TESTCASES`, etc.) when using automatic patch refresh.
-
-**Example:**
-```bash
-source script/setenv.sh
-
-# Basic compatibility analysis with graph output
-sudo -E python3 script/patch_merge.py \
-  --bug_distribution_csv ~/log/opensc.csv \
-  data/patches/opensc_patches.pkl.gz \
-  --graphviz_output ~/log/patch_compatibility.dot
-
-# Full merge with automatic patch refresh and fuzzer verification
-sudo -E python3 script/patch_merge.py \
-  --bug_distribution_csv ~/log/opensc.csv \
-  data/patches/opensc_patches.pkl.gz \
-  --graphviz_output ~/log/patch_compatibility.dot \
-  --revert_bug_info osv_testcases_summary.json \
-  --revert_build_csv ~/log/opensc_builds.csv \
-  --revert_target opensc \
-  --revert_output_dir ~/log/revert_patch/ \
-  --target_commit 2192a2 \
-  --fuzz_target fuzz_pkcs15init
-```
-
-**What it does:**
-1. Loads patch sets from the pickle cache and the bug distribution CSV
-2. Builds a compatibility graph: patches touching disjoint functions are automatically compatible; overlapping patches are compatible only if both bugs are triggered at a shared commit
-3. When overlapping patches exist at different commits, records them as needing refresh
-4. If `--revert_*` flags are provided, triggers `revert_patch_test` to regenerate stale patches and re-analyzes until stable
-5. Detects fully compatible groups (maximal cliques) using Bron-Kerbosch
-6. For the largest group, restores context lines at `--target_commit` and writes a merged diff to `patch/group_<commit>_final.diff`
-7. If `--fuzz_target` is provided, builds the fuzzer with the merged patch and runs stack verification against each bug
-
-**Compatibility logic:**
-- Patches touching **different functions** are always compatible
-- Patches touching **the same functions** require a shared commit where both bugs are triggered. If the patch commits differ from the shared commit, a refresh is needed
-- Local bugs (from `data/local_compatibility/<target>.json`) are attached as synthetic nodes in the graph (shown as red in Graphviz output)
-
-**Output files:**
-- `patch/group_<commit>_final.diff` — merged unified diff for the largest compatible group
-- `data/signature_change_list/merged_<commit>.json` — combined signature mappings for stack verification
-- Graphviz DOT file (if `--graphviz_output` specified) — visual compatibility graph
+| Agent | LangGraph + OpenAI | Claude Code CLI |
+| Approach | Mechanical function copy | Semantic (categorize, revert, minimize) |
+| Patch format | Pickle bundles (`.patch2`) | Plain `git diff` |
+| Build fixing | LLM tool loop per hunk | Claude Code edits files directly |
+| Merge | Compatibility graph + cliques | Incremental apply + regression check |
+| Conflict resolution | Detected but not resolved | Claude Code resolves automatically |
 
 ## Contributing
-Pull requests and bug reports are welcome.  Please ensure that all scripts pass basic syntax checks before submitting changes.
 
+Pull requests and bug reports are welcome.
