@@ -401,6 +401,7 @@ def write_summary(
         "target_commit": target_commit,
         "total_bugs_in_csv": None,  # filled below
         "bugs_already_trigger": len(bug_ids_trigger),
+        "bugs_already_trigger_ids": sorted(bug_ids_trigger),
         "bugs_attempted": len(completed),
         "bugs_skipped_resume": sum(1 for r in results if r["status"] == "skipped"),
         "bugs_succeeded": sum(1 for r in results if r["status"] == "success"),
@@ -607,7 +608,7 @@ def main() -> int:
     sys.path.insert(0, str(SCRIPT_DIR))
     from bug_transplant import build_project_image, build_claude_image
 
-    project_image = build_project_image(args.target)
+    project_image = build_project_image(args.target, target_commit, args.build_csv)
     claude_image = build_claude_image(args.target, project_image)
     logger.info("Docker images ready: %s", claude_image)
 
