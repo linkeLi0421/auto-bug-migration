@@ -47,6 +47,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Pin Claude Code CLI version for reproducibility.
+# Update this deliberately after testing with the new version.
+CLAUDE_CODE_VERSION = "2.1.81"
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -144,14 +148,41 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
 # Phase 1: Build Docker image with Claude Code layered on top
 # ---------------------------------------------------------------------------
 
-def build_project_image(project: str) -> str:
-    """Build the OSS-Fuzz project image (if not already built).
+def build_project_image(
+    project: str,
+    target_commit: str | None = None,
+    build_csv: str | None = None,
+) -> str:
+    """Build the OSS-Fuzz project image using the correct OSS-Fuzz commit.
+
+    Uses ``fuzz_helper.py build_version`` to call ``prepare_repository()``
+    (checkout matching OSS-Fuzz commit) and ``build_image_impl()`` so the
+    project's ``build.sh`` matches the target commit.
 
     Returns the project image tag.
     """
     image_tag = f"gcr.io/oss-fuzz/{project}"
 
-    # Check if already built
+    # Use fuzz_helper.py build_version to build with correct OSS-Fuzz commit.
+    # This calls prepare_repository() + build_image_impl() + runs a build.
+    # Even if the image exists, re-build to ensure build.sh matches.
+    if target_commit:
+        logger.info("Building project image for %s at commit %s...", project, target_commit[:12])
+        cmd = [
+            sys.executable, str(FUZZ_HELPER),
+            "build_version", project,
+            "--commit", target_commit,
+            "--no_corpus",
+        ]
+        if build_csv:
+            cmd += ["--build_csv", build_csv]
+        ret = subprocess.call(cmd)
+        if ret != 0:
+            logger.error("fuzz_helper.py build_version failed for %s", project)
+            sys.exit(1)
+        return image_tag
+
+    # Fallback: simple build_image if no target commit
     ret = subprocess.call(
         ["docker", "image", "inspect", image_tag],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -181,32 +212,52 @@ def build_claude_image(project: str, project_image: str) -> str:
     """
     tag = f"bug-transplant-{project}:latest"
 
-    # Check cache
-    ret = subprocess.call(
-        ["docker", "image", "inspect", tag],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if ret == 0:
-        logger.info("Claude agent image already exists: %s", tag)
-        return tag
-
+    # Always rebuild — the base project image may have changed
+    # (different OSS-Fuzz commit → different build.sh)
     logger.info("Building Claude agent image '%s' on top of '%s'...", tag, project_image)
 
     dockerfile_content = textwrap.dedent(f"""\
-        FROM {project_image}
-
+        # Stage 1: Install Claude Code on a modern base (glibc >= 2.28).
+        FROM ubuntu:22.04 AS claude-builder
         ENV DEBIAN_FRONTEND=noninteractive
-
-        # Node.js 20.x LTS + Claude Code CLI
         RUN apt-get update && apt-get install -y --no-install-recommends \\
-                curl ca-certificates clangd sudo \\
+                curl ca-certificates \\
             && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
             && apt-get install -y --no-install-recommends nodejs \\
-            && npm install -g @anthropic-ai/claude-code \\
+            && npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} \\
             && rm -rf /var/lib/apt/lists/*
 
+        # Stage 2: Project image with full Node.js + Claude Code tree copied in.
+        # We copy the entire /usr tree from builder to bring along all shared
+        # libs Node.js needs (glibc, libstdc++, etc.), avoiding version issues
+        # on older base images like Ubuntu 16.04/xenial.
+        FROM {project_image}
+        ENV DEBIAN_FRONTEND=noninteractive
+
+        # Copy Node.js, npm, and Claude Code with all dependencies
+        COPY --from=claude-builder /usr/bin/node /usr/local/bin/node
+        COPY --from=claude-builder /usr/lib/node_modules /usr/local/lib/node_modules
+        # Copy glibc and libstdc++ from builder so node binary works on old bases
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
+        COPY --from=claude-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
+        COPY --from=claude-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
+        COPY --from=claude-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
+
+        # Create wrapper scripts that use the bundled libs via LD_LIBRARY_PATH
+        RUN echo '#!/bin/bash' > /usr/local/bin/claude \\
+            && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js "$@"' >> /usr/local/bin/claude \\
+            && chmod +x /usr/local/bin/claude
+
+        # sudo may not exist on older base images
+        RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
+            && rm -rf /var/lib/apt/lists/* || true
+
         # Create a non-root user (Claude CLI refuses --dangerously-skip-permissions as root)
-        RUN useradd -m -d /home/agent -s /bin/bash agent \\
+        RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
             && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
             && chown -R agent:agent /src/ /out/ /work/ || true
 

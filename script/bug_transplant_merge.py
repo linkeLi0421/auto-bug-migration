@@ -154,10 +154,49 @@ def _collect_sanitizers(bug_sanitizers: list[str]) -> list[str]:
     return [s for s in SAFE_ORDER if s in needed]
 
 
+def _build_via_fuzz_helper(
+    project: str,
+    target_commit: str,
+    sanitizer: str,
+    build_csv: str | None,
+    out_dir: str,
+) -> bool:
+    """Build using fuzz_helper.py build_version (host-side).
+
+    This handles prepare_repository(), correct OSS-Fuzz commit checkout,
+    and Dockerfile matching — which ``compile`` inside the container cannot.
+    """
+    cmd = [
+        sys.executable, str(SCRIPT_DIR / "fuzz_helper.py"),
+        "build_version", project,
+        "--commit", target_commit,
+        "--sanitizer", sanitizer,
+        "--no_corpus",
+    ]
+    if build_csv:
+        cmd += ["--build_csv", build_csv]
+    logger.info("Building via fuzz_helper.py: sanitizer=%s commit=%s", sanitizer, target_commit[:12])
+    ret = subprocess.call(cmd)
+    if ret != 0:
+        logger.error("fuzz_helper.py build_version failed for sanitizer=%s (exit %d)", sanitizer, ret)
+        return False
+    # Stash binaries to /out/<sanitizer>/
+    san_dir = os.path.join(out_dir, sanitizer)
+    os.makedirs(san_dir, exist_ok=True)
+    for f in os.listdir(out_dir):
+        fpath = os.path.join(out_dir, f)
+        if os.path.isfile(fpath) and os.access(fpath, os.X_OK):
+            import shutil
+            shutil.copy2(fpath, os.path.join(san_dir, f))
+    logger.info("Binaries for sanitizer=%s saved to %s/", sanitizer, san_dir)
+    return True
+
+
 def start_merge_container(
     project: str,
     target_commit: str,
     testcases_dir: str,
+    build_csv: str | None = None,
     extra_volumes: list[str] | None = None,
     bug_sanitizers: list[str] | None = None,
 ) -> tuple[str, bool]:
@@ -253,76 +292,17 @@ def start_merge_container(
     # Copy all testcases to /work
     _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
 
-    # Build per-sanitizer to get fuzzer binaries for all bug types.
-    # Each sanitizer's binaries are saved to /out/<sanitizer>/ so they
-    # don't overwrite each other.
+    # Build per-sanitizer using fuzz_helper.py on the HOST.
+    # This handles prepare_repository(), OSS-Fuzz commit checkout, and
+    # Dockerfile matching — which `compile` inside the container cannot.
+    # The /out directory is shared between host builds and the container.
     sanitizers_needed = _collect_sanitizers(bug_sanitizers)
-    # MSAN/UBSAN permanently taint system libraries (libc++), making
-    # subsequent ASAN builds fail. So we build ASAN first in THIS
-    # container (used for all merge steps), and build MSAN/UBSAN in
-    # a SEPARATE ephemeral container just for baseline verification.
-    #
-    # ASAN build (in this container — stays clean)
-    logger.info("Building with sanitizer=address ...")
-    ret, output = _exec_capture(
-        container_name,
-        "sudo -E SANITIZER=address compile 2>&1",
-        timeout=600,
-    )
-    if ret != 0:
-        logger.error("ASAN build FAILED (exit %d). Output tail:", ret)
-        logger.error("%s", output[-500:] if output else "(no output)")
-        return container_name, False
-    _exec_capture(
-        container_name,
-        "mkdir -p /out/address && "
-        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
-    )
-    logger.info("ASAN binaries saved to /out/address/")
-
-    # Build other sanitizers in ephemeral containers to avoid contamination
     for san in sanitizers_needed:
-        if san == "address":
-            continue
-        logger.info("Building sanitizer=%s in ephemeral container...", san)
-        ephemeral = f"{container_name}-{san}"
-        subprocess.call(["docker", "rm", "-f", ephemeral],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Start ephemeral container from same image
-        eph_cmd = [
-            "docker", "run", "-d", "--name", ephemeral,
-            "--privileged", "--shm-size=2g",
-            "-e", "FUZZING_ENGINE=libfuzzer",
-            "-e", f"SANITIZER={san}",
-            "-e", "ARCHITECTURE=x86_64",
-            "-e", f"FUZZING_LANGUAGE={language}",
-            "-e", "HELPER=True",
-            "-e", "MAKEFLAGS=--output-sync=line -j30",
-            "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
-            "-e", "NINJA_STATUS=",
-            "-e", "TERM=dumb",
-            "-v", f"{out_dir}:/out",
-            "-v", f"{work_dir}:/work",
-            image_tag, "sleep", "infinity",
-        ]
-        subprocess.call(eph_cmd, stdout=subprocess.DEVNULL)
-        _exec(ephemeral, "git config --global --add safe.directory '*'", user="root")
-        _exec(ephemeral, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
-        _exec(ephemeral, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
-        ret, output = _exec_capture(ephemeral, f"sudo -E compile 2>&1", timeout=600)
-        if ret != 0:
-            logger.warning("Build FAILED for sanitizer=%s, skipping", san)
-        else:
-            _exec_capture(
-                ephemeral,
-                f"mkdir -p /out/{san} && "
-                f"for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/{san}/; done; true",
-            )
-            logger.info("Binaries for sanitizer=%s saved to /out/%s/", san, san)
-        # Copy stashed binaries to main container's /out/<san>/
-        # (they share the /out volume mount)
-        subprocess.call(["docker", "rm", "-f", ephemeral],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not _build_via_fuzz_helper(project, target_commit, san, build_csv, out_dir):
+            if san == "address":
+                logger.error("Cannot proceed without a working ASAN build")
+                return container_name, False
+            logger.warning("Skipping sanitizer=%s, bugs using it won't verify", san)
 
     return container_name, True
 
@@ -535,17 +515,15 @@ def run_merge(args: argparse.Namespace) -> int:
     # 2. Categorize bugs: local (already trigger) vs transplanted (have diff)
     # ------------------------------------------------------------------
     local_bug_ids = set()
-    if "bugs_already_trigger_ids" in summary:
-        local_bug_ids = set(summary["bugs_already_trigger_ids"])
-    else:
-        # Reconstruct from batch results - bugs not in results are local
-        # We need the CSV data to know which bugs trigger. For now, accept
-        # them from CLI or summary.
-        pass
-
-    # Allow CLI override for local bugs
     if args.local_bugs:
         local_bug_ids = set(args.local_bugs)
+        logger.info("Local bugs (from --local-bugs): %s", sorted(local_bug_ids))
+    elif "bugs_already_trigger_ids" in summary:
+        local_bug_ids = set(summary["bugs_already_trigger_ids"])
+        logger.info("Local bugs (from summary): %s", sorted(local_bug_ids))
+    else:
+        logger.warning("No local bug IDs found in summary or --local-bugs. "
+                        "Re-run bug_transplant_batch.py to update the summary.")
 
     # Build local bug metadata
     local_bugs: list[dict] = []
@@ -706,6 +684,7 @@ def run_merge(args: argparse.Namespace) -> int:
 
     container, build_ok = start_merge_container(
         project, target_commit, args.testcases_dir,
+        build_csv=args.build_csv,
         extra_volumes=args.volume,
         bug_sanitizers=all_sanitizers,
     )
@@ -1002,6 +981,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="OSS-Fuzz project name")
     parser.add_argument("--target-commit", default=None,
                         help="Override target commit (default: from summary)")
+    parser.add_argument("--build_csv", default=None,
+                        help="Build CSV mapping commits to OSS-Fuzz versions")
     parser.add_argument("--local-bugs", nargs="*", default=None,
                         help="Bug IDs that already trigger at target (override auto-detection)")
 
