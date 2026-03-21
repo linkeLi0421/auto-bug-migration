@@ -1,0 +1,1045 @@
+#!/usr/bin/env python3
+"""Merge per-bug transplant diffs into a single version triggering all bugs.
+
+Takes the per-bug diffs produced by ``bug_transplant_batch.py`` and merges
+them incrementally into the target commit.  After each diff is applied, ALL
+previously-applied bugs (plus the local bugs that already trigger) are
+verified.
+
+Conflict resolution:
+  1. ``git apply --check`` (dry run)
+  2. If clean → ``git apply``
+  3. If conflict → ``git apply --3way`` (let git attempt 3-way merge)
+  4. If still fails → invoke Claude Code to resolve manually
+
+Usage:
+  python3 script/bug_transplant_merge.py \\
+    --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \\
+    --bug_info osv_testcases_summary.json \\
+    --target wavpack \\
+    --target-commit 0b99613e
+
+  # Dry run (show merge order, detect file overlaps)
+  python3 script/bug_transplant_merge.py \\
+    --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \\
+    --bug_info osv_testcases_summary.json \\
+    --target wavpack --dry-run
+
+  # Keep container for debugging
+  python3 script/bug_transplant_merge.py \\
+    --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \\
+    --bug_info osv_testcases_summary.json \\
+    --target wavpack --keep-container
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+HOME_DIR = SCRIPT_DIR.parent
+DATA_DIR = HOME_DIR / "data"
+
+
+# ---------------------------------------------------------------------------
+# Diff analysis — file overlap detection and merge ordering
+# ---------------------------------------------------------------------------
+
+def files_in_diff(diff_path: str) -> set[str]:
+    """Extract file paths touched by a unified diff."""
+    files = set()
+    try:
+        text = Path(diff_path).read_text(errors="replace")
+    except OSError:
+        return files
+    for line in text.splitlines():
+        # Match "--- a/path" or "+++ b/path"
+        m = re.match(r'^[-+]{3}\s+[ab]/(.+)$', line)
+        if m:
+            files.add(m.group(1))
+    return files
+
+
+def compute_merge_order(
+    bug_diffs: list[dict],
+    local_bugs: list[dict],
+) -> list[dict]:
+    """Sort transplant diffs: fewest file overlaps with others first.
+
+    Bugs touching unique files go first (no conflict risk).
+    Bugs overlapping with many others go last.
+    """
+    # Pre-compute file sets
+    for bd in bug_diffs:
+        bd["_files"] = files_in_diff(bd["diff_path"])
+
+    local_files = set()
+    for lb in local_bugs:
+        # Local bugs have no diff, but if they did we'd include their files
+        pass
+
+    def overlap_score(bd: dict) -> int:
+        """Count how many OTHER diffs touch the same files."""
+        score = 0
+        for other in bug_diffs:
+            if other["bug_id"] == bd["bug_id"]:
+                continue
+            if bd["_files"] & other["_files"]:
+                score += 1
+        return score
+
+    return sorted(bug_diffs, key=lambda bd: (overlap_score(bd), len(bd["_files"])))
+
+
+def detect_conflicts(bug_diffs: list[dict]) -> list[tuple[str, str, set[str]]]:
+    """Return pairs of bugs that modify the same files."""
+    conflicts = []
+    for i, a in enumerate(bug_diffs):
+        for b in bug_diffs[i + 1:]:
+            overlap = a["_files"] & b["_files"]
+            if overlap:
+                conflicts.append((a["bug_id"], b["bug_id"], overlap))
+    return conflicts
+
+
+# ---------------------------------------------------------------------------
+# Container helpers
+# ---------------------------------------------------------------------------
+
+def _exec(container: str, cmd: str, user: str | None = None) -> int:
+    """docker exec, print output."""
+    docker_cmd = ["docker", "exec"]
+    if user:
+        docker_cmd += ["-u", user]
+    docker_cmd += [container, "bash", "-c", cmd]
+    return subprocess.call(docker_cmd)
+
+
+def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, str]:
+    """docker exec, capture output."""
+    docker_cmd = ["docker", "exec", container, "bash", "-c", cmd]
+    try:
+        result = subprocess.run(
+            docker_cmd, capture_output=True, text=True, timeout=timeout,
+        )
+        return result.returncode, result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return 124, f"TIMEOUT after {timeout}s"
+
+
+def _collect_sanitizers(bug_sanitizers: list[str]) -> list[str]:
+    """Return deduplicated sanitizer list in safe build order.
+
+    Order: address -> undefined -> memory.
+    MSAN must be last because it recompiles system libraries (libc++) with
+    MSAN instrumentation, permanently tainting them for the container.
+    """
+    # Fixed safe order — MSAN last because it's the most invasive
+    SAFE_ORDER = ["address", "undefined", "memory"]
+    needed = set(bug_sanitizers)
+    return [s for s in SAFE_ORDER if s in needed]
+
+
+def start_merge_container(
+    project: str,
+    target_commit: str,
+    testcases_dir: str,
+    extra_volumes: list[str] | None = None,
+    bug_sanitizers: list[str] | None = None,
+) -> tuple[str, bool]:
+    """Start a persistent container at the target commit for merging."""
+    container_name = f"bug-merge-{project}"
+    image_tag = f"bug-transplant-{project}:latest"
+
+    # Check image exists
+    ret = subprocess.call(
+        ["docker", "image", "inspect", image_tag],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if ret != 0:
+        logger.error(
+            "Image %s not found. Run bug_transplant_batch.py first to build it.",
+            image_tag,
+        )
+        sys.exit(1)
+
+    # Remove any existing container
+    subprocess.call(
+        ["docker", "rm", "-f", container_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    data_dir = str(DATA_DIR)
+    out_dir = str(HOME_DIR / "build" / "out" / project)
+    work_dir = str(HOME_DIR / "build" / "work" / project)
+    os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(work_dir, exist_ok=True)
+
+    # Detect project language from project.yaml
+    project_yaml = HOME_DIR / "oss-fuzz" / "projects" / project / "project.yaml"
+    language = "c++"
+    if project_yaml.exists():
+        for line in project_yaml.read_text().splitlines():
+            if line.startswith("language:"):
+                language = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+
+    docker_cmd = [
+        "docker", "run", "-d",
+        "--name", container_name,
+        "--privileged", "--shm-size=2g",
+        # OSS-Fuzz build environment variables (required by /usr/local/bin/compile)
+        "-e", "FUZZING_ENGINE=libfuzzer",
+        "-e", "SANITIZER=address",
+        "-e", "ARCHITECTURE=x86_64",
+        "-e", f"FUZZING_LANGUAGE={language}",
+        "-e", "HELPER=True",
+        "-e", "MAKEFLAGS=--output-sync=line -j30",
+        "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
+        "-e", "NINJA_STATUS=",
+        "-e", "TERM=dumb",
+        "-v", f"{data_dir}:/data",
+        "-v", f"{os.path.abspath(testcases_dir)}:/corpus",
+        "-v", f"{out_dir}:/out",
+        "-v", f"{work_dir}:/work",
+    ]
+
+    # Claude credentials for conflict resolution
+    claude_home = Path.home() / ".claude"
+    claude_json = Path.home() / ".claude.json"
+    if claude_home.exists():
+        docker_cmd += ["-v", f"{claude_home}:/tmp/.claude-src:ro"]
+    if claude_json.exists():
+        docker_cmd += ["-v", f"{claude_json}:/tmp/.claude.json.src:ro"]
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if anthropic_key:
+        docker_cmd += ["-e", f"ANTHROPIC_API_KEY={anthropic_key}"]
+
+    if extra_volumes:
+        for v in extra_volumes:
+            docker_cmd += ["-v", v]
+
+    docker_cmd += [image_tag, "sleep", "infinity"]
+
+    logger.info("Starting merge container: %s", container_name)
+    ret = subprocess.call(docker_cmd)
+    if ret != 0:
+        logger.error("Failed to start container")
+        sys.exit(1)
+
+    # Fix git safe.directory (container uid differs from repo owner)
+    _exec(container_name, "git config --global --add safe.directory '*'", user="root")
+    _exec(container_name, "sudo git config --global --add safe.directory '*'")
+
+    # Checkout target commit
+    _exec(container_name, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
+    _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
+
+    # Copy all testcases to /work
+    _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
+
+    # Build per-sanitizer to get fuzzer binaries for all bug types.
+    # Each sanitizer's binaries are saved to /out/<sanitizer>/ so they
+    # don't overwrite each other.
+    sanitizers_needed = _collect_sanitizers(bug_sanitizers)
+    # MSAN/UBSAN permanently taint system libraries (libc++), making
+    # subsequent ASAN builds fail. So we build ASAN first in THIS
+    # container (used for all merge steps), and build MSAN/UBSAN in
+    # a SEPARATE ephemeral container just for baseline verification.
+    #
+    # ASAN build (in this container — stays clean)
+    logger.info("Building with sanitizer=address ...")
+    ret, output = _exec_capture(
+        container_name,
+        "sudo -E SANITIZER=address compile 2>&1",
+        timeout=600,
+    )
+    if ret != 0:
+        logger.error("ASAN build FAILED (exit %d). Output tail:", ret)
+        logger.error("%s", output[-500:] if output else "(no output)")
+        return container_name, False
+    _exec_capture(
+        container_name,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
+    )
+    logger.info("ASAN binaries saved to /out/address/")
+
+    # Build other sanitizers in ephemeral containers to avoid contamination
+    for san in sanitizers_needed:
+        if san == "address":
+            continue
+        logger.info("Building sanitizer=%s in ephemeral container...", san)
+        ephemeral = f"{container_name}-{san}"
+        subprocess.call(["docker", "rm", "-f", ephemeral],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Start ephemeral container from same image
+        eph_cmd = [
+            "docker", "run", "-d", "--name", ephemeral,
+            "--privileged", "--shm-size=2g",
+            "-e", "FUZZING_ENGINE=libfuzzer",
+            "-e", f"SANITIZER={san}",
+            "-e", "ARCHITECTURE=x86_64",
+            "-e", f"FUZZING_LANGUAGE={language}",
+            "-e", "HELPER=True",
+            "-e", "MAKEFLAGS=--output-sync=line -j30",
+            "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
+            "-e", "NINJA_STATUS=",
+            "-e", "TERM=dumb",
+            "-v", f"{out_dir}:/out",
+            "-v", f"{work_dir}:/work",
+            image_tag, "sleep", "infinity",
+        ]
+        subprocess.call(eph_cmd, stdout=subprocess.DEVNULL)
+        _exec(ephemeral, "git config --global --add safe.directory '*'", user="root")
+        _exec(ephemeral, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
+        _exec(ephemeral, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
+        ret, output = _exec_capture(ephemeral, f"sudo -E compile 2>&1", timeout=600)
+        if ret != 0:
+            logger.warning("Build FAILED for sanitizer=%s, skipping", san)
+        else:
+            _exec_capture(
+                ephemeral,
+                f"mkdir -p /out/{san} && "
+                f"for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/{san}/; done; true",
+            )
+            logger.info("Binaries for sanitizer=%s saved to /out/%s/", san, san)
+        # Copy stashed binaries to main container's /out/<san>/
+        # (they share the /out volume mount)
+        subprocess.call(["docker", "rm", "-f", ephemeral],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return container_name, True
+
+
+# ---------------------------------------------------------------------------
+# Diff application
+# ---------------------------------------------------------------------------
+
+def try_apply_diff(container: str, diff_path: str, project: str) -> str:
+    """Try to apply a diff inside the container.
+
+    Returns: "clean", "3way", "conflict"
+    """
+    # Copy diff into container
+    diff_name = Path(diff_path).name
+    subprocess.call(
+        ["docker", "cp", diff_path, f"{container}:/tmp/{diff_name}"],
+    )
+
+    # Try clean apply
+    ret, output = _exec_capture(
+        container,
+        f"cd /src/{project} && git apply --check /tmp/{diff_name} 2>&1",
+    )
+    if ret == 0:
+        # Apply cleanly
+        ret2, _ = _exec_capture(
+            container,
+            f"cd /src/{project} && git apply /tmp/{diff_name} 2>&1",
+        )
+        if ret2 == 0:
+            return "clean"
+
+    # Try 3-way merge
+    ret, output = _exec_capture(
+        container,
+        f"cd /src/{project} && git apply --3way /tmp/{diff_name} 2>&1",
+    )
+    if ret == 0:
+        return "3way"
+
+    # Report conflict
+    logger.warning("Diff %s has conflicts:\n%s", diff_name, output[:500])
+    return "conflict"
+
+
+def resolve_conflict_with_claude(
+    container: str,
+    diff_path: str,
+    bug_id: str,
+    project: str,
+    applied_bugs: list[str],
+    claude_model: str | None = None,
+) -> bool:
+    """Use Claude Code to resolve a merge conflict.
+
+    Returns True if resolved successfully.
+    """
+    logger.info("[%s] Invoking Claude Code to resolve conflict...", bug_id)
+
+    # Setup Claude credentials
+    _exec(
+        container,
+        "cp -r /tmp/.claude-src $HOME/.claude 2>/dev/null; "
+        "rm -rf $HOME/.claude/projects 2>/dev/null; "
+        "cp /tmp/.claude.json.src $HOME/.claude.json 2>/dev/null; "
+        "true",
+    )
+
+    diff_name = Path(diff_path).name
+    applied_list = ", ".join(applied_bugs) if applied_bugs else "none yet"
+
+    prompt = textwrap.dedent(f"""\
+        I am merging multiple bug transplant patches into project {project}.
+
+        The following bugs have already been applied successfully: {applied_list}
+
+        I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
+        has merge conflicts with the current state of the code.
+
+        Please:
+        1. Read the patch file /tmp/{diff_name} to understand what changes it makes
+        2. Look at the current state of the conflicting files in /src/{project}
+        3. Manually apply the changes from the patch, adapting them to work with
+           the code as it currently is (including changes from previously applied bugs)
+        4. Make sure the changes preserve the bug-triggering logic from the patch
+        5. Do NOT revert changes from previously applied bugs
+
+        After making changes, run: compile
+        If there are build errors, fix them.
+    """)
+
+    escaped = shlex.quote(prompt)
+    claude_cmd = f"claude -p {escaped} --output-format text --dangerously-skip-permissions"
+    if claude_model:
+        claude_cmd += f" --model {shlex.quote(claude_model)}"
+
+    ret, output = _exec_capture(container, claude_cmd, timeout=1800)
+
+    if ret != 0:
+        logger.error("[%s] Claude Code failed (exit %d)", bug_id, ret)
+        return False
+
+    # Verify it compiles
+    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    if ret != 0:
+        logger.error("[%s] Build failed after Claude conflict resolution", bug_id)
+        return False
+
+    logger.info("[%s] Conflict resolved by Claude Code", bug_id)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Bug verification
+# ---------------------------------------------------------------------------
+
+def verify_bug_triggers(
+    container: str,
+    bug_id: str,
+    fuzzer: str,
+    testcase: str,
+    sanitizer: str = "address",
+) -> bool:
+    """Run the fuzzer with the testcase and check for a crash.
+
+    *sanitizer* controls the expected sanitizer so that ASAN-specific env
+    vars (like ``detect_leaks=0``) are set correctly, and the right
+    SUMMARY pattern is matched.
+    """
+    env_prefix = ""
+    if sanitizer == "address":
+        env_prefix = "ASAN_OPTIONS=detect_leaks=0 "
+
+    # Use per-sanitizer binary if available, fall back to /out/
+    fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
+    fallback = f"/out/{fuzzer}"
+
+    ret, output = _exec_capture(
+        container,
+        f"{env_prefix}([ -x {fuzzer_path} ] && {fuzzer_path} || {fallback}) /work/{testcase} 2>&1 | head -80",
+        timeout=120,
+    )
+
+    # Look for sanitizer SUMMARY line
+    has_summary = bool(re.search(
+        r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
+    ))
+    # Common crash indicators
+    has_crash = bool(re.search(
+        r'(ERROR|ABORTING|Segmentation fault|SEGV|heap-buffer-overflow'
+        r'|use-of-uninitialized-value|use-after-free|stack-overflow'
+        r'|runtime error:|object-size)',
+        output, re.IGNORECASE,
+    ))
+    # Non-zero exit with output is also a signal (e.g. UBSAN abort)
+    has_nonzero = ret != 0 and len(output.strip()) > 20
+
+    triggered = has_summary or has_crash
+    if triggered:
+        logger.info("[%s] Bug triggers OK", bug_id)
+    else:
+        logger.warning("[%s] Bug does NOT trigger (exit=%d)", bug_id, ret)
+        logger.info("[%s] Output: %s", bug_id, output[:500])
+
+    return triggered
+
+
+def verify_all_bugs(
+    container: str,
+    bugs: list[dict],
+) -> dict[str, bool]:
+    """Verify all bugs in the list, return {bug_id: triggered}."""
+    results = {}
+    for bug in bugs:
+        ok = verify_bug_triggers(
+            container,
+            bug["bug_id"],
+            bug["fuzzer"],
+            bug["testcase"],
+            bug.get("sanitizer", "address"),
+        )
+        results[bug["bug_id"]] = ok
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main merge logic
+# ---------------------------------------------------------------------------
+
+def run_merge(args: argparse.Namespace) -> int:
+    # ------------------------------------------------------------------
+    # 1. Load batch summary and bug_info
+    # ------------------------------------------------------------------
+    logger.info("Loading summary: %s", args.summary)
+    with open(args.summary) as f:
+        summary = json.load(f)
+
+    project = summary.get("project", args.target)
+    target_commit = summary.get("target_commit", args.target_commit or "")
+    if not target_commit:
+        logger.error("No target commit in summary or args")
+        return 1
+
+    logger.info("Loading bug info: %s", args.bug_info)
+    with open(args.bug_info) as f:
+        bug_info_dataset = json.load(f)
+
+    # ------------------------------------------------------------------
+    # 2. Categorize bugs: local (already trigger) vs transplanted (have diff)
+    # ------------------------------------------------------------------
+    local_bug_ids = set()
+    if "bugs_already_trigger_ids" in summary:
+        local_bug_ids = set(summary["bugs_already_trigger_ids"])
+    else:
+        # Reconstruct from batch results - bugs not in results are local
+        # We need the CSV data to know which bugs trigger. For now, accept
+        # them from CLI or summary.
+        pass
+
+    # Allow CLI override for local bugs
+    if args.local_bugs:
+        local_bug_ids = set(args.local_bugs)
+
+    # Build local bug metadata
+    local_bugs: list[dict] = []
+    for bug_id in local_bug_ids:
+        info = bug_info_dataset.get(bug_id, {})
+        reproduce = info.get("reproduce", {})
+        fuzzer = reproduce.get("fuzz_target", "")
+        sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+        if not fuzzer:
+            logger.warning("No fuzzer for local bug %s, skipping verification", bug_id)
+            continue
+        testcase = f"testcase-{bug_id}"
+        local_bugs.append({
+            "bug_id": bug_id,
+            "fuzzer": fuzzer,
+            "testcase": testcase,
+            "sanitizer": sanitizer,
+            "type": "local",
+        })
+
+    # Build transplanted bug list.
+    # First check summary results, then scan disk for diffs the summary
+    # may have missed (e.g. from --resume runs that only recorded "skipped").
+    transplant_diffs: list[dict] = []
+    seen_bug_ids: set[str] = set()
+
+    # From summary results
+    for result in summary.get("results", []):
+        diff_path = result.get("diff_path")
+        if diff_path and Path(diff_path).exists():
+            bug_id = result["bug_id"]
+            seen_bug_ids.add(bug_id)
+            info = bug_info_dataset.get(bug_id, {})
+            reproduce = info.get("reproduce", {})
+            fuzzer = reproduce.get("fuzz_target", result.get("fuzzer", ""))
+            sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+            transplant_diffs.append({
+                "bug_id": bug_id,
+                "diff_path": diff_path,
+                "fuzzer": fuzzer,
+                "testcase": f"testcase-{bug_id}",
+                "sanitizer": sanitizer,
+                "type": "transplant",
+            })
+
+    # Scan disk for any bug diffs not in summary (e.g. skipped by --resume)
+    bug_transplant_dir = DATA_DIR / "bug_transplant"
+    for result in summary.get("results", []):
+        bug_id = result.get("bug_id", "")
+        if bug_id in seen_bug_ids or not bug_id:
+            continue
+        # Check if diff exists on disk
+        out_dir = bug_transplant_dir / f"{project}_{bug_id}"
+        for name in ("bug_transplant.diff", "git_diff.diff"):
+            p = out_dir / name
+            if p.exists() and p.stat().st_size > 0:
+                seen_bug_ids.add(bug_id)
+                info = bug_info_dataset.get(bug_id, {})
+                reproduce = info.get("reproduce", {})
+                fuzzer = reproduce.get("fuzz_target", "")
+                sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                logger.info("Found diff on disk for %s: %s", bug_id, p)
+                transplant_diffs.append({
+                    "bug_id": bug_id,
+                    "diff_path": str(p),
+                    "fuzzer": fuzzer,
+                    "testcase": f"testcase-{bug_id}",
+                    "sanitizer": sanitizer,
+                    "type": "transplant",
+                })
+                break
+
+    # Also scan for bug dirs not mentioned in summary at all
+    if bug_transplant_dir.exists():
+        for d in bug_transplant_dir.iterdir():
+            if not d.is_dir() or not d.name.startswith(f"{project}_"):
+                continue
+            bug_id = d.name[len(f"{project}_"):]
+            if bug_id in seen_bug_ids or bug_id in local_bug_ids:
+                continue
+            for name in ("bug_transplant.diff", "git_diff.diff"):
+                p = d / name
+                if p.exists() and p.stat().st_size > 0:
+                    seen_bug_ids.add(bug_id)
+                    info = bug_info_dataset.get(bug_id, {})
+                    reproduce = info.get("reproduce", {})
+                    fuzzer = reproduce.get("fuzz_target", "")
+                    sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                    logger.info("Found extra diff on disk for %s: %s", bug_id, p)
+                    transplant_diffs.append({
+                        "bug_id": bug_id,
+                        "diff_path": str(p),
+                        "fuzzer": fuzzer,
+                        "testcase": f"testcase-{bug_id}",
+                        "sanitizer": sanitizer,
+                        "type": "transplant",
+                    })
+                    break
+
+    if not transplant_diffs:
+        logger.error("No transplant diffs found (summary or disk)")
+        return 1
+
+    logger.info("Local bugs (already trigger): %d", len(local_bugs))
+    logger.info("Transplant diffs to merge: %d", len(transplant_diffs))
+
+    # ------------------------------------------------------------------
+    # 3. Compute merge order and detect potential conflicts
+    # ------------------------------------------------------------------
+    ordered = compute_merge_order(transplant_diffs, local_bugs)
+
+    conflicts = detect_conflicts(ordered)
+
+    logger.info("Merge order:")
+    for i, bd in enumerate(ordered):
+        files_str = ", ".join(sorted(bd["_files"])) if bd.get("_files") else "?"
+        logger.info("  %d. %s [files: %s]", i + 1, bd["bug_id"], files_str)
+    if conflicts:
+        logger.warning("Potential file conflicts:")
+        for a, b, overlap in conflicts:
+            logger.warning("  %s <-> %s: %s", a, b, overlap)
+    else:
+        logger.info("No file-level conflicts detected")
+
+    # ------------------------------------------------------------------
+    # Dry run
+    # ------------------------------------------------------------------
+    if args.dry_run:
+        print(f"\n{'='*60}")
+        print(f"DRY RUN — Merge plan for {project} @ {target_commit[:12]}")
+        print(f"{'='*60}")
+        print(f"\nLocal bugs (verify only): {len(local_bugs)}")
+        for lb in local_bugs:
+            print(f"  - {lb['bug_id']} (fuzzer: {lb['fuzzer']})")
+        print(f"\nTransplant diffs to merge: {len(ordered)}")
+        for i, bd in enumerate(ordered):
+            files_str = ", ".join(sorted(bd["_files"]))
+            print(f"  {i+1}. {bd['bug_id']} [{files_str}]")
+        if conflicts:
+            print(f"\nPotential conflicts: {len(conflicts)}")
+            for a, b, overlap in conflicts:
+                print(f"  {a} <-> {b}: {overlap}")
+        else:
+            print("\nNo file-level conflicts detected")
+        print()
+        return 0
+
+    # ------------------------------------------------------------------
+    # 4. Start container and run merge
+    # ------------------------------------------------------------------
+    # Collect all sanitizers needed across local + transplant bugs
+    all_sanitizers = (
+        [lb.get("sanitizer", "address") for lb in local_bugs]
+        + [td.get("sanitizer", "address") for td in transplant_diffs]
+    )
+    sanitizers_needed = _collect_sanitizers(all_sanitizers)
+    logger.info("Sanitizers needed: %s", sanitizers_needed)
+
+    container, build_ok = start_merge_container(
+        project, target_commit, args.testcases_dir,
+        extra_volumes=args.volume,
+        bug_sanitizers=all_sanitizers,
+    )
+    if not build_ok:
+        logger.error("Baseline build failed — cannot merge. "
+                      "Use --keep-container to debug: docker exec -it %s bash",
+                      container)
+        if not args.keep_container:
+            subprocess.call(["docker", "rm", "-f", container],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 1
+
+    merge_results: list[dict] = []
+    applied_bugs: list[str] = []  # successfully applied bug IDs
+    all_verified_bugs: list[dict] = []  # bugs to verify after each step
+    regression_failures: list[dict] = []
+
+    try:
+        # ------------------------------------------------------------------
+        # 5. Verify local bugs trigger at baseline
+        # ------------------------------------------------------------------
+        if local_bugs:
+            logger.info("=== Verifying %d local bugs at baseline ===", len(local_bugs))
+            baseline = verify_all_bugs(container, local_bugs)
+            for bug_id, ok in baseline.items():
+                if ok:
+                    all_verified_bugs.append(
+                        next(lb for lb in local_bugs if lb["bug_id"] == bug_id)
+                    )
+                else:
+                    logger.warning("Local bug %s does NOT trigger at baseline", bug_id)
+
+        # ------------------------------------------------------------------
+        # 6. Apply transplant diffs incrementally
+        # ------------------------------------------------------------------
+        for i, bd in enumerate(ordered):
+            bug_id = bd["bug_id"]
+            diff_path = bd["diff_path"]
+            step = {
+                "step": i + 1,
+                "bug_id": bug_id,
+                "diff_path": diff_path,
+                "apply_method": None,
+                "build_ok": False,
+                "self_triggers": False,
+                "regressions": [],
+            }
+            logger.info(
+                "=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
+            )
+
+            # --- Try to apply ---
+            method = try_apply_diff(container, diff_path, project)
+            step["apply_method"] = method
+
+            if method == "conflict":
+                # Attempt Claude Code resolution
+                resolved = resolve_conflict_with_claude(
+                    container, diff_path, bug_id, project,
+                    applied_bugs, args.claude_model,
+                )
+                if resolved:
+                    step["apply_method"] = "claude_resolved"
+                else:
+                    step["apply_method"] = "failed"
+                    logger.error("[%s] Could not resolve conflict, skipping", bug_id)
+                    merge_results.append(step)
+                    continue
+
+            # --- Build (only ASAN first, then other sanitizers if needed) ---
+            # Always build ASAN first (primary), then rebuild other sanitizers
+            # only if bugs using them exist in the verified set.
+            logger.info("[%s] Building (address)...", bug_id)
+            _exec_capture(
+                container,
+                f"cd /src/{project} && make clean 2>/dev/null; "
+                f"rm -rf /work/* 2>/dev/null; true",
+            )
+            ret, build_output = _exec_capture(
+                container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+            )
+            build_failed = (ret != 0)
+            if not build_failed:
+                _exec_capture(
+                    container,
+                    "mkdir -p /out/address && "
+                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
+                )
+            else:
+                logger.error("[%s] Build failed for sanitizer=address. Tail:", bug_id)
+                logger.error("%s", build_output[-500:] if build_output else "(no output)")
+            step["build_ok"] = not build_failed
+            if build_failed:
+                logger.error("[%s] Build failed after applying diff", bug_id)
+                # Try to revert this diff
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && git checkout -- . 2>&1",
+                )
+                # Re-apply all previous good diffs
+                for prev_id in applied_bugs:
+                    prev = next(
+                        d for d in ordered if d["bug_id"] == prev_id
+                    )
+                    _exec_capture(
+                        container,
+                        f"cd /src/{project} && git apply /tmp/{Path(prev['diff_path']).name} 2>&1",
+                    )
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && make clean 2>/dev/null; rm -rf /work/* 2>/dev/null; true",
+                )
+                _exec_capture(container, "sudo -E SANITIZER=address compile 2>&1", timeout=300)
+                _exec_capture(
+                    container,
+                    "mkdir -p /out/address && "
+                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
+                )
+                merge_results.append(step)
+                continue
+
+            # --- Verify this bug triggers ---
+            logger.info("[%s] Verifying self-trigger...", bug_id)
+            step["self_triggers"] = verify_bug_triggers(
+                container, bug_id, bd["fuzzer"], bd["testcase"],
+                bd.get("sanitizer", "address"),
+            )
+
+            # --- Verify all previously applied bugs (regression check) ---
+            if all_verified_bugs:
+                logger.info("[%s] Regression check (%d bugs)...", bug_id, len(all_verified_bugs))
+                reg_results = verify_all_bugs(container, all_verified_bugs)
+                for rbug, ok in reg_results.items():
+                    if not ok:
+                        step["regressions"].append(rbug)
+                        regression_failures.append({
+                            "regressed_bug": rbug,
+                            "caused_by_applying": bug_id,
+                            "step": i + 1,
+                        })
+                        logger.warning(
+                            "[%s] REGRESSION: %s stopped triggering!", bug_id, rbug,
+                        )
+
+            # Track successful application
+            if step["self_triggers"]:
+                applied_bugs.append(bug_id)
+                all_verified_bugs.append(bd)
+
+            merge_results.append(step)
+
+        # ------------------------------------------------------------------
+        # 7. Final verification of ALL bugs
+        # ------------------------------------------------------------------
+        logger.info("=== Final verification of all %d bugs ===", len(all_verified_bugs))
+        final_results = verify_all_bugs(container, all_verified_bugs)
+        final_pass = all(final_results.values())
+
+        # ------------------------------------------------------------------
+        # 8. Extract combined diff
+        # ------------------------------------------------------------------
+        output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get combined diff from container
+        _, combined_diff = _exec_capture(
+            container, f"cd /src/{project} && git diff",
+        )
+        combined_diff_path = output_dir / "combined.diff"
+        combined_diff_path.write_text(combined_diff)
+        logger.info("Combined diff: %s (%d bytes)", combined_diff_path, len(combined_diff))
+
+        # Also copy to /out inside container
+        _exec(container, f"cd /src/{project} && git diff > /out/combined.diff")
+
+        # ------------------------------------------------------------------
+        # 9. Write merge summary
+        # ------------------------------------------------------------------
+        merge_summary = {
+            "type": "bug_transplant_merge",
+            "project": project,
+            "target_commit": target_commit,
+            "local_bugs": [lb["bug_id"] for lb in local_bugs],
+            "local_bugs_verified": sum(
+                1 for lb in local_bugs
+                if final_results.get(lb["bug_id"], False)
+            ),
+            "transplant_bugs_attempted": len(ordered),
+            "transplant_bugs_applied": len(applied_bugs),
+            "transplant_bugs_self_trigger": sum(
+                1 for s in merge_results if s["self_triggers"]
+            ),
+            "total_bugs_triggering": sum(1 for v in final_results.values() if v),
+            "total_bugs_expected": len(local_bugs) + len(ordered),
+            "all_pass": final_pass,
+            "regressions": regression_failures,
+            "combined_diff_path": str(combined_diff_path),
+            "combined_diff_bytes": len(combined_diff),
+            "steps": merge_results,
+            "final_verification": {
+                bug_id: ok for bug_id, ok in final_results.items()
+            },
+        }
+
+        summary_path = output_dir / "merge_summary.json"
+        summary_path.write_text(json.dumps(merge_summary, indent=2))
+        logger.info("Merge summary: %s", summary_path)
+
+        # ------------------------------------------------------------------
+        # 10. Print results
+        # ------------------------------------------------------------------
+        local_ok = merge_summary["local_bugs_verified"]
+        transplant_ok = sum(1 for s in merge_results if s["self_triggers"])
+        total_ok = local_ok + transplant_ok
+        total_goal = len(local_bugs) + len(ordered)
+
+        print(f"\n{'='*60}")
+        print(f"  RESULT:  {total_ok} / {total_goal} bugs triggering")
+        print(f"{'='*60}")
+        print(f"  Project:              {project} @ {target_commit[:12]}")
+        print()
+        print(f"  Local bugs:           {local_ok}/{len(local_bugs)} verified")
+        for lb in local_bugs:
+            ok = final_results.get(lb["bug_id"], False)
+            mark = "OK" if ok else "FAIL"
+            print(f"    [{mark:>4}] {lb['bug_id']} (fuzzer: {lb['fuzzer']})")
+        print()
+        print(f"  Transplanted bugs:    {transplant_ok}/{len(ordered)} triggering")
+        for step in merge_results:
+            if step["self_triggers"]:
+                mark = "  OK"
+            elif step["apply_method"] == "failed":
+                mark = "SKIP"
+            elif not step["build_ok"]:
+                mark = "BFAIL"
+            else:
+                mark = "FAIL"
+            method = step["apply_method"]
+            regs = f"  !! regressions: {step['regressions']}" if step["regressions"] else ""
+            print(f"    [{mark:>4}] {step['bug_id']} (apply: {method}){regs}")
+        print()
+        if regression_failures:
+            print(f"  Regressions:          {len(regression_failures)}")
+            for rf in regression_failures:
+                print(f"    {rf['regressed_bug']} broke when applying {rf['caused_by_applying']}")
+            print()
+        print(f"  Combined diff:        {combined_diff_path}")
+        print(f"  Summary:              {summary_path}")
+        print(f"{'='*60}\n")
+
+        return 0 if final_pass else 1
+
+    finally:
+        if not args.keep_container:
+            logger.info("Destroying container...")
+            subprocess.call(
+                ["docker", "rm", "-f", f"bug-merge-{project}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            logger.info(
+                "Container kept: docker exec -it bug-merge-%s bash", project,
+            )
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Merge per-bug transplant diffs into one version",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python3 script/bug_transplant_merge.py \\
+                --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \\
+                --bug_info osv_testcases_summary.json \\
+                --target wavpack
+
+              # Dry run
+              python3 script/bug_transplant_merge.py \\
+                --summary data/bug_transplant/batch_wavpack_0b99613e/summary.json \\
+                --bug_info osv_testcases_summary.json \\
+                --target wavpack --dry-run
+        """),
+    )
+
+    parser.add_argument("--summary", required=True,
+                        help="Path to batch summary.json")
+    parser.add_argument("--bug_info", required=True,
+                        help="Bug info JSON (osv_testcases_summary.json)")
+    parser.add_argument("--target", required=True,
+                        help="OSS-Fuzz project name")
+    parser.add_argument("--target-commit", default=None,
+                        help="Override target commit (default: from summary)")
+    parser.add_argument("--local-bugs", nargs="*", default=None,
+                        help="Bug IDs that already trigger at target (override auto-detection)")
+
+    # Execution
+    parser.add_argument("--claude-model", default=None,
+                        help="Claude model for conflict resolution")
+    parser.add_argument("--testcases-dir",
+                        default=os.environ.get("TESTCASES", ""),
+                        help="Testcase directory (default: $TESTCASES)")
+    parser.add_argument("-v", "--volume", action="append",
+                        help="Additional volume mounts")
+
+    # Modes
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show merge plan without executing")
+    parser.add_argument("--keep-container", action="store_true",
+                        help="Keep container alive for debugging")
+    parser.add_argument("--verbose", "-V", action="store_true")
+
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if not args.testcases_dir:
+        logger.error("Testcases dir not set. Use --testcases-dir or $TESTCASES.")
+        return 1
+
+    return run_merge(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

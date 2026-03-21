@@ -413,28 +413,17 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
         # Save raw Claude output
         (output_dir / "claude_output.txt").write_text(output)
 
-        # Copy diff from container if it exists
-        diff_ret = subprocess.call(
-            ["docker", "cp",
-             f"{container_name}:/out/bug_transplant.diff",
-             str(output_dir / "bug_transplant.diff")],
-        )
-        if diff_ret == 0:
-            diff_path = output_dir / "bug_transplant.diff"
-            logger.info("Bug transplant diff saved: %s", diff_path)
-            diff_size = diff_path.stat().st_size
-            if diff_size == 0:
-                logger.warning("Diff file is empty -- Claude may not have produced changes")
-        else:
-            logger.warning("No diff file found at /out/bug_transplant.diff in container")
-
-        # Also grab the git diff directly from the source
+        # Capture diff from the source tree (most reliable — doesn't
+        # depend on Claude remembering to run "git diff > /out/...")
         _, git_diff = _exec_capture(
             container_name, f"cd /src/{args.project} && git diff",
         )
+        diff_path = output_dir / "bug_transplant.diff"
+        diff_path.write_text(git_diff)
         if git_diff.strip():
-            (output_dir / "git_diff.diff").write_text(git_diff)
-            logger.info("Git diff also saved: %s", output_dir / "git_diff.diff")
+            logger.info("Bug transplant diff saved: %s (%d bytes)", diff_path, len(git_diff))
+        else:
+            logger.warning("Diff is empty -- Claude may not have produced changes")
 
         return exit_code
 
