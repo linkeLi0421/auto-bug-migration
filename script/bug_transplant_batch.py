@@ -310,8 +310,10 @@ def run_single_bug(
         cmd += ["--runner-image", args.runner_image]
     if args.skip_collect:
         cmd.append("--skip-collect")
-    if args.claude_model:
-        cmd += ["--claude-model", args.claude_model]
+    if args.agent:
+        cmd += ["--agent", args.agent]
+    if args.model:
+        cmd += ["--model", args.model]
     if args.timeout:
         cmd += ["--timeout", str(args.timeout)]
     if args.keep_containers:
@@ -455,10 +457,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Process a single bug only")
 
     # Execution
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+                        help="Code agent to use (default: claude)")
+    parser.add_argument("--model", default=None,
+                        help="Model to use (passed to agent CLI)")
     parser.add_argument("--jobs", type=int, default=1,
                         help="Parallel bug count (default: 1)")
-    parser.add_argument("--claude-model", default=None,
-                        help="Claude model (passed to bug_transplant.py)")
     parser.add_argument("--timeout", type=int, default=3600,
                         help="Per-bug timeout in seconds (default: 3600)")
 
@@ -606,11 +610,11 @@ def main() -> int:
     # ------------------------------------------------------------------
     logger.info("Building Docker images for %s...", args.target)
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import build_project_image, build_claude_image
+    from bug_transplant import build_project_image, build_agent_image
 
     project_image = build_project_image(args.target, target_commit, args.build_csv)
-    claude_image = build_claude_image(args.target, project_image)
-    logger.info("Docker images ready: %s", claude_image)
+    agent_image = build_agent_image(args.target, project_image, args.agent)
+    logger.info("Docker images ready: %s", agent_image)
 
     # ------------------------------------------------------------------
     # 5. Run bugs

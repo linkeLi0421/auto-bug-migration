@@ -6,8 +6,8 @@ from an old commit into the current version of the code.
 ## Environment
 
 - **Source code**: `/src/<project>/` (git repo at target commit)
-- **Build command**: `compile` (builds the project with sanitizers)
-- **Fuzzer binaries**: `/out/<fuzzer_name>` (after successful compile)
+- **Build command**: `sudo -E compile` (builds the project with sanitizers)
+- **Fuzzer binaries**: `/out/<fuzzer_name>` (after successful build)
 - **Testcase**: `/work/<testcase_name>` (binary PoC input)
 - **Crash data**: `/data/crash/` (crash stack from buggy commit)
 - **Trace data**: `/data/` (function traces from buggy commit)
@@ -17,13 +17,13 @@ from an old commit into the current version of the code.
 
 ```bash
 # Build
-compile
+sudo -E compile
 
 # Test if bug triggers
 /out/<fuzzer_name> /work/<testcase_name>
 
 # Quick check
-compile 2>&1 | tail -5 && /out/<fuzzer_name> /work/<testcase_name> 2>&1 | grep -E "SUMMARY|ERROR|Executed"
+sudo -E compile 2>&1 | tail -5 && /out/<fuzzer_name> /work/<testcase_name> 2>&1 | grep -E "SUMMARY|ERROR|Executed"
 
 # See what changed between commits
 git diff <buggy_commit> <target_commit> -- <file>

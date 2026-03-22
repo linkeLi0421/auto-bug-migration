@@ -199,6 +199,7 @@ def start_merge_container(
     build_csv: str | None = None,
     extra_volumes: list[str] | None = None,
     bug_sanitizers: list[str] | None = None,
+    agent_type: str = "claude",
 ) -> tuple[str, bool]:
     """Start a persistent container at the target commit for merging."""
     container_name = f"bug-merge-{project}"
@@ -257,17 +258,22 @@ def start_merge_container(
         "-v", f"{work_dir}:/work",
     ]
 
-    # Claude credentials for conflict resolution
-    claude_home = Path.home() / ".claude"
-    claude_json = Path.home() / ".claude.json"
-    if claude_home.exists():
-        docker_cmd += ["-v", f"{claude_home}:/tmp/.claude-src:ro"]
-    if claude_json.exists():
-        docker_cmd += ["-v", f"{claude_json}:/tmp/.claude.json.src:ro"]
+    # Agent credentials for conflict resolution (login mode)
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import AGENT_CONFIG
+    cfg = AGENT_CONFIG.get(agent_type, AGENT_CONFIG["claude"])
+    cred_dir = Path.home() / cfg["credentials_dir"]
+    if cred_dir.exists():
+        docker_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
+    cred_config = cfg.get("credentials_config")
+    if cred_config:
+        cred_config_path = Path.home() / cred_config
+        if cred_config_path.exists():
+            docker_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        docker_cmd += ["-e", f"ANTHROPIC_API_KEY={anthropic_key}"]
+    api_key = os.environ.get(cfg["api_key_env"], "")
+    if api_key:
+        docker_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
 
     if extra_volumes:
         for v in extra_volumes:
@@ -349,28 +355,39 @@ def try_apply_diff(container: str, diff_path: str, project: str) -> str:
     return "conflict"
 
 
-def resolve_conflict_with_claude(
+def resolve_conflict_with_agent(
     container: str,
     diff_path: str,
     bug_id: str,
     project: str,
     applied_bugs: list[str],
-    claude_model: str | None = None,
+    agent: str = "claude",
+    model: str | None = None,
 ) -> bool:
-    """Use Claude Code to resolve a merge conflict.
+    """Use a code agent to resolve a merge conflict.
 
     Returns True if resolved successfully.
     """
-    logger.info("[%s] Invoking Claude Code to resolve conflict...", bug_id)
+    # Import agent config from bug_transplant
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import AGENT_CONFIG
 
-    # Setup Claude credentials
+    cfg = AGENT_CONFIG[agent]
+    logger.info("[%s] Invoking %s to resolve conflict...", bug_id, agent)
+
+    # Setup agent credentials
+    creds_dir = cfg["credentials_dir"]
     _exec(
         container,
-        "cp -r /tmp/.claude-src $HOME/.claude 2>/dev/null; "
-        "rm -rf $HOME/.claude/projects 2>/dev/null; "
-        "cp /tmp/.claude.json.src $HOME/.claude.json 2>/dev/null; "
+        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
+        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
         "true",
     )
+    if cfg.get("credentials_config"):
+        _exec(
+            container,
+            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+        )
 
     diff_name = Path(diff_path).name
     applied_list = ", ".join(applied_bugs) if applied_bugs else "none yet"
@@ -396,14 +413,14 @@ def resolve_conflict_with_claude(
     """)
 
     escaped = shlex.quote(prompt)
-    claude_cmd = f"claude -p {escaped} --output-format text --dangerously-skip-permissions"
-    if claude_model:
-        claude_cmd += f" --model {shlex.quote(claude_model)}"
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
 
-    ret, output = _exec_capture(container, claude_cmd, timeout=1800)
+    ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     if ret != 0:
-        logger.error("[%s] Claude Code failed (exit %d)", bug_id, ret)
+        logger.error("[%s] %s agent failed (exit %d)", bug_id, agent, ret)
         return False
 
     # Verify it compiles
@@ -420,18 +437,77 @@ def resolve_conflict_with_claude(
 # Bug verification
 # ---------------------------------------------------------------------------
 
+def _extract_stack_from_text(text: str) -> list[str]:
+    """Extract function names from sanitizer crash output."""
+    stack = []
+    stack_re = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+([^\s]+)", re.IGNORECASE)
+    for line in text.splitlines():
+        m = stack_re.search(line)
+        if m:
+            # Clean: strip (anonymous namespace)::, __interceptor_, etc.
+            name = m.group(1)
+            name = re.sub(r'\(anonymous namespace\)::', '', name)
+            name = re.sub(r'^__interceptor_', '', name)
+            # Strip everything after '(' for C++ signatures
+            if '(' in name:
+                name = name[:name.index('(')]
+            stack.append(name)
+        if 'in LLVMFuzzerTestOneInput' in line:
+            break
+    return stack
+
+
+def _extract_stack_from_file(path: str) -> list[str]:
+    """Extract function names from a crash log file."""
+    try:
+        return _extract_stack_from_text(open(path, errors='replace').read())
+    except FileNotFoundError:
+        return []
+
+
+def _stacks_match(reference: list[str], current: list[str], threshold: float = 0.5) -> bool:
+    """Check if current stack matches reference using LCS ratio.
+
+    Filters out sanitizer-internal frames before comparison.
+    """
+    san_re = re.compile(
+        r'^(__asan|__lsan|__tsan|__msan|__ubsan|__sanitizer|__interception)',
+    )
+    ref_app = [f for f in reference if not san_re.match(f)]
+    cur_app = [f for f in current if not san_re.match(f)]
+
+    if not ref_app or not cur_app:
+        return False
+
+    # LCS (longest common subsequence)
+    n, m = len(ref_app), len(cur_app)
+    prev = [0] * (m + 1)
+    for i in range(1, n + 1):
+        curr = [0] * (m + 1)
+        for j in range(1, m + 1):
+            if ref_app[i - 1] == cur_app[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = max(prev[j], curr[j - 1])
+        prev = curr
+    lcs_len = prev[m]
+    ratio = lcs_len / max(len(ref_app), len(cur_app), 1)
+    return ratio >= threshold
+
+
 def verify_bug_triggers(
     container: str,
     bug_id: str,
     fuzzer: str,
     testcase: str,
     sanitizer: str = "address",
+    crash_log: str | None = None,
 ) -> bool:
-    """Run the fuzzer with the testcase and check for a crash.
+    """Run the fuzzer and compare crash stack against the reference.
 
-    *sanitizer* controls the expected sanitizer so that ASAN-specific env
-    vars (like ``detect_leaks=0``) are set correctly, and the right
-    SUMMARY pattern is matched.
+    If *crash_log* is provided, extracts the reference stack from it and
+    compares against the fuzzer output using LCS matching.  Otherwise
+    falls back to checking for any sanitizer SUMMARY line.
     """
     env_prefix = ""
     if sanitizer == "address":
@@ -443,32 +519,45 @@ def verify_bug_triggers(
 
     ret, output = _exec_capture(
         container,
-        f"{env_prefix}([ -x {fuzzer_path} ] && {fuzzer_path} || {fallback}) /work/{testcase} 2>&1 | head -80",
+        f"{env_prefix}([ -x {fuzzer_path} ] && {fuzzer_path} || {fallback}) /work/{testcase} 2>&1",
         timeout=120,
     )
 
-    # Look for sanitizer SUMMARY line
+    # Extract current stack from fuzzer output
+    current_stack = _extract_stack_from_text(output)
+
+    # If we have a reference crash log, compare stacks
+    if crash_log:
+        ref_stack = _extract_stack_from_file(crash_log)
+        if ref_stack:
+            if _stacks_match(ref_stack, current_stack):
+                logger.info("[%s] Bug triggers OK (stack match)", bug_id)
+                return True
+            else:
+                if current_stack:
+                    logger.warning(
+                        "[%s] Stack MISMATCH: ref=%s cur=%s",
+                        bug_id, ref_stack[:3], current_stack[:3],
+                    )
+                else:
+                    logger.warning("[%s] No crash (exit=%d)", bug_id, ret)
+                return False
+        # No reference stack available — fall through to basic check
+
+    # Fallback: any sanitizer crash is a match
     has_summary = bool(re.search(
         r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
     ))
-    # Common crash indicators
-    has_crash = bool(re.search(
-        r'(ERROR|ABORTING|Segmentation fault|SEGV|heap-buffer-overflow'
-        r'|use-of-uninitialized-value|use-after-free|stack-overflow'
-        r'|runtime error:|object-size)',
-        output, re.IGNORECASE,
-    ))
-    # Non-zero exit with output is also a signal (e.g. UBSAN abort)
-    has_nonzero = ret != 0 and len(output.strip()) > 20
+    if has_summary and current_stack:
+        logger.info("[%s] Bug triggers OK (SUMMARY match)", bug_id)
+        return True
 
-    triggered = has_summary or has_crash
-    if triggered:
-        logger.info("[%s] Bug triggers OK", bug_id)
-    else:
-        logger.warning("[%s] Bug does NOT trigger (exit=%d)", bug_id, ret)
-        logger.info("[%s] Output: %s", bug_id, output[:500])
+    if current_stack:
+        logger.info("[%s] Bug triggers OK (crash detected)", bug_id)
+        return True
 
-    return triggered
+    logger.warning("[%s] Bug does NOT trigger (exit=%d)", bug_id, ret)
+    return False
 
 
 def verify_all_bugs(
@@ -484,9 +573,25 @@ def verify_all_bugs(
             bug["fuzzer"],
             bug["testcase"],
             bug.get("sanitizer", "address"),
+            bug.get("crash_log"),
         )
         results[bug["bug_id"]] = ok
     return results
+
+
+def _find_crash_log(bug_id: str, bug_info: dict) -> str | None:
+    """Find the crash log file for a bug by scanning data/crash/.
+
+    Returns the path if found, None otherwise.
+    """
+    crash_dir = DATA_DIR / "crash"
+    if not crash_dir.exists():
+        return None
+    # Try to find by bug_id in filename
+    for f in crash_dir.iterdir():
+        if bug_id in f.name and f.name.startswith("target_crash-"):
+            return str(f)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -536,11 +641,14 @@ def run_merge(args: argparse.Namespace) -> int:
             logger.warning("No fuzzer for local bug %s, skipping verification", bug_id)
             continue
         testcase = f"testcase-{bug_id}"
+        # Find crash log for stack comparison
+        crash_log = _find_crash_log(bug_id, info)
         local_bugs.append({
             "bug_id": bug_id,
             "fuzzer": fuzzer,
             "testcase": testcase,
             "sanitizer": sanitizer,
+            "crash_log": crash_log,
             "type": "local",
         })
 
@@ -560,12 +668,14 @@ def run_merge(args: argparse.Namespace) -> int:
             reproduce = info.get("reproduce", {})
             fuzzer = reproduce.get("fuzz_target", result.get("fuzzer", ""))
             sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+            crash_log = _find_crash_log(bug_id, info)
             transplant_diffs.append({
                 "bug_id": bug_id,
                 "diff_path": diff_path,
                 "fuzzer": fuzzer,
                 "testcase": f"testcase-{bug_id}",
                 "sanitizer": sanitizer,
+                "crash_log": crash_log,
                 "type": "transplant",
             })
 
@@ -585,6 +695,7 @@ def run_merge(args: argparse.Namespace) -> int:
                 reproduce = info.get("reproduce", {})
                 fuzzer = reproduce.get("fuzz_target", "")
                 sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                crash_log = _find_crash_log(bug_id, info)
                 logger.info("Found diff on disk for %s: %s", bug_id, p)
                 transplant_diffs.append({
                     "bug_id": bug_id,
@@ -592,6 +703,7 @@ def run_merge(args: argparse.Namespace) -> int:
                     "fuzzer": fuzzer,
                     "testcase": f"testcase-{bug_id}",
                     "sanitizer": sanitizer,
+                    "crash_log": crash_log,
                     "type": "transplant",
                 })
                 break
@@ -612,6 +724,7 @@ def run_merge(args: argparse.Namespace) -> int:
                     reproduce = info.get("reproduce", {})
                     fuzzer = reproduce.get("fuzz_target", "")
                     sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                    crash_log = _find_crash_log(bug_id, info)
                     logger.info("Found extra diff on disk for %s: %s", bug_id, p)
                     transplant_diffs.append({
                         "bug_id": bug_id,
@@ -619,6 +732,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         "fuzzer": fuzzer,
                         "testcase": f"testcase-{bug_id}",
                         "sanitizer": sanitizer,
+                        "crash_log": crash_log,
                         "type": "transplant",
                     })
                     break
@@ -687,6 +801,7 @@ def run_merge(args: argparse.Namespace) -> int:
         build_csv=args.build_csv,
         extra_volumes=args.volume,
         bug_sanitizers=all_sanitizers,
+        agent_type=args.agent,
     )
     if not build_ok:
         logger.error("Baseline build failed — cannot merge. "
@@ -741,13 +856,13 @@ def run_merge(args: argparse.Namespace) -> int:
             step["apply_method"] = method
 
             if method == "conflict":
-                # Attempt Claude Code resolution
-                resolved = resolve_conflict_with_claude(
+                # Attempt agent-based resolution
+                resolved = resolve_conflict_with_agent(
                     container, diff_path, bug_id, project,
-                    applied_bugs, args.claude_model,
+                    applied_bugs, args.agent, args.model,
                 )
                 if resolved:
-                    step["apply_method"] = "claude_resolved"
+                    step["apply_method"] = "agent_resolved"
                 else:
                     step["apply_method"] = "failed"
                     logger.error("[%s] Could not resolve conflict, skipping", bug_id)
@@ -811,6 +926,7 @@ def run_merge(args: argparse.Namespace) -> int:
             step["self_triggers"] = verify_bug_triggers(
                 container, bug_id, bd["fuzzer"], bd["testcase"],
                 bd.get("sanitizer", "address"),
+                bd.get("crash_log"),
             )
 
             # --- Verify all previously applied bugs (regression check) ---
@@ -849,10 +965,20 @@ def run_merge(args: argparse.Namespace) -> int:
         output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get combined diff from container
-        _, combined_diff = _exec_capture(
-            container, f"cd /src/{project} && git diff",
-        )
+        # Get combined diff — only include files that the per-bug diffs
+        # intentionally modified (avoids build artifacts from compile).
+        touched_files: set[str] = set()
+        for bd in ordered:
+            touched_files.update(bd.get("_files", set()))
+        if touched_files:
+            file_args = " ".join(f"'{f}'" for f in sorted(touched_files))
+            _, combined_diff = _exec_capture(
+                container, f"cd /src/{project} && git diff -- {file_args}",
+            )
+        else:
+            _, combined_diff = _exec_capture(
+                container, f"cd /src/{project} && git diff",
+            )
         combined_diff_path = output_dir / "combined.diff"
         combined_diff_path.write_text(combined_diff)
         logger.info("Combined diff: %s (%d bytes)", combined_diff_path, len(combined_diff))
@@ -987,8 +1113,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Bug IDs that already trigger at target (override auto-detection)")
 
     # Execution
-    parser.add_argument("--claude-model", default=None,
-                        help="Claude model for conflict resolution")
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+                        help="Code agent for conflict resolution (default: claude)")
+    parser.add_argument("--model", default=None,
+                        help="Model to use (passed to agent CLI)")
     parser.add_argument("--testcases-dir",
                         default=os.environ.get("TESTCASES", ""),
                         help="Testcase directory (default: $TESTCASES)")

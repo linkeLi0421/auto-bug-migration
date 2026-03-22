@@ -47,9 +47,36 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Pin Claude Code CLI version for reproducibility.
-# Update this deliberately after testing with the new version.
-CLAUDE_CODE_VERSION = "2.1.81"
+# Pin CLI versions for reproducibility.
+# Update deliberately after testing with new versions.
+AGENT_VERSIONS = {
+    "claude": "2.1.81",   # @anthropic-ai/claude-code
+    "codex": "0.116.0",            # @openai/codex
+}
+
+# Agent-specific configuration
+AGENT_CONFIG = {
+    "claude": {
+        "npm_package": "@anthropic-ai/claude-code",
+        "cli_name": "claude",
+        "cli_entry": "@anthropic-ai/claude-code/cli.js",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "credentials_dir": ".claude",        # ~/.<this> on host
+        "credentials_config": ".claude.json", # ~/.<this> on host
+        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions",
+        "model_flag": "--model",
+    },
+    "codex": {
+        "npm_package": "@openai/codex",
+        "cli_name": "codex",
+        "cli_entry": "@openai/codex/bin/codex.js",  # npm bin: codex -> bin/codex.js
+        "api_key_env": "OPENAI_API_KEY",
+        "credentials_dir": ".codex",
+        "credentials_config": None,          # codex uses dir only
+        "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
+        "model_flag": "--model",
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -204,59 +231,60 @@ def build_project_image(
     return image_tag
 
 
-def build_claude_image(project: str, project_image: str) -> str:
-    """Layer Claude Code CLI on top of the project image.
+def build_agent_image(project: str, project_image: str, agent: str = "claude") -> str:
+    """Layer a code agent CLI on top of the project image.
 
-    Produces ``bug-transplant-<project>:latest``.  Follows the same pattern
-    as ``runners/claude_runner.py:build_project_image()``.
+    Produces ``bug-transplant-<project>:latest``.
+    Supports agent types: ``claude``, ``codex``.
     """
+    cfg = AGENT_CONFIG[agent]
+    version = AGENT_VERSIONS[agent]
+    npm_pkg = cfg["npm_package"]
+    cli_name = cfg["cli_name"]
+    cli_entry = cfg["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
 
     # Always rebuild — the base project image may have changed
-    # (different OSS-Fuzz commit → different build.sh)
-    logger.info("Building Claude agent image '%s' on top of '%s'...", tag, project_image)
+    logger.info("Building %s agent image '%s' on top of '%s'...", agent, tag, project_image)
 
     dockerfile_content = textwrap.dedent(f"""\
-        # Stage 1: Install Claude Code on a modern base (glibc >= 2.28).
-        FROM ubuntu:22.04 AS claude-builder
+        # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
+        FROM ubuntu:22.04 AS agent-builder
         ENV DEBIAN_FRONTEND=noninteractive
         RUN apt-get update && apt-get install -y --no-install-recommends \\
                 curl ca-certificates \\
             && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
             && apt-get install -y --no-install-recommends nodejs \\
-            && npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} \\
+            && npm install -g {npm_pkg}@{version} \\
             && rm -rf /var/lib/apt/lists/*
 
-        # Stage 2: Project image with full Node.js + Claude Code tree copied in.
-        # We copy the entire /usr tree from builder to bring along all shared
-        # libs Node.js needs (glibc, libstdc++, etc.), avoiding version issues
-        # on older base images like Ubuntu 16.04/xenial.
+        # Stage 2: Project image with agent CLI copied in.
         FROM {project_image}
         ENV DEBIAN_FRONTEND=noninteractive
 
-        # Copy Node.js, npm, and Claude Code with all dependencies
-        COPY --from=claude-builder /usr/bin/node /usr/local/bin/node
-        COPY --from=claude-builder /usr/lib/node_modules /usr/local/lib/node_modules
+        # Copy Node.js and agent CLI with all dependencies
+        COPY --from=agent-builder /usr/bin/node /usr/local/bin/node
+        COPY --from=agent-builder /usr/lib/node_modules /usr/local/lib/node_modules
         # Copy glibc and libstdc++ from builder so node binary works on old bases
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
-        COPY --from=claude-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
-        COPY --from=claude-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
-        COPY --from=claude-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
+        COPY --from=agent-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
+        COPY --from=agent-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
 
-        # Create wrapper scripts that use the bundled libs via LD_LIBRARY_PATH
-        RUN echo '#!/bin/bash' > /usr/local/bin/claude \\
-            && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js "$@"' >> /usr/local/bin/claude \\
-            && chmod +x /usr/local/bin/claude
+        # Create wrapper script that uses the bundled libs
+        RUN echo '#!/bin/bash' > /usr/local/bin/{cli_name} \\
+            && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/{cli_entry} "$@"' >> /usr/local/bin/{cli_name} \\
+            && chmod +x /usr/local/bin/{cli_name}
 
         # sudo may not exist on older base images
         RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
             && rm -rf /var/lib/apt/lists/* || true
 
-        # Create a non-root user (Claude CLI refuses --dangerously-skip-permissions as root)
+        # Create a non-root user (some CLIs refuse to run as root)
         RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
             && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
             && chown -R agent:agent /src/ /out/ /work/ || true
@@ -327,11 +355,14 @@ def setup_claude_md(args: argparse.Namespace) -> Path:
     return claude_dir
 
 
-def run_claude_in_container(args: argparse.Namespace) -> int:
-    """Start container, run Claude Code, collect results.
+def run_agent_in_container(args: argparse.Namespace) -> int:
+    """Start container, run code agent, collect results.
 
     Returns 0 on success, non-zero on failure.
     """
+    agent = getattr(args, "agent", "claude")
+    cfg = AGENT_CONFIG[agent]
+
     image_tag = f"bug-transplant-{args.project}:latest"
     container_name = f"bug-transplant-{args.project}-{args.bug_id}"
     buggy_short = args.buggy_commit[:8]
@@ -347,12 +378,8 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
 
-    # Prepare CLAUDE.md mount
+    # Prepare CLAUDE.md mount (used by claude; harmless for others)
     claude_dir = setup_claude_md(args)
-
-    # Prepare Claude credentials mount
-    claude_home = Path.home() / ".claude"
-    claude_json = Path.home() / ".claude.json"
 
     prompt = build_prompt(args)
 
@@ -374,23 +401,25 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
         "-v", f"{script_dir}:/script:ro",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
-        # CLAUDE.md for project guidance
+        # CLAUDE.md for project guidance (claude only, harmless for others)
         "-v", f"{claude_dir}/CLAUDE.md:/src/{args.project}/.claude/CLAUDE.md:ro",
         "-v", f"{claude_dir}/settings.json:/src/{args.project}/.claude/settings.json:ro",
     ]
 
-    # Mount Claude credentials if they exist
-    if claude_home.exists():
-        docker_run_cmd += ["-v", f"{claude_home}:/tmp/.claude-src:ro"]
-    if claude_json.exists():
-        docker_run_cmd += ["-v", f"{claude_json}:/tmp/.claude.json.src:ro"]
+    # Mount agent credentials (login mode)
+    cred_dir = Path.home() / cfg["credentials_dir"]
+    if cred_dir.exists():
+        docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
+    cred_config = cfg.get("credentials_config")
+    if cred_config:
+        cred_config_path = Path.home() / cred_config
+        if cred_config_path.exists():
+            docker_run_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    # Environment
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if anthropic_key:
-        docker_run_cmd += ["-e", f"ANTHROPIC_API_KEY={anthropic_key}"]
-    else:
-        logger.warning("ANTHROPIC_API_KEY not set -- Claude Code will fail to call the API")
+    # Environment — pass API key if set (fallback for non-login mode)
+    api_key = os.environ.get(cfg["api_key_env"], "")
+    if api_key:
+        docker_run_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
 
     # Additional user-specified env vars
     if args.env:
@@ -413,7 +442,11 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
     try:
         # --- Checkout target commit inside container ---
         logger.info("Checking out target commit %s...", args.target_commit)
-        _exec(container_name, f"sudo git checkout -f {args.target_commit}", user="root")
+        _exec(container_name, "git config --global --add safe.directory '*'", user="root")
+        # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
+        # before checkout so they don't pollute the git diff later.
+        _exec(container_name, f"cd /src/{args.project} && git clean -fdx", user="root")
+        _exec(container_name, f"cd /src/{args.project} && git checkout -f {args.target_commit}", user="root")
 
         # --- Copy testcase to /work for easier access ---
         _exec(
@@ -423,38 +456,44 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
         )
         _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-        # --- Setup Claude credentials ---
+        # --- Setup agent credentials (login mode) ---
+        creds_dir = cfg["credentials_dir"]
         _exec(
             container_name,
-            "cp -r /tmp/.claude-src $HOME/.claude 2>/dev/null; "
-            "rm -rf $HOME/.claude/projects 2>/dev/null; "
-            "cp /tmp/.claude.json.src $HOME/.claude.json 2>/dev/null; "
+            f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
+            f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
             "true",
         )
+        if cfg.get("credentials_config"):
+            _exec(
+                container_name,
+                f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+            )
 
-        # --- Copy project CLAUDE.md into the agent's home ---
-        _exec(
-            container_name,
-            f"mkdir -p /home/agent/.claude/projects/-src-{args.project}/; "
-            f"cp /src/{args.project}/.claude/CLAUDE.md "
-            f"/home/agent/.claude/projects/-src-{args.project}/CLAUDE.md 2>/dev/null; "
-            f"cp /src/{args.project}/.claude/settings.json "
-            f"/home/agent/.claude/projects/-src-{args.project}/settings.json 2>/dev/null; "
-            "true",
-        )
+        # --- Copy project CLAUDE.md into the agent's home (claude only) ---
+        if agent == "claude":
+            _exec(
+                container_name,
+                f"mkdir -p /home/agent/.claude/projects/-src-{args.project}/; "
+                f"cp /src/{args.project}/.claude/CLAUDE.md "
+                f"/home/agent/.claude/projects/-src-{args.project}/CLAUDE.md 2>/dev/null; "
+                f"cp /src/{args.project}/.claude/settings.json "
+                f"/home/agent/.claude/projects/-src-{args.project}/settings.json 2>/dev/null; "
+                "true",
+            )
 
-        # --- Run Claude Code ---
-        logger.info("Running Claude Code (this may take a while)...")
-        claude_cmd = _build_claude_command(prompt, args)
+        # --- Run agent ---
+        logger.info("Running %s agent (this may take a while)...", agent)
+        agent_cmd = _build_agent_command(prompt, args)
 
         start_time = time.monotonic()
         exit_code, output = _exec_capture(
-            container_name, claude_cmd, timeout=args.timeout,
+            container_name, agent_cmd, timeout=args.timeout,
         )
         elapsed = time.monotonic() - start_time
         logger.info(
-            "Claude Code finished in %.0fs (exit code %d, %d bytes output)",
-            elapsed, exit_code, len(output),
+            "%s agent finished in %.0fs (exit code %d, %d bytes output)",
+            agent, elapsed, exit_code, len(output),
         )
 
         # --- Save output ---
@@ -464,17 +503,41 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
         # Save raw Claude output
         (output_dir / "claude_output.txt").write_text(output)
 
-        # Capture diff from the source tree (most reliable — doesn't
-        # depend on Claude remembering to run "git diff > /out/...")
-        _, git_diff = _exec_capture(
-            container_name, f"cd /src/{args.project} && git diff",
-        )
+        # Prefer the agent's own diff (saved by the agent during its run).
+        # This only contains intentional changes — no build artifacts.
+        # Fall back to git diff if the agent didn't save one.
         diff_path = output_dir / "bug_transplant.diff"
-        diff_path.write_text(git_diff)
-        if git_diff.strip():
-            logger.info("Bug transplant diff saved: %s (%d bytes)", diff_path, len(git_diff))
+        agent_diff_ret = subprocess.call(
+            ["docker", "cp",
+             f"{container_name}:/out/bug_transplant.diff",
+             str(diff_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        agent_diff = ""
+        if agent_diff_ret == 0 and diff_path.exists():
+            agent_diff = diff_path.read_text()
+
+        if agent_diff.strip():
+            logger.info("Using agent's diff: %s (%d bytes)", diff_path, len(agent_diff))
         else:
-            logger.warning("Diff is empty -- Claude may not have produced changes")
+            # Fallback: capture from git (includes untracked files, excludes
+            # agent config dirs and common build artifacts)
+            logger.info("Agent didn't save diff, falling back to git diff")
+            _, git_diff = _exec_capture(
+                container_name,
+                f"cd /src/{args.project} && "
+                f"git add -AN -- . "
+                f"':(exclude).claude/' ':(exclude).codex/' "
+                f"':(exclude)build/' ':(exclude)_build/' "
+                f"':(exclude)*.o' ':(exclude)*.a' ':(exclude)*.so' && "
+                f"git diff -- . "
+                f"':(exclude).claude/' ':(exclude).codex/'",
+            )
+            diff_path.write_text(git_diff)
+            if git_diff.strip():
+                logger.info("Git diff saved: %s (%d bytes)", diff_path, len(git_diff))
+            else:
+                logger.warning("Diff is empty -- agent may not have produced changes")
 
         return exit_code
 
@@ -493,14 +556,22 @@ def run_claude_in_container(args: argparse.Namespace) -> int:
         shutil.rmtree(claude_dir.parent, ignore_errors=True)
 
 
-def _build_claude_command(prompt: str, args: argparse.Namespace) -> str:
-    """Build the ``claude -p ...`` shell command."""
+def _build_agent_command(prompt: str, args: argparse.Namespace) -> str:
+    """Build the CLI command for the selected agent."""
     import shlex
 
+    agent = getattr(args, "agent", "claude")
+    cfg = AGENT_CONFIG[agent]
     escaped = shlex.quote(prompt)
-    cmd = f"claude -p {escaped} --output-format text --dangerously-skip-permissions"
-    if args.claude_model:
-        cmd += f" --model {shlex.quote(args.claude_model)}"
+
+    # Build command from template
+    cmd = cfg["run_cmd"].format(prompt=escaped)
+
+    # Add model flag if specified
+    model = getattr(args, "model", None)
+    if model:
+        cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+
     return cmd
 
 
@@ -582,11 +653,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-collect", action="store_true",
                         help="Skip crash/trace collection (data already exists)")
 
-    # Claude Code
-    parser.add_argument("--claude-model", default=None,
-                        help="Claude model to use (default: CLI default)")
+    # Agent
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+                        help="Code agent to use (default: claude)")
+    parser.add_argument("--model", default=None,
+                        help="Model to use (passed to agent CLI)")
     parser.add_argument("--timeout", type=int, default=3600,
-                        help="Timeout in seconds for Claude Code (default: 3600)")
+                        help="Timeout in seconds for agent (default: 3600)")
 
     # Docker
     parser.add_argument("--keep-container", action="store_true",
@@ -656,13 +729,13 @@ def main() -> int:
     # ------------------------------------------------------------------
     logger.info("=== Phase 1: Building Docker images ===")
     project_image = build_project_image(args.project)
-    claude_image = build_claude_image(args.project, project_image)
+    agent_image = build_agent_image(args.project, project_image, args.agent)
 
     # ------------------------------------------------------------------
     # Phase 2+3: Run Claude Code in container
     # ------------------------------------------------------------------
     logger.info("=== Phase 2+3: Running Claude Code in container ===")
-    exit_code = run_claude_in_container(args)
+    exit_code = run_agent_in_container(args)
 
     # ------------------------------------------------------------------
     # Phase 4: Report results

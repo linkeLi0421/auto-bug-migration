@@ -644,6 +644,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             help='commit hash to checkout in the builder')
   build_version_parser.add_argument('--patch',
                             help='patch file to apply in the builder')
+  build_version_parser.add_argument('--forward-patch',
+                            action='store_true', default=False,
+                            help='apply --patch forward (git apply) instead of reverse (patch -R)')
   build_version_parser.add_argument('--build_csv',
                             help='this file contains a target project commit id and corresponding commit id')
   build_version_parser.add_argument(
@@ -1154,6 +1157,21 @@ def run_clusterfuzzlite(args):
         os.path.join(workspace, '*')
     ])
     return False
+
+
+def _strict_forward_patch_apply_snippet():
+  """Return bash snippet that applies /patch forward (no -R)."""
+  return '''
+    if ! git apply --check /patch 2>/dev/null; then
+      echo "Trying git apply with --3way...";
+      if ! git apply --3way /patch; then
+        echo "OSS-FUZZ FORWARD PATCH APPLY FAILED";
+        exit 1;
+      fi
+    else
+      git apply /patch;
+    fi
+  '''
 
 
 def _strict_reverse_patch_apply_snippet():
@@ -2111,7 +2129,10 @@ def build_version(args):
   '''
   
   if args.patch:
-    build_bash += _strict_reverse_patch_apply_snippet()
+    if getattr(args, 'forward_patch', False):
+      build_bash += _strict_forward_patch_apply_snippet()
+    else:
+      build_bash += _strict_reverse_patch_apply_snippet()
     run_args.extend([
         '-v',
         '%s:/patch' % args.patch,
