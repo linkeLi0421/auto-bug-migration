@@ -24,13 +24,13 @@ by the same testcase.
 
 ```bash
 # Build the project (inside container)
-compile
+sudo -E compile
 
 # Run the fuzzer with PoC to check if bug triggers
 /out/{fuzzer_name} /work/{testcase_name}
 
 # Quick build-and-test one-liner
-compile 2>&1 | tail -5 && /out/{fuzzer_name} /work/{testcase_name} 2>&1 | grep -E "SUMMARY|ERROR|Executed|WARNING"
+sudo -E compile 2>&1 | tail -5 && /out/{fuzzer_name} /work/{testcase_name} 2>&1 | grep -E "SUMMARY|ERROR|Executed|WARNING"
 ```
 
 ## Methodology (follow this exactly)
@@ -79,7 +79,7 @@ After getting the bug to trigger, minimize using single-change elimination:
 2. For each change i (from 1 to N):
    - Revert ONLY change i (keep all others).
    - Build and test:
-     `compile 2>&1 | tail -3 && /out/{fuzzer_name} /work/{testcase_name} 2>&1 | grep -E "SUMMARY|Executed|WARNING"`
+     `sudo -E compile 2>&1 | tail -3 && /out/{fuzzer_name} /work/{testcase_name} 2>&1 | grep -E "SUMMARY|Executed|WARNING"`
    - If bug still triggers -> change i is **unnecessary**, remove it permanently.
    - If bug stops triggering -> change i is **required**, re-apply it.
 3. Final verification: confirm the minimal set still triggers the bug.
