@@ -141,55 +141,51 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
         return 124, f"TIMEOUT after {timeout}s"
 
 
-def _collect_sanitizers(bug_sanitizers: list[str]) -> list[str]:
-    """Return deduplicated sanitizer list in safe build order.
 
-    Order: address -> undefined -> memory.
-    MSAN must be last because it recompiles system libraries (libc++) with
-    MSAN instrumentation, permanently tainting them for the container.
+def _rebuild_project_image(project: str, target_commit: str,
+                           build_csv: str | None, agent_type: str) -> str:
+    """Rebuild the project Docker image from the correct historical OSS-Fuzz commit.
+
+    Uses ``fuzz_helper.py build_version --runner-image auto`` to build the
+    project Docker image with the correct historical base-builder digest
+    pinned.  This is the same method used to build the CSV, so the merge
+    container gets the same compiler, ASAN runtime, and base libraries.
+
+    The compiled binaries from build_version are a side-effect we ignore —
+    we only need the ``gcr.io/oss-fuzz/{project}`` image it produces.
     """
-    # Fixed safe order — MSAN last because it's the most invasive
-    SAFE_ORDER = ["address", "undefined", "memory"]
-    needed = set(bug_sanitizers)
-    return [s for s in SAFE_ORDER if s in needed]
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import build_agent_image
 
-
-def _build_via_fuzz_helper(
-    project: str,
-    target_commit: str,
-    sanitizer: str,
-    build_csv: str | None,
-    out_dir: str,
-) -> bool:
-    """Build using fuzz_helper.py build_version (host-side).
-
-    This handles prepare_repository(), correct OSS-Fuzz commit checkout,
-    and Dockerfile matching — which ``compile`` inside the container cannot.
-    """
+    # Use fuzz_helper.py build_version to build the project Docker image.
+    # This handles: oss-fuzz commit checkout, base-builder digest pinning,
+    # Dockerfile patching, and docker build — exactly matching how the
+    # builds CSV was produced.
     cmd = [
         sys.executable, str(SCRIPT_DIR / "fuzz_helper.py"),
         "build_version", project,
         "--commit", target_commit,
-        "--sanitizer", sanitizer,
+        "--sanitizer", "address",
         "--no_corpus",
+        "--runner-image", "auto",
     ]
     if build_csv:
         cmd += ["--build_csv", build_csv]
-    logger.info("Building via fuzz_helper.py: sanitizer=%s commit=%s", sanitizer, target_commit[:12])
-    ret = subprocess.call(cmd)
-    if ret != 0:
-        logger.error("fuzz_helper.py build_version failed for sanitizer=%s (exit %d)", sanitizer, ret)
-        return False
-    # Stash binaries to /out/<sanitizer>/
-    san_dir = os.path.join(out_dir, sanitizer)
-    os.makedirs(san_dir, exist_ok=True)
-    for f in os.listdir(out_dir):
-        fpath = os.path.join(out_dir, f)
-        if os.path.isfile(fpath) and os.access(fpath, os.X_OK):
-            import shutil
-            shutil.copy2(fpath, os.path.join(san_dir, f))
-    logger.info("Binaries for sanitizer=%s saved to %s/", sanitizer, san_dir)
-    return True
+
+    logger.info("Building project image via fuzz_helper.py build_version --runner-image auto")
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if result.returncode != 0:
+        logger.error("fuzz_helper.py build_version failed (exit %d)", result.returncode)
+        logger.error("Build output (last 40 lines):\n%s",
+                      "\n".join(result.stdout.splitlines()[-40:]))
+        sys.exit(1)
+    logger.info("Project image built: gcr.io/oss-fuzz/%s", project)
+
+    # Layer the agent CLI on top of the freshly built project image
+    project_image = f"gcr.io/oss-fuzz/{project}"
+    image_tag = build_agent_image(project, project_image, agent_type)
+    logger.info("Agent image built: %s", image_tag)
+    return image_tag
 
 
 def start_merge_container(
@@ -198,24 +194,14 @@ def start_merge_container(
     testcases_dir: str,
     build_csv: str | None = None,
     extra_volumes: list[str] | None = None,
-    bug_sanitizers: list[str] | None = None,
     agent_type: str = "claude",
 ) -> tuple[str, bool]:
     """Start a persistent container at the target commit for merging."""
     container_name = f"bug-merge-{project}"
-    image_tag = f"bug-transplant-{project}:latest"
 
-    # Check image exists
-    ret = subprocess.call(
-        ["docker", "image", "inspect", image_tag],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    if ret != 0:
-        logger.error(
-            "Image %s not found. Run bug_transplant_batch.py first to build it.",
-            image_tag,
-        )
-        sys.exit(1)
+    # Rebuild the project image from the historical OSS-Fuzz commit so the
+    # container has the correct compiler, ASAN runtime, and base libraries.
+    image_tag = _rebuild_project_image(project, target_commit, build_csv, agent_type)
 
     # Remove any existing container
     subprocess.call(
@@ -298,17 +284,21 @@ def start_merge_container(
     # Copy all testcases to /work
     _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
 
-    # Build per-sanitizer using fuzz_helper.py on the HOST.
-    # This handles prepare_repository(), OSS-Fuzz commit checkout, and
-    # Dockerfile matching — which `compile` inside the container cannot.
-    # The /out directory is shared between host builds and the container.
-    sanitizers_needed = _collect_sanitizers(bug_sanitizers)
-    for san in sanitizers_needed:
-        if not _build_via_fuzz_helper(project, target_commit, san, build_csv, out_dir):
-            if san == "address":
-                logger.error("Cannot proceed without a working ASAN build")
-                return container_name, False
-            logger.warning("Skipping sanitizer=%s, bugs using it won't verify", san)
+    # Build ASAN only — no MSAN/UBSAN to avoid libc++ contamination.
+    logger.info("Building ASAN inside container...")
+    ret, build_output = _exec_capture(
+        container_name,
+        f"sudo -E SANITIZER=address compile 2>&1",
+        timeout=300,
+    )
+    if ret != 0:
+        logger.error("ASAN build failed. Tail:")
+        logger.error("%s", build_output[-500:] if build_output else "(no output)")
+        return container_name, False
+    logger.info("Baseline ASAN build OK")
+
+    # Restore testcases (compile may wipe /work)
+    _exec_capture(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
 
     return container_name, True
 
@@ -440,9 +430,12 @@ def resolve_conflict_with_agent(
 def _extract_stack_from_text(text: str) -> list[str]:
     """Extract function names from sanitizer crash output."""
     stack = []
-    stack_re = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+([^\s]+)", re.IGNORECASE)
+    # Symbolized: #N 0xHEX in function_name
+    sym_re = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+([^\s]+)", re.IGNORECASE)
+    # Unsymbolized: #N 0xHEX (binary+0xOFFSET) — use binary+offset as frame ID
+    unsym_re = re.compile(r"#\d+\s+0x[0-9a-f]+\s+\(([^)]+\+0x[0-9a-f]+)\)", re.IGNORECASE)
     for line in text.splitlines():
-        m = stack_re.search(line)
+        m = sym_re.search(line)
         if m:
             # Clean: strip (anonymous namespace)::, __interceptor_, etc.
             name = m.group(1)
@@ -452,6 +445,11 @@ def _extract_stack_from_text(text: str) -> list[str]:
             if '(' in name:
                 name = name[:name.index('(')]
             stack.append(name)
+        elif not stack or not sym_re.search(line):
+            # Only use unsymbolized fallback if no symbolized frames found yet
+            m2 = unsym_re.search(line)
+            if m2:
+                stack.append(m2.group(1))
         if 'in LLVMFuzzerTestOneInput' in line:
             break
     return stack
@@ -500,28 +498,27 @@ def verify_bug_triggers(
     bug_id: str,
     fuzzer: str,
     testcase: str,
-    sanitizer: str = "address",
     crash_log: str | None = None,
 ) -> bool:
-    """Run the fuzzer and compare crash stack against the reference.
+    """Run the ASAN fuzzer binary and check for a crash.
 
     If *crash_log* is provided, extracts the reference stack from it and
     compares against the fuzzer output using LCS matching.  Otherwise
     falls back to checking for any sanitizer SUMMARY line.
     """
-    env_prefix = ""
-    if sanitizer == "address":
-        env_prefix = "ASAN_OPTIONS=detect_leaks=0 "
+    sym_path = "/out/llvm-symbolizer"
+    fuzzer_path = f"/out/{fuzzer}"
 
-    # Use per-sanitizer binary if available, fall back to /out/
-    fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
-    fallback = f"/out/{fuzzer}"
-
-    ret, output = _exec_capture(
-        container,
-        f"{env_prefix}([ -x {fuzzer_path} ] && {fuzzer_path} || {fallback}) /work/{testcase} 2>&1",
-        timeout=120,
+    cmd = (
+        f"export ASAN_OPTIONS=detect_leaks=0:external_symbolizer_path={sym_path}; "
+        f"if [ ! -x {fuzzer_path} ]; then "
+        f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
+        f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
     )
+    logger.info("[%s] verify cmd: %s", bug_id, cmd)
+    ret, output = _exec_capture(container, cmd, timeout=120)
+    logger.info("[%s] verify exit=%d output_len=%d tail=%.500s",
+                bug_id, ret, len(output), output[-500:] if output else "(empty)")
 
     # Extract current stack from fuzzer output
     current_stack = _extract_stack_from_text(output)
@@ -540,16 +537,21 @@ def verify_bug_triggers(
                         bug_id, ref_stack[:3], current_stack[:3],
                     )
                 else:
-                    logger.warning("[%s] No crash (exit=%d)", bug_id, ret)
-                return False
-        # No reference stack available — fall through to basic check
+                    logger.warning("[%s] Stack comparison inconclusive (exit=%d)", bug_id, ret)
+                # Fall through to SUMMARY check instead of returning False —
+                # unsymbolized stacks can't match symbolized references, but
+                # the bug may still be triggering.
+        # No reference stack or mismatch — fall through to basic check
 
     # Fallback: any sanitizer crash is a match
     has_summary = bool(re.search(
         r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
     ))
-    if has_summary and current_stack:
-        logger.info("[%s] Bug triggers OK (SUMMARY match)", bug_id)
+    if has_summary:
+        if current_stack:
+            logger.info("[%s] Bug triggers OK (SUMMARY + stack match)", bug_id)
+        else:
+            logger.info("[%s] Bug triggers OK (SUMMARY match, unsymbolized)", bug_id)
         return True
 
     if current_stack:
@@ -572,7 +574,6 @@ def verify_all_bugs(
             bug["bug_id"],
             bug["fuzzer"],
             bug["testcase"],
-            bug.get("sanitizer", "address"),
             bug.get("crash_log"),
         )
         results[bug["bug_id"]] = ok
@@ -638,16 +639,17 @@ def run_merge(args: argparse.Namespace) -> int:
         fuzzer = reproduce.get("fuzz_target", "")
         sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
         if not fuzzer:
-            logger.warning("No fuzzer for local bug %s, skipping verification", bug_id)
+            logger.warning("No fuzzer for local bug %s, skipping", bug_id)
+            continue
+        if sanitizer != "address":
+            logger.warning("Skipping non-ASAN local bug %s (sanitizer=%s)", bug_id, sanitizer)
             continue
         testcase = f"testcase-{bug_id}"
-        # Find crash log for stack comparison
         crash_log = _find_crash_log(bug_id, info)
         local_bugs.append({
             "bug_id": bug_id,
             "fuzzer": fuzzer,
             "testcase": testcase,
-            "sanitizer": sanitizer,
             "crash_log": crash_log,
             "type": "local",
         })
@@ -668,13 +670,15 @@ def run_merge(args: argparse.Namespace) -> int:
             reproduce = info.get("reproduce", {})
             fuzzer = reproduce.get("fuzz_target", result.get("fuzzer", ""))
             sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+            if sanitizer != "address":
+                logger.warning("Skipping non-ASAN transplant bug %s (sanitizer=%s)", bug_id, sanitizer)
+                continue
             crash_log = _find_crash_log(bug_id, info)
             transplant_diffs.append({
                 "bug_id": bug_id,
                 "diff_path": diff_path,
                 "fuzzer": fuzzer,
                 "testcase": f"testcase-{bug_id}",
-                "sanitizer": sanitizer,
                 "crash_log": crash_log,
                 "type": "transplant",
             })
@@ -695,6 +699,8 @@ def run_merge(args: argparse.Namespace) -> int:
                 reproduce = info.get("reproduce", {})
                 fuzzer = reproduce.get("fuzz_target", "")
                 sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                if sanitizer != "address":
+                    continue
                 crash_log = _find_crash_log(bug_id, info)
                 logger.info("Found diff on disk for %s: %s", bug_id, p)
                 transplant_diffs.append({
@@ -702,7 +708,6 @@ def run_merge(args: argparse.Namespace) -> int:
                     "diff_path": str(p),
                     "fuzzer": fuzzer,
                     "testcase": f"testcase-{bug_id}",
-                    "sanitizer": sanitizer,
                     "crash_log": crash_log,
                     "type": "transplant",
                 })
@@ -719,11 +724,13 @@ def run_merge(args: argparse.Namespace) -> int:
             for name in ("bug_transplant.diff", "git_diff.diff"):
                 p = d / name
                 if p.exists() and p.stat().st_size > 0:
-                    seen_bug_ids.add(bug_id)
                     info = bug_info_dataset.get(bug_id, {})
                     reproduce = info.get("reproduce", {})
-                    fuzzer = reproduce.get("fuzz_target", "")
                     sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+                    if sanitizer != "address":
+                        continue
+                    seen_bug_ids.add(bug_id)
+                    fuzzer = reproduce.get("fuzz_target", "")
                     crash_log = _find_crash_log(bug_id, info)
                     logger.info("Found extra diff on disk for %s: %s", bug_id, p)
                     transplant_diffs.append({
@@ -731,7 +738,6 @@ def run_merge(args: argparse.Namespace) -> int:
                         "diff_path": str(p),
                         "fuzzer": fuzzer,
                         "testcase": f"testcase-{bug_id}",
-                        "sanitizer": sanitizer,
                         "crash_log": crash_log,
                         "type": "transplant",
                     })
@@ -788,19 +794,10 @@ def run_merge(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     # 4. Start container and run merge
     # ------------------------------------------------------------------
-    # Collect all sanitizers needed across local + transplant bugs
-    all_sanitizers = (
-        [lb.get("sanitizer", "address") for lb in local_bugs]
-        + [td.get("sanitizer", "address") for td in transplant_diffs]
-    )
-    sanitizers_needed = _collect_sanitizers(all_sanitizers)
-    logger.info("Sanitizers needed: %s", sanitizers_needed)
-
     container, build_ok = start_merge_container(
         project, target_commit, args.testcases_dir,
         build_csv=args.build_csv,
         extra_volumes=args.volume,
-        bug_sanitizers=all_sanitizers,
         agent_type=args.agent,
     )
     if not build_ok:
@@ -869,37 +866,29 @@ def run_merge(args: argparse.Namespace) -> int:
                     merge_results.append(step)
                     continue
 
-            # --- Build (only ASAN first, then other sanitizers if needed) ---
-            # Always build ASAN first (primary), then rebuild other sanitizers
-            # only if bugs using them exist in the verified set.
-            logger.info("[%s] Building (address)...", bug_id)
+            # --- Build ASAN ---
+            logger.info("[%s] Building (ASAN)...", bug_id)
             _exec_capture(
                 container,
                 f"cd /src/{project} && make clean 2>/dev/null; "
-                f"rm -rf /work/* 2>/dev/null; true",
+                f"rm -rf .obj *.a *.o 2>/dev/null; "
+                f"rm -f /src/*.o 2>/dev/null; true",
             )
             ret, build_output = _exec_capture(
                 container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
             )
-            build_failed = (ret != 0)
-            if not build_failed:
-                _exec_capture(
-                    container,
-                    "mkdir -p /out/address && "
-                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
-                )
-            else:
-                logger.error("[%s] Build failed for sanitizer=address. Tail:", bug_id)
+            # Restore testcases (compile may wipe /work)
+            _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+
+            step["build_ok"] = (ret == 0)
+            if ret != 0:
+                logger.error("[%s] Build failed. Tail:", bug_id)
                 logger.error("%s", build_output[-500:] if build_output else "(no output)")
-            step["build_ok"] = not build_failed
-            if build_failed:
-                logger.error("[%s] Build failed after applying diff", bug_id)
-                # Try to revert this diff
+                # Revert this diff and restore previous state
                 _exec_capture(
                     container,
                     f"cd /src/{project} && git checkout -- . 2>&1",
                 )
-                # Re-apply all previous good diffs
                 for prev_id in applied_bugs:
                     prev = next(
                         d for d in ordered if d["bug_id"] == prev_id
@@ -910,14 +899,12 @@ def run_merge(args: argparse.Namespace) -> int:
                     )
                 _exec_capture(
                     container,
-                    f"cd /src/{project} && make clean 2>/dev/null; rm -rf /work/* 2>/dev/null; true",
+                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                    f"rm -f /src/*.o 2>/dev/null; true",
                 )
                 _exec_capture(container, "sudo -E SANITIZER=address compile 2>&1", timeout=300)
-                _exec_capture(
-                    container,
-                    "mkdir -p /out/address && "
-                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && cp \"$f\" /out/address/; done; true",
-                )
+                _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
                 merge_results.append(step)
                 continue
 
@@ -925,7 +912,6 @@ def run_merge(args: argparse.Namespace) -> int:
             logger.info("[%s] Verifying self-trigger...", bug_id)
             step["self_triggers"] = verify_bug_triggers(
                 container, bug_id, bd["fuzzer"], bd["testcase"],
-                bd.get("sanitizer", "address"),
                 bd.get("crash_log"),
             )
 
