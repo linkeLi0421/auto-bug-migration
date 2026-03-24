@@ -132,6 +132,152 @@ def _find_conflicting_bugs(
 
 
 # ---------------------------------------------------------------------------
+# Bug ownership markers — annotate source after each diff is applied
+# ---------------------------------------------------------------------------
+
+def _annotate_diff_ownership(
+    container: str,
+    project: str,
+    diff_path: str,
+    bug_id: str,
+) -> None:
+    """Insert //BUG_START and //BUG_END markers around code added by a diff.
+
+    After a bug's diff has been applied to the source tree, this function
+    parses the diff to find contiguous groups of added lines (``+`` lines)
+    and wraps them with ownership comments so that a later conflict-
+    resolution agent can see which code belongs to which bug and avoid
+    modifying it.
+
+    The annotation is done with a Python helper script executed inside the
+    container, operating on the files already modified by the diff.
+    """
+    # Read the diff content
+    diff_text = Path(diff_path).read_text(errors="replace")
+
+    # Parse: collect (file, start_line, count) for each contiguous added block.
+    # We track the "new file" line number so we know where added lines land.
+    annotations: list[tuple[str, list[tuple[int, int]]]] = []
+    current_file = None
+    file_blocks: dict[str, list[tuple[int, int]]] = {}
+
+    new_line = 0
+    in_hunk = False
+    add_start = None
+    add_count = 0
+
+    for raw_line in diff_text.splitlines():
+        # Detect file header
+        m = re.match(r'^\+\+\+ b/(.+)$', raw_line)
+        if m:
+            # Flush previous add block
+            if add_start is not None and current_file:
+                file_blocks.setdefault(current_file, []).append(
+                    (add_start, add_count))
+                add_start = None
+                add_count = 0
+            current_file = m.group(1)
+            in_hunk = False
+            continue
+
+        # Detect hunk header
+        hm = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@', raw_line)
+        if hm:
+            # Flush
+            if add_start is not None and current_file:
+                file_blocks.setdefault(current_file, []).append(
+                    (add_start, add_count))
+                add_start = None
+                add_count = 0
+            new_line = int(hm.group(1))
+            in_hunk = True
+            continue
+
+        if not in_hunk or current_file is None:
+            continue
+
+        if raw_line.startswith('+'):
+            if add_start is None:
+                add_start = new_line
+                add_count = 1
+            else:
+                add_count += 1
+            new_line += 1
+        elif raw_line.startswith('-'):
+            # Deleted line — flush any add block
+            if add_start is not None:
+                file_blocks.setdefault(current_file, []).append(
+                    (add_start, add_count))
+                add_start = None
+                add_count = 0
+            # Deleted lines don't advance new_line
+        else:
+            # Context line — flush any add block
+            if add_start is not None:
+                file_blocks.setdefault(current_file, []).append(
+                    (add_start, add_count))
+                add_start = None
+                add_count = 0
+            new_line += 1
+
+    # Flush final block
+    if add_start is not None and current_file:
+        file_blocks.setdefault(current_file, []).append(
+            (add_start, add_count))
+
+    if not file_blocks:
+        return
+
+    # Only annotate C/C++ source files where // comments are valid
+    c_exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+    file_blocks = {
+        f: b for f, b in file_blocks.items()
+        if Path(f).suffix.lower() in c_exts
+    }
+    if not file_blocks:
+        return
+
+    # Build a Python script that inserts markers into the source files.
+    # Process blocks in reverse order so line numbers stay valid.
+    marker_start = f"//BUG_START {bug_id}"
+    marker_end = f"//BUG_END {bug_id}"
+
+    script_parts = [
+        "import sys",
+        "def annotate(path, blocks, ms, me):",
+        "    with open(path) as f: lines = f.readlines()",
+        "    for start, count in sorted(blocks, reverse=True):",
+        "        idx = start - 1",
+        "        if idx < 0 or idx > len(lines): continue",
+        "        # Skip if already annotated (by any bug)",
+        "        if idx > 0 and '//BUG_START' in lines[idx-1]: continue",
+        "        end_idx = idx + count",
+        "        lines.insert(end_idx, me + '\\n')",
+        "        lines.insert(idx, ms + '\\n')",
+        "    with open(path, 'w') as f: f.writelines(lines)",
+    ]
+
+    for fpath, blocks in file_blocks.items():
+        blocks_repr = repr(blocks)
+        script_parts.append(
+            f"annotate('/src/{project}/{fpath}', {blocks_repr}, "
+            f"{marker_start!r}, {marker_end!r})"
+        )
+
+    script = "\n".join(script_parts)
+    ret, output = _exec_capture(
+        container, f"python3 -c {shlex.quote(script)}", timeout=30,
+    )
+    if ret != 0:
+        logger.warning("[%s] Annotation failed: %s", bug_id, output[:300])
+    else:
+        n_files = len(file_blocks)
+        n_blocks = sum(len(b) for b in file_blocks.values())
+        logger.info("[%s] Annotated %d block(s) across %d file(s)",
+                    bug_id, n_blocks, n_files)
+
+
+# ---------------------------------------------------------------------------
 # Dispatch branch infrastructure
 # ---------------------------------------------------------------------------
 
@@ -579,6 +725,21 @@ def resolve_conflict_with_agent(
             Both patches are minimized (every hunk is necessary). You MUST
             preserve the bug-triggering logic from BOTH patches.
 
+            IMPORTANT — Bug ownership markers:
+            The source code contains comment markers that identify which code
+            belongs to which previously-applied bug:
+
+                //BUG_START OSV-XXXX
+                ... code for that bug ...
+                //BUG_END OSV-XXXX
+
+            You MUST NOT modify, move, or wrap code between these markers.
+            That code belongs to a previous bug and must stay exactly as-is.
+            Only add NEW code for bug {bug_id} outside these marked regions.
+            If {bug_id}'s patch needs to change the same lines as a marked
+            region, add {bug_id}'s version separately and use a dispatch
+            branch to select between them at runtime.
+
             Strategy:
             1. Read the patch file /tmp/{diff_name} to see ALL changes.
             2. For each change, apply it to the current code. Where the new
@@ -598,6 +759,10 @@ def resolve_conflict_with_agent(
                is harmless; a missing one loses a bug.
             4. If a hunk can be applied without conflicting with existing
                changes, apply it directly (no dispatch needed for that hunk).
+            5. After adding your code, wrap it with markers:
+               //BUG_START {bug_id}
+               ... your new code ...
+               //BUG_END {bug_id}
 
             After making changes, run: sudo -E compile
             If there are build errors, fix them.
@@ -622,6 +787,18 @@ def resolve_conflict_with_agent(
             Since both patches are minimized (every hunk is necessary for its
             bug), you MUST preserve the bug-triggering logic from BOTH patches.
 
+            IMPORTANT — Bug ownership markers:
+            The source code contains comment markers that identify which code
+            belongs to which previously-applied bug:
+
+                //BUG_START OSV-XXXX
+                ... code for that bug ...
+                //BUG_END OSV-XXXX
+
+            You MUST NOT modify, move, or wrap code between these markers.
+            That code belongs to a previous bug and must stay exactly as-is.
+            Only add NEW code for bug {bug_id} outside these marked regions.
+
             Please:
             1. Read the patch file /tmp/{diff_name} to understand what changes it makes
             2. Look at the current state of the conflicting files in /src/{project}
@@ -629,6 +806,10 @@ def resolve_conflict_with_agent(
                the code as it currently is (including changes from previously applied bugs)
             4. Make sure the changes preserve the bug-triggering logic from the patch
             5. Do NOT revert changes from previously applied bugs
+            6. Wrap your new code with markers:
+               //BUG_START {bug_id}
+               ... your new code ...
+               //BUG_END {bug_id}
 
             After making changes, run: sudo -E compile
             If there are build errors, fix them.
@@ -750,6 +931,20 @@ def resolve_with_dispatch(
             }}
 
         The header is at /src/{project}/__bug_dispatch.h.
+
+        IMPORTANT — Bug ownership markers:
+        The source code contains comment markers that identify which code
+        belongs to which previously-applied bug:
+
+            //BUG_START OSV-XXXX
+            ... code for that bug ...
+            //BUG_END OSV-XXXX
+
+        You MUST NOT modify, move, or wrap code between these markers.
+        That code belongs to a previous bug and must stay exactly as-is.
+        Only wrap code from {bug_id} (the newly-applied bug) in dispatch
+        branches. When wrapping, place dispatch branches OUTSIDE the
+        marked regions, never inside them.
 
         Rules:
         - Read the patch file to see ALL hunks
@@ -1410,6 +1605,10 @@ def run_merge(args: argparse.Namespace) -> int:
             # --- Try to apply ---
             method = try_apply_diff(container, diff_path, project)
             step["apply_method"] = method
+
+            # Annotate source with bug ownership markers after clean apply
+            if method in ("clean", "3way"):
+                _annotate_diff_ownership(container, project, diff_path, bug_id)
 
             if method == "conflict":
                 # Identify which previously-applied bugs overlap
