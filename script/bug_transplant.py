@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -389,12 +390,31 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
+    # Detect project language from project.yaml
+    project_yaml = HOME_DIR / "oss-fuzz" / "projects" / args.project / "project.yaml"
+    language = "c++"
+    if project_yaml.exists():
+        for line in project_yaml.read_text().splitlines():
+            if line.startswith("language:"):
+                language = line.split(":", 1)[1].strip().strip('"').strip("'")
+                break
+
     # --- Start persistent container ---
     docker_run_cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "--privileged",
         "--shm-size=2g",
+        # OSS-Fuzz build env vars (required by /usr/local/bin/compile)
+        "-e", "FUZZING_ENGINE=libfuzzer",
+        "-e", "SANITIZER=address",
+        "-e", "ARCHITECTURE=x86_64",
+        "-e", f"FUZZING_LANGUAGE={language}",
+        "-e", "HELPER=True",
+        "-e", "MAKEFLAGS=--output-sync=line -j30",
+        "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
+        "-e", "NINJA_STATUS=",
+        "-e", "TERM=dumb",
         # Volumes
         "-v", f"{data_dir}:/data",
         "-v", f"{testcases_dir}:/corpus",
@@ -538,6 +558,64 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 logger.info("Git diff saved: %s (%d bytes)", diff_path, len(git_diff))
             else:
                 logger.warning("Diff is empty -- agent may not have produced changes")
+
+        # ---------------------------------------------------------------
+        # Post-agent verification: rebuild with official `compile` and
+        # check that the bug actually triggers.  The agent may have used
+        # a non-standard build that produces different binaries.
+        # ---------------------------------------------------------------
+        if exit_code == 0 and (agent_diff.strip() if 'agent_diff' in dir() else True):
+            logger.info("=== Post-agent verification ===")
+            fuzzer = args.fuzzer_name
+            testcase = args.testcase
+
+            # Force official build
+            logger.info("Rebuilding with official compile...")
+            ret_build, build_out = _exec_capture(
+                container_name, "sudo -E compile 2>&1", timeout=300,
+            )
+            if ret_build != 0:
+                logger.error("Official compile failed after agent run")
+                logger.error("Build tail: %s", build_out[-500:] if build_out else "")
+                return 1
+
+            # Copy testcase in case compile wiped /work
+            _exec_capture(
+                container_name,
+                "cp /corpus/testcase-* /work/ 2>/dev/null; true",
+            )
+
+            # Run fuzzer with testcase
+            fuzzer_path = f"/out/{fuzzer}"
+            sym_path = "/out/llvm-symbolizer"
+            verify_cmd = (
+                f"export ASAN_OPTIONS=detect_leaks=0"
+                f":external_symbolizer_path={sym_path}; "
+                f"if [ ! -x {fuzzer_path} ]; then "
+                f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
+                f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
+            )
+            ret_fuzz, fuzz_out = _exec_capture(
+                container_name, verify_cmd, timeout=120,
+            )
+
+            # Check for crash
+            has_crash = bool(re.search(
+                r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
+                fuzz_out,
+            ))
+            if has_crash:
+                logger.info("Post-agent verification PASSED: bug triggers "
+                            "with official build")
+            else:
+                logger.error(
+                    "Post-agent verification FAILED: bug does NOT trigger "
+                    "with official compile. The agent may have used a "
+                    "non-standard build. exit=%d tail=%.300s",
+                    ret_fuzz,
+                    fuzz_out[-300:] if fuzz_out else "(empty)",
+                )
+                return 1
 
         return exit_code
 

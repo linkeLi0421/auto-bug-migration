@@ -513,10 +513,18 @@ def resolve_conflict_with_agent(
     agent: str = "claude",
     model: str | None = None,
     conflicting_diffs: list[tuple[str, str]] | None = None,
-) -> bool:
-    """Use a code agent to resolve a merge conflict by combining changes.
+    dispatch_bit: int | None = None,
+) -> str:
+    """Use a code agent to resolve a merge conflict.
 
-    Returns True if resolved successfully.
+    When *conflicting_diffs* and *dispatch_bit* are provided, the agent is
+    instructed to use input-driven dispatch branches for truly contradictory
+    changes.
+
+    Returns:
+      ``"resolved"``  – combined without dispatch branches
+      ``"dispatch"``  – dispatch branch(es) used
+      ``"failed"``    – could not resolve
     """
     # Import agent config from bug_transplant
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -555,31 +563,76 @@ def resolve_conflict_with_agent(
             )
     conflict_desc = "\n".join(conflict_desc_lines) if conflict_desc_lines else "  (unknown)"
 
-    prompt = textwrap.dedent(f"""\
-        I am merging multiple bug transplant patches into project {project}.
+    # Build dispatch-aware prompt when dispatch infrastructure is available
+    if dispatch_bit is not None:
+        prompt = textwrap.dedent(f"""\
+            I am merging multiple bug transplant patches into project {project}.
 
-        The following bugs have already been applied successfully: {applied_list}
+            The following bugs have already been applied successfully: {applied_list}
 
-        I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
-        has merge conflicts with the current state of the code.
+            I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
+            has merge conflicts with the current state of the code.
 
-        The conflicting previously-applied bug(s) and their patches:
-        {conflict_desc}
+            The conflicting previously-applied bug(s) and their patches:
+            {conflict_desc}
 
-        Since both patches are minimized (every hunk is necessary for its
-        bug), you MUST preserve the bug-triggering logic from BOTH patches.
+            Both patches are minimized (every hunk is necessary). You MUST
+            preserve the bug-triggering logic from BOTH patches.
 
-        Please:
-        1. Read the patch file /tmp/{diff_name} to understand what changes it makes
-        2. Look at the current state of the conflicting files in /src/{project}
-        3. Manually apply the changes from the patch, adapting them to work with
-           the code as it currently is (including changes from previously applied bugs)
-        4. Make sure the changes preserve the bug-triggering logic from the patch
-        5. Do NOT revert changes from previously applied bugs
+            Strategy:
+            1. Read the patch file /tmp/{diff_name} to see ALL changes.
+            2. For each change, apply it to the current code. Where the new
+               patch and existing code disagree on the same lines, wrap it
+               in a dispatch branch:
 
-        After making changes, run: sudo -E compile
-        If there are build errors, fix them.
-    """)
+               #include "__bug_dispatch.h"
+               if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                   // Code from bug {bug_id}'s patch
+               }} else {{
+                   // Existing code (from previously-applied bugs)
+               }}
+
+               The header is at /src/{project}/__bug_dispatch.h.
+
+            3. When in doubt, use a dispatch branch. An unnecessary branch
+               is harmless; a missing one loses a bug.
+            4. If a hunk can be applied without conflicting with existing
+               changes, apply it directly (no dispatch needed for that hunk).
+
+            After making changes, run: sudo -E compile
+            If there are build errors, fix them.
+
+            At the VERY END of your output, write exactly one of these tokens
+            on its own line:
+              DISPATCH_USED   — if you created any dispatch branches
+              NO_DISPATCH     — if you applied all changes without branching
+        """)
+    else:
+        prompt = textwrap.dedent(f"""\
+            I am merging multiple bug transplant patches into project {project}.
+
+            The following bugs have already been applied successfully: {applied_list}
+
+            I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
+            has merge conflicts with the current state of the code.
+
+            The conflicting previously-applied bug(s) and their patches:
+            {conflict_desc}
+
+            Since both patches are minimized (every hunk is necessary for its
+            bug), you MUST preserve the bug-triggering logic from BOTH patches.
+
+            Please:
+            1. Read the patch file /tmp/{diff_name} to understand what changes it makes
+            2. Look at the current state of the conflicting files in /src/{project}
+            3. Manually apply the changes from the patch, adapting them to work with
+               the code as it currently is (including changes from previously applied bugs)
+            4. Make sure the changes preserve the bug-triggering logic from the patch
+            5. Do NOT revert changes from previously applied bugs
+
+            After making changes, run: sudo -E compile
+            If there are build errors, fix them.
+        """)
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -590,16 +643,22 @@ def resolve_conflict_with_agent(
 
     if ret != 0:
         logger.error("[%s] %s agent failed (exit %d)", bug_id, agent, ret)
-        return False
+        return "failed"
 
     # Verify it compiles
     ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after conflict resolution", bug_id)
-        return False
+        return "failed"
 
-    logger.info("[%s] Conflict resolved by combining", bug_id)
-    return True
+    # Determine whether dispatch branches were used
+    if dispatch_bit is not None and "DISPATCH_USED" in output:
+        logger.info("[%s] Conflict resolved with dispatch branch (bit %s)",
+                    bug_id, dispatch_bit)
+        return "dispatch"
+
+    logger.info("[%s] Conflict resolved by combining (no dispatch)", bug_id)
+    return "resolved"
 
 
 def resolve_with_dispatch(
@@ -608,6 +667,7 @@ def resolve_with_dispatch(
     project: str,
     regressed_bugs: list[dict],
     dispatch_bit: int,
+    current_diff_path: str | None = None,
     agent: str = "claude",
     model: str | None = None,
 ) -> bool:
@@ -615,7 +675,9 @@ def resolve_with_dispatch(
 
     Called AFTER a transplant diff has been applied and verified, when
     regression checking reveals that previously-working bugs stopped
-    triggering.  The agent wraps the contradictory code in dispatch branches.
+    triggering.  The agent reads both the newly-applied patch and the
+    regressed bugs' patches to identify contradictory code, then wraps
+    it in dispatch branches.
 
     Returns True if dispatch was applied and build succeeds.
     """
@@ -641,6 +703,30 @@ def resolve_with_dispatch(
             f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
         )
 
+    # Copy patches into container for the agent to read
+    patch_lines = []
+    if current_diff_path:
+        subprocess.call(
+            ["docker", "cp", current_diff_path,
+             f"{container}:/tmp/patch_{bug_id}.diff"],
+        )
+        patch_lines.append(
+            f"  - Bug {bug_id} (newly applied): /tmp/patch_{bug_id}.diff"
+        )
+
+    for rb in regressed_bugs:
+        rp = rb.get("diff_path")
+        if rp:
+            rb_id = rb["bug_id"]
+            subprocess.call(
+                ["docker", "cp", rp,
+                 f"{container}:/tmp/patch_{rb_id}.diff"],
+            )
+            patch_lines.append(
+                f"  - Bug {rb_id} (regressed): /tmp/patch_{rb_id}.diff"
+            )
+    patch_list = "\n".join(patch_lines) if patch_lines else "  (no patches available)"
+
     regressed_ids = ", ".join(b["bug_id"] for b in regressed_bugs)
 
     prompt = textwrap.dedent(f"""\
@@ -649,29 +735,33 @@ def resolve_with_dispatch(
         After applying the patch for bug {bug_id}, these previously-working
         bugs stopped triggering: {regressed_ids}
 
-        This means some code changes needed by {bug_id} are contradictory
-        with code that the regressed bugs depend on.
+        I need you to wrap ALL code changes from {bug_id}'s patch in
+        dispatch branches so both sides can coexist in the same binary.
 
-        I need you to wrap the contradictory code in dispatch branches so
-        that BOTH sides can coexist in the same binary:
+        The patch for {bug_id}: /tmp/patch_{bug_id}.diff
 
-        #include "__bug_dispatch.h"
-        if (__bug_dispatch & (1 << {dispatch_bit})) {{
-            // Code needed by bug {bug_id}
-        }} else {{
-            // Original code needed by the regressed bugs
-        }}
+        For EVERY change this patch makes to the source code, wrap it:
+
+            #include "__bug_dispatch.h"
+            if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                // {bug_id}'s version of the code (from the patch)
+            }} else {{
+                // Original code (before the patch, needed by regressed bugs)
+            }}
 
         The header is at /src/{project}/__bug_dispatch.h.
-        The variable __bug_dispatch is a global uint8_t set from the fuzz
-        input at runtime.
 
-        To identify the contradictory code:
-        1. Look at the current git diff: cd /src/{project} && git diff
-        2. The changes from {bug_id}'s patch are in there — find the hunks
-           that would affect the regressed bugs' crash paths
-        3. Wrap ONLY the contradictory parts in dispatch branches
-        4. Leave compatible changes as-is
+        Rules:
+        - Read the patch file to see ALL hunks
+        - For each hunk, find where it was applied in the current source
+        - Wrap the changed lines in a dispatch branch
+        - The else branch must contain the ORIGINAL code (before {bug_id}'s
+          changes), not the current code
+        - If a hunk moves code (removes from one place, adds to another),
+          BOTH the removal site and the addition site need dispatch branches
+        - Do NOT skip any hunk — wrap them ALL
+        - An unnecessary dispatch branch is harmless; a missing one loses
+          a bug
 
         After making changes, run: sudo -E compile
         If there are build errors, fix them.
@@ -693,6 +783,180 @@ def resolve_with_dispatch(
         return False
 
     logger.info("[%s] Dispatch branches added (bit %d)", bug_id, dispatch_bit)
+    return True
+
+
+def _rebuild_and_apply_dispatch(
+    container: str,
+    project: str,
+    dispatch_state: dict,
+) -> None:
+    """Rebuild ASAN+UBSAN and re-apply dispatch bytes after code changes."""
+    for san in ("address", "undefined"):
+        _exec_capture(
+            container,
+            f"cd /src/{project} && make clean 2>/dev/null; "
+            f"rm -rf .obj *.a *.o 2>/dev/null; "
+            f"rm -f /src/*.o 2>/dev/null; true",
+        )
+        _exec_capture(
+            container,
+            f"sudo -E SANITIZER={san} compile 2>&1",
+            timeout=300,
+        )
+        _exec_capture(
+            container,
+            f"mkdir -p /out/{san} && "
+            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+            f"cp \"$f\" /out/{san}/; done; true",
+        )
+    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    if dispatch_state["poc_bytes"]:
+        _apply_all_dispatch_bytes(container, dispatch_state)
+
+
+def resolve_self_trigger_with_dispatch(
+    container: str,
+    bug_id: str,
+    project: str,
+    applied_bugs_data: list[dict],
+    crash_log: str | None,
+    current_diff_path: str | None,
+    dispatch_bit: int,
+    agent: str = "claude",
+    model: str | None = None,
+) -> bool:
+    """Add dispatch branches to unblock a bug whose self-trigger fails.
+
+    Called when a transplant diff has been applied and builds, but the bug
+    does not trigger — indicating that a previously-applied patch blocks the
+    testcase from reaching the crash site.  The agent reads the crash log and
+    all patches to identify the blocking change and wraps it in a dispatch
+    branch.
+
+    Returns True if dispatch was applied and build succeeds.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import AGENT_CONFIG
+
+    cfg = AGENT_CONFIG[agent]
+    logger.info("[%s] Invoking %s to unblock self-trigger (bit %d), "
+                "analyzing %d previous patches...",
+                bug_id, agent, dispatch_bit, len(applied_bugs_data))
+
+    # Setup agent credentials
+    creds_dir = cfg["credentials_dir"]
+    _exec(
+        container,
+        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
+        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        "true",
+    )
+    if cfg.get("credentials_config"):
+        _exec(
+            container,
+            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+        )
+
+    # Copy current bug's patch into container
+    patch_lines = []
+    if current_diff_path:
+        subprocess.call(
+            ["docker", "cp", current_diff_path,
+             f"{container}:/tmp/patch_{bug_id}.diff"],
+        )
+
+    # Copy crash log into container
+    crash_line = "(no crash log available)"
+    if crash_log and Path(crash_log).exists():
+        subprocess.call(
+            ["docker", "cp", crash_log,
+             f"{container}:/tmp/crash_{bug_id}.txt"],
+        )
+        crash_line = f"/tmp/crash_{bug_id}.txt"
+
+    # Copy previously-applied patches
+    prev_lines = []
+    for pb in applied_bugs_data:
+        pb_id = pb["bug_id"]
+        pp = pb.get("diff_path")
+        if pp:
+            subprocess.call(
+                ["docker", "cp", pp,
+                 f"{container}:/tmp/patch_{pb_id}.diff"],
+            )
+            prev_lines.append(f"  - Bug {pb_id}: /tmp/patch_{pb_id}.diff")
+    prev_list = "\n".join(prev_lines) if prev_lines else "  (none)"
+
+    prompt = textwrap.dedent(f"""\
+        I am merging multiple bug transplant patches into project {project}.
+
+        Bug {bug_id}'s patch has been applied, but the bug does NOT trigger
+        — the fuzzer exits cleanly (exit=0, no crash). The patch works when
+        applied alone, so previously-applied patches are blocking the
+        testcase from reaching the crash site.
+
+        The crash log showing what this bug SHOULD produce:
+          {crash_line}
+
+        Bug {bug_id}'s minimized patch:
+          /tmp/patch_{bug_id}.diff
+
+        Previously-applied patches:
+        {prev_list}
+
+        I need you to wrap the blocking changes in dispatch branches.
+
+        Step 1: Read {bug_id}'s patch to understand what functions and code
+                paths the bug needs to reach.
+
+        Step 2: Run `cd /src/{project} && git diff` to see ALL currently
+                applied changes in the source.
+
+        Step 3: For every change in the git diff that is in a function or
+                code path that {bug_id}'s testcase needs to traverse (based
+                on the crash log and {bug_id}'s patch), wrap it in a
+                dispatch branch:
+
+            #include "__bug_dispatch.h"
+            if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                // Original code (before any patches — what {bug_id} needs)
+            }} else {{
+                // Currently-applied change (needed by previous bugs)
+            }}
+
+        The header is at /src/{project}/__bug_dispatch.h.
+
+        Rules:
+        - When in doubt, WRAP the change. An unnecessary dispatch branch
+          is harmless; a missing one means the bug won't trigger.
+        - Check the previously-applied patch files to understand which
+          changes came from which bug.
+        - If a previous patch has multiple hunks in the same file, wrap
+          ALL of them — do not skip any.
+
+        After making changes, run: sudo -E compile
+        If there are build errors, fix them.
+    """)
+
+    escaped = shlex.quote(prompt)
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+
+    ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+    if ret != 0:
+        logger.error("[%s] Self-trigger dispatch agent failed (exit %d)",
+                     bug_id, ret)
+        return False
+
+    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    if ret != 0:
+        logger.error("[%s] Build failed after self-trigger dispatch", bug_id)
+        return False
+
+    logger.info("[%s] Self-trigger dispatch applied (bit %d)", bug_id,
+                dispatch_bit)
     return True
 
 
@@ -1154,12 +1418,46 @@ def run_merge(args: argparse.Namespace) -> int:
                     (c["bug_id"], c["diff_path"]) for c in conflicting
                 ]
 
-                resolved = resolve_conflict_with_agent(
+                # Inject dispatch files on first conflict (idempotent)
+                if not dispatch_state["dispatch_file_injected"]:
+                    _inject_dispatch_files(container, project)
+                    dispatch_state["dispatch_file_injected"] = True
+
+                bit_index = dispatch_state["next_bit"]
+
+                result = resolve_conflict_with_agent(
                     container, diff_path, bug_id, project,
                     applied_bugs, args.agent, args.model,
                     conflicting_diffs=conflicting_info,
+                    dispatch_bit=bit_index,
                 )
-                if resolved:
+
+                if result == "dispatch":
+                    step["apply_method"] = "dispatch"
+                    dispatch_state["bits"][bit_index] = {
+                        "bug_new": bug_id,
+                        "bug_existing": [c["bug_id"] for c in conflicting],
+                    }
+                    dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                    dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                    for c in conflicting:
+                        dispatch_state["poc_bytes"].setdefault(c["bug_id"], 0)
+                    dispatch_state["next_bit"] += 1
+
+                    if not dispatch_state["harness_modified"]:
+                        ok = _modify_harness_for_dispatch(
+                            container, project, bd["fuzzer"],
+                            args.agent, args.model,
+                        )
+                        if ok:
+                            dispatch_state["harness_modified"] = True
+                        else:
+                            logger.error("[%s] Harness modification failed", bug_id)
+                            step["apply_method"] = "failed"
+                            merge_results.append(step)
+                            continue
+
+                elif result == "resolved":
                     step["apply_method"] = "agent_resolved"
                 else:
                     step["apply_method"] = "failed"
@@ -1197,6 +1495,20 @@ def run_merge(args: argparse.Namespace) -> int:
             _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
             if dispatch_state["poc_bytes"]:
                 _apply_all_dispatch_bytes(container, dispatch_state)
+
+            # Save per-step diff snapshot for debugging
+            if not build_failed:
+                step_dir = (DATA_DIR / "bug_transplant"
+                            / f"merge_{project}_{target_commit[:8]}" / "steps")
+                step_dir.mkdir(parents=True, exist_ok=True)
+                _, step_diff = _exec_capture(
+                    container, f"cd /src/{project} && git diff",
+                )
+                step_file = step_dir / f"step_{i+1:02d}_{bug_id}.diff"
+                step_file.write_text(step_diff)
+                step["step_diff_path"] = str(step_file)
+                logger.info("[%s] Saved step diff: %s (%d bytes)",
+                            bug_id, step_file, len(step_diff))
 
             step["build_ok"] = not build_failed
             if build_failed:
@@ -1242,6 +1554,72 @@ def run_merge(args: argparse.Namespace) -> int:
                 bd.get("crash_log"),
             )
 
+            # --- If self-trigger fails, try dispatch to unblock ---
+            if not step["self_triggers"] and applied_bugs:
+                logger.info(
+                    "[%s] Self-trigger failed — attempting dispatch to "
+                    "unblock from %d previous patches...",
+                    bug_id, len(applied_bugs),
+                )
+
+                if not dispatch_state["dispatch_file_injected"]:
+                    _inject_dispatch_files(container, project)
+                    dispatch_state["dispatch_file_injected"] = True
+
+                bit_index = dispatch_state["next_bit"]
+                prev_bugs_data = [
+                    next(d for d in ordered if d["bug_id"] == pid)
+                    for pid in applied_bugs
+                ]
+
+                dispatch_ok = resolve_self_trigger_with_dispatch(
+                    container, bug_id, project,
+                    prev_bugs_data, bd.get("crash_log"),
+                    bd["diff_path"], bit_index,
+                    agent=args.agent, model=args.model,
+                )
+
+                if dispatch_ok:
+                    if not dispatch_state["harness_modified"]:
+                        hok = _modify_harness_for_dispatch(
+                            container, project, bd["fuzzer"],
+                            args.agent, args.model,
+                        )
+                        if hok:
+                            dispatch_state["harness_modified"] = True
+                            for lb in local_bugs:
+                                dispatch_state["poc_bytes"].setdefault(
+                                    lb["bug_id"], 0)
+                            for tbd in ordered:
+                                dispatch_state["poc_bytes"].setdefault(
+                                    tbd["bug_id"], 0)
+
+                    if dispatch_state["harness_modified"]:
+                        dispatch_state["bits"][bit_index] = {
+                            "bug_new": bug_id,
+                            "bug_blocked_by": list(applied_bugs),
+                            "type": "self_trigger_unblock",
+                        }
+                        dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                        dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                        dispatch_state["next_bit"] += 1
+
+                        _rebuild_and_apply_dispatch(
+                            container, project, dispatch_state)
+
+                        step["self_triggers"] = verify_bug_triggers(
+                            container, bug_id, bd["fuzzer"], bd["testcase"],
+                            bd.get("sanitizer", "address"),
+                            bd.get("crash_log"),
+                        )
+                        if step["self_triggers"]:
+                            step["apply_method"] += "+dispatch"
+                            logger.info(
+                                "[%s] Self-trigger OK after dispatch", bug_id)
+                        else:
+                            logger.warning(
+                                "[%s] Still fails after dispatch", bug_id)
+
             # --- Verify all previously applied bugs (regression check) ---
             if all_verified_bugs:
                 logger.info("[%s] Regression check (%d bugs)...", bug_id, len(all_verified_bugs))
@@ -1275,7 +1653,8 @@ def run_merge(args: argparse.Namespace) -> int:
                     bit_index = dispatch_state["next_bit"]
                     dispatch_ok = resolve_with_dispatch(
                         container, bug_id, project, regressed,
-                        bit_index, args.agent, args.model,
+                        bit_index, current_diff_path=bd["diff_path"],
+                        agent=args.agent, model=args.model,
                     )
 
                     if dispatch_ok:
@@ -1307,27 +1686,8 @@ def run_merge(args: argparse.Namespace) -> int:
                                 dispatch_state["poc_bytes"].setdefault(b["bug_id"], 0)
                             dispatch_state["next_bit"] += 1
 
-                            # Rebuild and re-apply dispatch bytes
-                            for san in ("address", "undefined"):
-                                _exec_capture(
-                                    container,
-                                    f"cd /src/{project} && make clean 2>/dev/null; "
-                                    f"rm -rf .obj *.a *.o 2>/dev/null; "
-                                    f"rm -f /src/*.o 2>/dev/null; true",
-                                )
-                                _exec_capture(
-                                    container,
-                                    f"sudo -E SANITIZER={san} compile 2>&1",
-                                    timeout=300,
-                                )
-                                _exec_capture(
-                                    container,
-                                    f"mkdir -p /out/{san} && "
-                                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                                    f"cp \"$f\" /out/{san}/; done; true",
-                                )
-                            _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
-                            _apply_all_dispatch_bytes(container, dispatch_state)
+                            _rebuild_and_apply_dispatch(
+                                container, project, dispatch_state)
 
                             # Re-verify regressed bugs
                             re_results = verify_all_bugs(container, regressed)
@@ -1397,6 +1757,22 @@ def run_merge(args: argparse.Namespace) -> int:
 
         # Also copy to /out inside container
         _exec(container, f"cd /src/{project} && git diff > /out/combined.diff")
+
+        # Save dispatch-modified PoCs to output directory
+        if dispatch_state["poc_bytes"]:
+            poc_dir = output_dir / "testcases"
+            poc_dir.mkdir(parents=True, exist_ok=True)
+            # Copy modified PoCs from /work/ in container to host
+            for bid, dval in dispatch_state["poc_bytes"].items():
+                testcase = f"testcase-{bid}"
+                host_path = poc_dir / testcase
+                subprocess.call(
+                    ["docker", "cp",
+                     f"{container}:/work/{testcase}",
+                     str(host_path)],
+                )
+            logger.info("Saved %d dispatch-modified PoCs to %s",
+                        len(dispatch_state["poc_bytes"]), poc_dir)
 
         # ------------------------------------------------------------------
         # 9. Write merge summary
