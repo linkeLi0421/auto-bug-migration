@@ -1,6 +1,0 @@
-Visibility warnings (-Wvisibility):
-- When the compiler emits "declaration of 'struct/union/enum X' will not be visible outside of this function [-Wvisibility]",
-  the fix is a forward declaration at file scope, NOT a function body rewrite.
-- Call `make_extra_patch_override(symbol_name="enum X")` (or `struct X` / `union X`) to insert the forward declaration
-  into the file's `_extra_*` hunk. Do NOT use get_error_patch_context or make_error_patch_override for this.
-- After make_extra_patch_override, run ossfuzz_apply_patch_and_test as usual.

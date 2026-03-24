@@ -1,5 +1,0 @@
-clang -c -o encoding.o encoding.c
-/src/libxml2/encoding.c:104:5: error: expected '}'
-    return NULL;
-    ^
-
