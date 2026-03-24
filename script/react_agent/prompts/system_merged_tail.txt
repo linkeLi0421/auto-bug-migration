@@ -1,2 +1,0 @@
-Merged/tail hunks (function-by-function):
-- Fix ONLY the active function (shown in error_func_code / focus_error_func_snippet) in this round.

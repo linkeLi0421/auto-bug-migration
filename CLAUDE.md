@@ -6,11 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository implements automated fuzzing workflows for OSS-Fuzz projects. The system transplants bug-triggering conditions from old (buggy) commits into current code versions, then merges all per-bug patches into a single version that triggers all bugs simultaneously.
 
-There are two pipelines:
-
-**New pipeline (Claude Code agent):** `bug_transplant_batch.py` iterates over bugs, `bug_transplant.py` runs Claude Code inside an OSS-Fuzz Docker container to semantically transplant each bug, and `bug_transplant_merge.py` merges per-bug diffs into one version with conflict resolution.
-
-**Legacy pipeline (ReAct agent):** `revert_patch_test.py` generates revert patches, calls `multi_agent.py` (which fans out to `agent_langgraph.py` per hunk) to fix build errors via LLM-generated override diffs. Still present in codebase but being replaced.
+`bug_transplant_batch.py` iterates over bugs, `bug_transplant.py` runs Claude Code inside an OSS-Fuzz Docker container to semantically transplant each bug, and `bug_transplant_merge.py` merges per-bug diffs into one version with conflict resolution.
 
 ## Key Commands
 
@@ -18,9 +14,9 @@ There are two pipelines:
 ```bash
 source script/setenv.sh
 ```
-Sets: `TESTCASES`, `REPO_PATH`, `BUGINFO_PATH`, `REACT_AGENT_JOBS`
+Sets: `TESTCASES`, `REPO_PATH`, `BUGINFO_PATH`, `ANTHROPIC_API_KEY`
 
-### New Pipeline: Bug Transplant via Claude Code
+### Bug Transplant via Claude Code
 
 #### Step 1: Batch transplant (one Claude Code session per bug)
 ```bash
@@ -74,7 +70,7 @@ sudo -E python3 script/bug_transplant.py <project> \
   --testcase testcase-OSV-XXXX --skip-collect
 ```
 
-### Data Collection (shared by both pipelines)
+### Data Collection
 ```bash
 # Collect crash log
 sudo -E python3 script/fuzz_helper.py collect_crash <project> <fuzzer> \
@@ -93,25 +89,10 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
   $TESTCASES/testcase-OSV-XXXX -e ASAN_OPTIONS=detect_leaks=0
 ```
 
-### Legacy Pipeline (ReAct agent)
-```bash
-# End-to-end (generates patches, fixes build errors, verifies)
-sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
-  --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/<project>_builds.csv \
-  --target <project> --auto-select-images
-```
-
-### Run tests
-```bash
-bash script/react_agent/test_langgraph_agent.sh
-bash script/react_agent/test_multi_agent.sh
-bash script/migration_tools/test_migration_tools.sh
-```
 
 ## Architecture
 
-### New Pipeline (top-down)
+### Pipeline (top-down)
 
 1. **`script/bug_transplant_batch.py`**: Batch orchestrator. Reads CSV/JSON data, selects target commit, resolves per-bug metadata (fuzzer, sanitizer, testcase), calls `bug_transplant.py` per bug. Outputs per-bug diffs to `data/bug_transplant/<project>_<bug_id>/`.
 
@@ -129,12 +110,6 @@ bash script/migration_tools/test_migration_tools.sh
 - **`script/buildAndtest.py`**: Generates CSV files by building/testing across commit ranges.
 - **`script/symbolizer.py`**, **`script/read_func_trace.py`**, **`script/compare_trace.py`**: Trace collection and analysis.
 - **`script/monitor_crash.py`**: Crash detection and stack extraction.
-
-### Legacy Pipeline (being replaced)
-
-- **`script/revert_patch_test.py`**: End-to-end orchestrator with AST-based diff splitting.
-- **`script/react_agent/`**: LangGraph ReAct agent, prompt system, tool registry.
-- **`script/migration_tools/`**: Patch bundle processing library.
 
 ## Key Concepts
 

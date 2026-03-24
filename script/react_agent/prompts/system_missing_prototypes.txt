@@ -1,5 +1,0 @@
-Missing prototypes:
-- For `-Wmissing-prototypes` warnings like “no previous prototype for function '__revert_*'”:
-  - Add a file-scope prototype via make_extra_patch_override (in the file's `_extra_*` hunk).
-  - Do NOT set prefer_definition — only a prototype (declaration) is needed, not a full function body.
-  - Do NOT silence by rewriting/removing the function.

@@ -1,4 +1,0 @@
-/src/libxml2/error.c:52:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'
-/src/libxml2/error.c:53:23: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'
-/src/libxml2/error.c:54:27: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'
-/src/libxml2/error.c:51:23: error: no member named 'nbErrors' in 'struct _xmlParserCtxt'

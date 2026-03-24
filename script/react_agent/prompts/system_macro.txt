@@ -1,4 +1,0 @@
-Macro-related syntax errors:
-- Do NOT invent placeholder `#define` values.
-- Use get_error_patch_context.macro_tokens_not_defined_in_slice as hints.
-- Prefer make_extra_patch_override(symbol_name=<TOKEN>) to insert the real macro definition into the file's `_extra_*` hunk (do not add `#define` lines in the function body).

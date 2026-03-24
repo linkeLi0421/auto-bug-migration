@@ -1,5 +1,0 @@
-clang -c -o error.o error.c
-/src/libxml2/error.c:675:27: error: no member named 'nbWarnings' in 'struct _xmlParserCtxt'
-    ctxt->nbWarnings++;
-                          ^
-

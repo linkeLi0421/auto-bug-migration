@@ -57,8 +57,7 @@ RESULT:  8 / 8 bugs triggering
 | `script/fuzz_helper.py` | Docker-based build/fuzz/reproduce/trace operations |
 | `script/buildAndtest.py` | Generate CSV files across commit ranges |
 | `data/feedback_bug_transplant.md` | Bug transplant methodology (categorize, revert, minimize) |
-| `script/react_agent/` | Legacy ReAct agent pipeline (being replaced) |
-| `script/revert_patch_test.py` | Legacy end-to-end orchestrator |
+| `script/oss-fuzz-api/` | OSV database utilities |
 | `Function_instrument/` | Trace instrumentation library |
 | `oss-fuzz/` | OSS-Fuzz framework checkout |
 
@@ -144,29 +143,6 @@ sudo -E python3 script/fuzz_helper.py build_version --commit <sha> \
 sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
   $TESTCASES/testcase-OSV-XXXX -e ASAN_OPTIONS=detect_leaks=0
 ```
-
-## Legacy pipeline
-
-The original pipeline uses a LangGraph ReAct agent with OpenAI models:
-
-```bash
-# End-to-end (generates patches, fixes build errors via LLM, verifies)
-sudo -E python3 script/revert_patch_test.py ~/log/<project>.csv \
-  --bug_info osv_testcases_summary.json \
-  --build_csv ~/log/<project>_builds.csv \
-  --target <project> --auto-select-images
-```
-
-This pipeline is being replaced by the Claude Code approach. Key differences:
-
-| | Legacy (ReAct agent) | New (Claude Code) |
-|---|---|---|
-| Agent | LangGraph + OpenAI | Claude Code CLI |
-| Approach | Mechanical function copy | Semantic (categorize, revert, minimize) |
-| Patch format | Pickle bundles (`.patch2`) | Plain `git diff` |
-| Build fixing | LLM tool loop per hunk | Claude Code edits files directly |
-| Merge | Compatibility graph + cliques | Incremental apply + regression check |
-| Conflict resolution | Detected but not resolved | Claude Code resolves automatically |
 
 ## Contributing
 

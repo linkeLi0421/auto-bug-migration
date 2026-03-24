@@ -1,2 +1,0 @@
-Available tools (call at most one per turn):
-{tools}

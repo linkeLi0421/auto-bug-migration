@@ -1,5 +1,0 @@
-./.libs/libxml2.a(encoding.o): in function `__revert_e11519_xmlLookupCharEncodingHandler':
-encoding.c:(.text.__revert_e11519_xmlLookupCharEncodingHandler+0xcf): undefined reference to `defaultHandlers'
-/usr/bin/ld: ./.libs/libxml2.a(parser.o): in function `__revert_e11519_xmlSkipBlankChars':
-parser.c:(.text.__revert_e11519_xmlSkipBlankChars+0x7cf): undefined reference to `xmlSaturatedAddSizeT'
-clang: error: linker command failed with exit code 1 (use -v to see invocation)

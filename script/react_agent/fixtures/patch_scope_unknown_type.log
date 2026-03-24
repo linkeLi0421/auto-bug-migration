@@ -1,3 +1,0 @@
-/src/libxml2/error.c:52:1: error: unknown type name 'foo_t'
-/src/libxml2/error.c:52:5: error: use of undeclared identifier 'bar'
-
