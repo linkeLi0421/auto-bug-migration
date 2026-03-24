@@ -116,6 +116,148 @@ def detect_conflicts(bug_diffs: list[dict]) -> list[tuple[str, str, set[str]]]:
     return conflicts
 
 
+def _find_conflicting_bugs(
+    current_bd: dict,
+    applied_bugs: list[str],
+    all_diffs: list[dict],
+) -> list[dict]:
+    """Find which previously-applied bug(s) have file overlap with *current_bd*."""
+    current_files = current_bd.get("_files", set())
+    conflicting = []
+    for prev_id in applied_bugs:
+        prev_bd = next((d for d in all_diffs if d["bug_id"] == prev_id), None)
+        if prev_bd and current_files & prev_bd.get("_files", set()):
+            conflicting.append(prev_bd)
+    return conflicting
+
+
+# ---------------------------------------------------------------------------
+# Dispatch branch infrastructure
+# ---------------------------------------------------------------------------
+
+_DISPATCH_HEADER = """\
+#ifndef __BUG_DISPATCH_H
+#define __BUG_DISPATCH_H
+#include <stdint.h>
+extern volatile uint8_t __bug_dispatch;
+#endif
+"""
+
+_DISPATCH_SOURCE = """\
+#include <stdint.h>
+volatile uint8_t __bug_dispatch = 0;
+"""
+
+
+def _inject_dispatch_files(container: str, project: str) -> None:
+    """Create __bug_dispatch.h and __bug_dispatch.c inside /src/{project}."""
+    for fname, content in (("__bug_dispatch.h", _DISPATCH_HEADER),
+                           ("__bug_dispatch.c", _DISPATCH_SOURCE)):
+        _exec_capture(
+            container,
+            f"cat > /src/{project}/{fname} << 'DISPATCH_EOF'\n{content}DISPATCH_EOF",
+        )
+    logger.info("Injected __bug_dispatch.h/.c into /src/%s", project)
+
+
+def _apply_all_dispatch_bytes(
+    container: str,
+    dispatch_state: dict,
+) -> None:
+    """Prepend dispatch bytes to PoCs in /work/ (idempotent — reads from /corpus/)."""
+    for bug_id, dval in dispatch_state["poc_bytes"].items():
+        testcase = f"testcase-{bug_id}"
+        _exec_capture(
+            container,
+            f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; "
+            f"python3 -c \""
+            f"d=open('/work/{testcase}','rb').read(); "
+            f"open('/work/{testcase}','wb').write(bytes([{dval}])+d)\"",
+        )
+
+
+def _modify_harness_for_dispatch(
+    container: str,
+    project: str,
+    fuzzer: str,
+    agent: str = "claude",
+    model: str | None = None,
+) -> bool:
+    """Use agent to modify the fuzz harness to consume a dispatch byte.
+
+    Returns True if harness was modified and builds successfully.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import AGENT_CONFIG
+
+    cfg = AGENT_CONFIG[agent]
+
+    # Setup agent credentials
+    creds_dir = cfg["credentials_dir"]
+    _exec(
+        container,
+        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
+        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        "true",
+    )
+    if cfg.get("credentials_config"):
+        _exec(
+            container,
+            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+        )
+
+    prompt = textwrap.dedent(f"""\
+        I need to modify the fuzz target for project {project} to support
+        an input-driven dispatch byte mechanism.
+
+        The file __bug_dispatch.h is already at /src/{project}/__bug_dispatch.h
+        and __bug_dispatch.c is at /src/{project}/__bug_dispatch.c.
+
+        Please make these changes:
+
+        1. Find the fuzz target source file that contains LLVMFuzzerTestOneInput
+           (likely builds the fuzzer "{fuzzer}").
+
+        2. Add at the top of that file:
+              #include "__bug_dispatch.h"
+
+        3. At the VERY START of LLVMFuzzerTestOneInput (before any existing
+           logic), add:
+              if (size < 1) return 0;
+              __bug_dispatch = data[0];
+              data++;
+              size--;
+
+        4. Make sure __bug_dispatch.c is compiled and linked into ALL fuzz
+           targets.  Depending on the build system you may need to:
+           - Add it to build.sh (e.g. add to a SOURCES list, or compile
+             and link it explicitly)
+           - Or add it to CMakeLists.txt / Makefile
+
+        After making changes, run: sudo -E compile
+        If there are build errors, fix them.
+    """)
+
+    escaped = shlex.quote(prompt)
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+
+    logger.info("Invoking %s to modify harness for dispatch byte...", agent)
+    ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+    if ret != 0:
+        logger.error("Harness modification agent failed (exit %d)", ret)
+        return False
+
+    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    if ret != 0:
+        logger.error("Build failed after harness modification")
+        return False
+
+    logger.info("Harness modified for dispatch byte mechanism")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Container helpers
 # ---------------------------------------------------------------------------
@@ -284,18 +426,35 @@ def start_merge_container(
     # Copy all testcases to /work
     _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
 
-    # Build ASAN only — no MSAN/UBSAN to avoid libc++ contamination.
-    logger.info("Building ASAN inside container...")
-    ret, build_output = _exec_capture(
-        container_name,
-        f"sudo -E SANITIZER=address compile 2>&1",
-        timeout=300,
-    )
-    if ret != 0:
-        logger.error("ASAN build failed. Tail:")
-        logger.error("%s", build_output[-500:] if build_output else "(no output)")
-        return container_name, False
-    logger.info("Baseline ASAN build OK")
+    # Build ASAN and UBSAN (no MSAN — it taints libc++ permanently).
+    for san in ("address", "undefined"):
+        logger.info("Building %s inside container...", san)
+        _exec_capture(
+            container_name,
+            f"cd /src/{project} && make clean 2>/dev/null; "
+            f"rm -rf .obj *.a *.o 2>/dev/null; "
+            f"rm -f /src/*.o 2>/dev/null; true",
+        )
+        ret, build_output = _exec_capture(
+            container_name,
+            f"sudo -E SANITIZER={san} compile 2>&1",
+            timeout=300,
+        )
+        if ret != 0:
+            logger.error("%s build failed. Tail:", san)
+            logger.error("%s", build_output[-500:] if build_output else "(no output)")
+            if san == "address":
+                return container_name, False
+            logger.warning("Skipping %s, bugs using it won't verify", san)
+            continue
+        # Stash per-sanitizer binaries
+        _exec_capture(
+            container_name,
+            f"mkdir -p /out/{san} && "
+            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+            f"cp \"$f\" /out/{san}/; done; true",
+        )
+        logger.info("Build OK for %s", san)
 
     # Restore testcases (compile may wipe /work)
     _exec_capture(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
@@ -353,8 +512,9 @@ def resolve_conflict_with_agent(
     applied_bugs: list[str],
     agent: str = "claude",
     model: str | None = None,
+    conflicting_diffs: list[tuple[str, str]] | None = None,
 ) -> bool:
-    """Use a code agent to resolve a merge conflict.
+    """Use a code agent to resolve a merge conflict by combining changes.
 
     Returns True if resolved successfully.
     """
@@ -382,6 +542,19 @@ def resolve_conflict_with_agent(
     diff_name = Path(diff_path).name
     applied_list = ", ".join(applied_bugs) if applied_bugs else "none yet"
 
+    # Copy conflicting patches into container for agent to read
+    conflict_desc_lines = []
+    if conflicting_diffs:
+        for cbug_id, cdiff_path in conflicting_diffs:
+            cdiff_name = Path(cdiff_path).name
+            subprocess.call(
+                ["docker", "cp", cdiff_path, f"{container}:/tmp/{cdiff_name}"],
+            )
+            conflict_desc_lines.append(
+                f"  - Bug {cbug_id}: /tmp/{cdiff_name}"
+            )
+    conflict_desc = "\n".join(conflict_desc_lines) if conflict_desc_lines else "  (unknown)"
+
     prompt = textwrap.dedent(f"""\
         I am merging multiple bug transplant patches into project {project}.
 
@@ -389,6 +562,12 @@ def resolve_conflict_with_agent(
 
         I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
         has merge conflicts with the current state of the code.
+
+        The conflicting previously-applied bug(s) and their patches:
+        {conflict_desc}
+
+        Since both patches are minimized (every hunk is necessary for its
+        bug), you MUST preserve the bug-triggering logic from BOTH patches.
 
         Please:
         1. Read the patch file /tmp/{diff_name} to understand what changes it makes
@@ -398,7 +577,7 @@ def resolve_conflict_with_agent(
         4. Make sure the changes preserve the bug-triggering logic from the patch
         5. Do NOT revert changes from previously applied bugs
 
-        After making changes, run: compile
+        After making changes, run: sudo -E compile
         If there are build errors, fix them.
     """)
 
@@ -416,10 +595,104 @@ def resolve_conflict_with_agent(
     # Verify it compiles
     ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
     if ret != 0:
-        logger.error("[%s] Build failed after Claude conflict resolution", bug_id)
+        logger.error("[%s] Build failed after conflict resolution", bug_id)
         return False
 
-    logger.info("[%s] Conflict resolved by Claude Code", bug_id)
+    logger.info("[%s] Conflict resolved by combining", bug_id)
+    return True
+
+
+def resolve_with_dispatch(
+    container: str,
+    bug_id: str,
+    project: str,
+    regressed_bugs: list[dict],
+    dispatch_bit: int,
+    agent: str = "claude",
+    model: str | None = None,
+) -> bool:
+    """Add dispatch branches to fix regressions caused by a transplant diff.
+
+    Called AFTER a transplant diff has been applied and verified, when
+    regression checking reveals that previously-working bugs stopped
+    triggering.  The agent wraps the contradictory code in dispatch branches.
+
+    Returns True if dispatch was applied and build succeeds.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant import AGENT_CONFIG
+
+    cfg = AGENT_CONFIG[agent]
+    logger.info("[%s] Invoking %s to add dispatch branches (bit %d) "
+                "for %d regressed bugs...",
+                bug_id, agent, dispatch_bit, len(regressed_bugs))
+
+    # Setup agent credentials
+    creds_dir = cfg["credentials_dir"]
+    _exec(
+        container,
+        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
+        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        "true",
+    )
+    if cfg.get("credentials_config"):
+        _exec(
+            container,
+            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+        )
+
+    regressed_ids = ", ".join(b["bug_id"] for b in regressed_bugs)
+
+    prompt = textwrap.dedent(f"""\
+        I am merging multiple bug transplant patches into project {project}.
+
+        After applying the patch for bug {bug_id}, these previously-working
+        bugs stopped triggering: {regressed_ids}
+
+        This means some code changes needed by {bug_id} are contradictory
+        with code that the regressed bugs depend on.
+
+        I need you to wrap the contradictory code in dispatch branches so
+        that BOTH sides can coexist in the same binary:
+
+        #include "__bug_dispatch.h"
+        if (__bug_dispatch & (1 << {dispatch_bit})) {{
+            // Code needed by bug {bug_id}
+        }} else {{
+            // Original code needed by the regressed bugs
+        }}
+
+        The header is at /src/{project}/__bug_dispatch.h.
+        The variable __bug_dispatch is a global uint8_t set from the fuzz
+        input at runtime.
+
+        To identify the contradictory code:
+        1. Look at the current git diff: cd /src/{project} && git diff
+        2. The changes from {bug_id}'s patch are in there — find the hunks
+           that would affect the regressed bugs' crash paths
+        3. Wrap ONLY the contradictory parts in dispatch branches
+        4. Leave compatible changes as-is
+
+        After making changes, run: sudo -E compile
+        If there are build errors, fix them.
+    """)
+
+    escaped = shlex.quote(prompt)
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+
+    ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+    if ret != 0:
+        logger.error("[%s] Dispatch agent failed (exit %d)", bug_id, ret)
+        return False
+
+    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    if ret != 0:
+        logger.error("[%s] Build failed after dispatch resolution", bug_id)
+        return False
+
+    logger.info("[%s] Dispatch branches added (bit %d)", bug_id, dispatch_bit)
     return True
 
 
@@ -498,27 +771,33 @@ def verify_bug_triggers(
     bug_id: str,
     fuzzer: str,
     testcase: str,
+    sanitizer: str = "address",
     crash_log: str | None = None,
 ) -> bool:
-    """Run the ASAN fuzzer binary and check for a crash.
+    """Run the fuzzer binary for the given sanitizer and check for a crash.
 
     If *crash_log* is provided, extracts the reference stack from it and
     compares against the fuzzer output using LCS matching.  Otherwise
     falls back to checking for any sanitizer SUMMARY line.
     """
     sym_path = "/out/llvm-symbolizer"
-    fuzzer_path = f"/out/{fuzzer}"
+    san_opts = {
+        "address": f"export ASAN_OPTIONS=detect_leaks=0:external_symbolizer_path={sym_path}; ",
+        "undefined": f"export UBSAN_OPTIONS=external_symbolizer_path={sym_path}:print_stacktrace=1; ",
+    }
+    env_prefix = san_opts.get(sanitizer, "")
+    fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
 
     cmd = (
-        f"export ASAN_OPTIONS=detect_leaks=0:external_symbolizer_path={sym_path}; "
+        f"{env_prefix}"
         f"if [ ! -x {fuzzer_path} ]; then "
         f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
         f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
     )
-    logger.info("[%s] verify cmd: %s", bug_id, cmd)
+    logger.debug("[%s] verify cmd: %s", bug_id, cmd)
     ret, output = _exec_capture(container, cmd, timeout=120)
-    logger.info("[%s] verify exit=%d output_len=%d tail=%.500s",
-                bug_id, ret, len(output), output[-500:] if output else "(empty)")
+    logger.debug("[%s] verify exit=%d output_len=%d tail=%.500s",
+                 bug_id, ret, len(output), output[-500:] if output else "(empty)")
 
     # Extract current stack from fuzzer output
     current_stack = _extract_stack_from_text(output)
@@ -574,6 +853,7 @@ def verify_all_bugs(
             bug["bug_id"],
             bug["fuzzer"],
             bug["testcase"],
+            bug.get("sanitizer", "address"),
             bug.get("crash_log"),
         )
         results[bug["bug_id"]] = ok
@@ -641,8 +921,8 @@ def run_merge(args: argparse.Namespace) -> int:
         if not fuzzer:
             logger.warning("No fuzzer for local bug %s, skipping", bug_id)
             continue
-        if sanitizer != "address":
-            logger.warning("Skipping non-ASAN local bug %s (sanitizer=%s)", bug_id, sanitizer)
+        if sanitizer not in ("address", "undefined"):
+            logger.warning("Skipping %s local bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
             continue
         testcase = f"testcase-{bug_id}"
         crash_log = _find_crash_log(bug_id, info)
@@ -650,6 +930,7 @@ def run_merge(args: argparse.Namespace) -> int:
             "bug_id": bug_id,
             "fuzzer": fuzzer,
             "testcase": testcase,
+            "sanitizer": sanitizer,
             "crash_log": crash_log,
             "type": "local",
         })
@@ -670,8 +951,8 @@ def run_merge(args: argparse.Namespace) -> int:
             reproduce = info.get("reproduce", {})
             fuzzer = reproduce.get("fuzz_target", result.get("fuzzer", ""))
             sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-            if sanitizer != "address":
-                logger.warning("Skipping non-ASAN transplant bug %s (sanitizer=%s)", bug_id, sanitizer)
+            if sanitizer not in ("address", "undefined"):
+                logger.warning("Skipping %s transplant bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
                 continue
             crash_log = _find_crash_log(bug_id, info)
             transplant_diffs.append({
@@ -679,6 +960,7 @@ def run_merge(args: argparse.Namespace) -> int:
                 "diff_path": diff_path,
                 "fuzzer": fuzzer,
                 "testcase": f"testcase-{bug_id}",
+                "sanitizer": sanitizer,
                 "crash_log": crash_log,
                 "type": "transplant",
             })
@@ -708,6 +990,7 @@ def run_merge(args: argparse.Namespace) -> int:
                     "diff_path": str(p),
                     "fuzzer": fuzzer,
                     "testcase": f"testcase-{bug_id}",
+                    "sanitizer": sanitizer,
                     "crash_log": crash_log,
                     "type": "transplant",
                 })
@@ -738,6 +1021,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         "diff_path": str(p),
                         "fuzzer": fuzzer,
                         "testcase": f"testcase-{bug_id}",
+                        "sanitizer": sanitizer,
                         "crash_log": crash_log,
                         "type": "transplant",
                     })
@@ -813,6 +1097,13 @@ def run_merge(args: argparse.Namespace) -> int:
     applied_bugs: list[str] = []  # successfully applied bug IDs
     all_verified_bugs: list[dict] = []  # bugs to verify after each step
     regression_failures: list[dict] = []
+    dispatch_state: dict = {
+        "next_bit": 0,                # next available bit index
+        "bits": {},                    # {bit_index: {bug_new, bug_existing}}
+        "poc_bytes": {},               # {bug_id: int} dispatch byte per bug
+        "harness_modified": False,     # dispatch byte consumption in harness
+        "dispatch_file_injected": False,  # __bug_dispatch.h/.c created
+    }
 
     try:
         # ------------------------------------------------------------------
@@ -832,7 +1123,11 @@ def run_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 6. Apply transplant diffs incrementally
         # ------------------------------------------------------------------
+        max_steps = getattr(args, "max_steps", None)
         for i, bd in enumerate(ordered):
+            if max_steps is not None and i >= max_steps:
+                logger.info("Reached --max-steps %d, stopping early", max_steps)
+                break
             bug_id = bd["bug_id"]
             diff_path = bd["diff_path"]
             step = {
@@ -853,10 +1148,16 @@ def run_merge(args: argparse.Namespace) -> int:
             step["apply_method"] = method
 
             if method == "conflict":
-                # Attempt agent-based resolution
+                # Identify which previously-applied bugs overlap
+                conflicting = _find_conflicting_bugs(bd, applied_bugs, ordered)
+                conflicting_info = [
+                    (c["bug_id"], c["diff_path"]) for c in conflicting
+                ]
+
                 resolved = resolve_conflict_with_agent(
                     container, diff_path, bug_id, project,
                     applied_bugs, args.agent, args.model,
+                    conflicting_diffs=conflicting_info,
                 )
                 if resolved:
                     step["apply_method"] = "agent_resolved"
@@ -866,24 +1167,40 @@ def run_merge(args: argparse.Namespace) -> int:
                     merge_results.append(step)
                     continue
 
-            # --- Build ASAN ---
-            logger.info("[%s] Building (ASAN)...", bug_id)
-            _exec_capture(
-                container,
-                f"cd /src/{project} && make clean 2>/dev/null; "
-                f"rm -rf .obj *.a *.o 2>/dev/null; "
-                f"rm -f /src/*.o 2>/dev/null; true",
-            )
-            ret, build_output = _exec_capture(
-                container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
-            )
+            # --- Build ASAN + UBSAN ---
+            logger.info("[%s] Building (ASAN + UBSAN)...", bug_id)
+            build_failed = False
+            for san in ("address", "undefined"):
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                    f"rm -f /src/*.o 2>/dev/null; true",
+                )
+                ret, build_output = _exec_capture(
+                    container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
+                )
+                if ret != 0:
+                    logger.error("[%s] Build failed for %s. Tail:", bug_id, san)
+                    logger.error("%s", build_output[-500:] if build_output else "(no output)")
+                    if san == "address":
+                        build_failed = True
+                        break
+                    continue
+                _exec_capture(
+                    container,
+                    f"mkdir -p /out/{san} && "
+                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                    f"cp \"$f\" /out/{san}/; done; true",
+                )
             # Restore testcases (compile may wipe /work)
             _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+            if dispatch_state["poc_bytes"]:
+                _apply_all_dispatch_bytes(container, dispatch_state)
 
-            step["build_ok"] = (ret == 0)
-            if ret != 0:
-                logger.error("[%s] Build failed. Tail:", bug_id)
-                logger.error("%s", build_output[-500:] if build_output else "(no output)")
+            step["build_ok"] = not build_failed
+            if build_failed:
+                logger.error("[%s] Build failed after applying diff", bug_id)
                 # Revert this diff and restore previous state
                 _exec_capture(
                     container,
@@ -897,14 +1214,23 @@ def run_merge(args: argparse.Namespace) -> int:
                         container,
                         f"cd /src/{project} && git apply /tmp/{Path(prev['diff_path']).name} 2>&1",
                     )
-                _exec_capture(
-                    container,
-                    f"cd /src/{project} && make clean 2>/dev/null; "
-                    f"rm -rf .obj *.a *.o 2>/dev/null; "
-                    f"rm -f /src/*.o 2>/dev/null; true",
-                )
-                _exec_capture(container, "sudo -E SANITIZER=address compile 2>&1", timeout=300)
+                for san in ("address", "undefined"):
+                    _exec_capture(
+                        container,
+                        f"cd /src/{project} && make clean 2>/dev/null; "
+                        f"rm -rf .obj *.a *.o 2>/dev/null; "
+                        f"rm -f /src/*.o 2>/dev/null; true",
+                    )
+                    _exec_capture(container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300)
+                    _exec_capture(
+                        container,
+                        f"mkdir -p /out/{san} && "
+                        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                        f"cp \"$f\" /out/{san}/; done; true",
+                    )
                 _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                if dispatch_state["poc_bytes"]:
+                    _apply_all_dispatch_bytes(container, dispatch_state)
                 merge_results.append(step)
                 continue
 
@@ -912,6 +1238,7 @@ def run_merge(args: argparse.Namespace) -> int:
             logger.info("[%s] Verifying self-trigger...", bug_id)
             step["self_triggers"] = verify_bug_triggers(
                 container, bug_id, bd["fuzzer"], bd["testcase"],
+                bd.get("sanitizer", "address"),
                 bd.get("crash_log"),
             )
 
@@ -919,6 +1246,7 @@ def run_merge(args: argparse.Namespace) -> int:
             if all_verified_bugs:
                 logger.info("[%s] Regression check (%d bugs)...", bug_id, len(all_verified_bugs))
                 reg_results = verify_all_bugs(container, all_verified_bugs)
+                regressed = []
                 for rbug, ok in reg_results.items():
                     if not ok:
                         step["regressions"].append(rbug)
@@ -930,6 +1258,88 @@ def run_merge(args: argparse.Namespace) -> int:
                         logger.warning(
                             "[%s] REGRESSION: %s stopped triggering!", bug_id, rbug,
                         )
+                        regressed.append(
+                            next(b for b in all_verified_bugs if b["bug_id"] == rbug)
+                        )
+
+                # --- Attempt dispatch branches if regressions found ---
+                if regressed and step["self_triggers"]:
+                    logger.info("[%s] Attempting dispatch branches for %d regressions...",
+                                bug_id, len(regressed))
+
+                    # Inject dispatch files on first use
+                    if not dispatch_state["dispatch_file_injected"]:
+                        _inject_dispatch_files(container, project)
+                        dispatch_state["dispatch_file_injected"] = True
+
+                    bit_index = dispatch_state["next_bit"]
+                    dispatch_ok = resolve_with_dispatch(
+                        container, bug_id, project, regressed,
+                        bit_index, args.agent, args.model,
+                    )
+
+                    if dispatch_ok:
+                        # Modify harness to consume dispatch byte (once)
+                        if not dispatch_state["harness_modified"]:
+                            hok = _modify_harness_for_dispatch(
+                                container, project, bd["fuzzer"],
+                                args.agent, args.model,
+                            )
+                            if hok:
+                                dispatch_state["harness_modified"] = True
+                                # ALL PoCs need dispatch byte once harness is modified
+                                for lb in local_bugs:
+                                    dispatch_state["poc_bytes"].setdefault(lb["bug_id"], 0)
+                                for tbd in ordered:
+                                    dispatch_state["poc_bytes"].setdefault(tbd["bug_id"], 0)
+                            else:
+                                logger.error("[%s] Harness modification failed", bug_id)
+
+                        if dispatch_state["harness_modified"]:
+                            # Record bit assignment
+                            dispatch_state["bits"][bit_index] = {
+                                "bug_new": bug_id,
+                                "bug_existing": [b["bug_id"] for b in regressed],
+                            }
+                            dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                            dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                            for b in regressed:
+                                dispatch_state["poc_bytes"].setdefault(b["bug_id"], 0)
+                            dispatch_state["next_bit"] += 1
+
+                            # Rebuild and re-apply dispatch bytes
+                            for san in ("address", "undefined"):
+                                _exec_capture(
+                                    container,
+                                    f"cd /src/{project} && make clean 2>/dev/null; "
+                                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                                    f"rm -f /src/*.o 2>/dev/null; true",
+                                )
+                                _exec_capture(
+                                    container,
+                                    f"sudo -E SANITIZER={san} compile 2>&1",
+                                    timeout=300,
+                                )
+                                _exec_capture(
+                                    container,
+                                    f"mkdir -p /out/{san} && "
+                                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                                    f"cp \"$f\" /out/{san}/; done; true",
+                                )
+                            _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                            _apply_all_dispatch_bytes(container, dispatch_state)
+
+                            # Re-verify regressed bugs
+                            re_results = verify_all_bugs(container, regressed)
+                            fixed = [bid for bid, ok in re_results.items() if ok]
+                            still_broken = [bid for bid, ok in re_results.items() if not ok]
+                            if fixed:
+                                logger.info("[%s] Dispatch fixed: %s", bug_id, fixed)
+                                step["regressions"] = still_broken
+                            if still_broken:
+                                logger.warning("[%s] Still regressed after dispatch: %s",
+                                               bug_id, still_broken)
+                            step["apply_method"] += "+dispatch"
 
             # Track successful application
             if step["self_triggers"]:
@@ -953,9 +1363,25 @@ def run_merge(args: argparse.Namespace) -> int:
 
         # Get combined diff — only include files that the per-bug diffs
         # intentionally modified (avoids build artifacts from compile).
+        # Also include dispatch infrastructure files if used.
         touched_files: set[str] = set()
         for bd in ordered:
             touched_files.update(bd.get("_files", set()))
+        if dispatch_state["harness_modified"]:
+            # Include dispatch files and any harness changes in the diff
+            touched_files.add("__bug_dispatch.h")
+            touched_files.add("__bug_dispatch.c")
+            # The harness file is unknown by name but git diff will pick it up
+            # when we use plain `git diff` as fallback; for safety, include
+            # all tracked changes if dispatch was used.
+            _, all_diff = _exec_capture(
+                container, f"cd /src/{project} && git diff",
+            )
+            # Parse the full diff to find harness file(s)
+            for line in all_diff.splitlines():
+                m = re.match(r'^[-+]{3}\s+[ab]/(.+)$', line)
+                if m:
+                    touched_files.add(m.group(1))
         if touched_files:
             file_args = " ".join(f"'{f}'" for f in sorted(touched_files))
             _, combined_diff = _exec_capture(
@@ -998,6 +1424,16 @@ def run_merge(args: argparse.Namespace) -> int:
             "steps": merge_results,
             "final_verification": {
                 bug_id: ok for bug_id, ok in final_results.items()
+            },
+            "dispatch": {
+                "branches_used": len(dispatch_state["bits"]),
+                "bits": {
+                    str(k): v for k, v in dispatch_state["bits"].items()
+                },
+                "poc_dispatch_bytes": {
+                    k: hex(v) for k, v in dispatch_state["poc_bytes"].items()
+                },
+                "harness_modified": dispatch_state["harness_modified"],
             },
         }
 
@@ -1042,6 +1478,21 @@ def run_merge(args: argparse.Namespace) -> int:
             print(f"  Regressions:          {len(regression_failures)}")
             for rf in regression_failures:
                 print(f"    {rf['regressed_bug']} broke when applying {rf['caused_by_applying']}")
+            print()
+        if dispatch_state["bits"]:
+            print(f"  Dispatch branches:    {len(dispatch_state['bits'])}")
+            for bit_idx, info in dispatch_state["bits"].items():
+                existing = ", ".join(info["bug_existing"])
+                print(f"    [bit {bit_idx}] {info['bug_new']} vs {existing}")
+            print(f"  Dispatch PoC bytes:")
+            for bid, dval in sorted(dispatch_state["poc_bytes"].items(),
+                                    key=lambda x: x[1], reverse=True):
+                if dval > 0:
+                    print(f"    {bid}: 0x{dval:02x}")
+            # All others implicitly 0x00
+            n_zero = sum(1 for v in dispatch_state["poc_bytes"].values() if v == 0)
+            if n_zero:
+                print(f"    ({n_zero} other bugs: 0x00)")
             print()
         print(f"  Combined diff:        {combined_diff_path}")
         print(f"  Summary:              {summary_path}")
@@ -1114,6 +1565,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Show merge plan without executing")
     parser.add_argument("--keep-container", action="store_true",
                         help="Keep container alive for debugging")
+    parser.add_argument("--max-steps", type=int, default=None,
+                        help="Stop after N transplant diffs (for debugging)")
     parser.add_argument("--verbose", "-V", action="store_true")
 
     return parser
