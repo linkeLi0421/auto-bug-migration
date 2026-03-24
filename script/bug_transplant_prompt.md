@@ -108,5 +108,10 @@ Report which changes were required and why, which were eliminated and why.
 - Do NOT change the bug-triggering logic -- only revert fixes and remove blockers.
 - Start MINIMAL: crash-stack functions only. Escalate to callees only if needed.
 - Build and test after EVERY change -- do not batch.
+- **ALWAYS use `sudo -E compile` to build.** NEVER build manually with make, gcc,
+  clang, cmake, or any other command. NEVER create your own fuzz target binaries.
+  Only test with `/out/{fuzzer_name}` produced by `sudo -E compile`. Manual builds
+  produce different binaries and bugs that trigger with them may NOT trigger with
+  the official build.
 - Always minimize before delivering.
 - Save final diff to `/out/bug_transplant.diff`.

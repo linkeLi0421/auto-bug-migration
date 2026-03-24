@@ -41,14 +41,21 @@ git diff > /out/bug_transplant.diff
 
 2. **Build after every change**: Never batch multiple changes without testing.
 
-3. **Look for validation checks**: If the obvious revert doesn't trigger the bug,
+3. **ALWAYS use `sudo -E compile` to build**: NEVER build manually with make, gcc,
+   clang, or cmake. The only valid build command is `sudo -E compile`. NEVER
+   create your own build commands or compile fuzz targets by hand. The official
+   build produces different binaries than manual builds — a bug that triggers
+   with a hand-built binary may NOT trigger with the official build. Test with
+   `/out/<fuzzer_name>`, never with binaries you built yourself.
+
+4. **Look for validation checks**: If the obvious revert doesn't trigger the bug,
    look for NEW input validation added after the buggy commit. This is the most
    commonly missed category.
 
-4. **Minimize**: After the bug triggers, do single-change elimination to find the
+5. **Minimize**: After the bug triggers, do single-change elimination to find the
    minimal diff. Use `git stash` and `git checkout -- <file>` to test each change.
 
-5. **Preserve current API**: Do not blindly copy old function bodies. Only revert
+6. **Preserve current API**: Do not blindly copy old function bodies. Only revert
    the specific lines that fixed the bug or block the testcase.
 
-6. **Save diff**: Always `git diff > /out/bug_transplant.diff` at the end.
+7. **Save diff**: Always `git diff > /out/bug_transplant.diff` at the end.
