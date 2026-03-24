@@ -242,31 +242,43 @@ def _annotate_diff_ownership(
     marker_start = f"//BUG_START {bug_id}"
     marker_end = f"//BUG_END {bug_id}"
 
-    script_parts = [
+    # Write script to a temp file inside the container to avoid shell
+    # quoting issues with nested quotes and multi-line code.
+    script_lines = [
         "import sys",
+        "",
         "def annotate(path, blocks, ms, me):",
-        "    with open(path) as f: lines = f.readlines()",
+        "    with open(path) as f:",
+        "        lines = f.readlines()",
         "    for start, count in sorted(blocks, reverse=True):",
         "        idx = start - 1",
-        "        if idx < 0 or idx > len(lines): continue",
+        "        if idx < 0 or idx > len(lines):",
+        "            continue",
         "        # Skip if already annotated (by any bug)",
-        "        if idx > 0 and '//BUG_START' in lines[idx-1]: continue",
+        "        if idx > 0 and '//BUG_START' in lines[idx - 1]:",
+        "            continue",
         "        end_idx = idx + count",
         "        lines.insert(end_idx, me + '\\n')",
         "        lines.insert(idx, ms + '\\n')",
-        "    with open(path, 'w') as f: f.writelines(lines)",
+        "    with open(path, 'w') as f:",
+        "        f.writelines(lines)",
+        "",
     ]
 
     for fpath, blocks in file_blocks.items():
         blocks_repr = repr(blocks)
-        script_parts.append(
+        script_lines.append(
             f"annotate('/src/{project}/{fpath}', {blocks_repr}, "
             f"{marker_start!r}, {marker_end!r})"
         )
 
-    script = "\n".join(script_parts)
+    script = "\n".join(script_lines) + "\n"
+
+    # Write script into the container via heredoc, then run it
+    write_cmd = "cat > /tmp/_annotate.py << 'ANNOTATE_EOF'\n" + script + "ANNOTATE_EOF"
+    _exec_capture(container, write_cmd, timeout=10)
     ret, output = _exec_capture(
-        container, f"python3 -c {shlex.quote(script)}", timeout=30,
+        container, "python3 /tmp/_annotate.py", timeout=30,
     )
     if ret != 0:
         logger.warning("[%s] Annotation failed: %s", bug_id, output[:300])
