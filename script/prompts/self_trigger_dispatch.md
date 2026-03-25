@@ -31,25 +31,13 @@ Step 2: Run `cd /src/{project} && git diff` to see ALL currently
 Step 3: For every change in the git diff that is in a function or
         code path that {bug_id}'s testcase needs to traverse (based
         on the crash log and {bug_id}'s patch), wrap it in a
-        dispatch branch. This includes BOTH additions AND deletions
-        from previous patches:
+        dispatch branch:
 
     #include "__bug_dispatch.h"
-
-    For added/modified lines from previous patches:
     if (__bug_dispatch & (1 << {dispatch_bit})) {{
         // Original code (before any patches — what {bug_id} needs)
     }} else {{
         // Currently-applied change (needed by previous bugs)
-    }}
-
-    For lines that previous patches DELETED (visible as "-" lines
-    in git diff or the patch files) — these lines no longer exist
-    in the source but {bug_id} may need them. Re-add them inside
-    a dispatch branch:
-    if (__bug_dispatch & (1 << {dispatch_bit})) {{
-        // Restore deleted lines (what {bug_id} needs)
-        <re-add the deleted lines here>
     }}
 
 The header is at /src/{project}/__bug_dispatch.h.
@@ -61,13 +49,6 @@ Rules:
   changes came from which bug.
 - If a previous patch has multiple hunks in the same file, wrap
   ALL of them — do not skip any.
-- Deletions matter! If a previous patch removed a bounds check,
-  a return statement, or any other code, and {bug_id}'s crash
-  path needs that code, restore it inside a dispatch branch.
-- SKIP dispatch for compile-time constructs that cannot be wrapped
-  in runtime if/else: #define, #undef, #include, struct/union/enum
-  definitions, global variable declarations, function signature
-  changes. Leave these as-is.
 
 After making changes, run: sudo -E compile
 If there are build errors, fix them.

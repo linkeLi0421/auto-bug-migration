@@ -15,24 +15,13 @@ dispatch branches so both sides can coexist in the same binary.
 Available patches:
 {patch_list}
 
-For EVERY change {bug_id}'s patch makes — additions, modifications,
-AND deletions — wrap it in a dispatch branch:
+For EVERY change this patch makes to the source code, wrap it:
 
     #include "__bug_dispatch.h"
-
-    For added/modified lines:
     if (__bug_dispatch & (1 << {dispatch_bit})) {{
         // {bug_id}'s version of the code (from the patch)
     }} else {{
         // Original code (before the patch, needed by regressed bugs)
-    }}
-
-    For deleted lines — do NOT just leave them deleted:
-    if (__bug_dispatch & (1 << {dispatch_bit})) {{
-        // Empty — lines removed by {bug_id}'s patch
-    }} else {{
-        // Original lines restored (needed by regressed bugs)
-        <put the deleted lines here>
     }}
 
 The header is at /src/{project}/__bug_dispatch.h.
@@ -45,13 +34,16 @@ belongs to which previously-applied bug:
     ... code for that bug ...
     //BUG_END OSV-XXXX
 
-You may wrap a marked region inside a dispatch else-branch to
-preserve it, but you MUST NOT modify the code between the markers.
+You MUST NOT modify, move, or wrap code between these markers.
+That code belongs to a previous bug and must stay exactly as-is.
+Only wrap code from {bug_id} (the newly-applied bug) in dispatch
+branches. When wrapping, place dispatch branches OUTSIDE the
+marked regions, never inside them.
 
 Rules:
 - Read the patch file to see ALL hunks
 - For each hunk, find where it was applied in the current source
-- Wrap ALL changes in dispatch branches (additions AND deletions)
+- Wrap the changed lines in a dispatch branch
 - The else branch must contain the ORIGINAL code (before {bug_id}'s
   changes), not the current code
 - If a hunk moves code (removes from one place, adds to another),
@@ -59,10 +51,6 @@ Rules:
 - Do NOT skip any hunk — wrap them ALL
 - An unnecessary dispatch branch is harmless; a missing one loses
   a bug
-- SKIP dispatch for compile-time constructs that cannot be wrapped
-  in runtime if/else: #define, #undef, #include, struct/union/enum
-  definitions, global variable declarations, function signature
-  changes. Leave these as-is.
 
 After making changes, run: sudo -E compile
 If there are build errors, fix them.
