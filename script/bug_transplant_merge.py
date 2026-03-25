@@ -820,7 +820,7 @@ def resolve_with_dispatch(
     prompt = _load_prompt(
         "regression_dispatch",
         project=project, bug_id=bug_id, regressed_ids=regressed_ids,
-        dispatch_bit=dispatch_bit,
+        dispatch_bit=dispatch_bit, patch_list=patch_list,
     )
 
     escaped = shlex.quote(prompt)
@@ -842,6 +842,28 @@ def resolve_with_dispatch(
     return True
 
 
+def _save_source_snapshot(container: str, project: str) -> str:
+    """Save the current source state as a diff snapshot inside the container.
+
+    Returns the path to the saved snapshot file.  The snapshot captures
+    the full working tree state including conflict-resolution edits,
+    dispatch branches, annotation markers, and harness changes.
+    """
+    snap_path = f"/tmp/_merge_snapshot_{project}.diff"
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git diff > {snap_path} 2>&1",
+    )
+    # Also snapshot new (untracked) files
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git diff --cached >> {snap_path} 2>&1; "
+        f"git ls-files --others --exclude-standard "
+        f"| tar cf /tmp/_merge_snapshot_untracked.tar -T - 2>/dev/null; true",
+    )
+    return snap_path
+
+
 def _revert_and_rebuild(
     container: str,
     project: str,
@@ -849,21 +871,28 @@ def _revert_and_rebuild(
     ordered: list[dict],
     dispatch_state: dict,
 ) -> None:
-    """Revert all source changes and re-apply only successfully applied bugs.
+    """Restore source to the pre-step snapshot and rebuild.
 
     Used when a patch must be rolled back (build failure, self-trigger
-    failure, etc.) to restore the source tree to a known-good state.
+    failure, etc.) to restore the source tree to the state before the
+    failed step was attempted.
     """
+    snap_path = f"/tmp/_merge_snapshot_{project}.diff"
+    # Reset to clean state, then re-apply the snapshot
     _exec_capture(
         container,
-        f"cd /src/{project} && git checkout -- . 2>&1",
+        f"cd /src/{project} && git checkout -- . && git clean -fd 2>&1",
     )
-    for prev_id in applied_bugs:
-        prev = next(d for d in ordered if d["bug_id"] == prev_id)
-        _exec_capture(
-            container,
-            f"cd /src/{project} && git apply /tmp/{Path(prev['diff_path']).name} 2>&1",
-        )
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git apply --allow-empty {snap_path} 2>&1",
+    )
+    # Restore untracked files (dispatch files, etc.)
+    _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"tar xf /tmp/_merge_snapshot_untracked.tar 2>/dev/null; true",
+    )
     for san in ("address", "undefined"):
         _exec_capture(
             container,
@@ -1461,6 +1490,9 @@ def run_merge(args: argparse.Namespace) -> int:
                 "=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
             )
 
+            # Save source snapshot before this step (for rollback)
+            _save_source_snapshot(container, project)
+
             # --- Try to apply ---
             method = try_apply_diff(container, diff_path, project)
             step["apply_method"] = method
@@ -1902,8 +1934,12 @@ def run_merge(args: argparse.Namespace) -> int:
         if dispatch_state["bits"]:
             print(f"  Dispatch branches:    {len(dispatch_state['bits'])}")
             for bit_idx, info in dispatch_state["bits"].items():
-                existing = ", ".join(info["bug_existing"])
-                print(f"    [bit {bit_idx}] {info['bug_new']} vs {existing}")
+                if info.get("type") == "self_trigger_unblock":
+                    blocked_by = ", ".join(info.get("bug_blocked_by", []))
+                    print(f"    [bit {bit_idx}] {info['bug_new']} unblocked from {blocked_by}")
+                else:
+                    existing = ", ".join(info.get("bug_existing", []))
+                    print(f"    [bit {bit_idx}] {info['bug_new']} vs {existing}")
             print(f"  Dispatch PoC bytes:")
             for bid, dval in sorted(dispatch_state["poc_bytes"].items(),
                                     key=lambda x: x[1], reverse=True):

@@ -12,9 +12,10 @@ bugs stopped triggering: {regressed_ids}
 I need you to wrap ALL code changes from {bug_id}'s patch in
 dispatch branches so both sides can coexist in the same binary.
 
-The patch for {bug_id}: /tmp/patch_{bug_id}.diff
+Available patches:
+{patch_list}
 
-For EVERY change this patch makes — additions, modifications,
+For EVERY change {bug_id}'s patch makes — additions, modifications,
 AND deletions — wrap it in a dispatch branch:
 
     #include "__bug_dispatch.h"
