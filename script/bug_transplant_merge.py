@@ -745,32 +745,46 @@ def resolve_conflict_with_agent(
                 ... code for that bug ...
                 //BUG_END OSV-XXXX
 
-            You MUST NOT modify, move, or wrap code between these markers.
-            That code belongs to a previous bug and must stay exactly as-is.
-            Only add NEW code for bug {bug_id} outside these marked regions.
-            If {bug_id}'s patch needs to change the same lines as a marked
-            region, add {bug_id}'s version separately and use a dispatch
-            branch to select between them at runtime.
+            You may wrap a marked region inside a dispatch else-branch to
+            preserve it for that bug's testcase, but you MUST NOT modify
+            the code between the markers.
 
-            Strategy:
-            1. Read the patch file /tmp/{diff_name} to see ALL changes.
-            2. For each change, apply it to the current code. Where the new
-               patch and existing code disagree on the same lines, wrap it
-               in a dispatch branch:
+            Strategy — dispatch the ENTIRE patch:
+            1. Read the patch file /tmp/{diff_name} to see ALL hunks.
+            2. Wrap EVERY hunk in a dispatch branch — not just the
+               conflicting ones. When any part of a patch conflicts,
+               the entire patch must be dispatched for consistency.
 
                #include "__bug_dispatch.h"
+
+               For hunks that ADD and/or MODIFY lines:
                if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                   // Code from bug {bug_id}'s patch
+                   // {bug_id}'s version (the "+" lines from the patch)
                }} else {{
-                   // Existing code (from previously-applied bugs)
+                   // Original code (the "-" lines or current code)
+               }}
+
+               For hunks that only DELETE lines — the deletion must also
+               be conditional. Do NOT just delete the lines. Instead:
+               if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                   // Empty — lines removed by {bug_id}'s patch
+               }} else {{
+                   // Original lines preserved for other bugs
+                   <the deleted lines go here>
                }}
 
                The header is at /src/{project}/__bug_dispatch.h.
 
             3. When in doubt, use a dispatch branch. An unnecessary branch
                is harmless; a missing one loses a bug.
-            4. If a hunk can be applied without conflicting with existing
-               changes, apply it directly (no dispatch needed for that hunk).
+            4. SKIP dispatch for changes that cannot be runtime-conditional:
+               - #define / #undef / #include preprocessor directives
+               - struct/union/enum type definitions
+               - global variable declarations or type changes
+               - function signature changes (return type, parameters)
+               These are compile-time constructs — wrapping them in
+               if/else would not compile. Leave them as-is (apply
+               directly from the patch or keep the existing version).
             5. After adding your code, wrap it with markers:
                //BUG_START {bug_id}
                ... your new code ...
@@ -933,13 +947,24 @@ def resolve_with_dispatch(
 
         The patch for {bug_id}: /tmp/patch_{bug_id}.diff
 
-        For EVERY change this patch makes to the source code, wrap it:
+        For EVERY change this patch makes — additions, modifications,
+        AND deletions — wrap it in a dispatch branch:
 
             #include "__bug_dispatch.h"
+
+            For added/modified lines:
             if (__bug_dispatch & (1 << {dispatch_bit})) {{
                 // {bug_id}'s version of the code (from the patch)
             }} else {{
                 // Original code (before the patch, needed by regressed bugs)
+            }}
+
+            For deleted lines — do NOT just leave them deleted:
+            if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                // Empty — lines removed by {bug_id}'s patch
+            }} else {{
+                // Original lines restored (needed by regressed bugs)
+                <put the deleted lines here>
             }}
 
         The header is at /src/{project}/__bug_dispatch.h.
@@ -952,16 +977,13 @@ def resolve_with_dispatch(
             ... code for that bug ...
             //BUG_END OSV-XXXX
 
-        You MUST NOT modify, move, or wrap code between these markers.
-        That code belongs to a previous bug and must stay exactly as-is.
-        Only wrap code from {bug_id} (the newly-applied bug) in dispatch
-        branches. When wrapping, place dispatch branches OUTSIDE the
-        marked regions, never inside them.
+        You may wrap a marked region inside a dispatch else-branch to
+        preserve it, but you MUST NOT modify the code between the markers.
 
         Rules:
         - Read the patch file to see ALL hunks
         - For each hunk, find where it was applied in the current source
-        - Wrap the changed lines in a dispatch branch
+        - Wrap ALL changes in dispatch branches (additions AND deletions)
         - The else branch must contain the ORIGINAL code (before {bug_id}'s
           changes), not the current code
         - If a hunk moves code (removes from one place, adds to another),
@@ -969,6 +991,10 @@ def resolve_with_dispatch(
         - Do NOT skip any hunk — wrap them ALL
         - An unnecessary dispatch branch is harmless; a missing one loses
           a bug
+        - SKIP dispatch for compile-time constructs that cannot be wrapped
+          in runtime if/else: #define, #undef, #include, struct/union/enum
+          definitions, global variable declarations, function signature
+          changes. Leave these as-is.
 
         After making changes, run: sudo -E compile
         If there are build errors, fix them.
@@ -1123,13 +1149,25 @@ def resolve_self_trigger_with_dispatch(
         Step 3: For every change in the git diff that is in a function or
                 code path that {bug_id}'s testcase needs to traverse (based
                 on the crash log and {bug_id}'s patch), wrap it in a
-                dispatch branch:
+                dispatch branch. This includes BOTH additions AND deletions
+                from previous patches:
 
             #include "__bug_dispatch.h"
+
+            For added/modified lines from previous patches:
             if (__bug_dispatch & (1 << {dispatch_bit})) {{
                 // Original code (before any patches — what {bug_id} needs)
             }} else {{
                 // Currently-applied change (needed by previous bugs)
+            }}
+
+            For lines that previous patches DELETED (visible as "-" lines
+            in git diff or the patch files) — these lines no longer exist
+            in the source but {bug_id} may need them. Re-add them inside
+            a dispatch branch:
+            if (__bug_dispatch & (1 << {dispatch_bit})) {{
+                // Restore deleted lines (what {bug_id} needs)
+                <re-add the deleted lines here>
             }}
 
         The header is at /src/{project}/__bug_dispatch.h.
@@ -1141,6 +1179,13 @@ def resolve_self_trigger_with_dispatch(
           changes came from which bug.
         - If a previous patch has multiple hunks in the same file, wrap
           ALL of them — do not skip any.
+        - Deletions matter! If a previous patch removed a bounds check,
+          a return statement, or any other code, and {bug_id}'s crash
+          path needs that code, restore it inside a dispatch branch.
+        - SKIP dispatch for compile-time constructs that cannot be wrapped
+          in runtime if/else: #define, #undef, #include, struct/union/enum
+          definitions, global variable declarations, function signature
+          changes. Leave these as-is.
 
         After making changes, run: sudo -E compile
         If there are build errors, fix them.
