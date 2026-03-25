@@ -844,28 +844,25 @@ def resolve_with_dispatch(
 
 
 def _save_source_snapshot(container: str, project: str) -> None:
-    """Save the current source state via ``git stash`` for rollback.
+    """Save the current source state as a diff for rollback.
 
-    Uses ``git stash`` which captures the full working tree including
-    binary files, file modes, and untracked files — more robust than
-    diff+apply for edge cases.  The stash entry stays at stash@{0}
-    while the working tree is immediately restored via ``apply``.
+    Captures ``git diff`` (tracked source changes only) and a list of
+    new files added by dispatch/annotation.  Does NOT use ``git add``
+    or ``git stash`` to avoid polluting the index with build artifacts.
     """
-    # Drop any previous snapshot stash
     _exec_capture(
         container,
-        f"cd /src/{project} && git stash drop 2>/dev/null; true",
+        f"cd /src/{project} && git diff > /tmp/_snap.diff 2>&1",
     )
-    # Save current state (stages everything, stashes, cleans tree)
+    # Save paths of untracked source files (dispatch headers, etc.)
     _exec_capture(
         container,
-        f"cd /src/{project} && git add -A && "
-        f"git stash push -m '_merge_snapshot' --include-untracked 2>&1",
-    )
-    # Restore working tree from stash (keep stash entry for rollback)
-    _exec_capture(
-        container,
-        f"cd /src/{project} && git stash apply 2>&1",
+        f"cd /src/{project} && "
+        f"git ls-files --others --exclude-standard "
+        f"'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' "
+        f"> /tmp/_snap_untracked.list 2>/dev/null; "
+        f"tar cf /tmp/_snap_untracked.tar "
+        f"-T /tmp/_snap_untracked.list 2>/dev/null; true",
     )
 
 
@@ -882,14 +879,21 @@ def _revert_and_rebuild(
     failure, etc.) to restore the source tree to the state before the
     failed step was attempted.
     """
-    # Discard failed step's changes, restore from stash
+    # Discard failed step's changes
     _exec_capture(
         container,
-        f"cd /src/{project} && git checkout -- . && git clean -fd 2>&1",
+        f"cd /src/{project} && git checkout -- . 2>&1",
     )
+    # Re-apply the snapshot diff (tracked changes only)
     _exec_capture(
         container,
-        f"cd /src/{project} && git stash pop 2>&1",
+        f"cd /src/{project} && git apply --allow-empty /tmp/_snap.diff 2>&1",
+    )
+    # Restore untracked source files (dispatch headers, etc.)
+    _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"tar xf /tmp/_snap_untracked.tar 2>/dev/null; true",
     )
     for san in ("address", "undefined"):
         _exec_capture(
