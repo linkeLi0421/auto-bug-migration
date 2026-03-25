@@ -1,4 +1,4 @@
-# Self-Trigger Dispatch
+# Self-Trigger Unblock
 
 Unblock a bug whose testcase is blocked by previously-applied patches.
 
@@ -14,41 +14,48 @@ testcase from reaching the crash site.
 The crash log showing what this bug SHOULD produce:
   {crash_line}
 
-Bug {bug_id}'s minimized patch:
+Bug {bug_id}'s original minimized patch (what works in isolation):
   /tmp/patch_{bug_id}.diff
 
 Previously-applied patches:
 {prev_list}
 
-I need you to wrap the blocking changes in dispatch branches.
+Your goal: make {bug_id}'s testcase trigger the crash shown above,
+without breaking any previously-applied bugs.
 
-Step 1: Read {bug_id}'s patch to understand what functions and code
-        paths the bug needs to reach.
+Step 1: Read {bug_id}'s patch to understand ALL changes it needs
+        — struct/type definitions, macro definitions, code changes
+        in every function it touches.
 
-Step 2: Run `cd /src/{project} && git diff` to see ALL currently
-        applied changes in the source.
+Step 2: Run `cd /src/{project} && git diff` to see the current
+        state of the source (all previously-applied patches).
 
-Step 3: For every change in the git diff that is in a function or
-        code path that {bug_id}'s testcase needs to traverse (based
-        on the crash log and {bug_id}'s patch), wrap it in a
-        dispatch branch:
+Step 3: Compare the patch against the current state. Identify:
+        a) Parts of {bug_id}'s patch that are MISSING from the
+           current code (e.g. struct field additions, changes in
+           functions that no previous patch touched). Apply these
+           directly — they don't conflict with anything.
+        b) Places where a previous patch changed code that
+           {bug_id}'s testcase needs to traverse, blocking it
+           from reaching the crash site.
+
+Step 4: For blocking changes found in (b), you have a runtime
+        dispatch mechanism available. It lets the fuzzer select
+        different code paths per-bug via a byte in the test input:
 
     #include "__bug_dispatch.h"
     if (__bug_dispatch & (1 << {dispatch_bit})) {{
-        // Original code (before any patches — what {bug_id} needs)
+        // Code path that {bug_id} needs
     }} else {{
-        // Currently-applied change (needed by previous bugs)
+        // Currently-applied code (needed by previous bugs)
     }}
 
-The header is at /src/{project}/__bug_dispatch.h.
+    The header is at /src/{project}/__bug_dispatch.h.
 
-Rules:
-- When in doubt, WRAP the change. An unnecessary dispatch branch
-  is harmless; a missing one means the bug won't trigger.
-- Check the previously-applied patch files to understand which
-  changes came from which bug.
-- If a previous patch has multiple hunks in the same file, wrap
-  ALL of them — do not skip any.
+    Use dispatch ONLY where a previous patch's change actually
+    blocks {bug_id}'s testcase. Do NOT dispatch struct/type
+    definitions, macros, or other compile-time constructs — apply
+    those directly.
 
 After making changes, run: sudo -E compile
 If there are build errors, fix them.
