@@ -872,6 +872,64 @@ def _save_step_diff(
                 bug_id, suffix, step_file, len(diff_text))
 
 
+def _save_step_state(
+    project: str,
+    target_commit: str,
+    step_index: int,
+    dispatch_state: dict,
+    applied_bugs: list[str],
+    merge_results: list[dict],
+    all_verified_bug_ids: list[str],
+) -> None:
+    """Save merge state after each step so we can resume with --start-step."""
+    step_dir = (DATA_DIR / "bug_transplant"
+                / f"merge_{project}_{target_commit[:8]}" / "steps")
+    step_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "step_index": step_index,
+        "dispatch_state": dispatch_state,
+        "applied_bugs": applied_bugs,
+        "merge_results": merge_results,
+        "all_verified_bug_ids": all_verified_bug_ids,
+    }
+    state_file = step_dir / f"step_{step_index+1:02d}_state.json"
+    state_file.write_text(json.dumps(state, indent=2))
+    logger.debug("Saved step state: %s", state_file)
+
+
+def _load_step_state(
+    project: str,
+    target_commit: str,
+    step_index: int,
+) -> dict | None:
+    """Load merge state saved after a completed step."""
+    step_dir = (DATA_DIR / "bug_transplant"
+                / f"merge_{project}_{target_commit[:8]}" / "steps")
+    state_file = step_dir / f"step_{step_index+1:02d}_state.json"
+    if not state_file.exists():
+        logger.error("Step state file not found: %s", state_file)
+        return None
+    return json.loads(state_file.read_text())
+
+
+def _find_step_apply_diff(
+    project: str,
+    target_commit: str,
+    step_index: int,
+) -> Path | None:
+    """Find the apply diff for a given step (the cumulative source snapshot)."""
+    step_dir = (DATA_DIR / "bug_transplant"
+                / f"merge_{project}_{target_commit[:8]}" / "steps")
+    # Look for the latest diff variant for this step (prefer self_trigger > conflict > apply)
+    for suffix in ("self_trigger_dispatch", "regression_dispatch",
+                   "conflict_dispatch", "apply"):
+        p = step_dir / f"step_{step_index+1:02d}_*_{suffix}.diff"
+        matches = sorted(step_dir.glob(f"step_{step_index+1:02d}_*_{suffix}.diff"))
+        if matches:
+            return matches[-1]
+    return None
+
+
 def _save_source_snapshot(container: str, project: str) -> None:
     """Save the current source state as a diff for rollback.
 
@@ -1482,27 +1540,121 @@ def run_merge(args: argparse.Namespace) -> int:
         "harness_modified": False,     # dispatch byte consumption in harness
         "dispatch_file_injected": False,  # __bug_dispatch.h/.c created
     }
+    start_step = getattr(args, "start_step", None)  # 1-based from CLI
 
     try:
         # ------------------------------------------------------------------
-        # 5. Verify local bugs trigger at baseline
+        # 5. Restore state if --start-step, else verify local bugs
         # ------------------------------------------------------------------
-        if local_bugs:
-            logger.info("=== Verifying %d local bugs at baseline ===", len(local_bugs))
-            baseline = verify_all_bugs(container, local_bugs)
-            for bug_id, ok in baseline.items():
-                if ok:
-                    all_verified_bugs.append(
-                        next(lb for lb in local_bugs if lb["bug_id"] == bug_id)
-                    )
-                else:
-                    logger.warning("Local bug %s does NOT trigger at baseline", bug_id)
+        if start_step and start_step > 1:
+            prev_idx = start_step - 2  # 0-based index of the step to restore
+            logger.info("=== Restoring state from step %d ===", start_step - 1)
+
+            # Load saved state
+            saved = _load_step_state(project, target_commit, prev_idx)
+            if saved is None:
+                logger.error("Cannot resume: no state file for step %d", start_step - 1)
+                return 1
+
+            # Find and apply the cumulative diff
+            diff_path = _find_step_apply_diff(project, target_commit, prev_idx)
+            if diff_path is None:
+                logger.error("Cannot resume: no apply diff for step %d", start_step - 1)
+                return 1
+
+            logger.info("Applying cumulative diff: %s", diff_path)
+
+            # Copy diff into container via docker cp and apply
+            subprocess.call(
+                ["docker", "cp", str(diff_path),
+                 f"{container}:/tmp/_resume.diff"],
+            )
+            ret, out = _exec_capture(
+                container,
+                f"cd /src/{project} && git apply /tmp/_resume.diff",
+            )
+            if ret != 0:
+                logger.error("Failed to apply resume diff: %s", out[-500:] if out else "")
+                return 1
+
+            # Restore dispatch_state
+            dispatch_state = saved["dispatch_state"]
+            # Convert string keys back to int for bits dict
+            dispatch_state["bits"] = {
+                int(k): v for k, v in dispatch_state["bits"].items()
+            }
+            applied_bugs = saved["applied_bugs"]
+            merge_results = saved["merge_results"]
+
+            # Re-inject dispatch files if they were used
+            if dispatch_state.get("dispatch_file_injected"):
+                _inject_dispatch_files(container, project)
+
+            # Rebuild all_verified_bugs from saved IDs
+            saved_ids = set(saved["all_verified_bug_ids"])
+            for lb in local_bugs:
+                if lb["bug_id"] in saved_ids:
+                    all_verified_bugs.append(lb)
+            for bd in ordered:
+                if bd["bug_id"] in saved_ids and bd["bug_id"] not in {
+                    lb["bug_id"] for lb in local_bugs
+                }:
+                    all_verified_bugs.append(bd)
+
+            # Rebuild: build ASAN+UBSAN and set up dispatch bytes
+            logger.info("Rebuilding from restored state...")
+            for san in ("address", "undefined"):
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                    f"rm -f /src/*.o 2>/dev/null; true",
+                )
+                ret, bout = _exec_capture(
+                    container,
+                    f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
+                )
+                if ret != 0:
+                    logger.error("Build failed for %s after restore: %s",
+                                 san, bout[-500:] if bout else "")
+                    return 1
+                _exec_capture(
+                    container,
+                    f"mkdir -p /out/{san} && "
+                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                    f"cp \"$f\" /out/{san}/; done; true",
+                )
+            _exec_capture(container,
+                          "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+            if dispatch_state["poc_bytes"]:
+                _apply_all_dispatch_bytes(container, dispatch_state)
+
+            logger.info("Restored: %d applied bugs, dispatch next_bit=%d",
+                        len(applied_bugs), dispatch_state["next_bit"])
+        else:
+            if local_bugs:
+                logger.info("=== Verifying %d local bugs at baseline ===",
+                            len(local_bugs))
+                baseline = verify_all_bugs(container, local_bugs)
+                for bug_id, ok in baseline.items():
+                    if ok:
+                        all_verified_bugs.append(
+                            next(lb for lb in local_bugs
+                                 if lb["bug_id"] == bug_id)
+                        )
+                    else:
+                        logger.warning(
+                            "Local bug %s does NOT trigger at baseline",
+                            bug_id)
 
         # ------------------------------------------------------------------
         # 6. Apply transplant diffs incrementally
         # ------------------------------------------------------------------
         max_steps = getattr(args, "max_steps", None)
+        skip_until = (start_step - 1) if start_step else 0  # 0-based
         for i, bd in enumerate(ordered):
+            if i < skip_until:
+                continue
             if max_steps is not None and i >= max_steps:
                 logger.info("Reached --max-steps %d, stopping early", max_steps)
                 break
@@ -1643,91 +1795,71 @@ def run_merge(args: argparse.Namespace) -> int:
 
             # --- If self-trigger fails, try dispatch to unblock ---
             if not step["self_triggers"] and applied_bugs:
-                # Skip dispatch if patch has compile-time changes that
-                # cannot be dispatched (struct fields, macros, headers)
-                diff_text = Path(diff_path).read_text(errors="replace")
-                has_header = any(
-                    f.endswith(('.h', '.hh', '.hpp', '.hxx'))
-                    for f in re.findall(r'^\+\+\+ b/(.+)$', diff_text, re.M)
+                logger.info(
+                    "[%s] Self-trigger failed — attempting dispatch to "
+                    "unblock from %d previous patches...",
+                    bug_id, len(applied_bugs),
                 )
-                has_struct = bool(re.search(
-                    r'^\+.*(?:#define\s|#undef\s|^\+\s*(?:int|char|uint|bool|float|double|void|unsigned|signed|struct|enum|union)\S*\s+\w+\s*;)',
-                    diff_text, re.M,
-                ))
-                if has_header:
-                    logger.warning(
-                        "[%s] Patch modifies header files — dispatch "
-                        "cannot fix compile-time changes (struct fields, "
-                        "macros). Skipping self-trigger dispatch.",
-                        bug_id,
-                    )
-                else:
-                    logger.info(
-                        "[%s] Self-trigger failed — attempting dispatch to "
-                        "unblock from %d previous patches...",
-                        bug_id, len(applied_bugs),
-                    )
 
-                if not has_header:
-                    if not dispatch_state["dispatch_file_injected"]:
-                        _inject_dispatch_files(container, project)
-                        dispatch_state["dispatch_file_injected"] = True
+                if not dispatch_state["dispatch_file_injected"]:
+                    _inject_dispatch_files(container, project)
+                    dispatch_state["dispatch_file_injected"] = True
 
-                    bit_index = dispatch_state["next_bit"]
-                    prev_bugs_data = [
-                        next(d for d in ordered if d["bug_id"] == pid)
-                        for pid in applied_bugs
-                    ]
+                bit_index = dispatch_state["next_bit"]
+                prev_bugs_data = [
+                    next(d for d in ordered if d["bug_id"] == pid)
+                    for pid in applied_bugs
+                ]
 
-                    dispatch_ok = resolve_self_trigger_with_dispatch(
-                        container, bug_id, project,
-                        prev_bugs_data, bd.get("crash_log"),
-                        bd["diff_path"], bit_index,
-                        agent=args.agent, model=args.model,
-                    )
+                dispatch_ok = resolve_self_trigger_with_dispatch(
+                    container, bug_id, project,
+                    prev_bugs_data, bd.get("crash_log"),
+                    bd["diff_path"], bit_index,
+                    agent=args.agent, model=args.model,
+                )
 
-                    if dispatch_ok:
-                        if not dispatch_state["harness_modified"]:
-                            hok = _modify_harness_for_dispatch(
-                                container, project, bd["fuzzer"],
-                                args.agent, args.model,
-                            )
-                            if hok:
-                                dispatch_state["harness_modified"] = True
-                                for lb in local_bugs:
-                                    dispatch_state["poc_bytes"].setdefault(
-                                        lb["bug_id"], 0)
-                                for tbd in ordered:
-                                    dispatch_state["poc_bytes"].setdefault(
-                                        tbd["bug_id"], 0)
+                if dispatch_ok:
+                    if not dispatch_state["harness_modified"]:
+                        hok = _modify_harness_for_dispatch(
+                            container, project, bd["fuzzer"],
+                            args.agent, args.model,
+                        )
+                        if hok:
+                            dispatch_state["harness_modified"] = True
+                            for lb in local_bugs:
+                                dispatch_state["poc_bytes"].setdefault(
+                                    lb["bug_id"], 0)
+                            for tbd in ordered:
+                                dispatch_state["poc_bytes"].setdefault(
+                                    tbd["bug_id"], 0)
 
-                        if dispatch_state["harness_modified"]:
-                            dispatch_state["bits"][bit_index] = {
-                                "bug_new": bug_id,
-                                "bug_blocked_by": list(applied_bugs),
-                                "type": "self_trigger_unblock",
-                            }
-                            dispatch_state["poc_bytes"].setdefault(bug_id, 0)
-                            dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                            dispatch_state["next_bit"] += 1
+                    if dispatch_state["harness_modified"]:
+                        dispatch_state["bits"][bit_index] = {
+                            "bug_new": bug_id,
+                            "bug_blocked_by": list(applied_bugs),
+                            "type": "self_trigger_unblock",
+                        }
+                        dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                        dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                        dispatch_state["next_bit"] += 1
 
-                            _rebuild_and_apply_dispatch(
-                                container, project, dispatch_state)
-                            _save_step_diff(container, project, target_commit,
-                                            i, bug_id, "self_trigger_dispatch", step)
+                        _rebuild_and_apply_dispatch(
+                            container, project, dispatch_state)
+                        _save_step_diff(container, project, target_commit,
+                                        i, bug_id, "self_trigger_dispatch", step)
 
-                            step["self_triggers"] = verify_bug_triggers(
-                                container, bug_id, bd["fuzzer"], bd["testcase"],
-                                bd.get("sanitizer", "address"),
-                                bd.get("crash_log"),
-                            )
-                            if step["self_triggers"]:
-                                step["apply_method"] += "+dispatch"
-                                logger.info(
-                                    "[%s] Self-trigger OK after dispatch", bug_id)
-                            else:
-                                logger.warning(
-                                    "[%s] Still fails after dispatch", bug_id)
+                        step["self_triggers"] = verify_bug_triggers(
+                            container, bug_id, bd["fuzzer"], bd["testcase"],
+                            bd.get("sanitizer", "address"),
+                            bd.get("crash_log"),
+                        )
+                        if step["self_triggers"]:
+                            step["apply_method"] += "+dispatch"
+                            logger.info(
+                                "[%s] Self-trigger OK after dispatch", bug_id)
+                        else:
+                            logger.warning(
+                                "[%s] Still fails after dispatch", bug_id)
 
             # --- If still can't self-trigger, revert this patch ---
             if not step["self_triggers"]:
@@ -1832,6 +1964,13 @@ def run_merge(args: argparse.Namespace) -> int:
                 all_verified_bugs.append(bd)
 
             merge_results.append(step)
+
+            # Save state for --start-step resume
+            _save_step_state(
+                project, target_commit, i, dispatch_state,
+                applied_bugs, merge_results,
+                [b["bug_id"] for b in all_verified_bugs],
+            )
 
         # ------------------------------------------------------------------
         # 7. Final verification of ALL bugs
@@ -2072,6 +2211,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Keep container alive for debugging")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Stop after N transplant diffs (for debugging)")
+    parser.add_argument("--start-step", type=int, default=None,
+                        help="Resume from step N (requires previous run's step diffs)")
     parser.add_argument("--verbose", "-V", action="store_true")
 
     return parser

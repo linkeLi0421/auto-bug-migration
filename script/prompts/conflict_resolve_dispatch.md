@@ -1,6 +1,6 @@
 # Conflict Resolution with Dispatch Branches
 
-Resolve merge conflicts by wrapping conflicting code in dispatch branches.
+Resolve merge conflicts by adding the smallest dispatch needed.
 
 ## Prompt
 
@@ -47,11 +47,21 @@ Strategy:
 
    The header is at /src/{project}/__bug_dispatch.h.
 
-3. When in doubt, use a dispatch branch. An unnecessary branch
-   is harmless; a missing one loses a bug.
-4. If a hunk can be applied without conflicting with existing
+3. If a hunk can be applied without conflicting with existing
    changes, apply it directly (no dispatch needed for that hunk).
-5. After adding your code, wrap it with markers:
+4. Keep dispatch regions as small as possible. Do NOT dispatch
+   unrelated hunks or whole files just for consistency.
+5. Prefer one flat dispatch branch over nested dispatch branches.
+   Do NOT put a new dispatch branch inside an existing one unless
+   a second independent conflict is strictly necessary.
+6. For deletions: if the deleted code is still needed by a
+   previously-applied bug, preserve it in the else-branch;
+   otherwise apply the deletion directly.
+7. SKIP runtime dispatch for compile-time-only constructs such as
+   #define/#undef/#include, type definitions, global declarations,
+   and function signature changes. Apply those directly or keep
+   the existing version.
+8. After adding your code, wrap it with markers:
    //BUG_START {bug_id}
    ... your new code ...
    //BUG_END {bug_id}
