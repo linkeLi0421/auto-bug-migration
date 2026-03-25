@@ -711,16 +711,17 @@ def resolve_conflict_with_agent(
             )
     conflict_desc = "\n".join(conflict_desc_lines) if conflict_desc_lines else "  (unknown)"
 
-    # Build dispatch-aware prompt when dispatch infrastructure is available
-    fmt_kwargs = dict(
+    # Build dispatch-aware prompt (dispatch_bit is always provided in the
+    # merge flow, so the non-dispatch path is removed)
+    if dispatch_bit is None:
+        raise ValueError(
+            f"[{bug_id}] dispatch_bit must be set for conflict resolution"
+        )
+    prompt = _load_prompt(
+        "conflict_resolve_dispatch",
         project=project, applied_list=applied_list, diff_name=diff_name,
-        bug_id=bug_id, conflict_desc=conflict_desc,
+        bug_id=bug_id, conflict_desc=conflict_desc, dispatch_bit=dispatch_bit,
     )
-    if dispatch_bit is not None:
-        fmt_kwargs["dispatch_bit"] = dispatch_bit
-        prompt = _load_prompt("conflict_resolve_dispatch", **fmt_kwargs)
-    else:
-        prompt = _load_prompt("conflict_resolve_no_dispatch", **fmt_kwargs)
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -842,26 +843,30 @@ def resolve_with_dispatch(
     return True
 
 
-def _save_source_snapshot(container: str, project: str) -> str:
-    """Save the current source state as a diff snapshot inside the container.
+def _save_source_snapshot(container: str, project: str) -> None:
+    """Save the current source state via ``git stash`` for rollback.
 
-    Returns the path to the saved snapshot file.  The snapshot captures
-    the full working tree state including conflict-resolution edits,
-    dispatch branches, annotation markers, and harness changes.
+    Uses ``git stash`` which captures the full working tree including
+    binary files, file modes, and untracked files — more robust than
+    diff+apply for edge cases.  The stash entry stays at stash@{0}
+    while the working tree is immediately restored via ``apply``.
     """
-    snap_path = f"/tmp/_merge_snapshot_{project}.diff"
+    # Drop any previous snapshot stash
     _exec_capture(
         container,
-        f"cd /src/{project} && git diff > {snap_path} 2>&1",
+        f"cd /src/{project} && git stash drop 2>/dev/null; true",
     )
-    # Also snapshot new (untracked) files
+    # Save current state (stages everything, stashes, cleans tree)
     _exec_capture(
         container,
-        f"cd /src/{project} && git diff --cached >> {snap_path} 2>&1; "
-        f"git ls-files --others --exclude-standard "
-        f"| tar cf /tmp/_merge_snapshot_untracked.tar -T - 2>/dev/null; true",
+        f"cd /src/{project} && git add -A && "
+        f"git stash push -m '_merge_snapshot' --include-untracked 2>&1",
     )
-    return snap_path
+    # Restore working tree from stash (keep stash entry for rollback)
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git stash apply 2>&1",
+    )
 
 
 def _revert_and_rebuild(
@@ -877,21 +882,14 @@ def _revert_and_rebuild(
     failure, etc.) to restore the source tree to the state before the
     failed step was attempted.
     """
-    snap_path = f"/tmp/_merge_snapshot_{project}.diff"
-    # Reset to clean state, then re-apply the snapshot
+    # Discard failed step's changes, restore from stash
     _exec_capture(
         container,
         f"cd /src/{project} && git checkout -- . && git clean -fd 2>&1",
     )
     _exec_capture(
         container,
-        f"cd /src/{project} && git apply --allow-empty {snap_path} 2>&1",
-    )
-    # Restore untracked files (dispatch files, etc.)
-    _exec_capture(
-        container,
-        f"cd /src/{project} && "
-        f"tar xf /tmp/_merge_snapshot_untracked.tar 2>/dev/null; true",
+        f"cd /src/{project} && git stash pop 2>&1",
     )
     for san in ("address", "undefined"):
         _exec_capture(
