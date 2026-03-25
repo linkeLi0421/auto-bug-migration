@@ -711,8 +711,9 @@ def resolve_conflict_with_agent(
             )
     conflict_desc = "\n".join(conflict_desc_lines) if conflict_desc_lines else "  (unknown)"
 
-    # Build dispatch-aware prompt (dispatch_bit is always provided in the
-    # merge flow, so the non-dispatch path is removed)
+    # Build the dispatch prompt. Conflict resolution always gets a dispatch
+    # bit in this merge flow, but the prompt now asks the agent to dispatch
+    # only the minimal conflicting logic rather than whole patches.
     if dispatch_bit is None:
         raise ValueError(
             f"[{bug_id}] dispatch_bit must be set for conflict resolution"
@@ -1642,71 +1643,91 @@ def run_merge(args: argparse.Namespace) -> int:
 
             # --- If self-trigger fails, try dispatch to unblock ---
             if not step["self_triggers"] and applied_bugs:
-                logger.info(
-                    "[%s] Self-trigger failed — attempting dispatch to "
-                    "unblock from %d previous patches...",
-                    bug_id, len(applied_bugs),
+                # Skip dispatch if patch has compile-time changes that
+                # cannot be dispatched (struct fields, macros, headers)
+                diff_text = Path(diff_path).read_text(errors="replace")
+                has_header = any(
+                    f.endswith(('.h', '.hh', '.hpp', '.hxx'))
+                    for f in re.findall(r'^\+\+\+ b/(.+)$', diff_text, re.M)
                 )
+                has_struct = bool(re.search(
+                    r'^\+.*(?:#define\s|#undef\s|^\+\s*(?:int|char|uint|bool|float|double|void|unsigned|signed|struct|enum|union)\S*\s+\w+\s*;)',
+                    diff_text, re.M,
+                ))
+                if has_header:
+                    logger.warning(
+                        "[%s] Patch modifies header files — dispatch "
+                        "cannot fix compile-time changes (struct fields, "
+                        "macros). Skipping self-trigger dispatch.",
+                        bug_id,
+                    )
+                else:
+                    logger.info(
+                        "[%s] Self-trigger failed — attempting dispatch to "
+                        "unblock from %d previous patches...",
+                        bug_id, len(applied_bugs),
+                    )
 
-                if not dispatch_state["dispatch_file_injected"]:
-                    _inject_dispatch_files(container, project)
-                    dispatch_state["dispatch_file_injected"] = True
+                if not has_header:
+                    if not dispatch_state["dispatch_file_injected"]:
+                        _inject_dispatch_files(container, project)
+                        dispatch_state["dispatch_file_injected"] = True
 
-                bit_index = dispatch_state["next_bit"]
-                prev_bugs_data = [
-                    next(d for d in ordered if d["bug_id"] == pid)
-                    for pid in applied_bugs
-                ]
+                    bit_index = dispatch_state["next_bit"]
+                    prev_bugs_data = [
+                        next(d for d in ordered if d["bug_id"] == pid)
+                        for pid in applied_bugs
+                    ]
 
-                dispatch_ok = resolve_self_trigger_with_dispatch(
-                    container, bug_id, project,
-                    prev_bugs_data, bd.get("crash_log"),
-                    bd["diff_path"], bit_index,
-                    agent=args.agent, model=args.model,
-                )
+                    dispatch_ok = resolve_self_trigger_with_dispatch(
+                        container, bug_id, project,
+                        prev_bugs_data, bd.get("crash_log"),
+                        bd["diff_path"], bit_index,
+                        agent=args.agent, model=args.model,
+                    )
 
-                if dispatch_ok:
-                    if not dispatch_state["harness_modified"]:
-                        hok = _modify_harness_for_dispatch(
-                            container, project, bd["fuzzer"],
-                            args.agent, args.model,
-                        )
-                        if hok:
-                            dispatch_state["harness_modified"] = True
-                            for lb in local_bugs:
-                                dispatch_state["poc_bytes"].setdefault(
-                                    lb["bug_id"], 0)
-                            for tbd in ordered:
-                                dispatch_state["poc_bytes"].setdefault(
-                                    tbd["bug_id"], 0)
+                    if dispatch_ok:
+                        if not dispatch_state["harness_modified"]:
+                            hok = _modify_harness_for_dispatch(
+                                container, project, bd["fuzzer"],
+                                args.agent, args.model,
+                            )
+                            if hok:
+                                dispatch_state["harness_modified"] = True
+                                for lb in local_bugs:
+                                    dispatch_state["poc_bytes"].setdefault(
+                                        lb["bug_id"], 0)
+                                for tbd in ordered:
+                                    dispatch_state["poc_bytes"].setdefault(
+                                        tbd["bug_id"], 0)
 
-                    if dispatch_state["harness_modified"]:
-                        dispatch_state["bits"][bit_index] = {
-                            "bug_new": bug_id,
-                            "bug_blocked_by": list(applied_bugs),
-                            "type": "self_trigger_unblock",
-                        }
-                        dispatch_state["poc_bytes"].setdefault(bug_id, 0)
-                        dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                        dispatch_state["next_bit"] += 1
+                        if dispatch_state["harness_modified"]:
+                            dispatch_state["bits"][bit_index] = {
+                                "bug_new": bug_id,
+                                "bug_blocked_by": list(applied_bugs),
+                                "type": "self_trigger_unblock",
+                            }
+                            dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                            dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                            dispatch_state["next_bit"] += 1
 
-                        _rebuild_and_apply_dispatch(
-                            container, project, dispatch_state)
-                        _save_step_diff(container, project, target_commit,
-                                        i, bug_id, "self_trigger_dispatch", step)
+                            _rebuild_and_apply_dispatch(
+                                container, project, dispatch_state)
+                            _save_step_diff(container, project, target_commit,
+                                            i, bug_id, "self_trigger_dispatch", step)
 
-                        step["self_triggers"] = verify_bug_triggers(
-                            container, bug_id, bd["fuzzer"], bd["testcase"],
-                            bd.get("sanitizer", "address"),
-                            bd.get("crash_log"),
-                        )
-                        if step["self_triggers"]:
-                            step["apply_method"] += "+dispatch"
-                            logger.info(
-                                "[%s] Self-trigger OK after dispatch", bug_id)
-                        else:
-                            logger.warning(
-                                "[%s] Still fails after dispatch", bug_id)
+                            step["self_triggers"] = verify_bug_triggers(
+                                container, bug_id, bd["fuzzer"], bd["testcase"],
+                                bd.get("sanitizer", "address"),
+                                bd.get("crash_log"),
+                            )
+                            if step["self_triggers"]:
+                                step["apply_method"] += "+dispatch"
+                                logger.info(
+                                    "[%s] Self-trigger OK after dispatch", bug_id)
+                            else:
+                                logger.warning(
+                                    "[%s] Still fails after dispatch", bug_id)
 
             # --- If still can't self-trigger, revert this patch ---
             if not step["self_triggers"]:
