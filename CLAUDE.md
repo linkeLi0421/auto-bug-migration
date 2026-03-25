@@ -104,6 +104,13 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
 
 5. **`script/bug_transplant_claude.md`**: CLAUDE.md mounted inside the container for persistent agent guidance.
 
+6. **`script/prompts/`**: Agent prompt templates used by the merge orchestrator. Loaded at runtime via `_load_prompt()` with variable substitution:
+   - `harness_dispatch.md` — Modify fuzz harness to consume dispatch byte from input
+   - `conflict_resolve_dispatch.md` — Resolve merge conflicts using dispatch branches (whole-patch dispatch)
+   - `conflict_resolve_no_dispatch.md` — Resolve merge conflicts without dispatch (manual adaptation)
+   - `regression_dispatch.md` — Wrap a newly-applied patch in dispatch to fix regressions
+   - `self_trigger_dispatch.md` — Unblock a bug blocked by previously-applied patches
+
 ### Data Infrastructure (shared)
 
 - **`script/fuzz_helper.py`**: Docker-based build/fuzz/reproduce/trace operations. Supports `--runner-image auto` for historical Docker image pinning.

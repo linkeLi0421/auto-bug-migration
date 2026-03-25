@@ -53,6 +53,26 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = SCRIPT_DIR.parent
 DATA_DIR = HOME_DIR / "data"
+PROMPTS_DIR = SCRIPT_DIR / "prompts"
+
+
+def _load_prompt(name: str, **kwargs: str) -> str:
+    """Load a prompt template from script/prompts/ and format it.
+
+    Reads ``script/prompts/{name}.md``, strips the YAML-style header
+    (everything before the first blank line after ``## Prompt``), and
+    calls ``.format(**kwargs)`` on the body.
+    """
+    path = PROMPTS_DIR / f"{name}.md"
+    text = path.read_text()
+    # Extract body after "## Prompt" header
+    marker = "## Prompt"
+    idx = text.find(marker)
+    if idx != -1:
+        text = text[idx + len(marker):]
+    # Strip leading blank lines
+    text = text.lstrip("\n")
+    return textwrap.dedent(text).format(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -364,37 +384,7 @@ def _modify_harness_for_dispatch(
             f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
         )
 
-    prompt = textwrap.dedent(f"""\
-        I need to modify the fuzz target for project {project} to support
-        an input-driven dispatch byte mechanism.
-
-        The file __bug_dispatch.h is already at /src/{project}/__bug_dispatch.h
-        and __bug_dispatch.c is at /src/{project}/__bug_dispatch.c.
-
-        Please make these changes:
-
-        1. Find the fuzz target source file that contains LLVMFuzzerTestOneInput
-           (likely builds the fuzzer "{fuzzer}").
-
-        2. Add at the top of that file:
-              #include "__bug_dispatch.h"
-
-        3. At the VERY START of LLVMFuzzerTestOneInput (before any existing
-           logic), add:
-              if (size < 1) return 0;
-              __bug_dispatch = data[0];
-              data++;
-              size--;
-
-        4. Make sure __bug_dispatch.c is compiled and linked into ALL fuzz
-           targets.  Depending on the build system you may need to:
-           - Add it to build.sh (e.g. add to a SOURCES list, or compile
-             and link it explicitly)
-           - Or add it to CMakeLists.txt / Makefile
-
-        After making changes, run: sudo -E compile
-        If there are build errors, fix them.
-    """)
+    prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -722,124 +712,15 @@ def resolve_conflict_with_agent(
     conflict_desc = "\n".join(conflict_desc_lines) if conflict_desc_lines else "  (unknown)"
 
     # Build dispatch-aware prompt when dispatch infrastructure is available
+    fmt_kwargs = dict(
+        project=project, applied_list=applied_list, diff_name=diff_name,
+        bug_id=bug_id, conflict_desc=conflict_desc,
+    )
     if dispatch_bit is not None:
-        prompt = textwrap.dedent(f"""\
-            I am merging multiple bug transplant patches into project {project}.
-
-            The following bugs have already been applied successfully: {applied_list}
-
-            I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
-            has merge conflicts with the current state of the code.
-
-            The conflicting previously-applied bug(s) and their patches:
-            {conflict_desc}
-
-            Both patches are minimized (every hunk is necessary). You MUST
-            preserve the bug-triggering logic from BOTH patches.
-
-            IMPORTANT — Bug ownership markers:
-            The source code contains comment markers that identify which code
-            belongs to which previously-applied bug:
-
-                //BUG_START OSV-XXXX
-                ... code for that bug ...
-                //BUG_END OSV-XXXX
-
-            You may wrap a marked region inside a dispatch else-branch to
-            preserve it for that bug's testcase, but you MUST NOT modify
-            the code between the markers.
-
-            Strategy — dispatch the ENTIRE patch:
-            1. Read the patch file /tmp/{diff_name} to see ALL hunks.
-            2. Wrap EVERY hunk in a dispatch branch — not just the
-               conflicting ones. When any part of a patch conflicts,
-               the entire patch must be dispatched for consistency.
-
-               #include "__bug_dispatch.h"
-
-               For hunks that ADD and/or MODIFY lines:
-               if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                   // {bug_id}'s version (the "+" lines from the patch)
-               }} else {{
-                   // Original code (the "-" lines or current code)
-               }}
-
-               For hunks that only DELETE lines — the deletion must also
-               be conditional. Do NOT just delete the lines. Instead:
-               if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                   // Empty — lines removed by {bug_id}'s patch
-               }} else {{
-                   // Original lines preserved for other bugs
-                   <the deleted lines go here>
-               }}
-
-               The header is at /src/{project}/__bug_dispatch.h.
-
-            3. When in doubt, use a dispatch branch. An unnecessary branch
-               is harmless; a missing one loses a bug.
-            4. SKIP dispatch for changes that cannot be runtime-conditional:
-               - #define / #undef / #include preprocessor directives
-               - struct/union/enum type definitions
-               - global variable declarations or type changes
-               - function signature changes (return type, parameters)
-               These are compile-time constructs — wrapping them in
-               if/else would not compile. Leave them as-is (apply
-               directly from the patch or keep the existing version).
-            5. After adding your code, wrap it with markers:
-               //BUG_START {bug_id}
-               ... your new code ...
-               //BUG_END {bug_id}
-
-            After making changes, run: sudo -E compile
-            If there are build errors, fix them.
-
-            At the VERY END of your output, write exactly one of these tokens
-            on its own line:
-              DISPATCH_USED   — if you created any dispatch branches
-              NO_DISPATCH     — if you applied all changes without branching
-        """)
+        fmt_kwargs["dispatch_bit"] = dispatch_bit
+        prompt = _load_prompt("conflict_resolve_dispatch", **fmt_kwargs)
     else:
-        prompt = textwrap.dedent(f"""\
-            I am merging multiple bug transplant patches into project {project}.
-
-            The following bugs have already been applied successfully: {applied_list}
-
-            I need to apply the patch at /tmp/{diff_name} for bug {bug_id}, but it
-            has merge conflicts with the current state of the code.
-
-            The conflicting previously-applied bug(s) and their patches:
-            {conflict_desc}
-
-            Since both patches are minimized (every hunk is necessary for its
-            bug), you MUST preserve the bug-triggering logic from BOTH patches.
-
-            IMPORTANT — Bug ownership markers:
-            The source code contains comment markers that identify which code
-            belongs to which previously-applied bug:
-
-                //BUG_START OSV-XXXX
-                ... code for that bug ...
-                //BUG_END OSV-XXXX
-
-            You MUST NOT modify, move, or wrap code between these markers.
-            That code belongs to a previous bug and must stay exactly as-is.
-            Only add NEW code for bug {bug_id} outside these marked regions.
-
-            Please:
-            1. Read the patch file /tmp/{diff_name} to understand what changes it makes
-            2. Look at the current state of the conflicting files in /src/{project}
-            3. Manually apply the changes from the patch, adapting them to work with
-               the code as it currently is (including changes from previously applied bugs)
-            4. Make sure the changes preserve the bug-triggering logic from the patch
-            5. Do NOT revert changes from previously applied bugs
-            6. Wrap your new code with markers:
-               //BUG_START {bug_id}
-               ... your new code ...
-               //BUG_END {bug_id}
-
-            After making changes, run: sudo -E compile
-            If there are build errors, fix them.
-        """)
+        prompt = _load_prompt("conflict_resolve_no_dispatch", **fmt_kwargs)
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -936,69 +817,11 @@ def resolve_with_dispatch(
 
     regressed_ids = ", ".join(b["bug_id"] for b in regressed_bugs)
 
-    prompt = textwrap.dedent(f"""\
-        I am merging multiple bug transplant patches into project {project}.
-
-        After applying the patch for bug {bug_id}, these previously-working
-        bugs stopped triggering: {regressed_ids}
-
-        I need you to wrap ALL code changes from {bug_id}'s patch in
-        dispatch branches so both sides can coexist in the same binary.
-
-        The patch for {bug_id}: /tmp/patch_{bug_id}.diff
-
-        For EVERY change this patch makes — additions, modifications,
-        AND deletions — wrap it in a dispatch branch:
-
-            #include "__bug_dispatch.h"
-
-            For added/modified lines:
-            if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                // {bug_id}'s version of the code (from the patch)
-            }} else {{
-                // Original code (before the patch, needed by regressed bugs)
-            }}
-
-            For deleted lines — do NOT just leave them deleted:
-            if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                // Empty — lines removed by {bug_id}'s patch
-            }} else {{
-                // Original lines restored (needed by regressed bugs)
-                <put the deleted lines here>
-            }}
-
-        The header is at /src/{project}/__bug_dispatch.h.
-
-        IMPORTANT — Bug ownership markers:
-        The source code contains comment markers that identify which code
-        belongs to which previously-applied bug:
-
-            //BUG_START OSV-XXXX
-            ... code for that bug ...
-            //BUG_END OSV-XXXX
-
-        You may wrap a marked region inside a dispatch else-branch to
-        preserve it, but you MUST NOT modify the code between the markers.
-
-        Rules:
-        - Read the patch file to see ALL hunks
-        - For each hunk, find where it was applied in the current source
-        - Wrap ALL changes in dispatch branches (additions AND deletions)
-        - The else branch must contain the ORIGINAL code (before {bug_id}'s
-          changes), not the current code
-        - If a hunk moves code (removes from one place, adds to another),
-          BOTH the removal site and the addition site need dispatch branches
-        - Do NOT skip any hunk — wrap them ALL
-        - An unnecessary dispatch branch is harmless; a missing one loses
-          a bug
-        - SKIP dispatch for compile-time constructs that cannot be wrapped
-          in runtime if/else: #define, #undef, #include, struct/union/enum
-          definitions, global variable declarations, function signature
-          changes. Leave these as-is.
-
-        After making changes, run: sudo -E compile
-        If there are build errors, fix them.
-    """)
+    prompt = _load_prompt(
+        "regression_dispatch",
+        project=project, bug_id=bug_id, regressed_ids=regressed_ids,
+        dispatch_bit=dispatch_bit,
+    )
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -1164,75 +987,11 @@ def resolve_self_trigger_with_dispatch(
             prev_lines.append(f"  - Bug {pb_id}: /tmp/patch_{pb_id}.diff")
     prev_list = "\n".join(prev_lines) if prev_lines else "  (none)"
 
-    prompt = textwrap.dedent(f"""\
-        I am merging multiple bug transplant patches into project {project}.
-
-        Bug {bug_id}'s patch has been applied, but the bug does NOT trigger
-        — the fuzzer exits cleanly (exit=0, no crash). The patch works when
-        applied alone, so previously-applied patches are blocking the
-        testcase from reaching the crash site.
-
-        The crash log showing what this bug SHOULD produce:
-          {crash_line}
-
-        Bug {bug_id}'s minimized patch:
-          /tmp/patch_{bug_id}.diff
-
-        Previously-applied patches:
-        {prev_list}
-
-        I need you to wrap the blocking changes in dispatch branches.
-
-        Step 1: Read {bug_id}'s patch to understand what functions and code
-                paths the bug needs to reach.
-
-        Step 2: Run `cd /src/{project} && git diff` to see ALL currently
-                applied changes in the source.
-
-        Step 3: For every change in the git diff that is in a function or
-                code path that {bug_id}'s testcase needs to traverse (based
-                on the crash log and {bug_id}'s patch), wrap it in a
-                dispatch branch. This includes BOTH additions AND deletions
-                from previous patches:
-
-            #include "__bug_dispatch.h"
-
-            For added/modified lines from previous patches:
-            if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                // Original code (before any patches — what {bug_id} needs)
-            }} else {{
-                // Currently-applied change (needed by previous bugs)
-            }}
-
-            For lines that previous patches DELETED (visible as "-" lines
-            in git diff or the patch files) — these lines no longer exist
-            in the source but {bug_id} may need them. Re-add them inside
-            a dispatch branch:
-            if (__bug_dispatch & (1 << {dispatch_bit})) {{
-                // Restore deleted lines (what {bug_id} needs)
-                <re-add the deleted lines here>
-            }}
-
-        The header is at /src/{project}/__bug_dispatch.h.
-
-        Rules:
-        - When in doubt, WRAP the change. An unnecessary dispatch branch
-          is harmless; a missing one means the bug won't trigger.
-        - Check the previously-applied patch files to understand which
-          changes came from which bug.
-        - If a previous patch has multiple hunks in the same file, wrap
-          ALL of them — do not skip any.
-        - Deletions matter! If a previous patch removed a bounds check,
-          a return statement, or any other code, and {bug_id}'s crash
-          path needs that code, restore it inside a dispatch branch.
-        - SKIP dispatch for compile-time constructs that cannot be wrapped
-          in runtime if/else: #define, #undef, #include, struct/union/enum
-          definitions, global variable declarations, function signature
-          changes. Leave these as-is.
-
-        After making changes, run: sudo -E compile
-        If there are build errors, fix them.
-    """)
+    prompt = _load_prompt(
+        "self_trigger_dispatch",
+        project=project, bug_id=bug_id, crash_line=crash_line,
+        prev_list=prev_list, dispatch_bit=dispatch_bit,
+    )
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
