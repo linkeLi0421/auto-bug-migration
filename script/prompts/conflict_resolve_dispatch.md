@@ -1,6 +1,6 @@
 # Conflict Resolution with Dispatch Branches
 
-Resolve merge conflicts by dispatching the ENTIRE patch.
+Resolve merge conflicts by wrapping conflicting code in dispatch branches.
 
 ## Prompt
 
@@ -25,46 +25,32 @@ belongs to which previously-applied bug:
     ... code for that bug ...
     //BUG_END OSV-XXXX
 
-You may wrap a marked region inside a dispatch else-branch to
-preserve it for that bug's testcase, but you MUST NOT modify
-the code between the markers.
+You MUST NOT modify, move, or wrap code between these markers.
+That code belongs to a previous bug and must stay exactly as-is.
+Only add NEW code for bug {bug_id} outside these marked regions.
+If {bug_id}'s patch needs to change the same lines as a marked
+region, add {bug_id}'s version separately and use a dispatch
+branch to select between them at runtime.
 
-Strategy — dispatch the ENTIRE patch:
-1. Read the patch file /tmp/{diff_name} to see ALL hunks.
-2. Wrap EVERY hunk in a dispatch branch — not just the
-   conflicting ones. When any part of a patch conflicts,
-   the entire patch must be dispatched for consistency.
+Strategy:
+1. Read the patch file /tmp/{diff_name} to see ALL changes.
+2. For each change, apply it to the current code. Where the new
+   patch and existing code disagree on the same lines, wrap it
+   in a dispatch branch:
 
    #include "__bug_dispatch.h"
-
-   For hunks that ADD and/or MODIFY lines:
    if (__bug_dispatch & (1 << {dispatch_bit})) {{
-       // {bug_id}'s version (the "+" lines from the patch)
+       // Code from bug {bug_id}'s patch
    }} else {{
-       // Original code (the "-" lines or current code)
-   }}
-
-   For hunks that only DELETE lines — the deletion must also
-   be conditional. Do NOT just delete the lines. Instead:
-   if (__bug_dispatch & (1 << {dispatch_bit})) {{
-       // Empty — lines removed by {bug_id}'s patch
-   }} else {{
-       // Original lines preserved for other bugs
-       <the deleted lines go here>
+       // Existing code (from previously-applied bugs)
    }}
 
    The header is at /src/{project}/__bug_dispatch.h.
 
 3. When in doubt, use a dispatch branch. An unnecessary branch
    is harmless; a missing one loses a bug.
-4. SKIP dispatch for changes that cannot be runtime-conditional:
-   - #define / #undef / #include preprocessor directives
-   - struct/union/enum type definitions
-   - global variable declarations or type changes
-   - function signature changes (return type, parameters)
-   These are compile-time constructs — wrapping them in
-   if/else would not compile. Leave them as-is (apply
-   directly from the patch or keep the existing version).
+4. If a hunk can be applied without conflicting with existing
+   changes, apply it directly (no dispatch needed for that hunk).
 5. After adding your code, wrap it with markers:
    //BUG_START {bug_id}
    ... your new code ...
