@@ -1019,6 +1019,49 @@ def resolve_with_dispatch(
     return True
 
 
+def _revert_and_rebuild(
+    container: str,
+    project: str,
+    applied_bugs: list[str],
+    ordered: list[dict],
+    dispatch_state: dict,
+) -> None:
+    """Revert all source changes and re-apply only successfully applied bugs.
+
+    Used when a patch must be rolled back (build failure, self-trigger
+    failure, etc.) to restore the source tree to a known-good state.
+    """
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git checkout -- . 2>&1",
+    )
+    for prev_id in applied_bugs:
+        prev = next(d for d in ordered if d["bug_id"] == prev_id)
+        _exec_capture(
+            container,
+            f"cd /src/{project} && git apply /tmp/{Path(prev['diff_path']).name} 2>&1",
+        )
+    for san in ("address", "undefined"):
+        _exec_capture(
+            container,
+            f"cd /src/{project} && make clean 2>/dev/null; "
+            f"rm -rf .obj *.a *.o 2>/dev/null; "
+            f"rm -f /src/*.o 2>/dev/null; true",
+        )
+        _exec_capture(
+            container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
+        )
+        _exec_capture(
+            container,
+            f"mkdir -p /out/{san} && "
+            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+            f"cp \"$f\" /out/{san}/; done; true",
+        )
+    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    if dispatch_state["poc_bytes"]:
+        _apply_all_dispatch_bytes(container, dispatch_state)
+
+
 def _rebuild_and_apply_dispatch(
     container: str,
     project: str,
@@ -1768,37 +1811,9 @@ def run_merge(args: argparse.Namespace) -> int:
 
             step["build_ok"] = not build_failed
             if build_failed:
-                logger.error("[%s] Build failed after applying diff", bug_id)
-                # Revert this diff and restore previous state
-                _exec_capture(
-                    container,
-                    f"cd /src/{project} && git checkout -- . 2>&1",
-                )
-                for prev_id in applied_bugs:
-                    prev = next(
-                        d for d in ordered if d["bug_id"] == prev_id
-                    )
-                    _exec_capture(
-                        container,
-                        f"cd /src/{project} && git apply /tmp/{Path(prev['diff_path']).name} 2>&1",
-                    )
-                for san in ("address", "undefined"):
-                    _exec_capture(
-                        container,
-                        f"cd /src/{project} && make clean 2>/dev/null; "
-                        f"rm -rf .obj *.a *.o 2>/dev/null; "
-                        f"rm -f /src/*.o 2>/dev/null; true",
-                    )
-                    _exec_capture(container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300)
-                    _exec_capture(
-                        container,
-                        f"mkdir -p /out/{san} && "
-                        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                        f"cp \"$f\" /out/{san}/; done; true",
-                    )
-                _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
-                if dispatch_state["poc_bytes"]:
-                    _apply_all_dispatch_bytes(container, dispatch_state)
+                logger.error("[%s] Build failed after applying diff, reverting", bug_id)
+                _revert_and_rebuild(
+                    container, project, applied_bugs, ordered, dispatch_state)
                 merge_results.append(step)
                 continue
 
@@ -1875,6 +1890,20 @@ def run_merge(args: argparse.Namespace) -> int:
                         else:
                             logger.warning(
                                 "[%s] Still fails after dispatch", bug_id)
+
+            # --- If still can't self-trigger, revert this patch ---
+            if not step["self_triggers"]:
+                logger.warning(
+                    "[%s] Cannot self-trigger (likely due to incompatible "
+                    "compile-time changes like macros/structs that cannot "
+                    "be dispatched). Reverting patch to avoid breaking "
+                    "other bugs.", bug_id,
+                )
+                step["apply_method"] = "reverted"
+                _revert_and_rebuild(
+                    container, project, applied_bugs, ordered, dispatch_state)
+                merge_results.append(step)
+                continue
 
             # --- Verify all previously applied bugs (regression check) ---
             if all_verified_bugs:
