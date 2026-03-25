@@ -843,6 +843,34 @@ def resolve_with_dispatch(
     return True
 
 
+def _save_step_diff(
+    container: str,
+    project: str,
+    target_commit: str,
+    step_index: int,
+    bug_id: str,
+    suffix: str,
+    step: dict,
+) -> None:
+    """Save a git diff snapshot for debugging.
+
+    *suffix* distinguishes multiple snapshots within one step, e.g.
+    ``apply``, ``conflict_dispatch``, ``regression_dispatch``,
+    ``self_trigger_dispatch``.
+    """
+    step_dir = (DATA_DIR / "bug_transplant"
+                / f"merge_{project}_{target_commit[:8]}" / "steps")
+    step_dir.mkdir(parents=True, exist_ok=True)
+    _, diff_text = _exec_capture(
+        container, f"cd /src/{project} && git diff",
+    )
+    step_file = step_dir / f"step_{step_index+1:02d}_{bug_id}_{suffix}.diff"
+    step_file.write_text(diff_text)
+    step.setdefault("step_diffs", {})[suffix] = str(step_file)
+    logger.info("[%s] Saved %s diff: %s (%d bytes)",
+                bug_id, suffix, step_file, len(diff_text))
+
+
 def _save_source_snapshot(container: str, project: str) -> None:
     """Save the current source state as a diff for rollback.
 
@@ -1525,6 +1553,8 @@ def run_merge(args: argparse.Namespace) -> int:
                 )
 
                 if result == "dispatch":
+                    _save_step_diff(container, project, target_commit,
+                                    i, bug_id, "conflict_dispatch", step)
                     step["apply_method"] = "dispatch"
                     dispatch_state["bits"][bit_index] = {
                         "bug_new": bug_id,
@@ -1590,17 +1620,9 @@ def run_merge(args: argparse.Namespace) -> int:
 
             # Save per-step diff snapshot for debugging
             if not build_failed:
-                step_dir = (DATA_DIR / "bug_transplant"
-                            / f"merge_{project}_{target_commit[:8]}" / "steps")
-                step_dir.mkdir(parents=True, exist_ok=True)
-                _, step_diff = _exec_capture(
-                    container, f"cd /src/{project} && git diff",
-                )
-                step_file = step_dir / f"step_{i+1:02d}_{bug_id}.diff"
-                step_file.write_text(step_diff)
-                step["step_diff_path"] = str(step_file)
-                logger.info("[%s] Saved step diff: %s (%d bytes)",
-                            bug_id, step_file, len(step_diff))
+                _save_step_diff(container, project, target_commit,
+                                i, bug_id, "apply", step)
+
 
             step["build_ok"] = not build_failed
             if build_failed:
@@ -1670,6 +1692,8 @@ def run_merge(args: argparse.Namespace) -> int:
 
                         _rebuild_and_apply_dispatch(
                             container, project, dispatch_state)
+                        _save_step_diff(container, project, target_commit,
+                                        i, bug_id, "self_trigger_dispatch", step)
 
                         step["self_triggers"] = verify_bug_triggers(
                             container, bug_id, bd["fuzzer"], bd["testcase"],
@@ -1766,6 +1790,8 @@ def run_merge(args: argparse.Namespace) -> int:
 
                             _rebuild_and_apply_dispatch(
                                 container, project, dispatch_state)
+                            _save_step_diff(container, project, target_commit,
+                                            i, bug_id, "regression_dispatch", step)
 
                             # Re-verify regressed bugs
                             re_results = verify_all_bugs(container, regressed)
