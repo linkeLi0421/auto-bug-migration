@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -325,6 +326,8 @@ _DISPATCH_SOURCE = """\
 #include <stdint.h>
 volatile uint8_t __bug_dispatch = 0;
 """
+
+_MAX_STEP_RETRIES = 1
 
 
 def _inject_dispatch_files(container: str, project: str) -> None:
@@ -662,6 +665,7 @@ def resolve_conflict_with_agent(
     model: str | None = None,
     conflicting_diffs: list[tuple[str, str]] | None = None,
     dispatch_bit: int | None = None,
+    feedback: str | None = None,
 ) -> str:
     """Use a code agent to resolve a merge conflict.
 
@@ -723,6 +727,11 @@ def resolve_conflict_with_agent(
         project=project, applied_list=applied_list, diff_name=diff_name,
         bug_id=bug_id, conflict_desc=conflict_desc, dispatch_bit=dispatch_bit,
     )
+    if feedback:
+        prompt += (
+            "\n\nFeedback from a previous failed attempt on this step:\n"
+            f"{feedback.strip()}\n"
+        )
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -760,6 +769,7 @@ def resolve_with_dispatch(
     current_diff_path: str | None = None,
     agent: str = "claude",
     model: str | None = None,
+    feedback: str | None = None,
 ) -> bool:
     """Add dispatch branches to fix regressions caused by a transplant diff.
 
@@ -824,6 +834,11 @@ def resolve_with_dispatch(
         project=project, bug_id=bug_id, regressed_ids=regressed_ids,
         dispatch_bit=dispatch_bit, patch_list=patch_list,
     )
+    if feedback:
+        prompt += (
+            "\n\nFeedback from a previous failed attempt on this step:\n"
+            f"{feedback.strip()}\n"
+        )
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -1042,6 +1057,7 @@ def resolve_self_trigger_with_dispatch(
     dispatch_bit: int,
     agent: str = "claude",
     model: str | None = None,
+    feedback: str | None = None,
 ) -> bool:
     """Add dispatch branches to unblock a bug whose self-trigger fails.
 
@@ -1110,6 +1126,11 @@ def resolve_self_trigger_with_dispatch(
         project=project, bug_id=bug_id, crash_line=crash_line,
         prev_list=prev_list, dispatch_bit=dispatch_bit,
     )
+    if feedback:
+        prompt += (
+            "\n\nFeedback from a previous failed attempt on this step:\n"
+            f"{feedback.strip()}\n"
+        )
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -1170,6 +1191,97 @@ def _extract_stack_from_file(path: str) -> list[str]:
         return _extract_stack_from_text(open(path, errors='replace').read())
     except FileNotFoundError:
         return []
+
+
+def _top_app_stack_frame(crash_log_path: str | None) -> str:
+    """Return the first non-sanitizer stack frame from a crash log."""
+    if not crash_log_path:
+        return "unknown"
+    san_re = re.compile(
+        r'^(__asan|__lsan|__tsan|__msan|__ubsan|__sanitizer|__interception)',
+    )
+    for frame in _extract_stack_from_file(crash_log_path):
+        if not san_re.match(frame):
+            return frame
+    return "unknown"
+
+
+def _capture_diff_stat(container: str, project: str) -> str:
+    """Capture a compact git diff --stat from the container."""
+    _, stat = _exec_capture(
+        container,
+        f"cd /src/{project} && git diff --stat 2>/dev/null",
+    )
+    return stat.strip() if stat else "(no changes)"
+
+
+def _build_step_feedback(
+    failure_type: str,
+    bug_id: str,
+    container: str,
+    project: str,
+    crash_log: str | None = None,
+    build_output: str | None = None,
+    regressed_bugs: list[str] | None = None,
+    applied_bugs: list[str] | None = None,
+) -> str:
+    """Build concise feedback for the agent about a failed step attempt.
+
+    *failure_type* is one of ``"build"``, ``"self_trigger"``, ``"regression"``.
+    """
+    diff_stat = _capture_diff_stat(container, project)
+
+    lines = [
+        f"Previous attempt for {bug_id} failed.",
+        "",
+        "What you changed (git diff --stat):",
+        f"  {diff_stat}",
+        "",
+    ]
+
+    if failure_type == "build":
+        tail = ""
+        if build_output:
+            tail_lines = build_output.strip().splitlines()[-20:]
+            tail = "\n".join(f"  {l}" for l in tail_lines)
+        lines.append("Result: Build failed.")
+        if tail:
+            lines.append(f"Last 20 lines of build output:\n{tail}")
+        lines.append("")
+        lines.append("Guidance:")
+        lines.append("- Make a smaller, more localized edit.")
+        lines.append("- Keep the patch closer to the standalone transplant.")
+        lines.append("- Avoid changing unrelated code paths or introducing "
+                      "compile-time inconsistencies.")
+
+    elif failure_type == "self_trigger":
+        top_frame = _top_app_stack_frame(crash_log)
+        blocking = ", ".join(applied_bugs) if applied_bugs else "none"
+        lines.append(f"Result: Bug {bug_id} did not crash (exit=0, no crash).")
+        lines.append(f"Expected crash top frame: {top_frame}")
+        lines.append(f"Previously applied bugs that may block: {blocking}")
+        lines.append("")
+        lines.append("Guidance:")
+        lines.append("- Re-read the standalone patch and preserve its full "
+                      "bug semantics.")
+        lines.append("- Check every function in the crash path for blocking "
+                      "changes from previous patches.")
+        lines.append("- When in doubt, WRAP the blocking change in a dispatch "
+                      "branch — an unnecessary branch is harmless.")
+
+    elif failure_type == "regression":
+        reg_ids = ", ".join(regressed_bugs) if regressed_bugs else "unknown"
+        lines.append(f"Result: These previously-working bugs stopped "
+                      f"triggering: {reg_ids}")
+        lines.append("")
+        lines.append("Guidance:")
+        lines.append("- Wrap ALL code changes from the new bug in dispatch "
+                      "branches to preserve existing code paths.")
+        lines.append("- Do NOT skip any hunk — wrap them ALL.")
+        lines.append("- The else branch must contain the original code "
+                      "(before the new patch), not modified code.")
+
+    return "\n".join(lines)
 
 
 def _stacks_match(reference: list[str], current: list[str], threshold: float = 0.5) -> bool:
@@ -1660,260 +1772,219 @@ def run_merge(args: argparse.Namespace) -> int:
                 break
             bug_id = bd["bug_id"]
             diff_path = bd["diff_path"]
-            step = {
-                "step": i + 1,
-                "bug_id": bug_id,
-                "diff_path": diff_path,
-                "apply_method": None,
-                "build_ok": False,
-                "self_triggers": False,
-                "regressions": [],
-            }
             logger.info(
                 "=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
             )
 
             # Save source snapshot before this step (for rollback)
             _save_source_snapshot(container, project)
+            dispatch_state_before_step = copy.deepcopy(dispatch_state)
+            step_feedback = None
+            retry_count = 0
 
-            # --- Try to apply ---
-            method = try_apply_diff(container, diff_path, project)
-            step["apply_method"] = method
+            while True:  # retry loop
+                if retry_count > 0:
+                    logger.info(
+                        "[%s] Retrying step with feedback (%d/%d)...",
+                        bug_id, retry_count, _MAX_STEP_RETRIES,
+                    )
+                    dispatch_state = copy.deepcopy(dispatch_state_before_step)
+                    _revert_and_rebuild(
+                        container, project, applied_bugs, ordered,
+                        dispatch_state,
+                    )
 
-            # Annotate source with bug ownership markers after clean apply
-            if method in ("clean", "3way"):
-                _annotate_diff_ownership(container, project, diff_path, bug_id)
+                step = {
+                    "step": i + 1,
+                    "bug_id": bug_id,
+                    "diff_path": diff_path,
+                    "apply_method": None,
+                    "build_ok": False,
+                    "self_triggers": False,
+                    "regressions": [],
+                }
+                step_regression_failures = []
 
-            if method == "conflict":
-                # Identify which previously-applied bugs overlap
-                conflicting = _find_conflicting_bugs(bd, applied_bugs, ordered)
-                conflicting_info = [
-                    (c["bug_id"], c["diff_path"]) for c in conflicting
-                ]
+                # --- Try to apply ---
+                method = try_apply_diff(container, diff_path, project)
+                step["apply_method"] = method
 
-                # Inject dispatch files on first conflict (idempotent)
-                if not dispatch_state["dispatch_file_injected"]:
-                    _inject_dispatch_files(container, project)
-                    dispatch_state["dispatch_file_injected"] = True
+                # Annotate source with bug ownership markers after clean apply
+                if method in ("clean", "3way"):
+                    _annotate_diff_ownership(container, project, diff_path, bug_id)
 
-                bit_index = dispatch_state["next_bit"]
+                if method == "conflict":
+                    # Identify which previously-applied bugs overlap
+                    conflicting = _find_conflicting_bugs(bd, applied_bugs, ordered)
+                    conflicting_info = [
+                        (c["bug_id"], c["diff_path"]) for c in conflicting
+                    ]
 
-                result = resolve_conflict_with_agent(
-                    container, diff_path, bug_id, project,
-                    applied_bugs, args.agent, args.model,
-                    conflicting_diffs=conflicting_info,
-                    dispatch_bit=bit_index,
-                )
-
-                if result == "dispatch":
-                    _save_step_diff(container, project, target_commit,
-                                    i, bug_id, "conflict_dispatch", step)
-                    step["apply_method"] = "dispatch"
-                    dispatch_state["bits"][bit_index] = {
-                        "bug_new": bug_id,
-                        "bug_existing": [c["bug_id"] for c in conflicting],
-                    }
-                    dispatch_state["poc_bytes"].setdefault(bug_id, 0)
-                    dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                    for c in conflicting:
-                        dispatch_state["poc_bytes"].setdefault(c["bug_id"], 0)
-                    dispatch_state["next_bit"] += 1
-
-                    if not dispatch_state["harness_modified"]:
-                        ok = _modify_harness_for_dispatch(
-                            container, project, bd["fuzzer"],
-                            args.agent, args.model,
-                        )
-                        if ok:
-                            dispatch_state["harness_modified"] = True
-                        else:
-                            logger.error("[%s] Harness modification failed", bug_id)
-                            step["apply_method"] = "failed"
-                            merge_results.append(step)
-                            continue
-
-                elif result == "resolved":
-                    step["apply_method"] = "agent_resolved"
-                else:
-                    step["apply_method"] = "failed"
-                    logger.error("[%s] Could not resolve conflict, skipping", bug_id)
-                    merge_results.append(step)
-                    continue
-
-            # --- Build ASAN + UBSAN ---
-            logger.info("[%s] Building (ASAN + UBSAN)...", bug_id)
-            build_failed = False
-            for san in ("address", "undefined"):
-                _exec_capture(
-                    container,
-                    f"cd /src/{project} && make clean 2>/dev/null; "
-                    f"rm -rf .obj *.a *.o 2>/dev/null; "
-                    f"rm -f /src/*.o 2>/dev/null; true",
-                )
-                ret, build_output = _exec_capture(
-                    container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-                )
-                if ret != 0:
-                    logger.error("[%s] Build failed for %s. Tail:", bug_id, san)
-                    logger.error("%s", build_output[-500:] if build_output else "(no output)")
-                    if san == "address":
-                        build_failed = True
-                        break
-                    continue
-                _exec_capture(
-                    container,
-                    f"mkdir -p /out/{san} && "
-                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                    f"cp \"$f\" /out/{san}/; done; true",
-                )
-            # Restore testcases (compile may wipe /work)
-            _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
-            if dispatch_state["poc_bytes"]:
-                _apply_all_dispatch_bytes(container, dispatch_state)
-
-            # Save per-step diff snapshot for debugging
-            if not build_failed:
-                _save_step_diff(container, project, target_commit,
-                                i, bug_id, "apply", step)
-
-
-            step["build_ok"] = not build_failed
-            if build_failed:
-                logger.error("[%s] Build failed after applying diff, reverting", bug_id)
-                _revert_and_rebuild(
-                    container, project, applied_bugs, ordered, dispatch_state)
-                merge_results.append(step)
-                continue
-
-            # --- Verify this bug triggers ---
-            logger.info("[%s] Verifying self-trigger...", bug_id)
-            step["self_triggers"] = verify_bug_triggers(
-                container, bug_id, bd["fuzzer"], bd["testcase"],
-                bd.get("sanitizer", "address"),
-                bd.get("crash_log"),
-            )
-
-            # --- If self-trigger fails, try dispatch to unblock ---
-            if not step["self_triggers"] and applied_bugs:
-                logger.info(
-                    "[%s] Self-trigger failed — attempting dispatch to "
-                    "unblock from %d previous patches...",
-                    bug_id, len(applied_bugs),
-                )
-
-                if not dispatch_state["dispatch_file_injected"]:
-                    _inject_dispatch_files(container, project)
-                    dispatch_state["dispatch_file_injected"] = True
-
-                bit_index = dispatch_state["next_bit"]
-                prev_bugs_data = [
-                    next(d for d in ordered if d["bug_id"] == pid)
-                    for pid in applied_bugs
-                ]
-
-                dispatch_ok = resolve_self_trigger_with_dispatch(
-                    container, bug_id, project,
-                    prev_bugs_data, bd.get("crash_log"),
-                    bd["diff_path"], bit_index,
-                    agent=args.agent, model=args.model,
-                )
-
-                if dispatch_ok:
-                    if not dispatch_state["harness_modified"]:
-                        hok = _modify_harness_for_dispatch(
-                            container, project, bd["fuzzer"],
-                            args.agent, args.model,
-                        )
-                        if hok:
-                            dispatch_state["harness_modified"] = True
-                            for lb in local_bugs:
-                                dispatch_state["poc_bytes"].setdefault(
-                                    lb["bug_id"], 0)
-                            for tbd in ordered:
-                                dispatch_state["poc_bytes"].setdefault(
-                                    tbd["bug_id"], 0)
-
-                    if dispatch_state["harness_modified"]:
-                        dispatch_state["bits"][bit_index] = {
-                            "bug_new": bug_id,
-                            "bug_blocked_by": list(applied_bugs),
-                            "type": "self_trigger_unblock",
-                        }
-                        dispatch_state["poc_bytes"].setdefault(bug_id, 0)
-                        dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                        dispatch_state["next_bit"] += 1
-
-                        _rebuild_and_apply_dispatch(
-                            container, project, dispatch_state)
-                        _save_step_diff(container, project, target_commit,
-                                        i, bug_id, "self_trigger_dispatch", step)
-
-                        step["self_triggers"] = verify_bug_triggers(
-                            container, bug_id, bd["fuzzer"], bd["testcase"],
-                            bd.get("sanitizer", "address"),
-                            bd.get("crash_log"),
-                        )
-                        if step["self_triggers"]:
-                            step["apply_method"] += "+dispatch"
-                            logger.info(
-                                "[%s] Self-trigger OK after dispatch", bug_id)
-                        else:
-                            logger.warning(
-                                "[%s] Still fails after dispatch", bug_id)
-
-            # --- If still can't self-trigger, revert this patch ---
-            if not step["self_triggers"]:
-                logger.warning(
-                    "[%s] Cannot self-trigger (likely due to incompatible "
-                    "compile-time changes like macros/structs that cannot "
-                    "be dispatched). Reverting patch to avoid breaking "
-                    "other bugs.", bug_id,
-                )
-                step["apply_method"] = "reverted"
-                _revert_and_rebuild(
-                    container, project, applied_bugs, ordered, dispatch_state)
-                merge_results.append(step)
-                continue
-
-            # --- Verify all previously applied bugs (regression check) ---
-            if all_verified_bugs:
-                logger.info("[%s] Regression check (%d bugs)...", bug_id, len(all_verified_bugs))
-                reg_results = verify_all_bugs(container, all_verified_bugs)
-                regressed = []
-                for rbug, ok in reg_results.items():
-                    if not ok:
-                        step["regressions"].append(rbug)
-                        regression_failures.append({
-                            "regressed_bug": rbug,
-                            "caused_by_applying": bug_id,
-                            "step": i + 1,
-                        })
-                        logger.warning(
-                            "[%s] REGRESSION: %s stopped triggering!", bug_id, rbug,
-                        )
-                        regressed.append(
-                            next(b for b in all_verified_bugs if b["bug_id"] == rbug)
-                        )
-
-                # --- Attempt dispatch branches if regressions found ---
-                if regressed and step["self_triggers"]:
-                    logger.info("[%s] Attempting dispatch branches for %d regressions...",
-                                bug_id, len(regressed))
-
-                    # Inject dispatch files on first use
+                    # Inject dispatch files on first conflict (idempotent)
                     if not dispatch_state["dispatch_file_injected"]:
                         _inject_dispatch_files(container, project)
                         dispatch_state["dispatch_file_injected"] = True
 
                     bit_index = dispatch_state["next_bit"]
-                    dispatch_ok = resolve_with_dispatch(
-                        container, bug_id, project, regressed,
-                        bit_index, current_diff_path=bd["diff_path"],
+
+                    result = resolve_conflict_with_agent(
+                        container, diff_path, bug_id, project,
+                        applied_bugs, args.agent, args.model,
+                        conflicting_diffs=conflicting_info,
+                        dispatch_bit=bit_index,
+                        feedback=step_feedback,
+                    )
+
+                    if result == "dispatch":
+                        _save_step_diff(container, project, target_commit,
+                                        i, bug_id, "conflict_dispatch", step)
+                        step["apply_method"] = "dispatch"
+                        dispatch_state["bits"][bit_index] = {
+                            "bug_new": bug_id,
+                            "bug_existing": [c["bug_id"] for c in conflicting],
+                        }
+                        dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                        dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                        for c in conflicting:
+                            dispatch_state["poc_bytes"].setdefault(c["bug_id"], 0)
+                        dispatch_state["next_bit"] += 1
+
+                        if not dispatch_state["harness_modified"]:
+                            ok = _modify_harness_for_dispatch(
+                                container, project, bd["fuzzer"],
+                                args.agent, args.model,
+                            )
+                            if ok:
+                                dispatch_state["harness_modified"] = True
+                            else:
+                                logger.error("[%s] Harness modification failed", bug_id)
+                                step["apply_method"] = "failed"
+                                dispatch_state = copy.deepcopy(dispatch_state_before_step)
+                                _revert_and_rebuild(
+                                    container, project, applied_bugs, ordered,
+                                    dispatch_state,
+                                )
+                                merge_results.append(step)
+                                break
+
+                    elif result == "resolved":
+                        step["apply_method"] = "agent_resolved"
+                    else:
+                        # Conflict resolution failed — retry or give up
+                        if retry_count < _MAX_STEP_RETRIES:
+                            step_feedback = _build_step_feedback(
+                                "build", bug_id, container, project,
+                                build_output="Conflict resolution failed",
+                            )
+                            retry_count += 1
+                            continue
+                        step["apply_method"] = "failed"
+                        logger.error("[%s] Could not resolve conflict, skipping", bug_id)
+                        dispatch_state = copy.deepcopy(dispatch_state_before_step)
+                        _revert_and_rebuild(
+                            container, project, applied_bugs, ordered,
+                            dispatch_state,
+                        )
+                        merge_results.append(step)
+                        break
+
+                # --- Build ASAN + UBSAN ---
+                logger.info("[%s] Building (ASAN + UBSAN)...", bug_id)
+                build_failed = False
+                last_build_output = ""
+                for san in ("address", "undefined"):
+                    _exec_capture(
+                        container,
+                        f"cd /src/{project} && make clean 2>/dev/null; "
+                        f"rm -rf .obj *.a *.o 2>/dev/null; "
+                        f"rm -f /src/*.o 2>/dev/null; true",
+                    )
+                    ret, build_output = _exec_capture(
+                        container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
+                    )
+                    if ret != 0:
+                        logger.error("[%s] Build failed for %s. Tail:", bug_id, san)
+                        logger.error("%s", build_output[-500:] if build_output else "(no output)")
+                        if san == "address":
+                            build_failed = True
+                            last_build_output = build_output or ""
+                            break
+                        continue
+                    _exec_capture(
+                        container,
+                        f"mkdir -p /out/{san} && "
+                        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                        f"cp \"$f\" /out/{san}/; done; true",
+                    )
+                # Restore testcases (compile may wipe /work)
+                _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                if dispatch_state["poc_bytes"]:
+                    _apply_all_dispatch_bytes(container, dispatch_state)
+
+                # Save per-step diff snapshot for debugging
+                if not build_failed:
+                    _save_step_diff(container, project, target_commit,
+                                    i, bug_id, "apply", step)
+
+                step["build_ok"] = not build_failed
+                if build_failed:
+                    # Retry build failure only if conflict resolution was used
+                    if (retry_count < _MAX_STEP_RETRIES
+                            and method == "conflict"):
+                        step_feedback = _build_step_feedback(
+                            "build", bug_id, container, project,
+                            build_output=last_build_output,
+                        )
+                        logger.warning(
+                            "[%s] Build failed after conflict resolution, retrying",
+                            bug_id,
+                        )
+                        retry_count += 1
+                        continue
+                    logger.error("[%s] Build failed after applying diff, reverting", bug_id)
+                    dispatch_state = copy.deepcopy(dispatch_state_before_step)
+                    _revert_and_rebuild(
+                        container, project, applied_bugs, ordered,
+                        dispatch_state,
+                    )
+                    merge_results.append(step)
+                    break
+
+                # --- Verify this bug triggers ---
+                logger.info("[%s] Verifying self-trigger...", bug_id)
+                step["self_triggers"] = verify_bug_triggers(
+                    container, bug_id, bd["fuzzer"], bd["testcase"],
+                    bd.get("sanitizer", "address"),
+                    bd.get("crash_log"),
+                )
+
+                # --- If self-trigger fails, try dispatch to unblock ---
+                if not step["self_triggers"] and applied_bugs:
+                    logger.info(
+                        "[%s] Self-trigger failed — attempting dispatch to "
+                        "unblock from %d previous patches...",
+                        bug_id, len(applied_bugs),
+                    )
+
+                    if not dispatch_state["dispatch_file_injected"]:
+                        _inject_dispatch_files(container, project)
+                        dispatch_state["dispatch_file_injected"] = True
+
+                    bit_index = dispatch_state["next_bit"]
+                    prev_bugs_data = [
+                        next(d for d in ordered if d["bug_id"] == pid)
+                        for pid in applied_bugs
+                    ]
+
+                    dispatch_ok = resolve_self_trigger_with_dispatch(
+                        container, bug_id, project,
+                        prev_bugs_data, bd.get("crash_log"),
+                        bd["diff_path"], bit_index,
                         agent=args.agent, model=args.model,
+                        feedback=step_feedback,
                     )
 
                     if dispatch_ok:
-                        # Modify harness to consume dispatch byte (once)
                         if not dispatch_state["harness_modified"]:
                             hok = _modify_harness_for_dispatch(
                                 container, project, bd["fuzzer"],
@@ -1921,49 +1992,173 @@ def run_merge(args: argparse.Namespace) -> int:
                             )
                             if hok:
                                 dispatch_state["harness_modified"] = True
-                                # ALL PoCs need dispatch byte once harness is modified
                                 for lb in local_bugs:
-                                    dispatch_state["poc_bytes"].setdefault(lb["bug_id"], 0)
+                                    dispatch_state["poc_bytes"].setdefault(
+                                        lb["bug_id"], 0)
                                 for tbd in ordered:
-                                    dispatch_state["poc_bytes"].setdefault(tbd["bug_id"], 0)
-                            else:
-                                logger.error("[%s] Harness modification failed", bug_id)
+                                    dispatch_state["poc_bytes"].setdefault(
+                                        tbd["bug_id"], 0)
 
                         if dispatch_state["harness_modified"]:
-                            # Record bit assignment
                             dispatch_state["bits"][bit_index] = {
                                 "bug_new": bug_id,
-                                "bug_existing": [b["bug_id"] for b in regressed],
+                                "bug_blocked_by": list(applied_bugs),
+                                "type": "self_trigger_unblock",
                             }
                             dispatch_state["poc_bytes"].setdefault(bug_id, 0)
                             dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                            for b in regressed:
-                                dispatch_state["poc_bytes"].setdefault(b["bug_id"], 0)
                             dispatch_state["next_bit"] += 1
 
                             _rebuild_and_apply_dispatch(
                                 container, project, dispatch_state)
                             _save_step_diff(container, project, target_commit,
-                                            i, bug_id, "regression_dispatch", step)
+                                            i, bug_id, "self_trigger_dispatch", step)
 
-                            # Re-verify regressed bugs
-                            re_results = verify_all_bugs(container, regressed)
-                            fixed = [bid for bid, ok in re_results.items() if ok]
-                            still_broken = [bid for bid, ok in re_results.items() if not ok]
-                            if fixed:
-                                logger.info("[%s] Dispatch fixed: %s", bug_id, fixed)
-                                step["regressions"] = still_broken
-                            if still_broken:
-                                logger.warning("[%s] Still regressed after dispatch: %s",
-                                               bug_id, still_broken)
-                            step["apply_method"] += "+dispatch"
+                            step["self_triggers"] = verify_bug_triggers(
+                                container, bug_id, bd["fuzzer"], bd["testcase"],
+                                bd.get("sanitizer", "address"),
+                                bd.get("crash_log"),
+                            )
+                            if step["self_triggers"]:
+                                step["apply_method"] += "+dispatch"
+                                logger.info(
+                                    "[%s] Self-trigger OK after dispatch", bug_id)
+                            else:
+                                logger.warning(
+                                    "[%s] Still fails after dispatch", bug_id)
 
-            # Track successful application
-            if step["self_triggers"]:
-                applied_bugs.append(bug_id)
-                all_verified_bugs.append(bd)
+                # --- If still can't self-trigger, retry or revert ---
+                if not step["self_triggers"]:
+                    if retry_count < _MAX_STEP_RETRIES:
+                        step_feedback = _build_step_feedback(
+                            "self_trigger", bug_id, container, project,
+                            crash_log=bd.get("crash_log"),
+                            applied_bugs=list(applied_bugs),
+                        )
+                        logger.warning(
+                            "[%s] Self-trigger failed, retrying step", bug_id,
+                        )
+                        retry_count += 1
+                        continue
+                    logger.warning(
+                        "[%s] Cannot self-trigger after %d attempt(s). "
+                        "Reverting patch to avoid breaking other bugs.",
+                        bug_id, retry_count + 1,
+                    )
+                    step["apply_method"] = "reverted"
+                    dispatch_state = copy.deepcopy(dispatch_state_before_step)
+                    _revert_and_rebuild(
+                        container, project, applied_bugs, ordered,
+                        dispatch_state,
+                    )
+                    merge_results.append(step)
+                    break
 
-            merge_results.append(step)
+                # --- Verify all previously applied bugs (regression check) ---
+                if all_verified_bugs:
+                    logger.info("[%s] Regression check (%d bugs)...", bug_id, len(all_verified_bugs))
+                    reg_results = verify_all_bugs(container, all_verified_bugs)
+                    regressed = []
+                    for rbug, ok in reg_results.items():
+                        if not ok:
+                            step["regressions"].append(rbug)
+                            step_regression_failures.append({
+                                "regressed_bug": rbug,
+                                "caused_by_applying": bug_id,
+                                "step": i + 1,
+                            })
+                            logger.warning(
+                                "[%s] REGRESSION: %s stopped triggering!", bug_id, rbug,
+                            )
+                            regressed.append(
+                                next(b for b in all_verified_bugs if b["bug_id"] == rbug)
+                            )
+
+                    # --- Attempt dispatch branches if regressions found ---
+                    if regressed and step["self_triggers"]:
+                        logger.info("[%s] Attempting dispatch branches for %d regressions...",
+                                    bug_id, len(regressed))
+
+                        # Inject dispatch files on first use
+                        if not dispatch_state["dispatch_file_injected"]:
+                            _inject_dispatch_files(container, project)
+                            dispatch_state["dispatch_file_injected"] = True
+
+                        bit_index = dispatch_state["next_bit"]
+                        dispatch_ok = resolve_with_dispatch(
+                            container, bug_id, project, regressed,
+                            bit_index, current_diff_path=bd["diff_path"],
+                            agent=args.agent, model=args.model,
+                            feedback=step_feedback,
+                        )
+
+                        if dispatch_ok:
+                            # Modify harness to consume dispatch byte (once)
+                            if not dispatch_state["harness_modified"]:
+                                hok = _modify_harness_for_dispatch(
+                                    container, project, bd["fuzzer"],
+                                    args.agent, args.model,
+                                )
+                                if hok:
+                                    dispatch_state["harness_modified"] = True
+                                    # ALL PoCs need dispatch byte once harness is modified
+                                    for lb in local_bugs:
+                                        dispatch_state["poc_bytes"].setdefault(lb["bug_id"], 0)
+                                    for tbd in ordered:
+                                        dispatch_state["poc_bytes"].setdefault(tbd["bug_id"], 0)
+                                else:
+                                    logger.error("[%s] Harness modification failed", bug_id)
+
+                            if dispatch_state["harness_modified"]:
+                                # Record bit assignment
+                                dispatch_state["bits"][bit_index] = {
+                                    "bug_new": bug_id,
+                                    "bug_existing": [b["bug_id"] for b in regressed],
+                                }
+                                dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                                dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                                for b in regressed:
+                                    dispatch_state["poc_bytes"].setdefault(b["bug_id"], 0)
+                                dispatch_state["next_bit"] += 1
+
+                                _rebuild_and_apply_dispatch(
+                                    container, project, dispatch_state)
+                                _save_step_diff(container, project, target_commit,
+                                                i, bug_id, "regression_dispatch", step)
+
+                                # Re-verify regressed bugs
+                                re_results = verify_all_bugs(container, regressed)
+                                fixed = [bid for bid, ok in re_results.items() if ok]
+                                still_broken = [bid for bid, ok in re_results.items() if not ok]
+                                if fixed:
+                                    logger.info("[%s] Dispatch fixed: %s", bug_id, fixed)
+                                    step["regressions"] = still_broken
+                                if still_broken:
+                                    logger.warning("[%s] Still regressed after dispatch: %s",
+                                                   bug_id, still_broken)
+                                step["apply_method"] += "+dispatch"
+
+                # --- If regressions remain, retry or accept ---
+                if step["regressions"] and retry_count < _MAX_STEP_RETRIES:
+                    step_feedback = _build_step_feedback(
+                        "regression", bug_id, container, project,
+                        regressed_bugs=list(step["regressions"]),
+                    )
+                    logger.warning(
+                        "[%s] Regressions remain (%s), retrying step",
+                        bug_id, step["regressions"],
+                    )
+                    retry_count += 1
+                    continue
+
+                # --- Step complete (success or accepted with regressions) ---
+                if step["self_triggers"]:
+                    applied_bugs.append(bug_id)
+                    all_verified_bugs.append(bd)
+
+                regression_failures.extend(step_regression_failures)
+                merge_results.append(step)
+                break  # exit retry loop
 
             # Save state for --start-step resume
             _save_step_state(
