@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This repository implements automated fuzzing workflows for OSS-Fuzz projects. The system transplants bug-triggering conditions from old (buggy) commits into current code versions, then merges all per-bug patches into a single version that triggers all bugs simultaneously.
 
-`bug_transplant_batch.py` iterates over bugs, `bug_transplant.py` runs Claude Code inside an OSS-Fuzz Docker container to semantically transplant each bug, and `bug_transplant_merge.py` merges per-bug diffs into one version with conflict resolution.
+`bug_transplant_batch.py` iterates over bugs, `bug_transplant.py` runs a code agent (Claude Code or Codex) inside an OSS-Fuzz Docker container to semantically transplant each bug, and `bug_transplant_merge.py` merges per-bug diffs into one version with conflict resolution.
 
 ## Key Commands
 
@@ -16,9 +16,9 @@ source script/setenv.sh
 ```
 Sets: `TESTCASES`, `REPO_PATH`, `BUGINFO_PATH`, `ANTHROPIC_API_KEY`
 
-### Bug Transplant via Claude Code
+### Bug Transplant via Code Agent
 
-#### Step 1: Batch transplant (one Claude Code session per bug)
+#### Step 1: Batch transplant (one agent session per bug)
 ```bash
 # Dry run — see what would execute
 python3 script/bug_transplant_batch.py ~/log/<project>.csv \
@@ -96,9 +96,9 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
 
 1. **`script/bug_transplant_batch.py`**: Batch orchestrator. Reads CSV/JSON data, selects target commit, resolves per-bug metadata (fuzzer, sanitizer, testcase), calls `bug_transplant.py` per bug. Outputs per-bug diffs to `data/bug_transplant/<project>_<bug_id>/`.
 
-2. **`script/bug_transplant.py`**: Single-bug launcher. Builds Claude-layered Docker image on OSS-Fuzz project image, starts persistent container, runs Claude Code with transplant prompt. Claude Code reads crash stack + trace, identifies bug fixes, surgically reverts them, minimizes the patch.
+2. **`script/bug_transplant.py`**: Single-bug launcher. Builds an agent-layered Docker image (Claude Code or Codex, via `--agent` flag) on OSS-Fuzz project image, starts persistent container, runs the agent with transplant prompt. The agent reads crash stack + trace, identifies bug fixes, surgically reverts them, minimizes the patch.
 
-3. **`script/bug_transplant_merge.py`**: Merge orchestrator. Applies per-bug diffs incrementally, builds ASAN + UBSAN in the main container, verifies all bugs after each step, resolves conflicts via Claude Code, outputs combined diff.
+3. **`script/bug_transplant_merge.py`**: Merge orchestrator. Applies per-bug diffs incrementally, builds ASAN + UBSAN in the main container, verifies all bugs after each step, resolves conflicts via code agent (Claude Code or Codex), outputs combined diff.
 
 4. **`script/bug_transplant_prompt.md`**: Prompt template with the transplant methodology (categorize changes as A/B/C, iterative apply, mandatory minimization).
 
@@ -136,7 +136,7 @@ The merge script builds with ASAN and UBSAN in the main container. MSAN support 
 - `TESTCASES`: Directory containing PoC testcase files
 - `REPO_PATH`: Git repo directory for target projects
 - `BUGINFO_PATH`: Path to `osv_testcases_summary.json`
-- `ANTHROPIC_API_KEY`: Required for Claude Code agent
+- `ANTHROPIC_API_KEY`: Required for Claude Code agent (or `OPENAI_API_KEY` for Codex)
 
 ### Data Sources
 - **`~/log/<project>.csv`**: Commit x bug status matrix (from `buildAndtest.py`)
