@@ -98,7 +98,7 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
 
 2. **`script/bug_transplant.py`**: Single-bug launcher. Builds Claude-layered Docker image on OSS-Fuzz project image, starts persistent container, runs Claude Code with transplant prompt. Claude Code reads crash stack + trace, identifies bug fixes, surgically reverts them, minimizes the patch.
 
-3. **`script/bug_transplant_merge.py`**: Merge orchestrator. Applies per-bug diffs incrementally, builds per-sanitizer (ASAN in main container, MSAN/UBSAN in ephemeral containers), verifies all bugs after each step, resolves conflicts via Claude Code, outputs combined diff.
+3. **`script/bug_transplant_merge.py`**: Merge orchestrator. Applies per-bug diffs incrementally, builds ASAN + UBSAN in the main container, verifies all bugs after each step, resolves conflicts via Claude Code, outputs combined diff.
 
 4. **`script/bug_transplant_prompt.md`**: Prompt template with the transplant methodology (categorize changes as A/B/C, iterative apply, mandatory minimization).
 
@@ -107,7 +107,6 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
 6. **`script/prompts/`**: Agent prompt templates used by the merge orchestrator. Loaded at runtime via `_load_prompt()` with variable substitution:
    - `harness_dispatch.md` — Modify fuzz harness to consume dispatch byte from input
    - `conflict_resolve_dispatch.md` — Resolve merge conflicts using dispatch branches (whole-patch dispatch)
-   - `conflict_resolve_no_dispatch.md` — Resolve merge conflicts without dispatch (manual adaptation)
    - `regression_dispatch.md` — Wrap a newly-applied patch in dispatch to fix regressions
    - `self_trigger_dispatch.md` — Unblock a bug blocked by previously-applied patches
 
@@ -129,8 +128,8 @@ Changes between buggy and current versions fall into three categories:
 Category B is most commonly missed. After triggering, minimize via single-change elimination.
 See `data/feedback_bug_transplant.md` for the full methodology with examples.
 
-### Multi-Sanitizer Builds
-MSAN permanently taints system libraries (libc++), so the merge script builds MSAN/UBSAN in **ephemeral containers** to keep the main container ASAN-clean for incremental merge steps.
+### Sanitizer Builds
+The merge script builds with ASAN and UBSAN in the main container. MSAN support was removed to simplify the merge flow (MSAN taints system libraries and required ephemeral containers).
 
 ### Environment Setup
 `source script/setenv.sh` sets:
