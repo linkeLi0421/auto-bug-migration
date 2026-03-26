@@ -1022,8 +1022,11 @@ def _find_step_apply_diff(
     """Find the apply diff for a given step (the cumulative source snapshot)."""
     step_dir = (DATA_DIR / "bug_transplant"
                 / f"merge_{project}_{target_commit[:8]}" / "steps")
-    # Look for the latest diff variant for this step (prefer self_trigger > conflict > apply)
-    for suffix in ("self_trigger_dispatch", "regression_dispatch",
+    # Look for the latest diff variant for this step.
+    # Order: regression_dispatch is the final state (after regressions
+    # are fixed), self_trigger_dispatch is after self-trigger unblock,
+    # conflict_dispatch after conflict resolution, apply is the initial.
+    for suffix in ("regression_dispatch", "self_trigger_dispatch",
                    "conflict_dispatch", "apply"):
         p = step_dir / f"step_{step_index+1:02d}_*_{suffix}.diff"
         matches = sorted(step_dir.glob(f"step_{step_index+1:02d}_*_{suffix}.diff"))
