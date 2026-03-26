@@ -1289,42 +1289,120 @@ def _top_app_stack_frame(crash_log_path: str | None) -> str:
     return "unknown"
 
 
-def _capture_diff_stat(container: str, project: str) -> str:
-    """Capture a compact git diff --stat from the container."""
-    _, stat = _exec_capture(
-        container,
-        f"cd /src/{project} && git diff --stat 2>/dev/null",
-    )
-    return stat.strip() if stat else "(no changes)"
+def _extract_diff_functions(diff_text: str) -> set[str]:
+    """Extract function names from diff @@ context lines."""
+    return set(re.findall(r'@@[^@]*@@\s*(?:\w+\s+)*(\w+)\s*\(', diff_text))
 
 
-def _capture_dispatch_diff(container: str, project: str, bug_id: str) -> str:
-    """Capture the dispatch-related changes the agent made for a bug.
-
-    Returns a focused diff showing only lines with __bug_dispatch or
-    BUG_START/BUG_END markers, with surrounding context.
-    """
-    _, diff = _exec_capture(
-        container,
-        f"cd /src/{project} && git diff "
-        f"| grep -B2 -A2 '__bug_dispatch\\|BUG_START\\|BUG_END' "
-        f"2>/dev/null | head -80",
-    )
-    return diff.strip() if diff else "(no dispatch changes found)"
-
-
-def _capture_fuzzer_output(
-    container: str, bug_id: str, fuzzer: str, testcase: str,
-    sanitizer: str = "address",
+def _diagnose_self_trigger_failure(
+    container: str,
+    project: str,
+    bug_id: str,
+    crash_log: str | None,
+    applied_bugs_data: list[dict],
 ) -> str:
-    """Run the fuzzer on the testcase and capture output (first 30 lines)."""
-    san_dir = f"/out/{sanitizer}" if sanitizer != "address" else "/out/address"
-    _, output = _exec_capture(
-        container,
-        f"{san_dir}/{fuzzer} /work/{testcase} 2>&1 | head -30",
-        timeout=30,
+    """Identify which previous patches likely block the testcase.
+
+    Cross-references the crash path functions with the functions touched
+    by each previously-applied patch to narrow down the blocker.
+    """
+    # Get crash path functions
+    crash_funcs = set()
+    san_re = re.compile(
+        r'^(__asan|__lsan|__tsan|__msan|__ubsan|__sanitizer|__interception)',
     )
-    return output.strip() if output else "(no output)"
+    if crash_log:
+        crash_funcs = {
+            f for f in _extract_stack_from_file(crash_log)
+            if not san_re.match(f)
+        }
+    crash_path_str = " → ".join(list(crash_funcs)[:6]) if crash_funcs else "unknown"
+
+    lines = [
+        f"Result: Bug {bug_id} did not crash.",
+        f"Expected crash path: {crash_path_str}",
+    ]
+
+    # For each previous bug, check if its patch touches crash-path functions
+    blockers = []
+    for pb in applied_bugs_data:
+        diff_path = pb.get("diff_path")
+        if not diff_path:
+            continue
+        try:
+            diff_text = Path(diff_path).read_text(errors="replace")
+        except OSError:
+            continue
+        diff_funcs = _extract_diff_functions(diff_text)
+        overlap = crash_funcs & diff_funcs
+        if overlap:
+            blockers.append((pb["bug_id"], sorted(overlap)))
+
+    if blockers:
+        lines.append("")
+        lines.append("Likely blockers (previous patches touching crash-path functions):")
+        for pb_id, funcs in blockers:
+            lines.append(f"  - {pb_id}: touches {', '.join(funcs)}")
+        lines.append("")
+        lines.append("Action: dispatch the changes from these bugs in the listed functions.")
+    else:
+        lines.append("")
+        lines.append("Could not identify specific blockers from function overlap.")
+        lines.append("Action: run `git diff` and look for any change in the crash path "
+                      "that prevents the testcase from reaching the crash site.")
+
+    return "\n".join(lines)
+
+
+def _diagnose_regression(
+    container: str,
+    project: str,
+    bug_id: str,
+    regressed_bugs_data: list[dict],
+) -> str:
+    """For each regressed bug, identify what the agent likely broke.
+
+    Runs each regressed bug's testcase to see current behavior, and
+    finds which files the agent changed that overlap with the regressed
+    bug's patch.
+    """
+    # Get files the agent changed
+    _, agent_names = _exec_capture(
+        container, f"cd /src/{project} && git diff --name-only 2>/dev/null",
+    )
+    agent_files = set(agent_names.strip().splitlines()) if agent_names else set()
+
+    lines = [f"Result: {len(regressed_bugs_data)} bug(s) regressed."]
+
+    for rb in regressed_bugs_data:
+        rb_id = rb["bug_id"]
+        lines.append("")
+        lines.append(f"{rb_id}:")
+
+        # Run regressed bug's testcase to see current behavior
+        fuzzer_path = f"/out/address/{rb['fuzzer']}"
+        _, output = _exec_capture(
+            container,
+            f"{fuzzer_path} /work/{rb['testcase']} 2>&1 | tail -5",
+            timeout=30,
+        )
+        tail = output.strip().splitlines()[-2:] if output else ["unknown"]
+        lines.append(f"  Now: {' | '.join(tail)}")
+
+        # Expected behavior from crash log
+        top_frame = _top_app_stack_frame(rb.get("crash_log"))
+        lines.append(f"  Expected crash in: {top_frame}")
+
+        # Find overlapping files
+        rb_files = files_in_diff(rb.get("diff_path", ""))
+        overlap = agent_files & rb_files
+        if overlap:
+            lines.append(f"  Your changes overlap with this bug in: {', '.join(sorted(overlap))}")
+            lines.append(f"  → Wrap your changes in these files with dispatch branches.")
+        else:
+            lines.append(f"  No direct file overlap found — check indirect effects.")
+
+    return "\n".join(lines)
 
 
 def _build_step_feedback(
@@ -1334,85 +1412,35 @@ def _build_step_feedback(
     project: str,
     crash_log: str | None = None,
     build_output: str | None = None,
-    regressed_bugs: list[str] | None = None,
-    applied_bugs: list[str] | None = None,
-    fuzzer: str | None = None,
-    testcase: str | None = None,
-    sanitizer: str = "address",
+    regressed_bugs_data: list[dict] | None = None,
+    applied_bugs_data: list[dict] | None = None,
 ) -> str:
-    """Build concise feedback for the agent about a failed step attempt.
+    """Build diagnostic feedback for the agent about a failed step attempt.
 
     *failure_type* is one of ``"build"``, ``"self_trigger"``, ``"regression"``.
     """
-    diff_stat = _capture_diff_stat(container, project)
-
-    lines = [
-        f"Previous attempt for {bug_id} failed.",
-        "",
-        "What you changed (git diff --stat):",
-        f"  {diff_stat}",
-        "",
-    ]
+    lines = [f"Previous attempt for {bug_id} failed.", ""]
 
     if failure_type == "build":
-        tail = ""
-        if build_output:
-            tail_lines = build_output.strip().splitlines()[-20:]
-            tail = "\n".join(f"  {l}" for l in tail_lines)
         lines.append("Result: Build failed.")
-        if tail:
-            lines.append(f"Last 20 lines of build output:\n{tail}")
-        lines.append("")
-        lines.append("Guidance:")
-        lines.append("- Make a smaller, more localized edit.")
-        lines.append("- Keep the patch closer to the standalone transplant.")
-        lines.append("- Avoid changing unrelated code paths or introducing "
-                      "compile-time inconsistencies.")
+        if build_output:
+            tail_lines = build_output.strip().splitlines()[-15:]
+            tail = "\n".join(f"  {l}" for l in tail_lines)
+            lines.append(f"Build error tail:\n{tail}")
 
     elif failure_type == "self_trigger":
-        top_frame = _top_app_stack_frame(crash_log)
-        blocking = ", ".join(applied_bugs) if applied_bugs else "none"
-        lines.append(f"Result: Bug {bug_id} did not crash (exit=0, no crash).")
-        lines.append(f"Expected crash top frame: {top_frame}")
-        lines.append(f"Previously applied bugs that may block: {blocking}")
-
-        # Include the actual fuzzer output so the agent can see what happened
-        if fuzzer and testcase:
-            fuzzer_output = _capture_fuzzer_output(
-                container, bug_id, fuzzer, testcase, sanitizer,
-            )
-            lines.append("")
-            lines.append("Fuzzer output when running the testcase:")
-            lines.append(fuzzer_output)
-
-        # Include the dispatch branches the agent added
-        dispatch_diff = _capture_dispatch_diff(container, project, bug_id)
-        lines.append("")
-        lines.append("Dispatch branches you added (grep of git diff):")
-        lines.append(dispatch_diff)
-
-        lines.append("")
-        lines.append("Guidance:")
-        lines.append("- Re-read the standalone patch and preserve its full "
-                      "bug semantics.")
-        lines.append("- Check every function in the crash path for blocking "
-                      "changes from previous patches.")
-        lines.append("- When in doubt, WRAP the blocking change in a dispatch "
-                      "branch — an unnecessary branch is harmless.")
-        lines.append("- If a previous patch has multiple hunks in the same "
-                      "file, wrap ALL of them — do not skip any.")
+        diag = _diagnose_self_trigger_failure(
+            container, project, bug_id, crash_log,
+            applied_bugs_data or [],
+        )
+        lines.append(diag)
 
     elif failure_type == "regression":
-        reg_ids = ", ".join(regressed_bugs) if regressed_bugs else "unknown"
-        lines.append(f"Result: These previously-working bugs stopped "
-                      f"triggering: {reg_ids}")
-        lines.append("")
-        lines.append("Guidance:")
-        lines.append("- Wrap ALL code changes from the new bug in dispatch "
-                      "branches to preserve existing code paths.")
-        lines.append("- Do NOT skip any hunk — wrap them ALL.")
-        lines.append("- The else branch must contain the original code "
-                      "(before the new patch), not modified code.")
+        diag = _diagnose_regression(
+            container, project, bug_id,
+            regressed_bugs_data or [],
+        )
+        lines.append(diag)
 
     return "\n".join(lines)
 
@@ -2170,13 +2198,14 @@ def run_merge(args: argparse.Namespace) -> int:
                 # --- If still can't self-trigger, retry or revert ---
                 if not step["self_triggers"]:
                     if retry_count < _MAX_STEP_RETRIES:
+                        prev_data = [
+                            next(d for d in ordered if d["bug_id"] == pid)
+                            for pid in applied_bugs
+                        ]
                         step_feedback = _build_step_feedback(
                             "self_trigger", bug_id, container, project,
                             crash_log=bd.get("crash_log"),
-                            applied_bugs=list(applied_bugs),
-                            fuzzer=bd["fuzzer"],
-                            testcase=bd["testcase"],
-                            sanitizer=bd.get("sanitizer", "address"),
+                            applied_bugs_data=prev_data,
                         )
                         logger.warning(
                             "[%s] Self-trigger failed, retrying step", bug_id,
@@ -2285,9 +2314,14 @@ def run_merge(args: argparse.Namespace) -> int:
 
                 # --- If regressions remain, retry or accept ---
                 if step["regressions"] and retry_count < _MAX_STEP_RETRIES:
+                    reg_data = [
+                        next(b for b in all_verified_bugs
+                             if b["bug_id"] == rid)
+                        for rid in step["regressions"]
+                    ]
                     step_feedback = _build_step_feedback(
                         "regression", bug_id, container, project,
-                        regressed_bugs=list(step["regressions"]),
+                        regressed_bugs_data=reg_data,
                     )
                     logger.warning(
                         "[%s] Regressions remain (%s), retrying step",
