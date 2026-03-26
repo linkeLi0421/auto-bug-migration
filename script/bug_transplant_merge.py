@@ -327,7 +327,7 @@ _DISPATCH_SOURCE = """\
 volatile uint8_t __bug_dispatch = 0;
 """
 
-_MAX_STEP_RETRIES = 1
+_MAX_STEP_RETRIES = 5
 
 
 def _inject_dispatch_files(container: str, project: str) -> None:
@@ -666,6 +666,7 @@ def resolve_conflict_with_agent(
     conflicting_diffs: list[tuple[str, str]] | None = None,
     dispatch_bit: int | None = None,
     feedback: str | None = None,
+    attempt: int = 0,
 ) -> str:
     """Use a code agent to resolve a merge conflict.
 
@@ -733,6 +734,8 @@ def resolve_conflict_with_agent(
             f"{feedback.strip()}\n"
         )
 
+    _save_prompt_to_container(container, bug_id, "conflict_resolve", prompt, attempt)
+
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
     if model:
@@ -770,6 +773,7 @@ def resolve_with_dispatch(
     agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
+    attempt: int = 0,
 ) -> bool:
     """Add dispatch branches to fix regressions caused by a transplant diff.
 
@@ -840,6 +844,8 @@ def resolve_with_dispatch(
             f"{feedback.strip()}\n"
         )
 
+    _save_prompt_to_container(container, bug_id, "regression_dispatch", prompt, attempt)
+
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
     if model:
@@ -857,6 +863,44 @@ def resolve_with_dispatch(
 
     logger.info("[%s] Dispatch branches added (bit %d)", bug_id, dispatch_bit)
     return True
+
+
+def _stage_untracked_source(container: str, project: str) -> None:
+    """Mark untracked source files as intent-to-add so git diff includes them.
+
+    Excludes build artifact directories (CMakeFiles, .obj, etc.) that
+    contain generated .c/.h files which would break ``git apply`` on
+    resume because they already exist in a fresh build.
+    """
+    _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"git ls-files --others --exclude-standard "
+        f"'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
+        f"| grep -v -e 'CMakeFiles/' -e '\\.obj/' -e '^build/' "
+        f"-e 'config\\.h$' -e 'cmake_install\\.cmake' "
+        f"| xargs -r git add -N 2>/dev/null; true",
+    )
+
+
+def _save_prompt_to_container(
+    container: str,
+    bug_id: str,
+    label: str,
+    prompt: str,
+    attempt: int = 0,
+) -> None:
+    """Save an agent prompt inside the container for debugging.
+
+    Written to ``/tmp/prompt_{bug_id}_{label}_a{attempt}.txt`` so each
+    retry attempt is preserved and can be inspected or copied out.
+    """
+    fname = f"prompt_{bug_id}_{label}_a{attempt}.txt"
+    _exec_capture(
+        container,
+        f"cat > /tmp/{fname} << 'PROMPT_EOF'\n"
+        f"{prompt}\nPROMPT_EOF",
+    )
 
 
 def _save_step_diff(
@@ -877,6 +921,7 @@ def _save_step_diff(
     step_dir = (DATA_DIR / "bug_transplant"
                 / f"merge_{project}_{target_commit[:8]}" / "steps")
     step_dir.mkdir(parents=True, exist_ok=True)
+    _stage_untracked_source(container, project)
     _, diff_text = _exec_capture(
         container, f"cd /src/{project} && git diff",
     )
@@ -885,6 +930,21 @@ def _save_step_diff(
     step.setdefault("step_diffs", {})[suffix] = str(step_file)
     logger.info("[%s] Saved %s diff: %s (%d bytes)",
                 bug_id, suffix, step_file, len(diff_text))
+
+    # Copy all saved prompts from the container for this bug (all attempts)
+    _, prompt_list = _exec_capture(
+        container,
+        f"ls /tmp/prompt_{bug_id}_*.txt 2>/dev/null || true",
+    )
+    for container_path in prompt_list.strip().splitlines():
+        if not container_path:
+            continue
+        fname = container_path.split("/")[-1]
+        host_path = step_dir / f"step_{step_index+1:02d}_{fname}"
+        subprocess.call(
+            ["docker", "cp", f"{container}:{container_path}", str(host_path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
 
 def _save_step_state(
@@ -948,23 +1008,13 @@ def _find_step_apply_diff(
 def _save_source_snapshot(container: str, project: str) -> None:
     """Save the current source state as a diff for rollback.
 
-    Captures ``git diff`` (tracked source changes only) and a list of
-    new files added by dispatch/annotation.  Does NOT use ``git add``
-    or ``git stash`` to avoid polluting the index with build artifacts.
+    Uses ``git add -N`` to mark untracked source files as intent-to-add,
+    then ``git diff`` captures both tracked modifications and new files.
     """
+    _stage_untracked_source(container, project)
     _exec_capture(
         container,
         f"cd /src/{project} && git diff > /tmp/_snap.diff 2>&1",
-    )
-    # Save paths of untracked source files (dispatch headers, etc.)
-    _exec_capture(
-        container,
-        f"cd /src/{project} && "
-        f"git ls-files --others --exclude-standard "
-        f"'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' "
-        f"> /tmp/_snap_untracked.list 2>/dev/null; "
-        f"tar cf /tmp/_snap_untracked.tar "
-        f"-T /tmp/_snap_untracked.list 2>/dev/null; true",
     )
 
 
@@ -981,21 +1031,23 @@ def _revert_and_rebuild(
     failure, etc.) to restore the source tree to the state before the
     failed step was attempted.
     """
-    # Discard failed step's changes
+    # Discard failed step's changes and clean up intent-to-add entries
     _exec_capture(
         container,
         f"cd /src/{project} && git checkout -- . 2>&1",
     )
-    # Re-apply the snapshot diff (tracked changes only)
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git reset 2>&1",
+    )
+    _exec_capture(
+        container,
+        f"cd /src/{project} && git clean -fd 2>&1",
+    )
+    # Re-apply the snapshot diff (includes new files via intent-to-add)
     _exec_capture(
         container,
         f"cd /src/{project} && git apply --allow-empty /tmp/_snap.diff 2>&1",
-    )
-    # Restore untracked source files (dispatch headers, etc.)
-    _exec_capture(
-        container,
-        f"cd /src/{project} && "
-        f"tar xf /tmp/_snap_untracked.tar 2>/dev/null; true",
     )
     for san in ("address", "undefined"):
         _exec_capture(
@@ -1058,6 +1110,7 @@ def resolve_self_trigger_with_dispatch(
     agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
+    attempt: int = 0,
 ) -> bool:
     """Add dispatch branches to unblock a bug whose self-trigger fails.
 
@@ -1131,6 +1184,8 @@ def resolve_self_trigger_with_dispatch(
             "\n\nFeedback from a previous failed attempt on this step:\n"
             f"{feedback.strip()}\n"
         )
+
+    _save_prompt_to_container(container, bug_id, "self_trigger_dispatch", prompt, attempt)
 
     escaped = shlex.quote(prompt)
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
@@ -1215,6 +1270,35 @@ def _capture_diff_stat(container: str, project: str) -> str:
     return stat.strip() if stat else "(no changes)"
 
 
+def _capture_dispatch_diff(container: str, project: str, bug_id: str) -> str:
+    """Capture the dispatch-related changes the agent made for a bug.
+
+    Returns a focused diff showing only lines with __bug_dispatch or
+    BUG_START/BUG_END markers, with surrounding context.
+    """
+    _, diff = _exec_capture(
+        container,
+        f"cd /src/{project} && git diff "
+        f"| grep -B2 -A2 '__bug_dispatch\\|BUG_START\\|BUG_END' "
+        f"2>/dev/null | head -80",
+    )
+    return diff.strip() if diff else "(no dispatch changes found)"
+
+
+def _capture_fuzzer_output(
+    container: str, bug_id: str, fuzzer: str, testcase: str,
+    sanitizer: str = "address",
+) -> str:
+    """Run the fuzzer on the testcase and capture output (first 30 lines)."""
+    san_dir = f"/out/{sanitizer}" if sanitizer != "address" else "/out/address"
+    _, output = _exec_capture(
+        container,
+        f"{san_dir}/{fuzzer} /work/{testcase} 2>&1 | head -30",
+        timeout=30,
+    )
+    return output.strip() if output else "(no output)"
+
+
 def _build_step_feedback(
     failure_type: str,
     bug_id: str,
@@ -1224,6 +1308,9 @@ def _build_step_feedback(
     build_output: str | None = None,
     regressed_bugs: list[str] | None = None,
     applied_bugs: list[str] | None = None,
+    fuzzer: str | None = None,
+    testcase: str | None = None,
+    sanitizer: str = "address",
 ) -> str:
     """Build concise feedback for the agent about a failed step attempt.
 
@@ -1260,6 +1347,22 @@ def _build_step_feedback(
         lines.append(f"Result: Bug {bug_id} did not crash (exit=0, no crash).")
         lines.append(f"Expected crash top frame: {top_frame}")
         lines.append(f"Previously applied bugs that may block: {blocking}")
+
+        # Include the actual fuzzer output so the agent can see what happened
+        if fuzzer and testcase:
+            fuzzer_output = _capture_fuzzer_output(
+                container, bug_id, fuzzer, testcase, sanitizer,
+            )
+            lines.append("")
+            lines.append("Fuzzer output when running the testcase:")
+            lines.append(fuzzer_output)
+
+        # Include the dispatch branches the agent added
+        dispatch_diff = _capture_dispatch_diff(container, project, bug_id)
+        lines.append("")
+        lines.append("Dispatch branches you added (grep of git diff):")
+        lines.append(dispatch_diff)
+
         lines.append("")
         lines.append("Guidance:")
         lines.append("- Re-read the standalone patch and preserve its full "
@@ -1268,6 +1371,8 @@ def _build_step_feedback(
                       "changes from previous patches.")
         lines.append("- When in doubt, WRAP the blocking change in a dispatch "
                       "branch — an unnecessary branch is harmless.")
+        lines.append("- If a previous patch has multiple hunks in the same "
+                      "file, wrap ALL of them — do not skip any.")
 
     elif failure_type == "regression":
         reg_ids = ", ".join(regressed_bugs) if regressed_bugs else "unknown"
@@ -1833,6 +1938,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         conflicting_diffs=conflicting_info,
                         dispatch_bit=bit_index,
                         feedback=step_feedback,
+                        attempt=retry_count,
                     )
 
                     if result == "dispatch":
@@ -1982,6 +2088,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         bd["diff_path"], bit_index,
                         agent=args.agent, model=args.model,
                         feedback=step_feedback,
+                        attempt=retry_count,
                     )
 
                     if dispatch_ok:
@@ -2034,6 +2141,9 @@ def run_merge(args: argparse.Namespace) -> int:
                             "self_trigger", bug_id, container, project,
                             crash_log=bd.get("crash_log"),
                             applied_bugs=list(applied_bugs),
+                            fuzzer=bd["fuzzer"],
+                            testcase=bd["testcase"],
+                            sanitizer=bd.get("sanitizer", "address"),
                         )
                         logger.warning(
                             "[%s] Self-trigger failed, retrying step", bug_id,
@@ -2090,6 +2200,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             bit_index, current_diff_path=bd["diff_path"],
                             agent=args.agent, model=args.model,
                             feedback=step_feedback,
+                            attempt=retry_count,
                         )
 
                         if dispatch_ok:
@@ -2183,6 +2294,8 @@ def run_merge(args: argparse.Namespace) -> int:
         # Get combined diff — only include files that the per-bug diffs
         # intentionally modified (avoids build artifacts from compile).
         # Also include dispatch infrastructure files if used.
+        # Stage untracked source files so new files appear in the diff.
+        _stage_untracked_source(container, project)
         touched_files: set[str] = set()
         for bd in ordered:
             touched_files.update(bd.get("_files", set()))

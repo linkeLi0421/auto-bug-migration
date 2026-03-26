@@ -50,6 +50,11 @@ Change to: `__bug_dispatch[{dispatch_byte}] & (1 << {dispatch_bit})` where:
 Affects: `conflict_resolve_dispatch.md`, `self_trigger_dispatch.md`,
 `regression_dispatch.md`
 
+Both `dispatch_byte` and `dispatch_bit` must be threaded through all
+three agent-call sites (`resolve_conflict_with_agent`,
+`resolve_self_trigger_with_dispatch`, `resolve_with_dispatch`) and
+passed to `_load_prompt()`.
+
 ## 4. Python dispatch_state changes
 
 ```python
@@ -63,26 +68,57 @@ dispatch_state = {
 }
 ```
 
+`dispatch_bytes` is persisted in `_save_step_state()` and restored in
+the `--start-step` resume path. This is required so that resume
+re-injects dispatch files with the correct array size and serializes
+PoCs with the right byte count.
+
 ## 5. Auto-grow logic
 
-When allocating a new bit and `next_bit >= dispatch_bytes * 8`:
+Extract a helper `_ensure_dispatch_capacity(dispatch_state, container, project)`
+called before each bit allocation. When `next_bit >= dispatch_bytes * 8`:
 
-1. `dispatch_bytes += 1`
+1. `dispatch_state["dispatch_bytes"] += 1`
 2. Re-inject `__bug_dispatch.h/.c` with new size
-3. Rebuild (harness adapts via macro)
-4. Pad all existing PoCs to new width
+3. Rebuild ASAN+UBSAN (harness adapts via macro)
+4. Rewrite all PoCs in `/work/` via `_apply_all_dispatch_bytes()`
+   so existing testcases get the wider prefix immediately
 
 ## 6. PoC serialization (`_apply_all_dispatch_bytes`)
 
 Currently: `bytes([dval])` (1 byte)
 
-Change to: `dval.to_bytes(dispatch_bytes, 'little')` (N bytes, little-endian
-to match `memcpy` on x86)
+Change to: `dval.to_bytes(dispatch_bytes, 'little')` (N bytes,
+little-endian so Python bit N maps to `__bug_dispatch[N//8] & (1 << N%8)`)
+
+## 7. Resume path (`--start-step`)
+
+Currently at line 1702: `_inject_dispatch_files(container, project)`
+with no size parameter.
+
+Change to: read `dispatch_bytes` from saved state and pass it:
+```python
+dispatch_bytes = dispatch_state.get("dispatch_bytes", 1)
+_inject_dispatch_files(container, project, dispatch_bytes)
+```
+
+## 8. Output formatting
+
+Update the summary/output code that prints `poc_bytes` values
+(currently assumes single-byte hex `0x{dval:02x}`). For multi-byte
+values, format as e.g. `0x0130` or show per-byte breakdown.
 
 ## Files changed
 
-- `script/bug_transplant_merge.py` — templates, inject function,
-  dispatch_state init, prompt args, poc serialization, grow logic
+- `script/bug_transplant_merge.py`:
+  - `_DISPATCH_HEADER` / `_DISPATCH_SOURCE` — parameterized with `{dispatch_bytes}`
+  - `_inject_dispatch_files()` — takes `dispatch_bytes` param
+  - `_apply_all_dispatch_bytes()` — multi-byte serialization
+  - `_ensure_dispatch_capacity()` — NEW grow helper
+  - `dispatch_state` init — add `dispatch_bytes: 1`
+  - `_save_step_state()` / resume path — persist and restore `dispatch_bytes`
+  - All three agent-call sites — pass both `dispatch_byte` and `dispatch_bit`
+  - Summary/output formatting — handle multi-byte poc values
 - `script/prompts/harness_dispatch.md` — macro-based multi-byte read
 - `script/prompts/conflict_resolve_dispatch.md` — `{dispatch_byte}` + `{dispatch_bit}`
 - `script/prompts/self_trigger_dispatch.md` — same
