@@ -328,7 +328,7 @@ _DISPATCH_SOURCE = """\
 volatile uint8_t __bug_dispatch[__BUG_DISPATCH_BYTES] = {0};
 """
 
-_MAX_STEP_RETRIES = 5
+_MAX_STEP_RETRIES = 1
 
 
 def _inject_dispatch_files(
@@ -1303,11 +1303,12 @@ def _diagnose_self_trigger_failure(
     bug_id: str,
     crash_log: str | None,
     applied_bugs_data: list[dict],
+    current_bug_data: dict | None = None,
 ) -> str:
     """Identify which previous patches likely block the testcase.
 
-    Cross-references the crash path functions with the functions touched
-    by each previously-applied patch to narrow down the blocker.
+    Cross-references the crash path functions (then files as fallback)
+    with each previously-applied patch.
     """
     # Get crash path functions
     crash_funcs = set()
@@ -1321,13 +1322,27 @@ def _diagnose_self_trigger_failure(
         }
     crash_path_str = " → ".join(list(crash_funcs)[:6]) if crash_funcs else "unknown"
 
+    # What the agent changed this attempt
+    _, diff_stat = _exec_capture(
+        container, f"cd /src/{project} && git diff --stat 2>/dev/null",
+    )
+
+    # Files the current bug's standalone patch touches
+    bug_files: set[str] = set()
+    if current_bug_data:
+        bug_files = files_in_diff(current_bug_data.get("diff_path", ""))
+
     lines = [
         f"Result: Bug {bug_id} did not crash.",
         f"Expected crash path: {crash_path_str}",
+        "",
+        "What you changed (git diff --stat):",
+        f"  {diff_stat.strip() if diff_stat else '(no changes)'}",
     ]
 
-    # For each previous bug, check if its patch touches crash-path functions
-    blockers = []
+    # Try function-level matching first
+    func_blockers = []
+    file_blockers = []
     for pb in applied_bugs_data:
         diff_path = pb.get("diff_path")
         if not diff_path:
@@ -1337,22 +1352,33 @@ def _diagnose_self_trigger_failure(
         except OSError:
             continue
         diff_funcs = _extract_diff_functions(diff_text)
-        overlap = crash_funcs & diff_funcs
-        if overlap:
-            blockers.append((pb["bug_id"], sorted(overlap)))
+        func_overlap = crash_funcs & diff_funcs
+        if func_overlap:
+            func_blockers.append((pb["bug_id"], "functions", sorted(func_overlap)))
+        else:
+            # File-level fallback: does this patch touch the same files
+            # as the current bug's patch?
+            pb_files = files_in_diff(diff_path)
+            file_overlap = bug_files & pb_files
+            if file_overlap:
+                file_blockers.append((pb["bug_id"], "files", sorted(file_overlap)))
 
+    blockers = func_blockers or file_blockers
     if blockers:
+        match_type = "crash-path functions" if func_blockers else "same files as this bug's patch"
         lines.append("")
-        lines.append("Likely blockers (previous patches touching crash-path functions):")
-        for pb_id, funcs in blockers:
-            lines.append(f"  - {pb_id}: touches {', '.join(funcs)}")
+        lines.append(f"Likely blockers (previous patches touching {match_type}):")
+        for pb_id, kind, items in blockers:
+            lines.append(f"  - {pb_id}: {kind}: {', '.join(items)}")
         lines.append("")
-        lines.append("Action: dispatch the changes from these bugs in the listed functions.")
+        lines.append("Action: check these patches' changes and dispatch any "
+                      "that block the testcase from reaching the crash site.")
     else:
         lines.append("")
-        lines.append("Could not identify specific blockers from function overlap.")
-        lines.append("Action: run `git diff` and look for any change in the crash path "
-                      "that prevents the testcase from reaching the crash site.")
+        lines.append("No specific blocker identified by function or file overlap.")
+        lines.append("Action: run `git diff` and check every change in the "
+                      "testcase's code path for early returns or validation "
+                      "that rejects the input before the crash site.")
 
     return "\n".join(lines)
 
@@ -1417,6 +1443,7 @@ def _build_step_feedback(
     build_output: str | None = None,
     regressed_bugs_data: list[dict] | None = None,
     applied_bugs_data: list[dict] | None = None,
+    current_bug_data: dict | None = None,
 ) -> str:
     """Build diagnostic feedback for the agent about a failed step attempt.
 
@@ -1435,6 +1462,7 @@ def _build_step_feedback(
         diag = _diagnose_self_trigger_failure(
             container, project, bug_id, crash_log,
             applied_bugs_data or [],
+            current_bug_data=current_bug_data,
         )
         lines.append(diag)
 
@@ -2209,6 +2237,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             "self_trigger", bug_id, container, project,
                             crash_log=bd.get("crash_log"),
                             applied_bugs_data=prev_data,
+                            current_bug_data=bd,
                         )
                         logger.warning(
                             "[%s] Self-trigger failed, retrying step", bug_id,
