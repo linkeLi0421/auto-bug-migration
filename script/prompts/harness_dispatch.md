@@ -1,6 +1,6 @@
 # Harness Dispatch Byte Modification
 
-Modify the fuzz target to consume a dispatch byte from the input.
+Modify the fuzz target to consume dispatch bytes from the input.
 
 ## Prompt
 
@@ -17,13 +17,14 @@ Please make these changes:
 
 2. Add at the top of that file:
       #include "__bug_dispatch.h"
+      #include <string.h>
 
 3. At the VERY START of LLVMFuzzerTestOneInput (before any existing
    logic), add:
-      if (size < 1) return 0;
-      __bug_dispatch = data[0];
-      data++;
-      size--;
+      if (size < __BUG_DISPATCH_BYTES) return 0;
+      memcpy((void*)__bug_dispatch, data, __BUG_DISPATCH_BYTES);
+      data += __BUG_DISPATCH_BYTES;
+      size -= __BUG_DISPATCH_BYTES;
 
 4. Make sure __bug_dispatch.c is compiled and linked into ALL fuzz
    targets.  Depending on the build system you may need to:

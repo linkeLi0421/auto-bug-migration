@@ -18,7 +18,7 @@ Available patches:
 For EVERY change this patch makes to the source code, wrap it:
 
     #include "__bug_dispatch.h"
-    if (__bug_dispatch & (1 << {dispatch_bit})) {{
+    if (__bug_dispatch[{dispatch_byte}] & (1 << {dispatch_bit})) {{
         // {bug_id}'s version of the code (from the patch)
     }} else {{
         // Original code (before the patch, needed by regressed bugs)

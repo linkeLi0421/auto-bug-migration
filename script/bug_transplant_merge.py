@@ -314,31 +314,36 @@ def _annotate_diff_ownership(
 # Dispatch branch infrastructure
 # ---------------------------------------------------------------------------
 
-_DISPATCH_HEADER = """\
+_DISPATCH_HEADER_TEMPLATE = """\
 #ifndef __BUG_DISPATCH_H
 #define __BUG_DISPATCH_H
 #include <stdint.h>
-extern volatile uint8_t __bug_dispatch;
+#define __BUG_DISPATCH_BYTES {dispatch_bytes}
+extern volatile uint8_t __bug_dispatch[__BUG_DISPATCH_BYTES];
 #endif
 """
 
 _DISPATCH_SOURCE = """\
-#include <stdint.h>
-volatile uint8_t __bug_dispatch = 0;
+#include "__bug_dispatch.h"
+volatile uint8_t __bug_dispatch[__BUG_DISPATCH_BYTES] = {0};
 """
 
 _MAX_STEP_RETRIES = 5
 
 
-def _inject_dispatch_files(container: str, project: str) -> None:
+def _inject_dispatch_files(
+    container: str, project: str, dispatch_bytes: int = 1,
+) -> None:
     """Create __bug_dispatch.h and __bug_dispatch.c inside /src/{project}."""
-    for fname, content in (("__bug_dispatch.h", _DISPATCH_HEADER),
+    header = _DISPATCH_HEADER_TEMPLATE.format(dispatch_bytes=dispatch_bytes)
+    for fname, content in (("__bug_dispatch.h", header),
                            ("__bug_dispatch.c", _DISPATCH_SOURCE)):
         _exec_capture(
             container,
             f"cat > /src/{project}/{fname} << 'DISPATCH_EOF'\n{content}DISPATCH_EOF",
         )
-    logger.info("Injected __bug_dispatch.h/.c into /src/%s", project)
+    logger.info("Injected __bug_dispatch.h/.c into /src/%s (bytes=%d)",
+                project, dispatch_bytes)
 
 
 def _apply_all_dispatch_bytes(
@@ -346,15 +351,35 @@ def _apply_all_dispatch_bytes(
     dispatch_state: dict,
 ) -> None:
     """Prepend dispatch bytes to PoCs in /work/ (idempotent — reads from /corpus/)."""
+    nbytes = dispatch_state.get("dispatch_bytes", 1)
     for bug_id, dval in dispatch_state["poc_bytes"].items():
         testcase = f"testcase-{bug_id}"
+        # Serialize as little-endian: Python bit N → byte[N//8] bit N%8
+        prefix = dval.to_bytes(nbytes, "little")
+        prefix_list = ",".join(str(b) for b in prefix)
         _exec_capture(
             container,
             f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; "
             f"python3 -c \""
             f"d=open('/work/{testcase}','rb').read(); "
-            f"open('/work/{testcase}','wb').write(bytes([{dval}])+d)\"",
+            f"open('/work/{testcase}','wb').write(bytes([{prefix_list}])+d)\"",
         )
+
+
+def _ensure_dispatch_capacity(
+    dispatch_state: dict,
+    container: str,
+    project: str,
+) -> None:
+    """Grow the dispatch byte array if next_bit exceeds current capacity."""
+    needed = (dispatch_state["next_bit"] // 8) + 1
+    current = dispatch_state.get("dispatch_bytes", 1)
+    if needed <= current:
+        return
+    dispatch_state["dispatch_bytes"] = needed
+    logger.info("Growing dispatch array: %d -> %d byte(s)", current, needed)
+    _inject_dispatch_files(container, project, needed)
+    _rebuild_and_apply_dispatch(container, project, dispatch_state)
 
 
 def _modify_harness_for_dispatch(
@@ -726,7 +751,8 @@ def resolve_conflict_with_agent(
     prompt = _load_prompt(
         "conflict_resolve_dispatch",
         project=project, applied_list=applied_list, diff_name=diff_name,
-        bug_id=bug_id, conflict_desc=conflict_desc, dispatch_bit=dispatch_bit,
+        bug_id=bug_id, conflict_desc=conflict_desc,
+        dispatch_byte=dispatch_bit // 8, dispatch_bit=dispatch_bit % 8,
     )
     if feedback:
         prompt += (
@@ -836,7 +862,8 @@ def resolve_with_dispatch(
     prompt = _load_prompt(
         "regression_dispatch",
         project=project, bug_id=bug_id, regressed_ids=regressed_ids,
-        dispatch_bit=dispatch_bit, patch_list=patch_list,
+        dispatch_byte=dispatch_bit // 8, dispatch_bit=dispatch_bit % 8,
+        patch_list=patch_list,
     )
     if feedback:
         prompt += (
@@ -1177,7 +1204,8 @@ def resolve_self_trigger_with_dispatch(
     prompt = _load_prompt(
         "self_trigger_dispatch",
         project=project, bug_id=bug_id, crash_line=crash_line,
-        prev_list=prev_list, dispatch_bit=dispatch_bit,
+        prev_list=prev_list,
+        dispatch_byte=dispatch_bit // 8, dispatch_bit=dispatch_bit % 8,
     )
     if feedback:
         prompt += (
@@ -1752,8 +1780,9 @@ def run_merge(args: argparse.Namespace) -> int:
     regression_failures: list[dict] = []
     dispatch_state: dict = {
         "next_bit": 0,                # next available bit index
+        "dispatch_bytes": 1,           # current __bug_dispatch[] array size
         "bits": {},                    # {bit_index: {bug_new, bug_existing}}
-        "poc_bytes": {},               # {bug_id: int} dispatch byte per bug
+        "poc_bytes": {},               # {bug_id: int} dispatch bitmask per bug
         "harness_modified": False,     # dispatch byte consumption in harness
         "dispatch_file_injected": False,  # __bug_dispatch.h/.c created
     }
@@ -1803,9 +1832,10 @@ def run_merge(args: argparse.Namespace) -> int:
             applied_bugs = saved["applied_bugs"]
             merge_results = saved["merge_results"]
 
-            # Re-inject dispatch files if they were used
+            # Re-inject dispatch files if they were used (with correct size)
             if dispatch_state.get("dispatch_file_injected"):
-                _inject_dispatch_files(container, project)
+                dbytes = dispatch_state.get("dispatch_bytes", 1)
+                _inject_dispatch_files(container, project, dbytes)
 
             # Rebuild all_verified_bugs from saved IDs
             saved_ids = set(saved["all_verified_bug_ids"])
@@ -1846,8 +1876,9 @@ def run_merge(args: argparse.Namespace) -> int:
             if dispatch_state["poc_bytes"]:
                 _apply_all_dispatch_bytes(container, dispatch_state)
 
-            logger.info("Restored: %d applied bugs, dispatch next_bit=%d",
-                        len(applied_bugs), dispatch_state["next_bit"])
+            logger.info("Restored: %d applied bugs, dispatch next_bit=%d (%d byte(s))",
+                        len(applied_bugs), dispatch_state["next_bit"],
+                        dispatch_state.get("dispatch_bytes", 1))
         else:
             if local_bugs:
                 logger.info("=== Verifying %d local bugs at baseline ===",
@@ -1927,9 +1958,10 @@ def run_merge(args: argparse.Namespace) -> int:
 
                     # Inject dispatch files on first conflict (idempotent)
                     if not dispatch_state["dispatch_file_injected"]:
-                        _inject_dispatch_files(container, project)
+                        _inject_dispatch_files(container, project, dispatch_state.get("dispatch_bytes", 1))
                         dispatch_state["dispatch_file_injected"] = True
 
+                    _ensure_dispatch_capacity(dispatch_state, container, project)
                     bit_index = dispatch_state["next_bit"]
 
                     result = resolve_conflict_with_agent(
@@ -2073,9 +2105,10 @@ def run_merge(args: argparse.Namespace) -> int:
                     )
 
                     if not dispatch_state["dispatch_file_injected"]:
-                        _inject_dispatch_files(container, project)
+                        _inject_dispatch_files(container, project, dispatch_state.get("dispatch_bytes", 1))
                         dispatch_state["dispatch_file_injected"] = True
 
+                    _ensure_dispatch_capacity(dispatch_state, container, project)
                     bit_index = dispatch_state["next_bit"]
                     prev_bugs_data = [
                         next(d for d in ordered if d["bug_id"] == pid)
@@ -2191,9 +2224,10 @@ def run_merge(args: argparse.Namespace) -> int:
 
                         # Inject dispatch files on first use
                         if not dispatch_state["dispatch_file_injected"]:
-                            _inject_dispatch_files(container, project)
+                            _inject_dispatch_files(container, project, dispatch_state.get("dispatch_bytes", 1))
                             dispatch_state["dispatch_file_injected"] = True
 
+                        _ensure_dispatch_capacity(dispatch_state, container, project)
                         bit_index = dispatch_state["next_bit"]
                         dispatch_ok = resolve_with_dispatch(
                             container, bug_id, project, regressed,
@@ -2440,7 +2474,9 @@ def run_merge(args: argparse.Namespace) -> int:
             for bid, dval in sorted(dispatch_state["poc_bytes"].items(),
                                     key=lambda x: x[1], reverse=True):
                 if dval > 0:
-                    print(f"    {bid}: 0x{dval:02x}")
+                    nbytes = dispatch_state.get("dispatch_bytes", 1)
+                    hex_width = nbytes * 2
+                    print(f"    {bid}: 0x{dval:0{hex_width}x}")
             # All others implicitly 0x00
             n_zero = sum(1 for v in dispatch_state["poc_bytes"].values() if v == 0)
             if n_zero:

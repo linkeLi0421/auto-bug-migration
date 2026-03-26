@@ -39,7 +39,7 @@ Strategy:
    in a dispatch branch:
 
    #include "__bug_dispatch.h"
-   if (__bug_dispatch & (1 << {dispatch_bit})) {{
+   if (__bug_dispatch[{dispatch_byte}] & (1 << {dispatch_bit})) {{
        // Code from bug {bug_id}'s patch
    }} else {{
        // Existing code (from previously-applied bugs)
