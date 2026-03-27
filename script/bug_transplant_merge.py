@@ -398,18 +398,22 @@ def _modify_harness_for_dispatch(
 
     cfg = AGENT_CONFIG[agent]
 
-    # Setup agent credentials
+    # Setup agent credentials (run as root to read host-owned 600 files)
     creds_dir = cfg["credentials_dir"]
     _exec(
         container,
-        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
-        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
         "true",
+        user="root",
     )
     if cfg.get("credentials_config"):
         _exec(
             container,
-            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+            user="root",
         )
 
     prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
@@ -422,7 +426,8 @@ def _modify_harness_for_dispatch(
     logger.info("Invoking %s to modify harness for dispatch byte...", agent)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
-        logger.error("Harness modification agent failed (exit %d)", ret)
+        logger.error("Harness modification agent failed (exit %d): %s",
+                     ret, output[-500:] if output else "(no output)")
         return False
 
     ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
@@ -711,18 +716,22 @@ def resolve_conflict_with_agent(
     cfg = AGENT_CONFIG[agent]
     logger.info("[%s] Invoking %s to resolve conflict...", bug_id, agent)
 
-    # Setup agent credentials
+    # Setup agent credentials (run as root to read host-owned 600 files)
     creds_dir = cfg["credentials_dir"]
     _exec(
         container,
-        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
-        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
         "true",
+        user="root",
     )
     if cfg.get("credentials_config"):
         _exec(
             container,
-            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+            user="root",
         )
 
     diff_name = Path(diff_path).name
@@ -770,7 +779,8 @@ def resolve_conflict_with_agent(
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     if ret != 0:
-        logger.error("[%s] %s agent failed (exit %d)", bug_id, agent, ret)
+        logger.error("[%s] %s agent failed (exit %d): %s",
+                     bug_id, agent, ret, output[-500:] if output else "(no output)")
         return "failed"
 
     # Verify it compiles
@@ -819,18 +829,22 @@ def resolve_with_dispatch(
                 "for %d regressed bugs...",
                 bug_id, agent, dispatch_bit, len(regressed_bugs))
 
-    # Setup agent credentials
+    # Setup agent credentials (run as root to read host-owned 600 files)
     creds_dir = cfg["credentials_dir"]
     _exec(
         container,
-        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
-        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
         "true",
+        user="root",
     )
     if cfg.get("credentials_config"):
         _exec(
             container,
-            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+            user="root",
         )
 
     # Copy patches into container for the agent to read
@@ -880,7 +894,8 @@ def resolve_with_dispatch(
 
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
-        logger.error("[%s] Dispatch agent failed (exit %d)", bug_id, ret)
+        logger.error("[%s] Dispatch agent failed (exit %d): %s",
+                     bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
     ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
@@ -1160,18 +1175,22 @@ def resolve_self_trigger_with_dispatch(
                 "analyzing %d previous patches...",
                 bug_id, agent, dispatch_bit, len(applied_bugs_data))
 
-    # Setup agent credentials
+    # Setup agent credentials (run as root to read host-owned 600 files)
     creds_dir = cfg["credentials_dir"]
     _exec(
         container,
-        f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
-        f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
         "true",
+        user="root",
     )
     if cfg.get("credentials_config"):
         _exec(
             container,
-            f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+            user="root",
         )
 
     # Copy current bug's patch into container
@@ -1225,8 +1244,8 @@ def resolve_self_trigger_with_dispatch(
 
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
-        logger.error("[%s] Self-trigger dispatch agent failed (exit %d)",
-                     bug_id, ret)
+        logger.error("[%s] Self-trigger dispatch agent failed (exit %d): %s",
+                     bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
     ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
@@ -1686,6 +1705,11 @@ def run_merge(args: argparse.Namespace) -> int:
         diff_path = result.get("diff_path")
         if diff_path and Path(diff_path).exists():
             bug_id = result["bug_id"]
+            if result.get("status") not in (None, "success"):
+                logger.warning(
+                    "Skipping %s: standalone transplant %s",
+                    bug_id, result.get("status", "unknown"))
+                continue
             seen_bug_ids.add(bug_id)
             info = bug_info_dataset.get(bug_id, {})
             reproduce = info.get("reproduce", {})
@@ -1884,10 +1908,20 @@ def run_merge(args: argparse.Namespace) -> int:
 
             # Restore dispatch_state
             dispatch_state = saved["dispatch_state"]
-            # Convert string keys back to int for bits dict
-            dispatch_state["bits"] = {
-                int(k): v for k, v in dispatch_state["bits"].items()
-            }
+            # Handle selector-format state (from newer code version)
+            if "dispatches" in dispatch_state and "bits" not in dispatch_state:
+                dispatch_state["bits"] = {
+                    int(k): v for k, v in dispatch_state["dispatches"].items()
+                }
+                dispatch_state["next_bit"] = dispatch_state.pop("next_selector", 0)
+                dispatch_state.pop("dispatches", None)
+                dispatch_state.pop("bug_selectors", None)
+                dispatch_state.pop("dispatch_mode", None)
+            else:
+                # Convert string keys back to int for bits dict
+                dispatch_state["bits"] = {
+                    int(k): v for k, v in dispatch_state["bits"].items()
+                }
             applied_bugs = saved["applied_bugs"]
             merge_results = saved["merge_results"]
 
@@ -2157,74 +2191,96 @@ def run_merge(args: argparse.Namespace) -> int:
 
                 # --- If self-trigger fails, try dispatch to unblock ---
                 if not step["self_triggers"] and applied_bugs:
-                    logger.info(
-                        "[%s] Self-trigger failed — attempting dispatch to "
-                        "unblock from %d previous patches...",
-                        bug_id, len(applied_bugs),
-                    )
-
-                    if not dispatch_state["dispatch_file_injected"]:
-                        _inject_dispatch_files(container, project, dispatch_state.get("dispatch_bytes", 1))
-                        dispatch_state["dispatch_file_injected"] = True
-
-                    _ensure_dispatch_capacity(dispatch_state, container, project)
-                    bit_index = dispatch_state["next_bit"]
-                    prev_bugs_data = [
-                        next(d for d in ordered if d["bug_id"] == pid)
-                        for pid in applied_bugs
+                    # Skip bugs whose changes are already fully dispatched
+                    # (gated behind a dispatch bit), since they can't block
+                    # the default code path.
+                    dispatched_bugs = {
+                        info["bug_new"]
+                        for info in dispatch_state["bits"].values()
+                    }
+                    undispatched = [
+                        pid for pid in applied_bugs
+                        if pid not in dispatched_bugs
                     ]
+                    if not undispatched:
+                        logger.info(
+                            "[%s] Self-trigger failed but all %d previous "
+                            "patches are already dispatched — skipping "
+                            "self-trigger dispatch (patch itself likely bad)",
+                            bug_id, len(applied_bugs),
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Self-trigger failed — attempting dispatch to "
+                            "unblock from %d previous patches "
+                            "(%d already dispatched, skipped)...",
+                            bug_id, len(undispatched),
+                            len(applied_bugs) - len(undispatched),
+                        )
 
-                    dispatch_ok = resolve_self_trigger_with_dispatch(
-                        container, bug_id, project,
-                        prev_bugs_data, bd.get("crash_log"),
-                        bd["diff_path"], bit_index,
-                        agent=args.agent, model=args.model,
-                        feedback=step_feedback,
-                        attempt=retry_count,
-                    )
+                    if undispatched:
+                        if not dispatch_state["dispatch_file_injected"]:
+                            _inject_dispatch_files(container, project, dispatch_state.get("dispatch_bytes", 1))
+                            dispatch_state["dispatch_file_injected"] = True
 
-                    if dispatch_ok:
-                        if not dispatch_state["harness_modified"]:
-                            hok = _modify_harness_for_dispatch(
-                                container, project, bd["fuzzer"],
-                                args.agent, args.model,
-                            )
-                            if hok:
-                                dispatch_state["harness_modified"] = True
-                                for lb in local_bugs:
-                                    dispatch_state["poc_bytes"].setdefault(
-                                        lb["bug_id"], 0)
-                                for tbd in ordered:
-                                    dispatch_state["poc_bytes"].setdefault(
-                                        tbd["bug_id"], 0)
+                        _ensure_dispatch_capacity(dispatch_state, container, project)
+                        bit_index = dispatch_state["next_bit"]
+                        prev_bugs_data = [
+                            next(d for d in ordered if d["bug_id"] == pid)
+                            for pid in undispatched
+                        ]
 
-                        if dispatch_state["harness_modified"]:
-                            dispatch_state["bits"][bit_index] = {
-                                "bug_new": bug_id,
-                                "bug_blocked_by": list(applied_bugs),
-                                "type": "self_trigger_unblock",
-                            }
-                            dispatch_state["poc_bytes"].setdefault(bug_id, 0)
-                            dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
-                            dispatch_state["next_bit"] += 1
+                        dispatch_ok = resolve_self_trigger_with_dispatch(
+                            container, bug_id, project,
+                            prev_bugs_data, bd.get("crash_log"),
+                            bd["diff_path"], bit_index,
+                            agent=args.agent, model=args.model,
+                            feedback=step_feedback,
+                            attempt=retry_count,
+                        )
 
-                            _rebuild_and_apply_dispatch(
-                                container, project, dispatch_state)
-                            _save_step_diff(container, project, target_commit,
-                                            i, bug_id, "self_trigger_dispatch", step)
+                        if dispatch_ok:
+                            if not dispatch_state["harness_modified"]:
+                                hok = _modify_harness_for_dispatch(
+                                    container, project, bd["fuzzer"],
+                                    args.agent, args.model,
+                                )
+                                if hok:
+                                    dispatch_state["harness_modified"] = True
+                                    for lb in local_bugs:
+                                        dispatch_state["poc_bytes"].setdefault(
+                                            lb["bug_id"], 0)
+                                    for tbd in ordered:
+                                        dispatch_state["poc_bytes"].setdefault(
+                                            tbd["bug_id"], 0)
 
-                            step["self_triggers"] = verify_bug_triggers(
-                                container, bug_id, bd["fuzzer"], bd["testcase"],
-                                bd.get("sanitizer", "address"),
-                                bd.get("crash_log"),
-                            )
-                            if step["self_triggers"]:
-                                step["apply_method"] += "+dispatch"
-                                logger.info(
-                                    "[%s] Self-trigger OK after dispatch", bug_id)
-                            else:
-                                logger.warning(
-                                    "[%s] Still fails after dispatch", bug_id)
+                            if dispatch_state["harness_modified"]:
+                                dispatch_state["bits"][bit_index] = {
+                                    "bug_new": bug_id,
+                                    "bug_blocked_by": list(undispatched),
+                                    "type": "self_trigger_unblock",
+                                }
+                                dispatch_state["poc_bytes"].setdefault(bug_id, 0)
+                                dispatch_state["poc_bytes"][bug_id] |= (1 << bit_index)
+                                dispatch_state["next_bit"] += 1
+
+                                _rebuild_and_apply_dispatch(
+                                    container, project, dispatch_state)
+                                _save_step_diff(container, project, target_commit,
+                                                i, bug_id, "self_trigger_dispatch", step)
+
+                                step["self_triggers"] = verify_bug_triggers(
+                                    container, bug_id, bd["fuzzer"], bd["testcase"],
+                                    bd.get("sanitizer", "address"),
+                                    bd.get("crash_log"),
+                                )
+                                if step["self_triggers"]:
+                                    step["apply_method"] += "+dispatch"
+                                    logger.info(
+                                        "[%s] Self-trigger OK after dispatch", bug_id)
+                                else:
+                                    logger.warning(
+                                        "[%s] Still fails after dispatch", bug_id)
 
                 # --- If still can't self-trigger, retry or revert ---
                 if not step["self_triggers"]:
