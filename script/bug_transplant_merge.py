@@ -1968,7 +1968,7 @@ def run_merge(args: argparse.Namespace) -> int:
             bug_id = bd["bug_id"]
             diff_path = bd["diff_path"]
             logger.info(
-                "=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
+                "\n\n=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
             )
 
             # Save source snapshot before this step (for rollback)
