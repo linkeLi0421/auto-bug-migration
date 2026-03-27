@@ -64,7 +64,7 @@ AGENT_CONFIG = {
         "api_key_env": "ANTHROPIC_API_KEY",
         "credentials_dir": ".claude",        # ~/.<this> on host
         "credentials_config": ".claude.json", # ~/.<this> on host
-        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions",
+        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions --max-turns 20",
         "model_flag": "--model",
     },
     "codex": {
