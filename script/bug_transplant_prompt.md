@@ -2,25 +2,25 @@
 
 You are inside an OSS-Fuzz Docker container for project **{project}**.
 
-## Objective
+## Goal
 
-Bug **{bug_id}** is triggered at buggy commit `{buggy_commit}` using testcase
-`/work/{testcase_name}`. The source at `/src/{project}` is currently at target
-commit `{target_commit}`.
+Bug **{bug_id}** reproduced at old commit `{buggy_commit}`.
+The source in `/src/{project}` is now at newer commit `{target_commit}`, where the bug has been fixed.
 
-Your job: modify the current version's code so the **same bug** is triggered
-by the same testcase.
+Your task is to make the old testcase at `/work/{testcase_name}` crash again in the current tree by undoing the fix or any added guard that prevents the testcase from reaching the bug.
 
-## Available data
+Target result:
+- same sanitizer class as the original crash
+- same crashing function, or very close in the same call path
 
-| File | Description |
-|---|---|
-| `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt` | Crash stack from buggy commit |
-| `/data/target_trace-{buggy_short}-{testcase_name}.txt` | Function trace + call relations from buggy commit |
-| `/work/{testcase_name}` | PoC testcase (binary fuzzer input) |
-| `/src/{project}` | Source code (at target commit `{target_commit}`) |
+## Files
 
-## Build and test commands
+- `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt` — original crash log
+- `/data/target_trace-{buggy_short}-{testcase_name}.txt` — trace/call path from buggy commit
+- `/work/{testcase_name}` — PoC input
+- `/src/{project}` — current fixed source tree
+
+## Allowed commands
 
 ```bash
 # Build the project (inside container)
@@ -72,18 +72,6 @@ code path.
 - Compare output with the original crash: same crash type, same crashing
   function, same call chain pattern.
 
-### Step 6: Minimize the patch (MANDATORY before delivering)
-After getting the bug to trigger, minimize using single-change elimination:
-
-1. Start with all N changes applied (bug triggers).
-2. For each change i (from 1 to N):
-   - Revert ONLY change i (keep all others).
-   - Build and test:
-     `sudo -E compile 2>&1 | tail -3 && /out/{fuzzer_name} /work/{testcase_name} 2>&1 | grep -E "SUMMARY|Executed|WARNING"`
-   - If bug still triggers -> change i is **unnecessary**, remove it permanently.
-   - If bug stops triggering -> change i is **required**, re-apply it.
-3. Final verification: confirm the minimal set still triggers the bug.
-
 Use `git stash` to save state and `git checkout -- <file>` to selectively
 revert individual files during testing.
 
@@ -93,25 +81,7 @@ cd /src/{project}
 git diff > /out/bug_transplant.diff
 ```
 
-Report which changes were required and why, which were eliminated and why.
-
-## Common fix patterns to revert
-
-| Fix Pattern | Revert Action |
-|---|---|
-| `memset(buffer, 0, size)` added | Remove the memset |
-| `malloc` -> `calloc` | Change back to `malloc` |
-| New bounds check: `if (x > limit) return FALSE` | Remove the check |
-| Added `NULL` checks | May need to remove if they prevent reaching the bug |
-
 ## Rules
-- Do NOT change the bug-triggering logic -- only revert fixes and remove blockers.
-- Start MINIMAL: crash-stack functions only. Escalate to callees only if needed.
-- Build and test after EVERY change -- do not batch.
-- **ALWAYS use `sudo -E compile` to build.** NEVER build manually with make, gcc,
-  clang, cmake, or any other command. NEVER create your own fuzz target binaries.
-  Only test with `/out/{fuzzer_name}` produced by `sudo -E compile`. Manual builds
-  produce different binaries and bugs that trigger with them may NOT trigger with
-  the official build.
-- Always minimize before delivering.
-- Save final diff to `/out/bug_transplant.diff`.
+
+- NEVER build with make/gcc/cmake — only `sudo -E compile`.
+- Build and test after every change.
