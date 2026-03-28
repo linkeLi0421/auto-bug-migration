@@ -351,13 +351,17 @@ def run_single_bug(
 
     result["elapsed_seconds"] = round(time.monotonic() - start, 1)
 
-    # Check for output diff
+    # Check for output diff and crash stack
     out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
     for name in ("bug_transplant.diff", "git_diff.diff"):
         p = out_dir / name
         if p.exists() and p.stat().st_size > 0:
             result["diff_path"] = str(p)
             break
+
+    crash_path = out_dir / "transplant_crash.txt"
+    if crash_path.exists() and crash_path.stat().st_size > 0:
+        result["crash_log_path"] = str(crash_path)
 
     logger.info(
         "[%s] Finished: status=%s exit=%d elapsed=%.0fs diff=%s",
@@ -453,8 +457,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Filtering
     parser.add_argument("--target-commit", default=None,
                         help="Override target commit (default: commit with most bugs)")
-    parser.add_argument("--bug_id", default=None,
-                        help="Process a single bug only")
+    parser.add_argument("--bug_id", nargs="+", default=None,
+                        help="Process specific bug(s) only")
 
     # Execution
     parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
@@ -544,20 +548,18 @@ def main() -> int:
 
     target_commit = target_row["commit_id"]
 
-    # Filter to single bug if requested
+    # Filter to specific bug(s) if requested
     if args.bug_id:
-        if args.bug_id in bugs_need_transplant:
-            bugs_need_transplant = {args.bug_id: bugs_need_transplant[args.bug_id]}
-        elif args.bug_id in bug_ids_trigger:
-            logger.info("Bug %s already triggers at target commit — nothing to do", args.bug_id)
-            return 0
-        else:
-            # Bug not in CSV data — try running anyway with user-provided info
-            logger.warning("Bug %s not found in CSV; will attempt with target commit", args.bug_id)
-            # Create a synthetic row
-            bugs_need_transplant = {
-                args.bug_id: {"commit_id": args.target_commit or target_commit},
-            }
+        filtered = {}
+        for bid in args.bug_id:
+            if bid in bugs_need_transplant:
+                filtered[bid] = bugs_need_transplant[bid]
+            elif bid in bug_ids_trigger:
+                logger.info("Bug %s already triggers at target commit — skipping", bid)
+            else:
+                logger.warning("Bug %s not found in CSV; will attempt with target commit", bid)
+                filtered[bid] = {"commit_id": args.target_commit or target_commit}
+        bugs_need_transplant = filtered
 
     if not bugs_need_transplant:
         logger.info("No bugs need transplanting")

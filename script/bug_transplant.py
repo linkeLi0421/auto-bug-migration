@@ -64,7 +64,7 @@ AGENT_CONFIG = {
         "api_key_env": "ANTHROPIC_API_KEY",
         "credentials_dir": ".claude",        # ~/.<this> on host
         "credentials_config": ".claude.json", # ~/.<this> on host
-        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions --max-turns 20",
+        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions --max-turns 30",
         "model_flag": "--model",
     },
     "codex": {
@@ -89,6 +89,7 @@ OSS_FUZZ_DIR = HOME_DIR / "oss-fuzz"
 DATA_DIR = HOME_DIR / "data"
 FUZZ_HELPER = SCRIPT_DIR / "fuzz_helper.py"
 PROMPT_TEMPLATE = SCRIPT_DIR / "bug_transplant_prompt.md"
+MINIMIZE_TEMPLATE = SCRIPT_DIR / "prompts" / "minimize_patch.md"
 CLAUDE_MD_TEMPLATE = SCRIPT_DIR / "bug_transplant_claude.md"
 
 
@@ -332,6 +333,19 @@ def build_prompt(args: argparse.Namespace) -> str:
     return prompt
 
 
+def _build_minimize_prompt(args: argparse.Namespace) -> str:
+    """Read the minimize prompt template and fill in parameters."""
+    template = MINIMIZE_TEMPLATE.read_text()
+    return template.format(
+        project=args.project,
+        bug_id=args.bug_id,
+        buggy_short=args.buggy_commit[:8],
+        target_commit=args.target_commit,
+        testcase_name=args.testcase,
+        fuzzer_name=args.fuzzer_name,
+    )
+
+
 def setup_claude_md(args: argparse.Namespace) -> Path:
     """Prepare a temporary directory containing CLAUDE.md for mounting.
 
@@ -375,7 +389,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
     out_dir = str(HOME_DIR / "build" / "out" / args.project)
     work_dir = str(HOME_DIR / "build" / "work" / args.project)
 
-    # Ensure output directories exist
+    # Clean and recreate build directories to avoid stale binaries/artifacts
+    # from previous runs (prevents "Text file busy" and wrong test results).
+    shutil.rmtree(out_dir, ignore_errors=True)
+    shutil.rmtree(work_dir, ignore_errors=True)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -465,7 +482,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         _exec(container_name, "git config --global --add safe.directory '*'", user="root")
         # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
         # before checkout so they don't pollute the git diff later.
-        _exec(container_name, f"cd /src/{args.project} && git clean -fdx", user="root")
+        # Exclude .claude/ and .codex/ — they are bind-mounted for credentials.
+        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e .claude/ -e .codex/", user="root")
         _exec(container_name, f"cd /src/{args.project} && git checkout -f {args.target_commit}", user="root")
 
         # --- Copy testcase to /work for easier access ---
@@ -476,18 +494,22 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-        # --- Setup agent credentials (login mode) ---
+        # --- Setup agent credentials (run as root to read host-owned 600 files) ---
         creds_dir = cfg["credentials_dir"]
         _exec(
             container_name,
-            f"cp -r /tmp/.agent-creds-src $HOME/{creds_dir} 2>/dev/null; "
-            f"rm -rf $HOME/{creds_dir}/projects 2>/dev/null; "
+            f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+            f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+            f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
             "true",
+            user="root",
         )
         if cfg.get("credentials_config"):
             _exec(
                 container_name,
-                f"cp /tmp/.agent-config-src $HOME/{cfg['credentials_config']} 2>/dev/null; true",
+                f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+                f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+                user="root",
             )
 
         # --- Copy project CLAUDE.md into the agent's home (claude only) ---
@@ -511,6 +533,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             container_name, agent_cmd, timeout=args.timeout,
         )
         elapsed = time.monotonic() - start_time
+
+        # claude exits 0 even on max-turns — detect from output text
+        if exit_code == 0 and "Reached max turns" in output:
+            logger.warning("Agent hit max turns limit — treating as failure")
+            exit_code = 1
+
         logger.info(
             "%s agent finished in %.0fs (exit code %d, %d bytes output)",
             agent, elapsed, exit_code, len(output),
@@ -607,6 +635,51 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             if has_crash:
                 logger.info("Post-agent verification PASSED: bug triggers "
                             "with official build")
+                # Save crash stack
+                crash_out_path = output_dir / "transplant_crash.txt"
+                crash_out_path.write_text(fuzz_out)
+                logger.info("Crash stack saved: %s", crash_out_path)
+
+                # --- Phase 2: Minimization (separate agent) ---
+                logger.info("=== Minimization phase ===")
+                minimize_prompt = _build_minimize_prompt(args)
+                minimize_cmd = _build_agent_command(minimize_prompt, args)
+                min_start = time.monotonic()
+                min_exit, min_output = _exec_capture(
+                    container_name, minimize_cmd, timeout=args.timeout,
+                )
+                min_elapsed = time.monotonic() - min_start
+                logger.info("Minimization finished in %.0fs (exit %d)",
+                            min_elapsed, min_exit)
+                (output_dir / "minimize_output.txt").write_text(min_output)
+
+                # Re-save the (now minimized) diff
+                subprocess.call(
+                    ["docker", "cp",
+                     f"{container_name}:/out/bug_transplant.diff",
+                     str(diff_path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+
+                # Re-verify after minimization
+                _exec_capture(container_name,
+                              "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                ret_fuzz2, fuzz_out2 = _exec_capture(
+                    container_name, verify_cmd, timeout=120)
+                has_crash2 = bool(re.search(
+                    r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
+                    fuzz_out2))
+                if has_crash2:
+                    logger.info("Post-minimize verification PASSED")
+                    crash_out_path.write_text(fuzz_out2)
+                else:
+                    logger.warning("Post-minimize verification FAILED — "
+                                   "keeping pre-minimize diff")
+                    # Restore the unminimized diff
+                    _, pre_min_diff = _exec_capture(
+                        container_name,
+                        f"cd /src/{args.project} && git diff")
+                    diff_path.write_text(pre_min_diff)
             else:
                 logger.error(
                     "Post-agent verification FAILED: bug does NOT trigger "
@@ -615,7 +688,17 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     ret_fuzz,
                     fuzz_out[-300:] if fuzz_out else "(empty)",
                 )
+                # Remove unverified diff so downstream doesn't use it
+                if diff_path.exists():
+                    diff_path.unlink()
+                    logger.info("Removed unverified diff: %s", diff_path)
                 return 1
+
+        # Agent failed — remove any partial diff
+        if exit_code != 0 and diff_path.exists():
+            diff_path.unlink()
+            logger.info("Agent failed (exit %d), removed partial diff: %s",
+                        exit_code, diff_path)
 
         return exit_code
 
