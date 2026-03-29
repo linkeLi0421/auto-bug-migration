@@ -8,7 +8,7 @@ Bug **{bug_id}** triggers with the current diff applied. Your job is to
 remove unnecessary changes until only the minimal set remains.
 
 The unminimized diff: `git diff` (already applied in `/src/{project}`)
-Testcase: `/work/{testcase_name}`
+Testcase: `/work/{testcase_name}` (may have been modified from original)
 Crash log for reference: `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt`
 
 ## Commands
@@ -29,7 +29,11 @@ sudo -E compile
 3. For files that are required, try minimizing within the file:
    look at each hunk and try reverting individual changes.
 4. Run the final set 3 times to confirm the crash is stable.
-5. Save: `cd /src/{project} && git diff > /out/bug_transplant.diff`
+5. Save:
+   ```bash
+   cd /src/{project} && git diff > /out/bug_transplant.diff
+   cp /work/{testcase_name} /out/{testcase_name}
+   ```
 
 ## Rules
 

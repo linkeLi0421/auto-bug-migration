@@ -94,11 +94,6 @@ def parse_csv_data(csv_content: str) -> list[dict]:
 def select_crash_test_input(bug_id: str, testcases_dir: str) -> str:
     """Return preferred testcase filename."""
     base_name = f"testcase-{bug_id}"
-    if not testcases_dir:
-        return base_name
-    original_candidate = f"{base_name}-original"
-    if os.path.exists(os.path.join(testcases_dir, original_candidate)):
-        return original_candidate
     return base_name
 
 
