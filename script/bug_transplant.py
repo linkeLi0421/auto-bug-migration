@@ -64,7 +64,7 @@ AGENT_CONFIG = {
         "api_key_env": "ANTHROPIC_API_KEY",
         "credentials_dir": ".claude",        # ~/.<this> on host
         "credentials_config": ".claude.json", # ~/.<this> on host
-        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions --max-turns 30",
+        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions",
         "model_flag": "--model",
     },
     "codex": {
@@ -88,9 +88,8 @@ HOME_DIR = SCRIPT_DIR.parent
 OSS_FUZZ_DIR = HOME_DIR / "oss-fuzz"
 DATA_DIR = HOME_DIR / "data"
 FUZZ_HELPER = SCRIPT_DIR / "fuzz_helper.py"
-PROMPT_TEMPLATE = SCRIPT_DIR / "bug_transplant_prompt.md"
+PROMPT_TEMPLATE = SCRIPT_DIR / "prompts" / "bug_transplant.md"
 MINIMIZE_TEMPLATE = SCRIPT_DIR / "prompts" / "minimize_patch.md"
-CLAUDE_MD_TEMPLATE = SCRIPT_DIR / "bug_transplant_claude.md"
 
 
 # ---------------------------------------------------------------------------
@@ -346,8 +345,8 @@ def _build_minimize_prompt(args: argparse.Namespace) -> str:
     )
 
 
-def setup_claude_md(args: argparse.Namespace) -> Path:
-    """Prepare a temporary directory containing CLAUDE.md for mounting.
+def setup_claude_settings(args: argparse.Namespace) -> Path:
+    """Prepare a temporary directory containing Claude settings for mounting.
 
     Returns the path to a temporary .claude/ directory that will be
     mounted into the container at /src/{project}/.claude/.
@@ -355,9 +354,6 @@ def setup_claude_md(args: argparse.Namespace) -> Path:
     tmpdir = Path(tempfile.mkdtemp(prefix="bug_transplant_claude_"))
     claude_dir = tmpdir / ".claude"
     claude_dir.mkdir()
-
-    # Copy template as CLAUDE.md
-    shutil.copy2(CLAUDE_MD_TEMPLATE, claude_dir / "CLAUDE.md")
 
     # Write settings to allow all tools without prompting
     settings = claude_dir / "settings.json"
@@ -396,8 +392,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(work_dir, exist_ok=True)
 
-    # Prepare CLAUDE.md mount (used by claude; harmless for others)
-    claude_dir = setup_claude_md(args)
+    # Prepare Claude settings mount (used by claude; harmless for others)
+    claude_dir = setup_claude_settings(args)
 
     prompt = build_prompt(args)
 
@@ -438,8 +434,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         "-v", f"{script_dir}:/script:ro",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
-        # CLAUDE.md for project guidance (claude only, harmless for others)
-        "-v", f"{claude_dir}/CLAUDE.md:/src/{args.project}/.claude/CLAUDE.md:ro",
+        # Claude settings (permissions only, no CLAUDE.md)
         "-v", f"{claude_dir}/settings.json:/src/{args.project}/.claude/settings.json:ro",
     ]
 
@@ -512,13 +507,11 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 user="root",
             )
 
-        # --- Copy project CLAUDE.md into the agent's home (claude only) ---
+        # --- Copy Claude settings into the agent's home (claude only) ---
         if agent == "claude":
             _exec(
                 container_name,
                 f"mkdir -p /home/agent/.claude/projects/-src-{args.project}/; "
-                f"cp /src/{args.project}/.claude/CLAUDE.md "
-                f"/home/agent/.claude/projects/-src-{args.project}/CLAUDE.md 2>/dev/null; "
                 f"cp /src/{args.project}/.claude/settings.json "
                 f"/home/agent/.claude/projects/-src-{args.project}/settings.json 2>/dev/null; "
                 "true",
@@ -551,48 +544,61 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # Save raw Claude output
         (output_dir / "claude_output.txt").write_text(output)
 
-        # Prefer the agent's own diff (saved by the agent during its run).
-        # This only contains intentional changes — no build artifacts.
-        # Fall back to git diff if the agent didn't save one.
+        # Collect source-only diff (exclude build artifacts from CMake
+        # in-source builds, .o/.a/.so files, and agent config dirs).
+        # Always regenerate from git to avoid the agent accidentally
+        # capturing build artifacts via bare `git diff`.
         diff_path = output_dir / "bug_transplant.diff"
-        agent_diff_ret = subprocess.call(
+        _git_diff_excludes = (
+            "':(exclude).claude/' ':(exclude).codex/' "
+            "':(exclude)CMakeFiles/' ':(exclude)*/CMakeFiles/' "
+            "':(exclude)CMakeCache.txt' ':(exclude)cmake_install.cmake' "
+            "':(exclude)*/cmake_install.cmake' ':(exclude)CTestTestfile.cmake' "
+            "':(exclude)*/CTestTestfile.cmake' ':(exclude)CPackConfig.cmake' "
+            "':(exclude)CPackSourceConfig.cmake' ':(exclude)cmake_uninstall.cmake' "
+            "':(exclude)Makefile' ':(exclude)*/Makefile' "
+            "':(exclude)*.o' ':(exclude)*.a' ':(exclude)*.so' ':(exclude)*.so.*' "
+            "':(exclude)*.d' ':(exclude)*.pc' ':(exclude)config.h' "
+            "':(exclude)build/' ':(exclude)_build/'"
+        )
+        _, git_diff = _exec_capture(
+            container_name,
+            f"cd /src/{args.project} && "
+            f"git diff HEAD -- . {_git_diff_excludes}",
+        )
+        diff_path.write_text(git_diff)
+        if git_diff.strip():
+            logger.info("Source diff saved: %s (%d bytes)", diff_path, len(git_diff))
+        else:
+            logger.info("Diff is empty (testcase-only transplant or no changes)")
+
+        # --- Collect modified testcase (agent may have patched it) ---
+        testcase_out = output_dir / args.testcase
+        tc_ret = subprocess.call(
             ["docker", "cp",
-             f"{container_name}:/out/bug_transplant.diff",
-             str(diff_path)],
+             f"{container_name}:/out/{args.testcase}",
+             str(testcase_out)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        agent_diff = ""
-        if agent_diff_ret == 0 and diff_path.exists():
-            agent_diff = diff_path.read_text()
-
-        if agent_diff.strip():
-            logger.info("Using agent's diff: %s (%d bytes)", diff_path, len(agent_diff))
+        if tc_ret == 0 and testcase_out.exists():
+            logger.info("Collected modified testcase: %s", testcase_out)
         else:
-            # Fallback: capture from git (includes untracked files, excludes
-            # agent config dirs and common build artifacts)
-            logger.info("Agent didn't save diff, falling back to git diff")
-            _, git_diff = _exec_capture(
-                container_name,
-                f"cd /src/{args.project} && "
-                f"git add -AN -- . "
-                f"':(exclude).claude/' ':(exclude).codex/' "
-                f"':(exclude)build/' ':(exclude)_build/' "
-                f"':(exclude)*.o' ':(exclude)*.a' ':(exclude)*.so' && "
-                f"git diff -- . "
-                f"':(exclude).claude/' ':(exclude).codex/'",
+            # Fallback: grab from /work (agent may have modified in-place)
+            tc_ret2 = subprocess.call(
+                ["docker", "cp",
+                 f"{container_name}:/work/{args.testcase}",
+                 str(testcase_out)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-            diff_path.write_text(git_diff)
-            if git_diff.strip():
-                logger.info("Git diff saved: %s (%d bytes)", diff_path, len(git_diff))
-            else:
-                logger.warning("Diff is empty -- agent may not have produced changes")
+            if tc_ret2 == 0 and testcase_out.exists():
+                logger.info("Collected testcase from /work: %s", testcase_out)
 
         # ---------------------------------------------------------------
         # Post-agent verification: rebuild with official `compile` and
         # check that the bug actually triggers.  The agent may have used
         # a non-standard build that produces different binaries.
         # ---------------------------------------------------------------
-        if exit_code == 0 and (agent_diff.strip() if 'agent_diff' in dir() else True):
+        if exit_code == 0:
             logger.info("=== Post-agent verification ===")
             fuzzer = args.fuzzer_name
             testcase = args.testcase
@@ -607,10 +613,13 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 logger.error("Build tail: %s", build_out[-500:] if build_out else "")
                 return 1
 
-            # Copy testcase in case compile wiped /work
+            # Restore testcase: prefer agent's modified copy from /out,
+            # fall back to /work (agent may have modified in-place),
+            # last resort: original from /corpus
             _exec_capture(
                 container_name,
-                "cp /corpus/testcase-* /work/ 2>/dev/null; true",
+                f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "
+                f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
             )
 
             # Run fuzzer with testcase
@@ -661,9 +670,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
 
-                # Re-verify after minimization
-                _exec_capture(container_name,
-                              "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                # Re-verify after minimization (use agent's testcase)
+                _exec_capture(
+                    container_name,
+                    f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "
+                    f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
+                )
                 ret_fuzz2, fuzz_out2 = _exec_capture(
                     container_name, verify_cmd, timeout=120)
                 has_crash2 = bool(re.search(
