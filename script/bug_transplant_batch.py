@@ -259,13 +259,27 @@ def resolve_bug_metadata(
 # ---------------------------------------------------------------------------
 
 def is_bug_completed(project: str, bug_id: str) -> bool:
-    """Check if a non-empty diff already exists for this bug."""
+    """Check if transplant artifacts already exist for this bug.
+
+    A bug is considered completed if it has a diff file (even empty for
+    testcase-only transplants) AND a testcase or crash log, or if the
+    agent declared it impossible.
+    """
     out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
-    for name in ("bug_transplant.diff", "git_diff.diff"):
-        p = out_dir / name
-        if p.exists() and p.stat().st_size > 0:
-            return True
-    return False
+    if not out_dir.exists():
+        return False
+    # Agent declared impossible
+    if (out_dir / "bug_transplant.impossible").exists():
+        return True
+    has_diff = any(
+        (out_dir / name).exists()
+        for name in ("bug_transplant.diff", "git_diff.diff")
+    )
+    has_testcase = any(
+        p.name.startswith("testcase-") for p in out_dir.glob("testcase-*")
+    )
+    has_crash = (out_dir / "transplant_crash.txt").exists()
+    return has_diff and (has_testcase or has_crash)
 
 
 def run_single_bug(
@@ -275,6 +289,8 @@ def run_single_bug(
     target_commit: str,
     metadata: dict,
     args: argparse.Namespace,
+    container_name: str | None = None,
+    claude_dir: str | None = None,
 ) -> dict:
     """Run bug_transplant.py for a single bug, return result dict."""
     result = {
@@ -315,6 +331,11 @@ def run_single_bug(
         cmd.append("--keep-container")
     if args.verbose:
         cmd.append("--verbose")
+    # Shared container mode
+    if container_name:
+        cmd += ["--container-name", container_name]
+    if claude_dir:
+        cmd += ["--claude-dir", claude_dir]
 
     logger.info("[%s] Starting: buggy=%s target=%s fuzzer=%s",
                 bug_id, buggy_commit[:8], target_commit[:8], metadata["fuzzer"])
@@ -622,8 +643,44 @@ def main() -> int:
     results: list[dict] = []
     batch_start = time.monotonic()
 
+    # --- Create shared container for sequential mode ---
+    from bug_transplant import (
+        setup_claude_dir, create_shared_container,
+    )
+    import shutil
+
+    shared_container = None
+    shared_claude_dir = None
+
     try:
         if args.jobs <= 1:
+            # Create shared container + CLAUDE.md once for all bugs
+            shared_container = f"bug-transplant-{args.target}-batch"
+            first_fuzzer = bug_tasks[0][2]["fuzzer"] if bug_tasks else "unknown"
+
+            # Build a temporary args-like object for setup_claude_dir
+            class _SetupArgs:
+                pass
+            _sa = _SetupArgs()
+            _sa.project = args.target
+            _sa.target_commit = target_commit
+            _sa.fuzzer_name = first_fuzzer
+            shared_claude_path = setup_claude_dir(_sa)
+            shared_claude_dir = str(shared_claude_path)
+
+            # Create the shared container once
+            ret = create_shared_container(
+                project=args.target,
+                target_commit=target_commit,
+                container_name=shared_container,
+                claude_dir=shared_claude_path,
+                agent=args.agent,
+                testcases_dir=args.testcases_dir,
+            )
+            if ret != 0:
+                logger.error("Failed to create shared container")
+                return 1
+
             # Sequential
             for bug_id, buggy_commit, metadata in bug_tasks:
                 if args.resume and is_bug_completed(args.target, bug_id):
@@ -635,6 +692,8 @@ def main() -> int:
                 result = run_single_bug(
                     args.target, bug_id, buggy_commit, target_commit,
                     metadata, args,
+                    container_name=shared_container,
+                    claude_dir=shared_claude_dir,
                 )
                 results.append(result)
                 write_progress(artifacts_root, results, ongoing=[])
@@ -667,6 +726,27 @@ def main() -> int:
 
     except KeyboardInterrupt:
         logger.warning("Interrupted — writing partial summary")
+    finally:
+        # Clean up shared container
+        if shared_container and not args.keep_containers:
+            logger.info("Destroying shared container %s...", shared_container)
+            subprocess.call(
+                ["docker", "rm", "-f", shared_container],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif shared_container:
+            logger.info("Shared container kept: docker exec -it %s bash",
+                        shared_container)
+        # Save final CLAUDE.md to artifacts
+        if shared_claude_dir:
+            claude_md = Path(shared_claude_dir) / "CLAUDE.md"
+            if claude_md.exists():
+                import shutil
+                dest = artifacts_root / "CLAUDE.md"
+                shutil.copy2(claude_md, dest)
+                logger.info("Shared knowledge saved: %s", dest)
+            # Clean up temp dir
+            shutil.rmtree(Path(shared_claude_dir).parent, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # 6. Write summary
