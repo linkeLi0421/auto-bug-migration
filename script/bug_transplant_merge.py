@@ -104,9 +104,9 @@ def compute_merge_order(
     Bugs touching unique files go first (no conflict risk).
     Bugs overlapping with many others go last.
     """
-    # Pre-compute file sets
+    # Pre-compute file sets (testcase-only bugs have no files)
     for bd in bug_diffs:
-        bd["_files"] = files_in_diff(bd["diff_path"])
+        bd["_files"] = files_in_diff(bd["diff_path"]) if bd.get("diff_path") else set()
 
     local_files = set()
     for lb in local_bugs:
@@ -465,6 +465,25 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
 
 
 
+def _restore_testcases(container: str, project: str) -> None:
+    """Restore testcases to /work: originals from /corpus, then patched from output dirs."""
+    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    # Overwrite with patched testcases
+    bug_transplant_dir = DATA_DIR / "bug_transplant"
+    if bug_transplant_dir.exists():
+        for d in bug_transplant_dir.iterdir():
+            if not d.is_dir() or not d.name.startswith(f"{project}_"):
+                continue
+            for tc in d.glob("testcase-*"):
+                if tc.is_file() and tc.stat().st_size > 0:
+                    subprocess.run(
+                        ["docker", "exec", "-i", container,
+                         "bash", "-c", f"cat > /work/{tc.name}"],
+                        input=tc.read_bytes(), timeout=10,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+
+
 def _rebuild_project_image(project: str, target_commit: str,
                            build_csv: str | None, agent_type: str) -> str:
     """Rebuild the project Docker image from the correct historical OSS-Fuzz commit.
@@ -604,8 +623,25 @@ def start_merge_container(
     _exec(container_name, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
 
-    # Copy all testcases to /work
+    # Copy all testcases to /work (originals from corpus)
     _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
+
+    # Overwrite with patched testcases from transplant output dirs
+    bug_transplant_dir = DATA_DIR / "bug_transplant"
+    if bug_transplant_dir.exists():
+        for d in bug_transplant_dir.iterdir():
+            if not d.is_dir() or not d.name.startswith(f"{project}_"):
+                continue
+            for tc in d.glob("testcase-*"):
+                if tc.is_file() and tc.stat().st_size > 0:
+                    ret = subprocess.run(
+                        ["docker", "exec", "-i", container_name,
+                         "bash", "-c", f"cat > /work/{tc.name}"],
+                        input=tc.read_bytes(), timeout=10,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
+                    if ret.returncode == 0:
+                        logger.info("Copied patched testcase: %s", tc.name)
 
     # Build ASAN and UBSAN (no MSAN — it taints libc++ permanently).
     for san in ("address", "undefined"):
@@ -638,7 +674,7 @@ def start_merge_container(
         logger.info("Build OK for %s", san)
 
     # Restore testcases (compile may wipe /work)
-    _exec_capture(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    _restore_testcases(container_name, project)
 
     return container_name, True
 
@@ -1002,13 +1038,23 @@ def _save_step_state(
     step_dir = (DATA_DIR / "bug_transplant"
                 / f"merge_{project}_{target_commit[:8]}" / "steps")
     step_dir.mkdir(parents=True, exist_ok=True)
-    state = {
+    def _json_safe(obj):
+        """Strip non-serializable fields (sets) from dicts."""
+        if isinstance(obj, dict):
+            return {k: _json_safe(v) for k, v in obj.items() if k != "_files"}
+        if isinstance(obj, list):
+            return [_json_safe(v) for v in obj]
+        if isinstance(obj, set):
+            return sorted(obj)
+        return obj
+
+    state = _json_safe({
         "step_index": step_index,
         "dispatch_state": dispatch_state,
         "applied_bugs": applied_bugs,
         "merge_results": merge_results,
         "all_verified_bug_ids": all_verified_bug_ids,
-    }
+    })
     state_file = step_dir / f"step_{step_index+1:02d}_state.json"
     state_file.write_text(json.dumps(state, indent=2))
     logger.debug("Saved step state: %s", state_file)
@@ -1110,7 +1156,7 @@ def _revert_and_rebuild(
             "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
             f"cp \"$f\" /out/{san}/; done; true",
         )
-    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
 
@@ -1139,7 +1185,7 @@ def _rebuild_and_apply_dispatch(
             "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
             f"cp \"$f\" /out/{san}/; done; true",
         )
-    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+    _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
 
@@ -1695,101 +1741,90 @@ def run_merge(args: argparse.Namespace) -> int:
         })
 
     # Build transplanted bug list.
-    # First check summary results, then scan disk for diffs the summary
-    # may have missed (e.g. from --resume runs that only recorded "skipped").
+    # A transplanted bug has either a non-empty diff, a patched testcase, or both.
+    # Testcase-only transplants (empty diff + patched testcase) are included
+    # and skip the diff-apply step during merge.
     transplant_diffs: list[dict] = []
     seen_bug_ids: set[str] = set()
+    bug_transplant_dir = DATA_DIR / "bug_transplant"
+
+    def _load_transplant_bug(bug_id: str, diff_path: str | None, source: str):
+        """Helper to build a transplant entry from a bug's output directory."""
+        if bug_id in seen_bug_ids or bug_id in local_bug_ids:
+            return
+        out_dir = bug_transplant_dir / f"{project}_{bug_id}"
+
+        # Skip impossible bugs
+        if out_dir.exists() and (out_dir / "bug_transplant.impossible").exists():
+            logger.info("Skipping %s: declared impossible", bug_id)
+            return
+
+        # Find diff (may be empty for testcase-only transplants)
+        if not diff_path or not Path(diff_path).exists():
+            if out_dir.exists():
+                for name in ("bug_transplant.diff", "git_diff.diff"):
+                    p = out_dir / name
+                    if p.exists():
+                        diff_path = str(p)
+                        break
+
+        # Find patched testcase in output dir
+        patched_testcase = None
+        if out_dir.exists():
+            for tc in out_dir.glob(f"testcase-{bug_id}*"):
+                if tc.is_file() and tc.stat().st_size > 0:
+                    patched_testcase = str(tc)
+                    break
+
+        # Need at least a non-empty diff OR a patched testcase
+        has_diff = diff_path and Path(diff_path).exists() and Path(diff_path).stat().st_size > 0
+        if not has_diff and not patched_testcase:
+            return
+
+        info = bug_info_dataset.get(bug_id, {})
+        reproduce = info.get("reproduce", {})
+        fuzzer = reproduce.get("fuzz_target", "")
+        sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
+        if sanitizer not in ("address", "undefined"):
+            logger.warning("Skipping %s transplant bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
+            return
+        crash_log = _find_crash_log(bug_id, info)
+        seen_bug_ids.add(bug_id)
+        entry = {
+            "bug_id": bug_id,
+            "diff_path": diff_path if has_diff else None,
+            "patched_testcase": patched_testcase,
+            "fuzzer": fuzzer,
+            "testcase": f"testcase-{bug_id}",
+            "sanitizer": sanitizer,
+            "crash_log": crash_log,
+            "type": "transplant",
+            "testcase_only": not has_diff,
+        }
+        logger.info("Found %s for %s: diff=%s testcase=%s (%s)",
+                     source, bug_id,
+                     "yes" if has_diff else "empty",
+                     "patched" if patched_testcase else "original",
+                     "testcase-only" if not has_diff else "with-diff")
+        transplant_diffs.append(entry)
 
     # From summary results
     for result in summary.get("results", []):
-        diff_path = result.get("diff_path")
-        if diff_path and Path(diff_path).exists():
-            bug_id = result["bug_id"]
-            if result.get("status") not in (None, "success"):
-                logger.warning(
-                    "Skipping %s: standalone transplant %s",
-                    bug_id, result.get("status", "unknown"))
-                continue
-            seen_bug_ids.add(bug_id)
-            info = bug_info_dataset.get(bug_id, {})
-            reproduce = info.get("reproduce", {})
-            fuzzer = reproduce.get("fuzz_target", result.get("fuzzer", ""))
-            sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-            if sanitizer not in ("address", "undefined"):
-                logger.warning("Skipping %s transplant bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
-                continue
-            crash_log = _find_crash_log(bug_id, info)
-            transplant_diffs.append({
-                "bug_id": bug_id,
-                "diff_path": diff_path,
-                "fuzzer": fuzzer,
-                "testcase": f"testcase-{bug_id}",
-                "sanitizer": sanitizer,
-                "crash_log": crash_log,
-                "type": "transplant",
-            })
-
-    # Scan disk for any bug diffs not in summary (e.g. skipped by --resume)
-    bug_transplant_dir = DATA_DIR / "bug_transplant"
-    for result in summary.get("results", []):
         bug_id = result.get("bug_id", "")
-        if bug_id in seen_bug_ids or not bug_id:
+        if not bug_id:
             continue
-        # Check if diff exists on disk
-        out_dir = bug_transplant_dir / f"{project}_{bug_id}"
-        for name in ("bug_transplant.diff", "git_diff.diff"):
-            p = out_dir / name
-            if p.exists() and p.stat().st_size > 0:
-                seen_bug_ids.add(bug_id)
-                info = bug_info_dataset.get(bug_id, {})
-                reproduce = info.get("reproduce", {})
-                fuzzer = reproduce.get("fuzz_target", "")
-                sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-                if sanitizer != "address":
-                    continue
-                crash_log = _find_crash_log(bug_id, info)
-                logger.info("Found diff on disk for %s: %s", bug_id, p)
-                transplant_diffs.append({
-                    "bug_id": bug_id,
-                    "diff_path": str(p),
-                    "fuzzer": fuzzer,
-                    "testcase": f"testcase-{bug_id}",
-                    "sanitizer": sanitizer,
-                    "crash_log": crash_log,
-                    "type": "transplant",
-                })
-                break
+        if result.get("status") not in (None, "success"):
+            logger.info("Skipping %s: status=%s", bug_id, result.get("status"))
+            continue
+        _load_transplant_bug(bug_id, result.get("diff_path"), "summary")
 
-    # Also scan for bug dirs not mentioned in summary at all
+    # Scan disk for any bug dirs not yet loaded
     if bug_transplant_dir.exists():
         for d in bug_transplant_dir.iterdir():
             if not d.is_dir() or not d.name.startswith(f"{project}_"):
                 continue
             bug_id = d.name[len(f"{project}_"):]
-            if bug_id in seen_bug_ids or bug_id in local_bug_ids:
-                continue
-            for name in ("bug_transplant.diff", "git_diff.diff"):
-                p = d / name
-                if p.exists() and p.stat().st_size > 0:
-                    info = bug_info_dataset.get(bug_id, {})
-                    reproduce = info.get("reproduce", {})
-                    sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-                    if sanitizer != "address":
-                        continue
-                    seen_bug_ids.add(bug_id)
-                    fuzzer = reproduce.get("fuzz_target", "")
-                    crash_log = _find_crash_log(bug_id, info)
-                    logger.info("Found extra diff on disk for %s: %s", bug_id, p)
-                    transplant_diffs.append({
-                        "bug_id": bug_id,
-                        "diff_path": str(p),
-                        "fuzzer": fuzzer,
-                        "testcase": f"testcase-{bug_id}",
-                        "sanitizer": sanitizer,
-                        "crash_log": crash_log,
-                        "type": "transplant",
-                    })
-                    break
+            _load_transplant_bug(bug_id, None, "disk")
 
     if not transplant_diffs:
         logger.error("No transplant diffs found (summary or disk)")
@@ -1966,6 +2001,7 @@ def run_merge(args: argparse.Namespace) -> int:
                 )
             _exec_capture(container,
                           "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+            _restore_testcases(container, project)
             if dispatch_state["poc_bytes"]:
                 _apply_all_dispatch_bytes(container, dispatch_state)
 
@@ -2000,9 +2036,12 @@ def run_merge(args: argparse.Namespace) -> int:
                 logger.info("Reached --max-steps %d, stopping early", max_steps)
                 break
             bug_id = bd["bug_id"]
-            diff_path = bd["diff_path"]
+            diff_path = bd.get("diff_path")
+            is_testcase_only = bd.get("testcase_only", False)
             logger.info(
-                "\n\n=== Step %d/%d: Applying %s ===", i + 1, len(ordered), bug_id,
+                "\n\n=== Step %d/%d: %s %s ===", i + 1, len(ordered),
+                "Registering (testcase-only)" if is_testcase_only else "Applying",
+                bug_id,
             )
 
             # Save source snapshot before this step (for rollback)
@@ -2033,6 +2072,45 @@ def run_merge(args: argparse.Namespace) -> int:
                     "regressions": [],
                 }
                 step_regression_failures = []
+
+                # --- Testcase-only bugs: no diff to apply ---
+                if is_testcase_only:
+                    step["apply_method"] = "testcase_only"
+                    logger.info("[%s] Testcase-only transplant — no diff to apply", bug_id)
+                    # Copy patched testcase into container
+                    ptc = bd.get("patched_testcase")
+                    if ptc and Path(ptc).exists():
+                        tc_data = Path(ptc).read_bytes()
+                        subprocess.run(
+                            ["docker", "exec", "-i", container,
+                             "bash", "-c", f"cat > /work/{bd['testcase']}"],
+                            input=tc_data, timeout=10,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
+                    # Skip directly to build + verify (no diff apply or conflict resolution)
+                    # Build is already done from previous step; just verify
+                    step["build_ok"] = True
+                    # Check if bug triggers
+                    triggers = verify_bug_triggers(
+                        container, bug_id, bd["fuzzer"],
+                        bd["testcase"],
+                        bd.get("sanitizer", "address"),
+                        bd.get("crash_log"),
+                    )
+                    step["self_triggers"] = triggers
+                    if triggers:
+                        logger.info("[%s] Testcase-only bug triggers OK", bug_id)
+                        applied_bugs.append(bug_id)
+                        all_verified_bugs.append(bd)
+                    else:
+                        logger.warning("[%s] Testcase-only bug does NOT trigger", bug_id)
+                    merge_results.append(step)
+                    _save_step_state(
+                        project, target_commit, i, dispatch_state,
+                        applied_bugs, merge_results,
+                        [b["bug_id"] for b in all_verified_bugs],
+                    )
+                    break  # exit retry loop
 
                 # --- Try to apply ---
                 method = try_apply_diff(container, diff_path, project)
@@ -2148,7 +2226,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         f"cp \"$f\" /out/{san}/; done; true",
                     )
                 # Restore testcases (compile may wipe /work)
-                _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                _restore_testcases(container, project)
                 if dispatch_state["poc_bytes"]:
                     _apply_all_dispatch_bytes(container, dispatch_state)
 
