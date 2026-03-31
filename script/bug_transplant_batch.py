@@ -640,6 +640,26 @@ def main() -> int:
     artifacts_root = DATA_DIR / "bug_transplant" / f"batch_{args.target}_{target_commit[:8]}"
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
+    # Load previous results from existing summary/progress so --resume
+    # preserves 'success'/'failed' status instead of overwriting with 'skipped'.
+    prev_results: dict[str, dict] = {}
+    for fname in ("summary.json", "progress.json"):
+        prev_path = artifacts_root / fname
+        if prev_path.exists():
+            try:
+                prev_data = json.loads(prev_path.read_text())
+                for r in prev_data.get("results", []):
+                    bid = r.get("bug_id")
+                    if bid and bid not in prev_results:
+                        prev_results[bid] = r
+                if prev_results:
+                    logger.info(
+                        "Loaded %d previous results from %s", len(prev_results), fname
+                    )
+                    break
+            except Exception:
+                pass
+
     results: list[dict] = []
     batch_start = time.monotonic()
 
@@ -685,7 +705,9 @@ def main() -> int:
             for bug_id, buggy_commit, metadata in bug_tasks:
                 if args.resume and is_bug_completed(args.target, bug_id):
                     logger.info("[%s] Already completed, skipping (--resume)", bug_id)
-                    results.append({"bug_id": bug_id, "status": "skipped"})
+                    prev = prev_results.get(bug_id)
+                    results.append(prev if prev and prev.get("status") not in ("skipped", None)
+                                   else {"bug_id": bug_id, "status": "skipped"})
                     write_progress(artifacts_root, results, ongoing=[])
                     continue
 
@@ -705,7 +727,9 @@ def main() -> int:
                 for bug_id, buggy_commit, metadata in bug_tasks:
                     if args.resume and is_bug_completed(args.target, bug_id):
                         logger.info("[%s] Already completed, skipping (--resume)", bug_id)
-                        results.append({"bug_id": bug_id, "status": "skipped"})
+                        prev = prev_results.get(bug_id)
+                        results.append(prev if prev and prev.get("status") not in ("skipped", None)
+                                       else {"bug_id": bug_id, "status": "skipped"})
                         continue
 
                     fut = executor.submit(
