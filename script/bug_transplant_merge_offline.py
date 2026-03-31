@@ -477,6 +477,17 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             return 1
         dispatch_state["harness_modified"] = True
 
+        # Capture the harness diff immediately so we can re-apply it after
+        # every git checkout -f during phase 1 and phase 2.
+        harness_diff = _clean_diff(container, project)
+        harness_diff_path = output_dir / "harness.diff"
+        if harness_diff.strip():
+            harness_diff_path.write_text(harness_diff)
+            logger.info("Harness diff saved (%d bytes)", len(harness_diff))
+        else:
+            logger.warning("No harness diff captured after modification!")
+            harness_diff_path = None
+
         # Stash ASAN binaries (harness modification already built with ASAN)
         _exec_capture(container,
                       "mkdir -p /out/address && "
@@ -496,7 +507,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             logger.warning("UBSAN build failed, skipping")
 
         # Copy testcases (originals + patched)
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
 
         # ------------------------------------------------------------------
@@ -566,7 +577,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 "success": False,
             }
 
-            # Reset source to clean (dispatch files + harness already applied)
+            # Reset source to clean, then restore dispatch files + harness
             _exec_capture(container,
                           f"cd /src/{project} && "
                           f"git reset HEAD -- . 2>/dev/null; "
@@ -574,8 +585,14 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                           f"git clean -fdx "
                           f"-e __bug_dispatch.h -e __bug_dispatch.c "
                           f"2>/dev/null; true")
-            # Re-inject dispatch files (checkout may have removed them)
             _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
+            # Re-apply harness modification (checkout wiped it)
+            if harness_diff_path and harness_diff_path.exists():
+                hdiff = harness_diff_path.read_text()
+                _exec_capture(container,
+                              f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+                _exec_capture(container,
+                              f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
 
             output = ""
             for attempt in range(_MAX_WRAP_RETRIES + 1):
@@ -600,9 +617,16 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                 logger.warning("[%s] Attempt %d failed, retrying...",
                                bug_id, attempt + 1)
-                # Reset for retry
+                # Reset for retry and re-apply harness
                 _exec_capture(container,
                               f"cd /src/{project} && git checkout -f HEAD -- .")
+                _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
+                if harness_diff_path and harness_diff_path.exists():
+                    hdiff = harness_diff_path.read_text()
+                    _exec_capture(container,
+                                  f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+                    _exec_capture(container,
+                                  f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
 
             if not step["success"]:
                 logger.error("[%s] FAILED after %d attempts, skipping",
@@ -614,11 +638,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                            list(wrapped_diffs.keys()))
 
         # ------------------------------------------------------------------
-        # 8. Phase 2: Apply all wrapped diffs together
+        # 8. Phase 2: Merge all wrapped diffs via code agent
         # ------------------------------------------------------------------
-        logger.info("\n=== Applying %d wrapped diffs ===", len(wrapped_diffs))
+        logger.info("\n=== Merging %d wrapped diffs ===", len(wrapped_diffs))
 
-        # Reset source to clean + dispatch files
+        # Reset source to clean + dispatch files + harness
         _exec_capture(container,
                       f"cd /src/{project} && "
                       f"git reset HEAD -- . 2>/dev/null; "
@@ -626,23 +650,100 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                       f"git clean -fdx 2>/dev/null; true")
         _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
 
-        applied_bugs: list[str] = []
+        # Re-apply harness modification from saved diff (captured in step 4)
+        if harness_diff_path and harness_diff_path.exists():
+            hdiff = harness_diff_path.read_text()
+            _exec_capture(container,
+                          f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+            _exec_capture(container,
+                          f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+
+        # Copy all wrapped patches into container
+        patch_descriptions = []
         for bug_id, wdiff_path in wrapped_diffs.items():
             diff_content = Path(wdiff_path).read_text()
-            diff_name = f"wrapped_{bug_id}.diff"
+            # Strip __bug_dispatch hunks (already injected)
+            filtered_lines = []
+            skip = False
+            for line in diff_content.splitlines(keepends=True):
+                if line.startswith("diff --git") and "__bug_dispatch" in line:
+                    skip = True
+                elif line.startswith("diff --git"):
+                    skip = False
+                if not skip:
+                    filtered_lines.append(line)
+            filtered = "".join(filtered_lines)
+            if not filtered.strip():
+                continue
+            fname = f"wrapped_{bug_id}.diff"
             _exec_capture(container,
-                          f"cat > /tmp/{diff_name} << 'DIFFEOF'\n{diff_content}DIFFEOF")
+                          f"cat > /tmp/{fname} << 'DIFFEOF'\n{filtered}DIFFEOF")
+            patch_descriptions.append(f"- `/tmp/{fname}` — {bug_id}")
 
-            ret, apply_out = _exec_capture(
-                container,
-                f"cd /src/{project} && git apply --3way /tmp/{diff_name} 2>&1",
+        if not patch_descriptions:
+            logger.info("No patches to merge (all were dispatch-only)")
+            applied_bugs = list(wrapped_diffs.keys())
+        elif len(wrapped_diffs) <= 15:
+            # Use code agent to merge all patches at once
+            patch_list = "\n".join(patch_descriptions)
+            merge_prompt = _load_prompt(
+                "merge_wrapped_patches",
+                project=project,
+                target_commit=target_commit,
+                patch_list=patch_list,
             )
-            if ret == 0:
-                applied_bugs.append(bug_id)
-                logger.info("[%s] Applied wrapped diff OK", bug_id)
+
+            cfg = AGENT_CONFIG[args.agent]
+            # Setup agent credentials
+            creds_dir = cfg["credentials_dir"]
+            _exec(container,
+                  f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+                  f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+                  f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
+                  user="root")
+            if cfg.get("credentials_config"):
+                _exec(container,
+                      f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+                      f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+                      user="root")
+
+            escaped = shlex.quote(merge_prompt)
+            agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+            if args.model:
+                agent_cmd += f" {cfg['model_flag']} {shlex.quote(args.model)}"
+
+            logger.info("Invoking %s to merge %d patches...",
+                        args.agent, len(patch_descriptions))
+            ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+
+            if ret != 0:
+                logger.error("Agent failed to merge patches (exit %d)", ret)
+                logger.error("Output tail: %s", output[-500:] if output else "")
             else:
-                logger.error("[%s] Failed to apply wrapped diff: %s",
-                             bug_id, apply_out[-300:])
+                logger.info("Agent merged patches successfully")
+
+            # Verify build
+            ret, build_out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            if ret != 0:
+                logger.error("Build failed after merge: %s", build_out[-500:])
+            else:
+                applied_bugs = list(wrapped_diffs.keys())
+        else:
+            # Too many patches for one agent — fall back to sequential git apply
+            logger.info("Too many patches (%d) for single agent, applying sequentially",
+                        len(wrapped_diffs))
+            applied_bugs = []
+            for bug_id in wrapped_diffs:
+                fname = f"wrapped_{bug_id}.diff"
+                ret, out = _exec_capture(
+                    container,
+                    f"cd /src/{project} && git apply --3way /tmp/{fname} 2>&1",
+                )
+                if ret == 0:
+                    applied_bugs.append(bug_id)
+                    logger.info("[%s] Applied OK", bug_id)
+                else:
+                    logger.error("[%s] Failed: %s", bug_id, out[-200:])
 
         # Build ASAN + UBSAN with all patches applied
         logger.info("Building with all patches applied...")
@@ -661,14 +762,14 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                           "[ ! -d \"$f\" ] && cp \"$f\" /out/undefined/; done; true")
 
         # Restore testcases with dispatch bytes
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
 
         # ------------------------------------------------------------------
         # 9. Final verification
         # ------------------------------------------------------------------
         logger.info("\n=== Final verification ===")
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
 
         final_results = verify_all_bugs(container, all_bugs)
@@ -766,7 +867,7 @@ def main():
                         help="Directory containing testcase files")
     parser.add_argument("--local-bugs", nargs="*", default=None,
                         help="Bug IDs that already trigger at target")
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
                         help="Code agent to use")
     parser.add_argument("--model", default=None,
                         help="Model override for agent")
