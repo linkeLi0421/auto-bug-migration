@@ -477,7 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Process specific bug(s) only")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
                         help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")

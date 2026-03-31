@@ -465,23 +465,42 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
 
 
 
-def _restore_testcases(container: str, project: str) -> None:
-    """Restore testcases to /work: originals from /corpus, then patched from output dirs."""
-    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
-    # Overwrite with patched testcases
+def _restore_testcases(
+    container: str, project: str, bugs: list[dict] | None = None,
+) -> None:
+    """Restore testcases to /work for the given bugs only.
+
+    For each bug: use patched testcase from the per-bug output dir if it
+    exists, otherwise copy the original from /corpus/.
+    If *bugs* is None, falls back to copying all testcases from /corpus/
+    (legacy behavior).
+    """
+    if bugs is None:
+        _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+        return
+
     bug_transplant_dir = DATA_DIR / "bug_transplant"
-    if bug_transplant_dir.exists():
-        for d in bug_transplant_dir.iterdir():
-            if not d.is_dir() or not d.name.startswith(f"{project}_"):
-                continue
-            for tc in d.glob("testcase-*"):
+    for bug in bugs:
+        tc_name = bug.get("testcase", f"testcase-{bug['bug_id']}")
+        # Check for patched testcase in per-bug output dir
+        out_dir = bug_transplant_dir / f"{project}_{bug['bug_id']}"
+        patched = None
+        if out_dir.exists():
+            for tc in out_dir.glob(f"{tc_name}*"):
                 if tc.is_file() and tc.stat().st_size > 0:
-                    subprocess.run(
-                        ["docker", "exec", "-i", container,
-                         "bash", "-c", f"cat > /work/{tc.name}"],
-                        input=tc.read_bytes(), timeout=10,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
+                    patched = tc
+                    break
+        if patched:
+            subprocess.run(
+                ["docker", "exec", "-i", container,
+                 "bash", "-c", f"cat > /work/{tc_name}"],
+                input=patched.read_bytes(), timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            # Copy original from /corpus/
+            _exec_capture(container,
+                          f"cp /corpus/{tc_name} /work/{tc_name} 2>/dev/null; true")
 
 
 def _rebuild_project_image(project: str, target_commit: str,
@@ -2738,7 +2757,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Bug IDs that already trigger at target (override auto-detection)")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
                         help="Code agent for conflict resolution (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")

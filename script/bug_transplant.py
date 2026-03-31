@@ -52,7 +52,8 @@ logger = logging.getLogger(__name__)
 # Update deliberately after testing with new versions.
 AGENT_VERSIONS = {
     "claude": "2.1.81",   # @anthropic-ai/claude-code
-    "codex": "0.116.0",            # @openai/codex
+    "codex": "0.116.0",   # @openai/codex
+    "opencode": "latest",  # Go binary, installed via brew/curl
 }
 
 # Agent-specific configuration
@@ -70,12 +71,22 @@ AGENT_CONFIG = {
     "codex": {
         "npm_package": "@openai/codex",
         "cli_name": "codex",
-        "cli_entry": "@openai/codex/bin/codex.js",  # npm bin: codex -> bin/codex.js
+        "cli_entry": "@openai/codex/bin/codex.js",
         "api_key_env": "OPENAI_API_KEY",
         "credentials_dir": ".codex",
-        "credentials_config": None,          # codex uses dir only
+        "credentials_config": None,
         "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
         "model_flag": "--model",
+    },
+    "opencode": {
+        "npm_package": None,                  # Go binary, not npm
+        "cli_name": "opencode",
+        "cli_entry": None,                    # installed as Go binary
+        "api_key_env": "ANTHROPIC_API_KEY",   # default; also supports OPENAI_API_KEY etc.
+        "credentials_dir": ".opencode",
+        "credentials_config": ".opencode.json",
+        "run_cmd": "opencode run {prompt}",   # run subcommand, message as positional arg
+        "model_flag": "-m",                   # -m provider/model format
     },
 }
 
@@ -237,7 +248,7 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
     """Layer a code agent CLI on top of the project image.
 
     Produces ``bug-transplant-<project>:latest``.
-    Supports agent types: ``claude``, ``codex``.
+    Supports agent types: ``claude``, ``codex``, ``opencode``.
     """
     cfg = AGENT_CONFIG[agent]
     version = AGENT_VERSIONS[agent]
@@ -249,54 +260,89 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
     # Always rebuild — the base project image may have changed
     logger.info("Building %s agent image '%s' on top of '%s'...", agent, tag, project_image)
 
-    dockerfile_content = textwrap.dedent(f"""\
-        # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
-        FROM ubuntu:22.04 AS agent-builder
-        ENV DEBIAN_FRONTEND=noninteractive
-        RUN apt-get update && apt-get install -y --no-install-recommends \\
-                curl ca-certificates \\
-            && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
-            && apt-get install -y --no-install-recommends nodejs \\
-            && npm install -g {npm_pkg}@{version} \\
-            && rm -rf /var/lib/apt/lists/*
+    if npm_pkg:
+        # Node.js-based agent (claude, codex)
+        dockerfile_content = textwrap.dedent(f"""\
+            # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
+            FROM ubuntu:22.04 AS agent-builder
+            ENV DEBIAN_FRONTEND=noninteractive
+            RUN apt-get update && apt-get install -y --no-install-recommends \\
+                    curl ca-certificates \\
+                && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
+                && apt-get install -y --no-install-recommends nodejs \\
+                && npm install -g {npm_pkg}@{version} \\
+                && rm -rf /var/lib/apt/lists/*
 
-        # Stage 2: Project image with agent CLI copied in.
-        FROM {project_image}
-        ENV DEBIAN_FRONTEND=noninteractive
+            # Stage 2: Project image with agent CLI copied in.
+            FROM {project_image}
+            ENV DEBIAN_FRONTEND=noninteractive
 
-        # Copy Node.js and agent CLI with all dependencies
-        COPY --from=agent-builder /usr/bin/node /usr/local/bin/node
-        COPY --from=agent-builder /usr/lib/node_modules /usr/local/lib/node_modules
-        # Copy glibc and libstdc++ from builder so node binary works on old bases
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
-        COPY --from=agent-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
-        COPY --from=agent-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
-        COPY --from=agent-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
+            # Copy Node.js and agent CLI with all dependencies
+            COPY --from=agent-builder /usr/bin/node /usr/local/bin/node
+            COPY --from=agent-builder /usr/lib/node_modules /usr/local/lib/node_modules
+            # Copy glibc and libstdc++ from builder so node binary works on old bases
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
+            COPY --from=agent-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
+            COPY --from=agent-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
+            COPY --from=agent-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
 
-        # Create wrapper script that uses the bundled libs
-        RUN echo '#!/bin/bash' > /usr/local/bin/{cli_name} \\
-            && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/{cli_entry} "$@"' >> /usr/local/bin/{cli_name} \\
-            && chmod +x /usr/local/bin/{cli_name}
+            # Create wrapper script that uses the bundled libs
+            RUN echo '#!/bin/bash' > /usr/local/bin/{cli_name} \\
+                && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/{cli_entry} "$@"' >> /usr/local/bin/{cli_name} \\
+                && chmod +x /usr/local/bin/{cli_name}
 
-        # sudo may not exist on older base images
-        RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
-            && rm -rf /var/lib/apt/lists/* || true
+            # sudo may not exist on older base images
+            RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
+                && rm -rf /var/lib/apt/lists/* || true
 
-        # Create a non-root user (some CLIs refuse to run as root)
-        RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
-            && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
-            && chown -R agent:agent /src/ /out/ /work/ || true
+            # Create a non-root user (some CLIs refuse to run as root)
+            RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
+                && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
+                && chown -R agent:agent /src/ /out/ /work/ || true
 
-        ENV HOME=/home/agent
-        USER agent
+            ENV HOME=/home/agent
+            USER agent
 
-        WORKDIR /src/{project}
-        CMD ["sleep", "infinity"]
-    """)
+            WORKDIR /src/{project}
+            CMD ["sleep", "infinity"]
+        """)
+    else:
+        # Go-based agent (opencode) — install via curl
+        dockerfile_content = textwrap.dedent(f"""\
+            # Stage 1: Install Go-based agent on a modern base.
+            FROM ubuntu:22.04 AS agent-builder
+            ENV DEBIAN_FRONTEND=noninteractive
+            RUN apt-get update && apt-get install -y --no-install-recommends \\
+                    curl ca-certificates \\
+                && curl -fsSL https://opencode.ai/install | bash \\
+                && rm -rf /var/lib/apt/lists/*
+
+            # Stage 2: Project image with agent binary copied in.
+            FROM {project_image}
+            ENV DEBIAN_FRONTEND=noninteractive
+
+            # Copy opencode binary
+            COPY --from=agent-builder /root/.opencode/bin/{cli_name} /usr/local/bin/{cli_name}
+
+            # sudo may not exist on older base images
+            RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
+                && rm -rf /var/lib/apt/lists/* || true
+
+            # Create a non-root user (some CLIs refuse to run as root)
+            RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
+                && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
+                && chown -R agent:agent /src/ /out/ /work/ || true
+
+            ENV HOME=/home/agent
+            USER agent
+
+            WORKDIR /src/{project}
+            CMD ["sleep", "infinity"]
+        """)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         df_path = Path(tmpdir) / "Dockerfile"
@@ -1056,7 +1102,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip crash/trace collection (data already exists)")
 
     # Agent
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
+    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
                         help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
