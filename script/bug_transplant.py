@@ -575,10 +575,17 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
 
     # Clean and recreate build directories to avoid stale binaries/artifacts
     # from previous runs (prevents "Text file busy" and wrong test results).
-    shutil.rmtree(out_dir, ignore_errors=True)
-    shutil.rmtree(work_dir, ignore_errors=True)
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(work_dir, exist_ok=True)
+    # When reusing a shared container, do NOT delete the host-side directories:
+    # Docker bind-mount backing directories must not be removed while the
+    # container is running — doing so breaks the mount inside the container.
+    if reuse_container:
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(work_dir, exist_ok=True)
+    else:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(work_dir, exist_ok=True)
 
     # Use shared claude_dir if provided (batch mode), otherwise create new
     shared_claude_dir = getattr(args, "claude_dir", None)
@@ -664,6 +671,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             return 1
     else:
         logger.info("Reusing container: %s", container_name)
+        # Wipe /out and /work contents from inside the container so stale
+        # binaries don't bleed across bugs. (We cannot rmtree the host-side
+        # directories while the bind mount is live.)
+        _exec(container_name, "rm -rf /out/* /work/*", user="root")
 
     try:
         # --- Checkout target commit inside container ---

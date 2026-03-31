@@ -2219,17 +2219,21 @@ for d in dirs:
 
 
 def get_crash_log_bash(commit:str, args):
+  patch_snippet = ''
+  if getattr(args, 'patch', None):
+    patch_snippet = _strict_forward_patch_apply_snippet()
   bash_crash = f'''
-    cd /src/{args.project.name}; 
+    cd /src/{args.project.name};
     # Checkout base commit and set up environment
-    git checkout -f {commit}; 
+    git checkout -f {commit};
+    {patch_snippet}
 
     # Compile and run with crash input
     cd -;
     export CFLAGS="${{CFLAGS:-}} -g -fno-inline-functions -Wno-error";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -fno-inline-functions -Wno-error";
     mkdir -p /data/crash;
-    
+
     compile;
     /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
   '''
