@@ -71,15 +71,13 @@ sudo -E compile
 
 ## Early exit if impossible
 
-If you determine the bug CANNOT be reintroduced -- for example the crash depends on a
-different version of a vendored/external library (e.g. zstd, zlib, lz4), or the vulnerable
-code path was completely removed and cannot be reached -- stop early and write a reason:
+If you determine the bug CANNOT be reintroduced -- stop early and write a reason:
 
 ```bash
 echo "IMPOSSIBLE: <one-line reason>" > /out/bug_transplant.impossible
 ```
 
-Do not keep trying if the root cause is outside the project's own code.
+Do not keep trying if the root cause is genuinely outside any code the project ships.
 
 ## Saving results
 

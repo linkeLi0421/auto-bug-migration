@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -259,27 +260,9 @@ def resolve_bug_metadata(
 # ---------------------------------------------------------------------------
 
 def is_bug_completed(project: str, bug_id: str) -> bool:
-    """Check if transplant artifacts already exist for this bug.
-
-    A bug is considered completed if it has a diff file (even empty for
-    testcase-only transplants) AND a testcase or crash log, or if the
-    agent declared it impossible.
-    """
+    """Check if the output folder for this bug already exists."""
     out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
-    if not out_dir.exists():
-        return False
-    # Agent declared impossible
-    if (out_dir / "bug_transplant.impossible").exists():
-        return True
-    has_diff = any(
-        (out_dir / name).exists()
-        for name in ("bug_transplant.diff", "git_diff.diff")
-    )
-    has_testcase = any(
-        p.name.startswith("testcase-") for p in out_dir.glob("testcase-*")
-    )
-    has_crash = (out_dir / "transplant_crash.txt").exists()
-    return has_diff and (has_testcase or has_crash)
+    return out_dir.exists()
 
 
 def run_single_bug(
@@ -407,6 +390,25 @@ def write_progress(output_dir: Path, results: list[dict], ongoing: list[str]) ->
     path.write_text(json.dumps(progress, indent=2))
 
 
+def _result_from_folder(project: str, bug_id: str) -> dict:
+    """Derive a result entry from the output folder contents."""
+    out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
+    if (out_dir / "bug_transplant.impossible").exists():
+        reason = (out_dir / "bug_transplant.impossible").read_text().strip()
+        return {"bug_id": bug_id, "status": "impossible", "reason": reason}
+    has_diff = any(
+        (out_dir / name).exists()
+        for name in ("bug_transplant.diff", "git_diff.diff")
+    )
+    has_crash = (out_dir / "transplant_crash.txt").exists()
+    has_testcase = any(out_dir.glob("testcase-*"))
+    if has_diff and (has_crash or has_testcase):
+        return {"bug_id": bug_id, "status": "success"}
+    if has_diff:
+        return {"bug_id": bug_id, "status": "failed", "reason": "diff but no crash/testcase"}
+    return {"bug_id": bug_id, "status": "failed", "reason": "no artifacts"}
+
+
 def write_summary(
     output_dir: Path,
     results: list[dict],
@@ -415,23 +417,50 @@ def write_summary(
     bug_ids_trigger: set[str],
     total_elapsed: float,
 ) -> None:
-    """Write final summary JSON."""
-    completed = [r for r in results if r["status"] != "skipped"]
+    """Write final summary JSON, merging with existing folder-based results."""
+    # Load existing summary to preserve entries not in this run
+    existing: dict[str, dict] = {}
+    path = output_dir / "summary.json"
+    if path.exists():
+        try:
+            old = json.loads(path.read_text())
+            for r in old.get("results", []):
+                bid = r.get("bug_id")
+                if bid:
+                    existing[bid] = r
+        except Exception:
+            pass
+
+    # Scan all folders on disk to build ground-truth results
+    for folder in (DATA_DIR / "bug_transplant").iterdir():
+        if not folder.is_dir():
+            continue
+        prefix = f"{project}_"
+        if not folder.name.startswith(prefix):
+            continue
+        bug_id = folder.name[len(prefix):]
+        existing[bug_id] = _result_from_folder(project, bug_id)
+
+    # Override with fresh results from this run (more authoritative)
+    for r in results:
+        bid = r.get("bug_id")
+        if bid and r.get("status") not in ("skipped", None):
+            existing[bid] = r
+
+    merged_results = sorted(existing.values(), key=lambda r: r.get("bug_id", ""))
+    completed = [r for r in merged_results if r["status"] not in ("skipped",)]
     summary = {
         "type": "bug_transplant_batch",
         "project": project,
         "target_commit": target_commit,
-        "total_bugs_in_csv": None,  # filled below
         "bugs_already_trigger": len(bug_ids_trigger),
         "bugs_already_trigger_ids": sorted(bug_ids_trigger),
         "bugs_attempted": len(completed),
-        "bugs_skipped_resume": sum(1 for r in results if r["status"] == "skipped"),
-        "bugs_succeeded": sum(1 for r in results if r["status"] == "success"),
-        "bugs_failed": sum(1 for r in results if r["status"] in ("failed", "error")),
+        "bugs_succeeded": sum(1 for r in completed if r["status"] == "success"),
+        "bugs_failed": sum(1 for r in completed if r["status"] in ("failed", "error", "impossible")),
         "total_elapsed_seconds": round(total_elapsed, 1),
-        "results": results,
+        "results": merged_results,
     }
-    path = output_dir / "summary.json"
     path.write_text(json.dumps(summary, indent=2))
     logger.info("Summary written: %s", path)
 
@@ -719,6 +748,10 @@ def main() -> int:
                 )
                 results.append(result)
                 write_progress(artifacts_root, results, ongoing=[])
+                # Persist CLAUDE.md after each bug so knowledge survives interruption
+                _claude_md = Path(shared_claude_dir) / "CLAUDE.md"
+                if _claude_md.exists():
+                    shutil.copy2(_claude_md, artifacts_root / "CLAUDE.md")
         else:
             # Parallel via ThreadPoolExecutor
             ongoing: set[str] = set()
@@ -765,7 +798,6 @@ def main() -> int:
         if shared_claude_dir:
             claude_md = Path(shared_claude_dir) / "CLAUDE.md"
             if claude_md.exists():
-                import shutil
                 dest = artifacts_root / "CLAUDE.md"
                 shutil.copy2(claude_md, dest)
                 logger.info("Shared knowledge saved: %s", dest)
