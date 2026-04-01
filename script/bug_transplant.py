@@ -257,7 +257,15 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
     cli_entry = cfg["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
 
-    # Always rebuild — the base project image may have changed
+    # Skip rebuild if the agent image already exists
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", tag],
+        capture_output=True,
+    )
+    if inspect.returncode == 0:
+        logger.info("%s agent image already exists, reusing: %s", agent, tag)
+        return tag
+
     logger.info("Building %s agent image '%s' on top of '%s'...", agent, tag, project_image)
 
     if npm_pkg:
@@ -410,14 +418,28 @@ def setup_claude_dir(args: argparse.Namespace) -> Path:
         '"deny": ["WebSearch", "WebFetch"]}}\n'
     )
 
-    # Seed CLAUDE.md with memory template (will be mounted writable)
+    # Write opencode.json to allow all tools without prompting (for opencode agent)
+    opencode_cfg = tmpdir / "opencode.json"
+    opencode_cfg.write_text('{"permission": "allow"}\n')
+
+    # Seed CLAUDE.md: use saved knowledge from a previous batch run if available,
+    # otherwise fall back to the blank template.
     claude_md = claude_dir / "CLAUDE.md"
-    template = MEMORY_TEMPLATE.read_text()
-    claude_md.write_text(template.format(
-        project=args.project,
-        target_commit=args.target_commit,
-        fuzzer_name=args.fuzzer_name,
-    ))
+    saved_claude_md = (
+        DATA_DIR / "bug_transplant"
+        / f"batch_{args.project}_{args.target_commit[:8]}"
+        / "CLAUDE.md"
+    )
+    if saved_claude_md.exists():
+        claude_md.write_text(saved_claude_md.read_text())
+        logger.info("Seeding CLAUDE.md from previous run: %s", saved_claude_md)
+    else:
+        template = MEMORY_TEMPLATE.read_text()
+        claude_md.write_text(template.format(
+            project=args.project,
+            target_commit=args.target_commit,
+            fuzzer_name=args.fuzzer_name,
+        ))
 
     return claude_dir
 
@@ -483,6 +505,7 @@ def create_shared_container(
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
         "-v", f"{claude_dir}/settings.json:/src/{project}/.claude/settings.json:ro",
+        "-v", f"{claude_dir}/../opencode.json:/src/{project}/opencode.json:ro",
         "-v", f"{claude_dir}/CLAUDE.md:/src/{project}/CLAUDE.md",
     ]
 
@@ -634,6 +657,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "-v", f"{work_dir}:/work",
             # Claude settings (ro) + CLAUDE.md as shared memory (rw)
             "-v", f"{claude_dir}/settings.json:/src/{args.project}/.claude/settings.json:ro",
+            "-v", f"{claude_dir}/../opencode.json:/src/{args.project}/opencode.json:ro",
             "-v", f"{claude_dir}/CLAUDE.md:/src/{args.project}/CLAUDE.md",
         ]
 
