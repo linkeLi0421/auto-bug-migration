@@ -2499,6 +2499,13 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
       build_content = build_file.read()
   if target == 'opensc':
     build_content = build_content.replace('./configure', './configure --disable-strict')
+  if target == 'ntopng':
+    # nDPI's autogen.sh stopped calling ./configure in July 2024; inject it.
+    build_content = re.sub(
+        r'(\.\/autogen\.sh)\n(\s*make\b)',
+        r'\1\n./configure\n\2',
+        build_content,
+    )
   # Tolerate sample/test link failures in projects that build non-essential
   # targets alongside the library (e.g. unicorn's make.sh builds samples
   # that fail with undefined sanitizer due to missing compiler-rt symbols).
