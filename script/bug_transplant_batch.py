@@ -115,6 +115,82 @@ def _is_ancestor(repo_path: str, older: str, newer: str) -> bool:
     return ret.returncode == 0
 
 
+def find_adjacent_csv_commit(
+    data: list[dict],
+    buggy_commit: str,
+    target_commit: str,
+    repo_path: str,
+) -> str | None:
+    """Return the first CSV commit after *buggy_commit* in the direction of
+    *target_commit*, by walking the git ancestry path and checking which
+    commits appear in the CSV.
+
+    This gives the window [buggy_commit, adjacent) that most likely contains
+    the bug fix (or introduction), without scanning every individual git commit.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log",
+             f"{buggy_commit}..{target_commit}",
+             "--ancestry-path", "--reverse", "--format=%H"],
+            cwd=repo_path,
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return None
+        ordered_commits = [c for c in result.stdout.strip().splitlines() if c]
+    except Exception as exc:
+        logger.debug("find_adjacent_csv_commit git log error: %s", exc)
+        return None
+
+    csv_commit_set = {row["commit_id"] for row in data}
+    for commit in ordered_commits:
+        if commit in csv_commit_set:
+            return commit
+    return None
+
+
+def generate_fix_diffs(
+    bug_tasks: list[tuple[str, str, dict]],
+    repo_path: str,
+) -> None:
+    """Pre-generate fix hint diffs for all bugs in bug_tasks.
+
+    Runs git diff on the host repo and writes results to
+    DATA_DIR/patch_diffs/fix_hint-<buggy_short>-<testcase>.diff.
+    Done upfront so diffs exist even for bugs skipped by --resume.
+    """
+    patch_diffs_dir = DATA_DIR / "patch_diffs"
+    patch_diffs_dir.mkdir(exist_ok=True)
+
+    for bug_id, buggy_commit, metadata in bug_tasks:
+        adjacent_commit = metadata.get("adjacent_commit")
+        if not adjacent_commit:
+            continue
+        testcase = metadata["testcase"]
+        buggy_short = buggy_commit[:8]
+        out_path = patch_diffs_dir / f"fix_hint-{buggy_short}-{testcase}.diff"
+        if out_path.exists():
+            logger.info("[%s] Fix diff already exists: %s", bug_id, out_path.name)
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "diff", buggy_commit, adjacent_commit],
+                cwd=repo_path,
+                capture_output=True, text=True,
+            )
+            diff_text = result.stdout
+        except Exception as exc:
+            logger.warning("[%s] git diff failed: %s", bug_id, exc)
+            continue
+        if not diff_text.strip():
+            logger.info("[%s] Fix diff empty — skipping", bug_id)
+            continue
+        out_path.write_text(diff_text)
+        logger.info("[%s] Fix diff saved: %s (adjacent=%s)",
+                    bug_id, out_path.name, adjacent_commit[:8])
+
+
 def _trigger_rank(status: str | None) -> int:
     if status in {"1|1", "1|0"}:
         return 2
@@ -274,6 +350,7 @@ def run_single_bug(
     args: argparse.Namespace,
     container_name: str | None = None,
     claude_dir: str | None = None,
+    repo_path: str | None = None,
 ) -> dict:
     """Run bug_transplant.py for a single bug, return result dict."""
     result = {
@@ -304,6 +381,10 @@ def run_single_bug(
         cmd += ["--runner-image", args.runner_image]
     if args.skip_collect:
         cmd.append("--skip-collect")
+    if repo_path:
+        cmd += ["--repo-path", repo_path]
+    if metadata.get("adjacent_commit"):
+        cmd += ["--adjacent-commit", metadata["adjacent_commit"]]
     if args.agent:
         cmd += ["--agent", args.agent]
     if args.model:
@@ -441,11 +522,13 @@ def write_summary(
         bug_id = folder.name[len(prefix):]
         existing[bug_id] = _result_from_folder(project, bug_id)
 
-    # Override with fresh results from this run (more authoritative)
+    # Override with fresh results from this run, but let the on-disk
+    # impossible marker win — the agent may exit 0 after writing it.
     for r in results:
         bid = r.get("bug_id")
         if bid and r.get("status") not in ("skipped", None):
-            existing[bid] = r
+            if existing.get(bid, {}).get("status") != "impossible":
+                existing[bid] = r
 
     merged_results = sorted(existing.values(), key=lambda r: r.get("bug_id", ""))
     completed = [r for r in merged_results if r["status"] not in ("skipped",)]
@@ -627,9 +710,25 @@ def main() -> int:
         if not os.path.exists(testcase_path):
             logger.warning("Skipping %s: testcase not found at %s", bug_id, testcase_path)
             continue
-        bug_tasks.append((bug_id, row["commit_id"], metadata))
+        # Find the adjacent CSV commit (first tested commit after buggy toward target)
+        buggy_commit = row["commit_id"]
+        if repo_path:
+            adjacent = find_adjacent_csv_commit(
+                parsed_data, buggy_commit, target_commit, repo_path,
+            )
+            if adjacent:
+                metadata["adjacent_commit"] = adjacent
+                logger.info("[%s] Adjacent CSV commit: %s..%s",
+                            bug_id, buggy_commit[:8], adjacent[:8])
+            else:
+                logger.debug("[%s] No adjacent CSV commit found", bug_id)
+        bug_tasks.append((bug_id, buggy_commit, metadata))
 
     logger.info("Bugs to process: %d", len(bug_tasks))
+
+    # Generate fix diffs upfront so they exist even for --resume skipped bugs
+    if repo_path:
+        generate_fix_diffs(bug_tasks, repo_path)
 
     # ------------------------------------------------------------------
     # Dry run
@@ -745,6 +844,7 @@ def main() -> int:
                     metadata, args,
                     container_name=shared_container,
                     claude_dir=shared_claude_dir,
+                    repo_path=repo_path,
                 )
                 results.append(result)
                 write_progress(artifacts_root, results, ongoing=[])

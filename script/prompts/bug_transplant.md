@@ -14,7 +14,7 @@ The bug triggers at the old commit but not at the new one.
 ## Files
 
 - `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt` -- original crash log
-- `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit
+- `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit{fix_diff_line}
 - `/work/{testcase_name}` -- PoC testcase (you may modify this)
 - `/src/{project}` -- source tree at `{target_commit}`
 - `/src/{project}/CLAUDE.md` -- shared knowledge (read first, update when done)
@@ -40,8 +40,8 @@ sudo -E compile
    the new format) rather than reverting format definitions -- this keeps code changes minimal.
    Use `xxd` or `printf` + `dd` to patch specific bytes in the testcase file.
 
-3. **Diff the two commits to find what differs in the crash path.** Use the crash stack trace
-   to identify the relevant functions, then:
+3. **Diff the two commits to find what differs in the crash path.**{adjacent_commit_hint}
+   Use the crash stack trace to identify the relevant functions, then:
    ```bash
    git diff {buggy_commit} {target_commit} -- <file>
    ```

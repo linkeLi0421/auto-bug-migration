@@ -184,6 +184,50 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
     return True
 
 
+def collect_fix_diff(args: argparse.Namespace) -> bool:
+    """Generate a diff between the buggy commit and the adjacent CSV commit.
+
+    The adjacent commit must be provided via args.adjacent_commit (pre-computed
+    by bug_transplant_batch.py from the CSV row immediately after the buggy row
+    in the direction of the target).
+
+    Saves the diff to DATA_DIR/patch_diffs/fix_hint-<buggy_short>-<testcase>.diff.
+    Returns True if the diff was saved (or already exists), False otherwise.
+    """
+    adjacent_commit = getattr(args, 'adjacent_commit', None)
+    repo_path = getattr(args, 'repo_path', None)
+    if not adjacent_commit or not repo_path:
+        return False
+
+    buggy_short = args.buggy_commit[:8]
+    patch_diffs_dir = DATA_DIR / "patch_diffs"
+    patch_diffs_dir.mkdir(exist_ok=True)
+    out_path = patch_diffs_dir / f"fix_hint-{buggy_short}-{args.testcase}.diff"
+
+    if out_path.exists():
+        logger.info("Fix diff already exists: %s", out_path)
+        return True
+
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", args.buggy_commit, adjacent_commit],
+            cwd=repo_path,
+            capture_output=True, text=True,
+        )
+        diff_text = diff_result.stdout
+    except Exception as exc:
+        logger.debug("collect_fix_diff git diff error: %s", exc)
+        return False
+
+    if not diff_text.strip():
+        logger.info("Fix diff is empty — skipping")
+        return False
+
+    out_path.write_text(diff_text)
+    logger.info("Fix diff saved: %s (adjacent=%s)", out_path, adjacent_commit[:8])
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Phase 1: Build Docker image with Claude Code layered on top
 # ---------------------------------------------------------------------------
@@ -375,6 +419,23 @@ def build_prompt(args: argparse.Namespace) -> str:
     template = PROMPT_TEMPLATE.read_text()
     buggy_short = args.buggy_commit[:8]
 
+    adjacent_commit = getattr(args, 'adjacent_commit', None)
+    if adjacent_commit:
+        fix_diff_line = (
+            f"\n- `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff` -- "
+            f"diff from buggy commit to adjacent CSV commit `{adjacent_commit[:8]}` "
+            f"(the next tested commit toward the fix — read this first)"
+        )
+        adjacent_commit_hint = (
+            f" If available, start by reading"
+            f" `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff`:"
+            f" it is the diff from the buggy commit to the next tested commit"
+            f" `{adjacent_commit[:8]}` and likely contains the fix."
+        )
+    else:
+        fix_diff_line = ""
+        adjacent_commit_hint = ""
+
     prompt = template.format(
         project=args.project,
         bug_id=args.bug_id,
@@ -383,6 +444,9 @@ def build_prompt(args: argparse.Namespace) -> str:
         buggy_short=buggy_short,
         testcase_name=args.testcase,
         fuzzer_name=args.fuzzer_name,
+        fix_diff_line=fix_diff_line,
+        adjacent_commit=adjacent_commit or "",
+        adjacent_commit_hint=adjacent_commit_hint,
     )
     return prompt
 
@@ -1129,6 +1193,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("TESTCASES", ""),
                         help="Directory containing testcase files "
                              "(default: $TESTCASES env var)")
+    parser.add_argument("--repo-path",
+                        default=os.environ.get("REPO_PATH", ""),
+                        help="Local git repo of the target project for fix-diff generation "
+                             "(default: $REPO_PATH env var)")
+    parser.add_argument("--adjacent-commit", default=None,
+                        help="First CSV commit after the buggy commit toward target "
+                             "(pre-computed by bug_transplant_batch.py)")
     parser.add_argument("--build-csv", default=None,
                         help="Build CSV mapping commits to OSS-Fuzz versions")
     parser.add_argument("--runner-image", default=None,
@@ -1210,6 +1281,12 @@ def main() -> int:
             logger.warning("Missing data files (Claude Code will work without them):")
             for f in missing:
                 logger.warning("  %s", f)
+
+    # Fix diff: generate for standalone runs (batch pre-generates these already)
+    if args.repo_path:
+        project_repo = os.path.join(args.repo_path, args.project)
+        args.repo_path = project_repo if os.path.isdir(project_repo) else args.repo_path
+        collect_fix_diff(args)
 
     # ------------------------------------------------------------------
     # Phase 1: Build Docker images
