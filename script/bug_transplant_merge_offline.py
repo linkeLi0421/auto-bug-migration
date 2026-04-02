@@ -466,27 +466,38 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
         dispatch_state["dispatch_file_injected"] = True
 
-        # Find the primary fuzzer name (all bugs should share it)
-        primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
-        ok = _modify_harness_for_dispatch(
-            container, project, primary_fuzzer,
-            agent=args.agent, model=args.model,
-        )
-        if not ok:
-            logger.error("Failed to modify harness for dispatch")
-            return 1
-        dispatch_state["harness_modified"] = True
-
-        # Capture the harness diff immediately so we can re-apply it after
-        # every git checkout -f during phase 1 and phase 2.
-        harness_diff = _clean_diff(container, project)
+        # If we already have a harness diff from a previous run, reuse it.
+        # This avoids re-invoking a code agent unnecessarily and keeps resume
+        # behavior deterministic.
         harness_diff_path = output_dir / "harness.diff"
-        if harness_diff.strip():
-            harness_diff_path.write_text(harness_diff)
-            logger.info("Harness diff saved (%d bytes)", len(harness_diff))
+        if harness_diff_path.exists() and harness_diff_path.stat().st_size > 0:
+            logger.info("Harness diff already exists, reusing: %s", harness_diff_path)
+            dispatch_state["harness_modified"] = True
         else:
-            logger.warning("No harness diff captured after modification!")
             harness_diff_path = None
+
+        if harness_diff_path is None:
+            # Find the primary fuzzer name (all bugs should share it)
+            primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
+            ok = _modify_harness_for_dispatch(
+                container, project, primary_fuzzer,
+                agent=args.agent, model=args.model,
+            )
+            if not ok:
+                logger.error("Failed to modify harness for dispatch")
+                return 1
+            dispatch_state["harness_modified"] = True
+
+            # Capture the harness diff immediately so we can re-apply it after
+            # every git checkout -f during phase 1 and phase 2.
+            harness_diff = _clean_diff(container, project)
+            harness_diff_path = output_dir / "harness.diff"
+            if harness_diff.strip():
+                harness_diff_path.write_text(harness_diff)
+                logger.info("Harness diff saved (%d bytes)", len(harness_diff))
+            else:
+                logger.warning("No harness diff captured after modification!")
+                harness_diff_path = None
 
         # Stash ASAN binaries (harness modification already built with ASAN)
         _exec_capture(container,
@@ -683,67 +694,94 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         if not patch_descriptions:
             logger.info("No patches to merge (all were dispatch-only)")
             applied_bugs = list(wrapped_diffs.keys())
-        elif len(wrapped_diffs) <= 15:
-            # Use code agent to merge all patches at once
-            patch_list = "\n".join(patch_descriptions)
-            merge_prompt = _load_prompt(
-                "merge_wrapped_patches",
-                project=project,
-                target_commit=target_commit,
-                patch_list=patch_list,
+        else:
+            # Use code agent to merge patches in chunks (avoid single huge prompt).
+            # We keep the existing merge prompt/behavior, but run it multiple times.
+            # Each chunk is merged on top of the previous chunk's result.
+            max_chunk = 15
+            total_patches = len(patch_descriptions)
+            logger.info(
+                "Merging %d patches in chunks of <=%d via %s",
+                total_patches, max_chunk, args.agent,
             )
 
             cfg = AGENT_CONFIG[args.agent]
-            # Setup agent credentials
             creds_dir = cfg["credentials_dir"]
-            _exec(container,
-                  f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-                  f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-                  f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
-                  user="root")
-            if cfg.get("credentials_config"):
-                _exec(container,
-                      f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-                      f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-                      user="root")
 
-            escaped = shlex.quote(merge_prompt)
-            agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-            if args.model:
-                agent_cmd += f" {cfg['model_flag']} {shlex.quote(args.model)}"
-
-            logger.info("Invoking %s to merge %d patches...",
-                        args.agent, len(patch_descriptions))
-            ret, output = _exec_capture(container, agent_cmd, timeout=3600)
-
-            if ret != 0:
-                logger.error("Agent failed to merge patches (exit %d)", ret)
-                logger.error("Output tail: %s", output[-500:] if output else "")
-            else:
-                logger.info("Agent merged patches successfully")
-
-            # Verify build
-            ret, build_out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
-            if ret != 0:
-                logger.error("Build failed after merge: %s", build_out[-500:])
-            else:
-                applied_bugs = list(wrapped_diffs.keys())
-        else:
-            # Too many patches for one agent — fall back to sequential git apply
-            logger.info("Too many patches (%d) for single agent, applying sequentially",
-                        len(wrapped_diffs))
-            applied_bugs = []
-            for bug_id in wrapped_diffs:
-                fname = f"wrapped_{bug_id}.diff"
-                ret, out = _exec_capture(
+            def _setup_agent_creds() -> None:
+                _exec(
                     container,
-                    f"cd /src/{project} && git apply --3way /tmp/{fname} 2>&1",
+                    f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+                    f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+                    f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
+                    user="root",
                 )
-                if ret == 0:
-                    applied_bugs.append(bug_id)
-                    logger.info("[%s] Applied OK", bug_id)
-                else:
-                    logger.error("[%s] Failed: %s", bug_id, out[-200:])
+                if cfg.get("credentials_config"):
+                    _exec(
+                        container,
+                        f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+                        f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+                        user="root",
+                    )
+
+            applied_bugs = []
+            merge_failed = False
+            for chunk_idx, start in enumerate(range(0, total_patches, max_chunk), start=1):
+                chunk = patch_descriptions[start:start + max_chunk]
+                patch_list = "\n".join(chunk)
+                merge_prompt = _load_prompt(
+                    "merge_wrapped_patches",
+                    project=project,
+                    target_commit=target_commit,
+                    patch_list=patch_list,
+                )
+
+                _setup_agent_creds()
+
+                escaped = shlex.quote(merge_prompt)
+                agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+                if args.model:
+                    agent_cmd += f" {cfg['model_flag']} {shlex.quote(args.model)}"
+
+                logger.info(
+                    "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
+                    args.agent,
+                    chunk_idx,
+                    len(chunk),
+                    start + 1,
+                    min(start + len(chunk), total_patches),
+                    total_patches,
+                )
+                ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+                if ret != 0:
+                    logger.error(
+                        "Agent failed on chunk %d (exit %d). Output tail: %s",
+                        chunk_idx, ret, output[-500:] if output else "",
+                    )
+                    merge_failed = True
+                    break
+
+                # Verify build after each chunk so failures are localized.
+                ret, build_out = _exec_capture(
+                    container, "sudo -E compile 2>&1", timeout=300,
+                )
+                if ret != 0:
+                    logger.error(
+                        "Build failed after chunk %d: %s",
+                        chunk_idx, build_out[-500:],
+                    )
+                    merge_failed = True
+                    break
+
+                # Track which bug IDs were included in this chunk
+                for desc in chunk:
+                    m = re.search(r"—\s+(OSV-[0-9]{4}-[0-9]+)\s*$", desc)
+                    if m:
+                        applied_bugs.append(m.group(1))
+
+            if not merge_failed:
+                # If everything succeeded, consider all wrapped diffs merged.
+                applied_bugs = list(wrapped_diffs.keys())
 
         # Build ASAN + UBSAN with all patches applied
         logger.info("Building with all patches applied...")
@@ -787,9 +825,15 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         combined_path.write_text(combined_diff)
         logger.info("Combined diff: %s (%d bytes)", combined_path, len(combined_diff))
 
-        # Save testcases
+    # Save testcases
         tc_dir = output_dir / "testcases"
         tc_dir.mkdir(exist_ok=True)
+        # Only mark artifacts as "patched" if we actually introduced dispatch
+        # bytes / harness changes. (In this offline pipeline this is normally
+        # true, but keep the check to avoid misleading filenames.)
+        mark_patched = bool(dispatch_state.get("dispatch_bytes", 0)) and bool(
+            dispatch_state.get("harness_modified")
+        )
         for bug in all_bugs:
             tc_name = bug["testcase"]
             tc_ret = subprocess.run(
@@ -798,7 +842,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 capture_output=True, timeout=10,
             )
             if tc_ret.returncode == 0 and tc_ret.stdout:
-                (tc_dir / tc_name).write_bytes(tc_ret.stdout)
+                if mark_patched:
+                    # After rewrite, treat the saved artifact as the patched testcase.
+                    (tc_dir / f"patched-{tc_name}").write_bytes(tc_ret.stdout)
+                else:
+                    (tc_dir / tc_name).write_bytes(tc_ret.stdout)
 
         logger.info("Testcases saved to %s", tc_dir)
 
