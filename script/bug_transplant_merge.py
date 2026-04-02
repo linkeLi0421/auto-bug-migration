@@ -350,7 +350,12 @@ def _apply_all_dispatch_bytes(
     container: str,
     dispatch_state: dict,
 ) -> None:
-    """Prepend dispatch bytes to PoCs in /work/ (idempotent — reads from /corpus/)."""
+    """Prepend dispatch bytes to PoCs in /work/.
+
+    This must NOT clobber patched testcases already restored into /work/.
+    It is idempotent: if the testcase already begins with the expected
+    dispatch prefix, it is left unchanged.
+    """
     nbytes = dispatch_state.get("dispatch_bytes", 1)
     for bug_id, dval in dispatch_state["poc_bytes"].items():
         testcase = f"testcase-{bug_id}"
@@ -359,10 +364,13 @@ def _apply_all_dispatch_bytes(
         prefix_list = ",".join(str(b) for b in prefix)
         _exec_capture(
             container,
-            f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; "
+            # If /work file doesn't exist yet, fall back to /corpus.
+            f"if [ ! -f /work/{testcase} ]; then "
+            f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; fi; "
             f"python3 -c \""
+            f"p=bytes([{prefix_list}]); "
             f"d=open('/work/{testcase}','rb').read(); "
-            f"open('/work/{testcase}','wb').write(bytes([{prefix_list}])+d)\"",
+            f"open('/work/{testcase}','wb').write(d if d.startswith(p) else (p+d))\"",
         )
 
 
