@@ -57,6 +57,8 @@ from bug_transplant_merge import (
     _find_crash_log,
     compute_merge_order,
     files_in_diff,
+    _prepare_container_testcases_dir,
+    _save_work_testcase_to_host,
 )
 from bug_transplant import AGENT_CONFIG
 
@@ -429,6 +431,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
     if not all_bugs:
         logger.error("No bugs to merge")
         return 1
+    testcase_stage_dir = _prepare_container_testcases_dir(
+        args.testcases_dir,
+        output_dir / "testcases",
+        testcase_names=[bug["testcase"] for bug in all_bugs],
+    )
 
     # ------------------------------------------------------------------
     # 2. Assign dispatch bits
@@ -450,7 +457,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     container, build_ok = start_merge_container(
         project, target_commit,
-        testcases_dir=args.testcases_dir,
+        testcases_dir=str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
         agent_type=args.agent,
@@ -520,6 +527,16 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # Copy testcases (originals + patched)
         _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
+
+        # Persist patched local testcases into this run's testcase dir before
+        # local verification. Later restores will prefer these patched files.
+        for bug in local_bugs:
+            tc_name = bug["testcase"]
+            staged_patched = testcase_stage_dir / f"{tc_name}-patched"
+            if _save_work_testcase_to_host(container, tc_name, staged_patched):
+                bug["patched_testcase"] = str(staged_patched)
+                logger.info("[%s] Staged patched local testcase: %s",
+                            bug["bug_id"], staged_patched)
 
         # ------------------------------------------------------------------
         # 5. Verify local bugs at baseline
@@ -844,7 +861,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             if tc_ret.returncode == 0 and tc_ret.stdout:
                 if mark_patched:
                     # After rewrite, treat the saved artifact as the patched testcase.
-                    (tc_dir / f"patched-{tc_name}").write_bytes(tc_ret.stdout)
+                    (tc_dir / f"{tc_name}-patched").write_bytes(tc_ret.stdout)
                 else:
                     (tc_dir / tc_name).write_bytes(tc_ret.stdout)
 
