@@ -55,6 +55,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = SCRIPT_DIR.parent
 DATA_DIR = HOME_DIR / "data"
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
+CONTAINER_TESTCASES_DIR = "/testcases"
 
 
 def _load_prompt(name: str, **kwargs: str) -> str:
@@ -74,6 +75,55 @@ def _load_prompt(name: str, **kwargs: str) -> str:
     # Strip leading blank lines
     text = text.lstrip("\n")
     return textwrap.dedent(text).format(**kwargs)
+
+
+def _prepare_container_testcases_dir(
+    source_dir: str | Path,
+    staged_dir: str | Path,
+    testcase_names: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> Path:
+    """Stage testcase-* files for a specific merge run.
+
+    The container mounts *staged_dir* and should never read testcases
+    directly from the original source directory. This keeps each merge task
+    isolated to its own testcase set.
+    """
+    source = Path(source_dir)
+    staged = Path(staged_dir)
+    staged.mkdir(parents=True, exist_ok=True)
+
+    for old in staged.glob("testcase-*"):
+        if old.is_file():
+            old.unlink()
+
+    selected = set(testcase_names or [])
+    for testcase in source.glob("testcase-*"):
+        if not testcase.is_file():
+            continue
+        if selected and testcase.name not in selected:
+            continue
+        shutil.copy2(testcase, staged / testcase.name)
+
+    return staged
+
+
+def _save_work_testcase_to_host(
+    container: str,
+    testcase_name: str,
+    output_path: str | Path,
+) -> bool:
+    """Copy `/work/<testcase_name>` from the container to a host path."""
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["docker", "exec", container, "bash", "-c", f"cat /work/{testcase_name}"],
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return False
+    out.write_bytes(result.stdout)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +414,9 @@ def _apply_all_dispatch_bytes(
         prefix_list = ",".join(str(b) for b in prefix)
         _exec_capture(
             container,
-            # If /work file doesn't exist yet, fall back to /corpus.
+            # If /work file doesn't exist yet, fall back to the staged testcase dir.
             f"if [ ! -f /work/{testcase} ]; then "
-            f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; fi; "
+            f"cp {CONTAINER_TESTCASES_DIR}/{testcase} /work/{testcase} 2>/dev/null; fi; "
             f"python3 -c \""
             f"p=bytes([{prefix_list}]); "
             f"d=open('/work/{testcase}','rb').read(); "
@@ -479,17 +529,29 @@ def _restore_testcases(
     """Restore testcases to /work for the given bugs only.
 
     For each bug: use patched testcase from the per-bug output dir if it
-    exists, otherwise copy the original from /corpus/.
-    If *bugs* is None, falls back to copying all testcases from /corpus/
+    exists, otherwise copy the original from the staged testcase dir.
+    If *bugs* is None, falls back to copying all testcases from that dir
     (legacy behavior).
     """
     if bugs is None:
-        _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+        _exec_capture(
+            container,
+            f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null; true",
+        )
         return
 
     bug_transplant_dir = DATA_DIR / "bug_transplant"
     for bug in bugs:
         tc_name = bug.get("testcase", f"testcase-{bug['bug_id']}")
+        explicit_patched = bug.get("patched_testcase")
+        if explicit_patched and Path(explicit_patched).is_file():
+            subprocess.run(
+                ["docker", "exec", "-i", container,
+                 "bash", "-c", f"cat > /work/{tc_name}"],
+                input=Path(explicit_patched).read_bytes(), timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            continue
         # Check for patched testcase in per-bug output dir
         out_dir = bug_transplant_dir / f"{project}_{bug['bug_id']}"
         patched = None
@@ -506,9 +568,9 @@ def _restore_testcases(
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
         else:
-            # Copy original from /corpus/
+            # Copy original from the staged testcase dir.
             _exec_capture(container,
-                          f"cp /corpus/{tc_name} /work/{tc_name} 2>/dev/null; true")
+                          f"cp {CONTAINER_TESTCASES_DIR}/{tc_name} /work/{tc_name} 2>/dev/null; true")
 
 
 def _rebuild_project_image(project: str, target_commit: str,
@@ -608,7 +670,7 @@ def start_merge_container(
         "-e", "NINJA_STATUS=",
         "-e", "TERM=dumb",
         "-v", f"{data_dir}:/data",
-        "-v", f"{os.path.abspath(testcases_dir)}:/corpus",
+        "-v", f"{os.path.abspath(testcases_dir)}:{CONTAINER_TESTCASES_DIR}",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
     ]
@@ -650,8 +712,11 @@ def start_merge_container(
     _exec(container_name, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
 
-    # Copy all testcases to /work (originals from corpus)
-    _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
+    # Copy all testcases to /work from the staged testcase dir.
+    _exec(
+        container_name,
+        f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null || true",
+    )
 
     # Overwrite with patched testcases from transplant output dirs
     bug_transplant_dir = DATA_DIR / "bug_transplant"
@@ -1901,11 +1966,19 @@ def run_merge(args: argparse.Namespace) -> int:
         print()
         return 0
 
+    testcase_names = [bug["testcase"] for bug in (local_bugs + transplant_diffs)]
+    output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
+    testcase_stage_dir = _prepare_container_testcases_dir(
+        args.testcases_dir,
+        output_dir / "testcases",
+        testcase_names=testcase_names,
+    )
+
     # ------------------------------------------------------------------
     # 4. Start container and run merge
     # ------------------------------------------------------------------
     container, build_ok = start_merge_container(
-        project, target_commit, args.testcases_dir,
+        project, target_commit, str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
         agent_type=args.agent,
@@ -2027,7 +2100,7 @@ def run_merge(args: argparse.Namespace) -> int:
                     f"cp \"$f\" /out/{san}/; done; true",
                 )
             _exec_capture(container,
-                          "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                          f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null; true")
             _restore_testcases(container, project)
             if dispatch_state["poc_bytes"]:
                 _apply_all_dispatch_bytes(container, dispatch_state)
@@ -2549,7 +2622,6 @@ def run_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 8. Extract combined diff
         # ------------------------------------------------------------------
-        output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Get combined diff — only include files that the per-bug diffs
