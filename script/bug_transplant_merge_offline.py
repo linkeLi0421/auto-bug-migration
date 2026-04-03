@@ -235,6 +235,49 @@ _MAX_WRAP_RETRIES = 1
 
 
 # ---------------------------------------------------------------------------
+# Sandboxed agent command construction
+# ---------------------------------------------------------------------------
+
+def _build_agent_cmd(
+    cfg: dict,
+    prompt: str,
+    agent: str,
+    model: str | None,
+    project: str,
+    *,
+    extra_writable_dirs: list[str] | None = None,
+) -> str:
+    """Build the agent CLI command, using sandbox mode for codex.
+
+    For codex, uses ``--sandbox workspace-write`` with ``-C /src/<project>``
+    so the agent can only modify project source files.  Additional writable
+    directories (e.g. /work, /tmp) can be passed via *extra_writable_dirs*.
+    """
+    escaped = shlex.quote(prompt)
+
+    if agent == "codex":
+        # Sandboxed mode: workspace-write restricts writes to -C dir + --add-dir
+        parts = [
+            "codex exec",
+            "--sandbox workspace-write",
+            f"-C /src/{shlex.quote(project)}",
+        ]
+        for d in (extra_writable_dirs or []):
+            parts.append(f"--add-dir {shlex.quote(d)}")
+        parts.append(escaped)
+        if model:
+            parts.append(f"{cfg['model_flag']} {shlex.quote(model)}")
+        parts.append("--json")
+        return " ".join(parts)
+
+    # Non-codex agents: use the generic run_cmd template
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+    return agent_cmd
+
+
+# ---------------------------------------------------------------------------
 # Bug loading and categorization
 # ---------------------------------------------------------------------------
 
@@ -506,12 +549,10 @@ def wrap_bug_with_dispatch(
         output_testcase_path=f"/work/{bug['testcase']}",
     )
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-    if agent == "codex":
-        agent_cmd += " --json"
+    agent_cmd = _build_agent_cmd(
+        cfg, prompt, agent, model, project,
+        extra_writable_dirs=["/work", "/tmp"],
+    )
 
     logger.info("[%s] Invoking %s for dispatch wrapping (bit %d)...",
                 bug_id, agent, bit_index)
@@ -866,12 +907,10 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                 _setup_agent_creds()
 
-                escaped = shlex.quote(merge_prompt)
-                agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-                if args.model:
-                    agent_cmd += f" {cfg['model_flag']} {shlex.quote(args.model)}"
-                if args.agent == "codex":
-                    agent_cmd += " --json"
+                agent_cmd = _build_agent_cmd(
+                    cfg, merge_prompt, args.agent, args.model, project,
+                    extra_writable_dirs=["/work", "/tmp"],
+                )
 
                 logger.info(
                     "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
