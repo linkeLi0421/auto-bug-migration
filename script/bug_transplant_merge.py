@@ -477,23 +477,9 @@ def _modify_harness_for_dispatch(
     prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
 
     escaped = shlex.quote(prompt)
-    if agent == "codex":
-        # Use sandboxed mode: only /src/<project>, /work, /tmp are writable
-        parts = [
-            "codex exec",
-            "--sandbox workspace-write",
-            f"-C /src/{shlex.quote(project)}",
-            "--add-dir /work",
-            "--add-dir /tmp",
-            escaped,
-        ]
-        if model:
-            parts.append(f"{cfg['model_flag']} {shlex.quote(model)}")
-        agent_cmd = " ".join(parts)
-    else:
-        agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-        if model:
-            agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
+    if model:
+        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
 
     logger.info("Invoking %s to modify harness for dispatch byte...", agent)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
