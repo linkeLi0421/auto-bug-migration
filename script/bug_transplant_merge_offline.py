@@ -76,6 +76,87 @@ _DIFF_EXCLUDES = (
     "':(exclude)build/' ':(exclude)_build/' "
     "':(exclude).claude/' ':(exclude).codex/'"
 )
+_DIFF_INCLUDES = (
+    "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
+    "'CMakeLists.txt'"
+)
+
+
+# ---------------------------------------------------------------------------
+# Token / cost tracking for codex CLI (--json mode)
+# ---------------------------------------------------------------------------
+# Pricing per 1M tokens for gpt-5.4-medium (update as needed)
+_CODEX_PRICING = {
+    "gpt-5.4-medium": {"input": 2.50, "cached_input": 0.625, "output": 10.00},
+}
+_CODEX_PRICING_DEFAULT = {"input": 2.50, "cached_input": 0.625, "output": 10.00}
+
+# Running totals across the entire merge session
+_session_usage = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "cost": 0.0}
+
+
+def _parse_codex_usage(output: str, model: str | None = None) -> dict:
+    """Parse JSONL output from ``codex exec --json`` and return usage summary."""
+    total_in = 0
+    total_cached = 0
+    total_out = 0
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = ev.get("usage")
+        if usage:
+            total_in += usage.get("input_tokens", 0)
+            total_cached += usage.get("cached_input_tokens", 0)
+            total_out += usage.get("output_tokens", 0)
+
+    pricing = _CODEX_PRICING.get(model or "", _CODEX_PRICING_DEFAULT)
+    uncached_in = total_in - total_cached
+    cost = (
+        uncached_in * pricing["input"] / 1_000_000
+        + total_cached * pricing["cached_input"] / 1_000_000
+        + total_out * pricing["output"] / 1_000_000
+    )
+
+    _session_usage["input_tokens"] += total_in
+    _session_usage["cached_input_tokens"] += total_cached
+    _session_usage["output_tokens"] += total_out
+    _session_usage["cost"] += cost
+
+    return {
+        "input_tokens": total_in,
+        "cached_input_tokens": total_cached,
+        "output_tokens": total_out,
+        "cost": cost,
+    }
+
+
+def _log_usage(label: str, output: str, model: str | None = None) -> None:
+    """Parse codex JSONL output and log token usage + cost."""
+    u = _parse_codex_usage(output, model)
+    if u["input_tokens"] == 0 and u["output_tokens"] == 0:
+        return
+    logger.info(
+        "[%s] Tokens: %d in (%d cached) + %d out = %d total  |  Cost: $%.4f  |  Session total: $%.4f",
+        label,
+        u["input_tokens"], u["cached_input_tokens"], u["output_tokens"],
+        u["input_tokens"] + u["output_tokens"],
+        u["cost"], _session_usage["cost"],
+    )
+
+
+def _strip_build_artifact_hunks(diff_text: str) -> str:
+    """Remove diff hunks for build-artifact paths (CMakeFiles/, etc.)."""
+    import re
+    # Split into per-file sections on 'diff --git' boundaries
+    parts = re.split(r'(?=^diff --git )', diff_text, flags=re.MULTILINE)
+    _ARTIFACT_PATS = re.compile(r'CMakeFiles/|/CMakeFiles/')
+    kept = [p for p in parts if not _ARTIFACT_PATS.search(p.split('\n', 1)[0])]
+    return ''.join(kept)
 
 
 def _clean_diff(container: str, project: str) -> str:
@@ -83,9 +164,19 @@ def _clean_diff(container: str, project: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd /src/{project} && git diff HEAD -- . {_DIFF_EXCLUDES}",
+        f"cd /src/{project} && git diff HEAD -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
     )
-    return diff
+    return _strip_build_artifact_hunks(diff)
+
+
+def _clean_diff_against(container: str, project: str, base_rev: str) -> str:
+    """Get a clean git diff against a specific baseline revision."""
+    _stage_untracked_source(container, project)
+    _, diff = _exec_capture(
+        container,
+        f"cd /src/{project} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+    )
+    return _strip_build_artifact_hunks(diff)
 
 
 def _save_source_snapshot(container: str, project: str) -> None:
@@ -100,6 +191,45 @@ def _restore_source_snapshot(container: str, project: str) -> None:
     _exec_capture(container,
                   f"cd /src/{project} && git checkout -f HEAD && "
                   f"git stash pop 2>/dev/null; true")
+
+
+def _clean_container_working_tree_before_harness_diff(container: str, project: str) -> None:
+    """Reset /src/<project> before reapplying a saved harness diff."""
+    _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        "(git reset --hard HEAD 2>/dev/null || true) && "
+        "(git clean -fdx 2>/dev/null || true) && "
+        "rm -f __bug_dispatch.c __bug_dispatch.h 2>/dev/null || true",
+    )
+
+
+def _create_harness_baseline_commit(container: str, project: str) -> str:
+    """Create a temporary commit for the harness-applied baseline."""
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        "git add -A && "
+        "git -c user.name='Codex' -c user.email='codex@example.com' "
+        "commit --allow-empty -m 'codex harness baseline' >/dev/null 2>&1 && "
+        "git rev-parse HEAD",
+    )
+    if ret != 0:
+        raise RuntimeError(f"failed to create harness baseline commit: {out[-500:]}")
+    return out.strip().splitlines()[-1]
+
+
+def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -> None:
+    """Restore the exact harness baseline snapshot."""
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"git checkout -f {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
+        f"git reset --hard {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
+        "git clean -fdx >/dev/null 2>&1 || true",
+    )
+    if ret != 0:
+        raise RuntimeError(f"failed to restore harness baseline: {out[-500:]}")
 
 _MAX_WRAP_RETRIES = 1
 
@@ -380,10 +510,15 @@ def wrap_bug_with_dispatch(
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
     if model:
         agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+    if agent == "codex":
+        agent_cmd += " --json"
 
     logger.info("[%s] Invoking %s for dispatch wrapping (bit %d)...",
                 bug_id, agent, bit_index)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+
+    if agent == "codex":
+        _log_usage(f"{bug_id} wrap", output, model)
 
     if ret != 0:
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
@@ -470,20 +605,35 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 4. Inject dispatch files and modify harness
         # ------------------------------------------------------------------
-        _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-        dispatch_state["dispatch_file_injected"] = True
-
         # If we already have a harness diff from a previous run, reuse it.
         # This avoids re-invoking a code agent unnecessarily and keeps resume
         # behavior deterministic.
         harness_diff_path = output_dir / "harness.diff"
         if harness_diff_path.exists() and harness_diff_path.stat().st_size > 0:
             logger.info("Harness diff already exists, reusing: %s", harness_diff_path)
+            _clean_container_working_tree_before_harness_diff(container, project)
+            hdiff = harness_diff_path.read_text()
+            _exec_capture(container,
+                          f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+            ret, out = _exec_capture(container,
+                                     f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+            if ret != 0:
+                logger.error("Failed to apply existing harness.diff")
+                logger.error(out)
+                return 1
+            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            if ret != 0:
+                logger.error("Build failed after applying existing harness.diff")
+                logger.error(out[-500:] if out else "(no output)")
+                return 1
+            dispatch_state["dispatch_file_injected"] = True
             dispatch_state["harness_modified"] = True
         else:
             harness_diff_path = None
 
         if harness_diff_path is None:
+            _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
+            dispatch_state["dispatch_file_injected"] = True
             # Find the primary fuzzer name (all bugs should share it)
             primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
             ok = _modify_harness_for_dispatch(
@@ -505,6 +655,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             else:
                 logger.warning("No harness diff captured after modification!")
                 harness_diff_path = None
+
+        harness_baseline_rev = _create_harness_baseline_commit(container, project)
+        logger.info("Harness baseline commit: %s", harness_baseline_rev[:12])
 
         # Stash ASAN binaries (harness modification already built with ASAN)
         _exec_capture(container,
@@ -605,22 +758,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 "success": False,
             }
 
-            # Reset source to clean, then restore dispatch files + harness
-            _exec_capture(container,
-                          f"cd /src/{project} && "
-                          f"git reset HEAD -- . 2>/dev/null; "
-                          f"git checkout -f HEAD -- . && "
-                          f"git clean -fdx "
-                          f"-e __bug_dispatch.h -e __bug_dispatch.c "
-                          f"2>/dev/null; true")
-            _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-            # Re-apply harness modification (checkout wiped it)
-            if harness_diff_path and harness_diff_path.exists():
-                hdiff = harness_diff_path.read_text()
-                _exec_capture(container,
-                              f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
-                _exec_capture(container,
-                              f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+            # Reset source to the exact harness baseline, then apply only the
+            # bug-specific wrapped delta on top of it.
+            _restore_harness_baseline(container, project, harness_baseline_rev)
 
             output = ""
             for attempt in range(_MAX_WRAP_RETRIES + 1):
@@ -630,8 +770,10 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 )
 
                 if success:
-                    # Extract the wrapped diff (source files only, no build artifacts)
-                    wrapped_diff = _clean_diff(container, project)
+                    # Extract only the delta from the harness baseline.
+                    wrapped_diff = _clean_diff_against(
+                        container, project, harness_baseline_rev,
+                    )
                     if wrapped_diff.strip():
                         wrapped_path = output_dir / f"wrapped_{bug_id}.diff"
                         wrapped_path.write_text(wrapped_diff)
@@ -645,16 +787,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                 logger.warning("[%s] Attempt %d failed, retrying...",
                                bug_id, attempt + 1)
-                # Reset for retry and re-apply harness
-                _exec_capture(container,
-                              f"cd /src/{project} && git checkout -f HEAD -- .")
-                _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-                if harness_diff_path and harness_diff_path.exists():
-                    hdiff = harness_diff_path.read_text()
-                    _exec_capture(container,
-                                  f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
-                    _exec_capture(container,
-                                  f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+                # Reset for retry to the exact harness baseline.
+                _restore_harness_baseline(container, project, harness_baseline_rev)
 
             if not step["success"]:
                 logger.error("[%s] FAILED after %d attempts, skipping",
@@ -670,42 +804,19 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         logger.info("\n=== Merging %d wrapped diffs ===", len(wrapped_diffs))
 
-        # Reset source to clean + dispatch files + harness
-        _exec_capture(container,
-                      f"cd /src/{project} && "
-                      f"git reset HEAD -- . 2>/dev/null; "
-                      f"git checkout -f HEAD -- . && "
-                      f"git clean -fdx 2>/dev/null; true")
-        _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-
-        # Re-apply harness modification from saved diff (captured in step 4)
-        if harness_diff_path and harness_diff_path.exists():
-            hdiff = harness_diff_path.read_text()
-            _exec_capture(container,
-                          f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
-            _exec_capture(container,
-                          f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+        # Reset source to the exact harness baseline before merging wrapped
+        # bug deltas.
+        _restore_harness_baseline(container, project, harness_baseline_rev)
 
         # Copy all wrapped patches into container
         patch_descriptions = []
         for bug_id, wdiff_path in wrapped_diffs.items():
             diff_content = Path(wdiff_path).read_text()
-            # Strip __bug_dispatch hunks (already injected)
-            filtered_lines = []
-            skip = False
-            for line in diff_content.splitlines(keepends=True):
-                if line.startswith("diff --git") and "__bug_dispatch" in line:
-                    skip = True
-                elif line.startswith("diff --git"):
-                    skip = False
-                if not skip:
-                    filtered_lines.append(line)
-            filtered = "".join(filtered_lines)
-            if not filtered.strip():
+            if not diff_content.strip():
                 continue
             fname = f"wrapped_{bug_id}.diff"
             _exec_capture(container,
-                          f"cat > /tmp/{fname} << 'DIFFEOF'\n{filtered}DIFFEOF")
+                          f"cat > /tmp/{fname} << 'DIFFEOF'\n{diff_content}DIFFEOF")
             patch_descriptions.append(f"- `/tmp/{fname}` — {bug_id}")
 
         if not patch_descriptions:
@@ -759,6 +870,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 agent_cmd = cfg["run_cmd"].format(prompt=escaped)
                 if args.model:
                     agent_cmd += f" {cfg['model_flag']} {shlex.quote(args.model)}"
+                if args.agent == "codex":
+                    agent_cmd += " --json"
 
                 logger.info(
                     "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
@@ -770,6 +883,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                     total_patches,
                 )
                 ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+                if args.agent == "codex":
+                    _log_usage(f"merge chunk {chunk_idx}", output, args.model)
                 if ret != 0:
                     logger.error(
                         "Agent failed on chunk %d (exit %d). Output tail: %s",
@@ -837,7 +952,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 10. Save combined diff + testcases
         # ------------------------------------------------------------------
-        combined_diff = _clean_diff(container, project)
+        combined_diff = _clean_diff_against(container, project, harness_baseline_rev)
         combined_path = output_dir / "combined.diff"
         combined_path.write_text(combined_diff)
         logger.info("Combined diff: %s (%d bytes)", combined_path, len(combined_diff))
@@ -885,6 +1000,14 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         (output_dir / "summary.json").write_text(
             json.dumps(merge_summary, indent=2))
         logger.info("Summary: %s", output_dir / "summary.json")
+
+        if _session_usage["cost"] > 0:
+            u = _session_usage
+            logger.info(
+                "=== Session token usage: %d in (%d cached) + %d out  |  Total cost: $%.4f ===",
+                u["input_tokens"], u["cached_input_tokens"],
+                u["output_tokens"], u["cost"],
+            )
 
         return 0 if triggered == total else 1
 
