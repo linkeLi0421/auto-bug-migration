@@ -61,6 +61,7 @@ from bug_transplant_merge import (
     _save_work_testcase_to_host,
 )
 from bug_transplant import AGENT_CONFIG
+from codex_usage import CodexUsageTracker
 
 # Pathspecs to exclude build artifacts from git diff
 _DIFF_EXCLUDES = (
@@ -82,71 +83,8 @@ _DIFF_INCLUDES = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Token / cost tracking for codex CLI (--json mode)
-# ---------------------------------------------------------------------------
-# Pricing per 1M tokens for gpt-5.4-medium (update as needed)
-_CODEX_PRICING = {
-    "gpt-5.4-medium": {"input": 2.50, "cached_input": 0.625, "output": 10.00},
-}
-_CODEX_PRICING_DEFAULT = {"input": 2.50, "cached_input": 0.625, "output": 10.00}
-
-# Running totals across the entire merge session
-_session_usage = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0, "cost": 0.0}
-
-
-def _parse_codex_usage(output: str, model: str | None = None) -> dict:
-    """Parse JSONL output from ``codex exec --json`` and return usage summary."""
-    total_in = 0
-    total_cached = 0
-    total_out = 0
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        usage = ev.get("usage")
-        if usage:
-            total_in += usage.get("input_tokens", 0)
-            total_cached += usage.get("cached_input_tokens", 0)
-            total_out += usage.get("output_tokens", 0)
-
-    pricing = _CODEX_PRICING.get(model or "", _CODEX_PRICING_DEFAULT)
-    uncached_in = total_in - total_cached
-    cost = (
-        uncached_in * pricing["input"] / 1_000_000
-        + total_cached * pricing["cached_input"] / 1_000_000
-        + total_out * pricing["output"] / 1_000_000
-    )
-
-    _session_usage["input_tokens"] += total_in
-    _session_usage["cached_input_tokens"] += total_cached
-    _session_usage["output_tokens"] += total_out
-    _session_usage["cost"] += cost
-
-    return {
-        "input_tokens": total_in,
-        "cached_input_tokens": total_cached,
-        "output_tokens": total_out,
-        "cost": cost,
-    }
-
-
-def _log_usage(label: str, output: str, model: str | None = None) -> None:
-    """Parse codex JSONL output and log token usage + cost."""
-    u = _parse_codex_usage(output, model)
-    if u["input_tokens"] == 0 and u["output_tokens"] == 0:
-        return
-    logger.info(
-        "[%s] Tokens: %d in (%d cached) + %d out = %d total  |  Cost: $%.4f  |  Session total: $%.4f",
-        label,
-        u["input_tokens"], u["cached_input_tokens"], u["output_tokens"],
-        u["input_tokens"] + u["output_tokens"],
-        u["cost"], _session_usage["cost"],
-    )
+# Session-wide token/cost tracker (shared across all codex invocations)
+_usage_tracker = CodexUsageTracker()
 
 
 def _strip_build_artifact_hunks(diff_text: str) -> str:
@@ -244,36 +182,21 @@ def _build_agent_cmd(
     agent: str,
     model: str | None,
     project: str,
-    *,
-    extra_writable_dirs: list[str] | None = None,
 ) -> str:
-    """Build the agent CLI command, using sandbox mode for codex.
+    """Build the agent CLI command.
 
-    For codex, uses ``--sandbox workspace-write`` with ``-C /src/<project>``
-    so the agent can only modify project source files.  Additional writable
-    directories (e.g. /work, /tmp) can be passed via *extra_writable_dirs*.
+    Note: codex's ``--sandbox workspace-write`` uses bubblewrap (bwrap)
+    which requires user namespaces and fails inside Docker containers with
+    ``bwrap: setting up uid map: Permission denied``.  We therefore keep
+    ``--dangerously-bypass-approvals-and-sandbox`` and rely on the Docker
+    container itself as the sandbox boundary.
     """
     escaped = shlex.quote(prompt)
-
-    if agent == "codex":
-        # Sandboxed mode: workspace-write restricts writes to -C dir + --add-dir
-        parts = [
-            "codex exec",
-            "--sandbox workspace-write",
-            f"-C /src/{shlex.quote(project)}",
-        ]
-        for d in (extra_writable_dirs or []):
-            parts.append(f"--add-dir {shlex.quote(d)}")
-        parts.append(escaped)
-        if model:
-            parts.append(f"{cfg['model_flag']} {shlex.quote(model)}")
-        parts.append("--json")
-        return " ".join(parts)
-
-    # Non-codex agents: use the generic run_cmd template
     agent_cmd = cfg["run_cmd"].format(prompt=escaped)
     if model:
         agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+    if agent == "codex":
+        agent_cmd += " --json"
     return agent_cmd
 
 
@@ -549,17 +472,14 @@ def wrap_bug_with_dispatch(
         output_testcase_path=f"/work/{bug['testcase']}",
     )
 
-    agent_cmd = _build_agent_cmd(
-        cfg, prompt, agent, model, project,
-        extra_writable_dirs=["/work", "/tmp"],
-    )
+    agent_cmd = _build_agent_cmd(cfg, prompt, agent, model, project)
 
     logger.info("[%s] Invoking %s for dispatch wrapping (bit %d)...",
                 bug_id, agent, bit_index)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     if agent == "codex":
-        _log_usage(f"{bug_id} wrap", output, model)
+        _usage_tracker.log_usage(f"{bug_id} wrap", output, model)
 
     if ret != 0:
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
@@ -843,116 +763,138 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 8. Phase 2: Merge all wrapped diffs via code agent
         # ------------------------------------------------------------------
-        logger.info("\n=== Merging %d wrapped diffs ===", len(wrapped_diffs))
-
-        # Reset source to the exact harness baseline before merging wrapped
-        # bug deltas.
-        _restore_harness_baseline(container, project, harness_baseline_rev)
-
-        # Copy all wrapped patches into container
-        patch_descriptions = []
-        for bug_id, wdiff_path in wrapped_diffs.items():
-            diff_content = Path(wdiff_path).read_text()
-            if not diff_content.strip():
-                continue
-            fname = f"wrapped_{bug_id}.diff"
+        combined_path = output_dir / "combined.diff"
+        if combined_path.exists() and combined_path.stat().st_size > 0:
+            # Reuse existing combined diff — skip the agent merge entirely.
+            logger.info("combined.diff already exists, reusing: %s (%d bytes)",
+                        combined_path, combined_path.stat().st_size)
+            _restore_harness_baseline(container, project, harness_baseline_rev)
+            cdiff = combined_path.read_text()
             _exec_capture(container,
-                          f"cat > /tmp/{fname} << 'DIFFEOF'\n{diff_content}DIFFEOF")
-            patch_descriptions.append(f"- `/tmp/{fname}` — {bug_id}")
-
-        if not patch_descriptions:
-            logger.info("No patches to merge (all were dispatch-only)")
+                          f"cat > /tmp/combined.diff << 'CEOF'\n{cdiff}CEOF")
+            ret, out = _exec_capture(
+                container,
+                f"cd /src/{project} && git apply /tmp/combined.diff 2>&1",
+            )
+            if ret != 0:
+                logger.error("Failed to apply existing combined.diff: %s", out[-500:])
+                return 1
+            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            if ret != 0:
+                logger.error("Build failed after applying combined.diff: %s",
+                             out[-500:] if out else "(no output)")
+                return 1
             applied_bugs = list(wrapped_diffs.keys())
         else:
-            # Use code agent to merge patches in chunks (avoid single huge prompt).
-            # We keep the existing merge prompt/behavior, but run it multiple times.
-            # Each chunk is merged on top of the previous chunk's result.
-            max_chunk = 15
-            total_patches = len(patch_descriptions)
-            logger.info(
-                "Merging %d patches in chunks of <=%d via %s",
-                total_patches, max_chunk, args.agent,
-            )
+            logger.info("\n=== Merging %d wrapped diffs ===", len(wrapped_diffs))
 
-            cfg = AGENT_CONFIG[args.agent]
-            creds_dir = cfg["credentials_dir"]
+            # Reset source to the exact harness baseline before merging wrapped
+            # bug deltas.
+            _restore_harness_baseline(container, project, harness_baseline_rev)
 
-            def _setup_agent_creds() -> None:
-                _exec(
-                    container,
-                    f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-                    f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-                    f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
-                    user="root",
+            # Copy all wrapped patches into container
+            patch_descriptions = []
+            for bug_id, wdiff_path in wrapped_diffs.items():
+                diff_content = Path(wdiff_path).read_text()
+                if not diff_content.strip():
+                    continue
+                fname = f"wrapped_{bug_id}.diff"
+                _exec_capture(container,
+                              f"cat > /tmp/{fname} << 'DIFFEOF'\n{diff_content}DIFFEOF")
+                patch_descriptions.append(f"- `/tmp/{fname}` — {bug_id}")
+
+            if not patch_descriptions:
+                logger.info("No patches to merge (all were dispatch-only)")
+                applied_bugs = list(wrapped_diffs.keys())
+            else:
+                # Use code agent to merge patches in chunks (avoid single huge prompt).
+                # We keep the existing merge prompt/behavior, but run it multiple times.
+                # Each chunk is merged on top of the previous chunk's result.
+                max_chunk = 15
+                total_patches = len(patch_descriptions)
+                logger.info(
+                    "Merging %d patches in chunks of <=%d via %s",
+                    total_patches, max_chunk, args.agent,
                 )
-                if cfg.get("credentials_config"):
+
+                cfg = AGENT_CONFIG[args.agent]
+                creds_dir = cfg["credentials_dir"]
+
+                def _setup_agent_creds() -> None:
                     _exec(
                         container,
-                        f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-                        f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+                        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
+                        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
+                        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
                         user="root",
                     )
+                    if cfg.get("credentials_config"):
+                        _exec(
+                            container,
+                            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
+                            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
+                            user="root",
+                        )
 
-            applied_bugs = []
-            merge_failed = False
-            for chunk_idx, start in enumerate(range(0, total_patches, max_chunk), start=1):
-                chunk = patch_descriptions[start:start + max_chunk]
-                patch_list = "\n".join(chunk)
-                merge_prompt = _load_prompt(
-                    "merge_wrapped_patches",
-                    project=project,
-                    target_commit=target_commit,
-                    patch_list=patch_list,
-                )
-
-                _setup_agent_creds()
-
-                agent_cmd = _build_agent_cmd(
-                    cfg, merge_prompt, args.agent, args.model, project,
-                    extra_writable_dirs=["/work", "/tmp"],
-                )
-
-                logger.info(
-                    "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
-                    args.agent,
-                    chunk_idx,
-                    len(chunk),
-                    start + 1,
-                    min(start + len(chunk), total_patches),
-                    total_patches,
-                )
-                ret, output = _exec_capture(container, agent_cmd, timeout=3600)
-                if args.agent == "codex":
-                    _log_usage(f"merge chunk {chunk_idx}", output, args.model)
-                if ret != 0:
-                    logger.error(
-                        "Agent failed on chunk %d (exit %d). Output tail: %s",
-                        chunk_idx, ret, output[-500:] if output else "",
+                applied_bugs = []
+                merge_failed = False
+                for chunk_idx, start in enumerate(range(0, total_patches, max_chunk), start=1):
+                    chunk = patch_descriptions[start:start + max_chunk]
+                    patch_list = "\n".join(chunk)
+                    merge_prompt = _load_prompt(
+                        "merge_wrapped_patches",
+                        project=project,
+                        target_commit=target_commit,
+                        patch_list=patch_list,
                     )
-                    merge_failed = True
-                    break
 
-                # Verify build after each chunk so failures are localized.
-                ret, build_out = _exec_capture(
-                    container, "sudo -E compile 2>&1", timeout=300,
-                )
-                if ret != 0:
-                    logger.error(
-                        "Build failed after chunk %d: %s",
-                        chunk_idx, build_out[-500:],
+                    _setup_agent_creds()
+
+                    agent_cmd = _build_agent_cmd(
+                        cfg, merge_prompt, args.agent, args.model, project,
                     )
-                    merge_failed = True
-                    break
 
-                # Track which bug IDs were included in this chunk
-                for desc in chunk:
-                    m = re.search(r"—\s+(OSV-[0-9]{4}-[0-9]+)\s*$", desc)
-                    if m:
-                        applied_bugs.append(m.group(1))
+                    logger.info(
+                        "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
+                        args.agent,
+                        chunk_idx,
+                        len(chunk),
+                        start + 1,
+                        min(start + len(chunk), total_patches),
+                        total_patches,
+                    )
+                    ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+                    if args.agent == "codex":
+                        _usage_tracker.log_usage(f"merge chunk {chunk_idx}", output, args.model)
+                    if ret != 0:
+                        logger.error(
+                            "Agent failed on chunk %d (exit %d). Output tail: %s",
+                            chunk_idx, ret, output[-500:] if output else "",
+                        )
+                        merge_failed = True
+                        break
 
-            if not merge_failed:
-                # If everything succeeded, consider all wrapped diffs merged.
-                applied_bugs = list(wrapped_diffs.keys())
+                    # Verify build after each chunk so failures are localized.
+                    ret, build_out = _exec_capture(
+                        container, "sudo -E compile 2>&1", timeout=300,
+                    )
+                    if ret != 0:
+                        logger.error(
+                            "Build failed after chunk %d: %s",
+                            chunk_idx, build_out[-500:],
+                        )
+                        merge_failed = True
+                        break
+
+                    # Track which bug IDs were included in this chunk
+                    for desc in chunk:
+                        m = re.search(r"—\s+(OSV-[0-9]{4}-[0-9]+)\s*$", desc)
+                        if m:
+                            applied_bugs.append(m.group(1))
+
+                if not merge_failed:
+                    # If everything succeeded, consider all wrapped diffs merged.
+                    applied_bugs = list(wrapped_diffs.keys())
 
         # Build ASAN + UBSAN with all patches applied
         logger.info("Building with all patches applied...")
@@ -1040,13 +982,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             json.dumps(merge_summary, indent=2))
         logger.info("Summary: %s", output_dir / "summary.json")
 
-        if _session_usage["cost"] > 0:
-            u = _session_usage
-            logger.info(
-                "=== Session token usage: %d in (%d cached) + %d out  |  Total cost: $%.4f ===",
-                u["input_tokens"], u["cached_input_tokens"],
-                u["output_tokens"], u["cost"],
-            )
+        _usage_tracker.log_session_total()
 
         return 0 if triggered == total else 1
 

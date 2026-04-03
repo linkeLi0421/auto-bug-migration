@@ -48,6 +48,9 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Lazy-initialized in main(); imported here so the module can be used as a library.
+_usage_tracker = None
+
 # Pin CLI versions for reproducibility.
 # Update deliberately after testing with new versions.
 AGENT_VERSIONS = {
@@ -827,6 +830,9 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.warning("Agent hit max turns limit — treating as failure")
             exit_code = 1
 
+        if agent == "codex" and _usage_tracker:
+            _usage_tracker.log_usage("transplant", output, getattr(args, "model", None))
+
         logger.info(
             "%s agent finished in %.0fs (exit code %d, %d bytes output)",
             agent, elapsed, exit_code, len(output),
@@ -1002,6 +1008,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     container_name, minimize_cmd, timeout=args.timeout,
                 )
                 min_elapsed = time.monotonic() - min_start
+                if agent == "codex" and _usage_tracker:
+                    _usage_tracker.log_usage("minimize", min_output, getattr(args, "model", None))
                 logger.info("Minimization finished in %.0fs (exit %d)",
                             min_elapsed, min_exit)
                 (output_dir / "minimize_output.txt").write_text(min_output)
@@ -1119,6 +1127,10 @@ def _build_agent_command(prompt: str, args: argparse.Namespace) -> str:
     if model:
         cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
 
+    # Enable JSONL output for codex so we can parse token usage
+    if agent == "codex":
+        cmd += " --json"
+
     return cmd
 
 
@@ -1235,6 +1247,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    global _usage_tracker
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -1245,6 +1259,10 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Initialize codex token tracker
+    from codex_usage import CodexUsageTracker
+    _usage_tracker = CodexUsageTracker()
 
     # Validate testcases dir
     if not args.testcases_dir:
@@ -1319,6 +1337,8 @@ def main() -> int:
 
     if (output_dir / "claude_output.txt").exists():
         logger.info("Claude output: %s", output_dir / "claude_output.txt")
+
+    _usage_tracker.log_session_total()
 
     return exit_code
 
