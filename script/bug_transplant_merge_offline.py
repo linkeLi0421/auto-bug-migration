@@ -60,7 +60,7 @@ from bug_transplant_merge import (
     _prepare_container_testcases_dir,
     _save_work_testcase_to_host,
 )
-from bug_transplant import AGENT_CONFIG
+from bug_transplant import CODEX_CONFIG, setup_codex_creds, build_codex_command
 from codex_usage import CodexUsageTracker
 
 # Pathspecs to exclude build artifacts from git diff
@@ -75,7 +75,7 @@ _DIFF_EXCLUDES = (
     "':(exclude)*.d' ':(exclude)*.pc' ':(exclude)config.h' "
     "':(exclude)blosc/config.h' "
     "':(exclude)build/' ':(exclude)_build/' "
-    "':(exclude).claude/' ':(exclude).codex/'"
+    "':(exclude).codex/'"
 )
 _DIFF_INCLUDES = (
     "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
@@ -172,32 +172,7 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
 _MAX_WRAP_RETRIES = 1
 
 
-# ---------------------------------------------------------------------------
-# Sandboxed agent command construction
-# ---------------------------------------------------------------------------
-
-def _build_agent_cmd(
-    cfg: dict,
-    prompt: str,
-    agent: str,
-    model: str | None,
-    project: str,
-) -> str:
-    """Build the agent CLI command.
-
-    Note: codex's ``--sandbox workspace-write`` uses bubblewrap (bwrap)
-    which requires user namespaces and fails inside Docker containers with
-    ``bwrap: setting up uid map: Permission denied``.  We therefore keep
-    ``--dangerously-bypass-approvals-and-sandbox`` and rely on the Docker
-    container itself as the sandbox boundary.
-    """
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-    if agent == "codex":
-        agent_cmd += " --json"
-    return agent_cmd
+# build_codex_command is now imported from bug_transplant
 
 
 # ---------------------------------------------------------------------------
@@ -410,14 +385,12 @@ def wrap_bug_with_dispatch(
     bug: dict,
     bit_index: int,
     dispatch_state: dict,
-    agent: str = "claude",
     model: str | None = None,
 ) -> tuple[bool, str]:
-    """Invoke agent to wrap a bug's patch with dispatch gating.
+    """Invoke codex to wrap a bug's patch with dispatch gating.
 
     Returns (success, output).
     """
-    cfg = AGENT_CONFIG[agent]
     bug_id = bug["bug_id"]
     diff_path = bug["diff_path"]
     dispatch_bit = bit_index % 8
@@ -442,23 +415,8 @@ def wrap_bug_with_dispatch(
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-    # Setup agent credentials
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    # Setup codex credentials
+    setup_codex_creds(container)
 
     prompt = _load_prompt(
         "dispatch_wrap_offline",
@@ -472,14 +430,13 @@ def wrap_bug_with_dispatch(
         output_testcase_path=f"/work/{bug['testcase']}",
     )
 
-    agent_cmd = _build_agent_cmd(cfg, prompt, agent, model, project)
+    agent_cmd = build_codex_command(prompt, model)
 
-    logger.info("[%s] Invoking %s for dispatch wrapping (bit %d)...",
-                bug_id, agent, bit_index)
+    logger.info("[%s] Invoking codex for dispatch wrapping (bit %d)...",
+                bug_id, bit_index)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
-    if agent == "codex":
-        _usage_tracker.log_usage(f"{bug_id} wrap", output, model)
+    _usage_tracker.log_usage(f"{bug_id} wrap", output, model)
 
     if ret != 0:
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
@@ -556,7 +513,6 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         testcases_dir=str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
-        agent_type=args.agent,
     )
     if not build_ok:
         logger.error("Container startup / initial build failed")
@@ -599,7 +555,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
             ok = _modify_harness_for_dispatch(
                 container, project, primary_fuzzer,
-                agent=args.agent, model=args.model,
+                model=args.model,
             )
             if not ok:
                 logger.error("Failed to modify harness for dispatch")
@@ -727,7 +683,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             for attempt in range(_MAX_WRAP_RETRIES + 1):
                 success, output = wrap_bug_with_dispatch(
                     container, project, bd, bit_index,
-                    dispatch_state, agent=args.agent, model=args.model,
+                    dispatch_state, model=args.model,
                 )
 
                 if success:
@@ -813,28 +769,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 max_chunk = 15
                 total_patches = len(patch_descriptions)
                 logger.info(
-                    "Merging %d patches in chunks of <=%d via %s",
-                    total_patches, max_chunk, args.agent,
+                    "Merging %d patches in chunks of <=%d via codex",
+                    total_patches, max_chunk,
                 )
-
-                cfg = AGENT_CONFIG[args.agent]
-                creds_dir = cfg["credentials_dir"]
-
-                def _setup_agent_creds() -> None:
-                    _exec(
-                        container,
-                        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-                        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-                        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
-                        user="root",
-                    )
-                    if cfg.get("credentials_config"):
-                        _exec(
-                            container,
-                            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-                            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-                            user="root",
-                        )
 
                 applied_bugs = []
                 merge_failed = False
@@ -848,15 +785,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                         patch_list=patch_list,
                     )
 
-                    _setup_agent_creds()
-
-                    agent_cmd = _build_agent_cmd(
-                        cfg, merge_prompt, args.agent, args.model, project,
-                    )
+                    setup_codex_creds(container)
+                    agent_cmd = build_codex_command(merge_prompt, args.model)
 
                     logger.info(
-                        "Invoking %s to merge chunk %d (%d patches: %d..%d/%d)",
-                        args.agent,
+                        "Invoking codex to merge chunk %d (%d patches: %d..%d/%d)",
                         chunk_idx,
                         len(chunk),
                         start + 1,
@@ -864,8 +797,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                         total_patches,
                     )
                     ret, output = _exec_capture(container, agent_cmd, timeout=3600)
-                    if args.agent == "codex":
-                        _usage_tracker.log_usage(f"merge chunk {chunk_idx}", output, args.model)
+                    _usage_tracker.log_usage(f"merge chunk {chunk_idx}", output, args.model)
                     if ret != 0:
                         logger.error(
                             "Agent failed on chunk %d (exit %d). Output tail: %s",
@@ -1030,10 +962,8 @@ def main():
                         help="Directory containing testcase files")
     parser.add_argument("--local-bugs", nargs="*", default=None,
                         help="Bug IDs that already trigger at target")
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
-                        help="Code agent to use")
     parser.add_argument("--model", default=None,
-                        help="Model override for agent")
+                        help="Model override for codex")
     parser.add_argument("-v", "--volume", action="append",
                         help="Extra Docker volume mounts")
     parser.add_argument("--dry-run", action="store_true",

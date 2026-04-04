@@ -444,7 +444,6 @@ def _modify_harness_for_dispatch(
     container: str,
     project: str,
     fuzzer: str,
-    agent: str = "claude",
     model: str | None = None,
 ) -> bool:
     """Use agent to modify the fuzz harness to consume a dispatch byte.
@@ -452,36 +451,14 @@ def _modify_harness_for_dispatch(
     Returns True if harness was modified and builds successfully.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
+    agent_cmd = build_codex_command(prompt, model)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
-    logger.info("Invoking %s to modify harness for dispatch byte...", agent)
+    logger.info("Invoking codex to modify harness for dispatch byte...")
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("Harness modification agent failed (exit %d): %s",
@@ -574,7 +551,7 @@ def _restore_testcases(
 
 
 def _rebuild_project_image(project: str, target_commit: str,
-                           build_csv: str | None, agent_type: str) -> str:
+                           build_csv: str | None) -> str:
     """Rebuild the project Docker image from the correct historical OSS-Fuzz commit.
 
     Uses ``fuzz_helper.py build_version --runner-image auto`` to build the
@@ -614,7 +591,7 @@ def _rebuild_project_image(project: str, target_commit: str,
 
     # Layer the agent CLI on top of the freshly built project image
     project_image = f"gcr.io/oss-fuzz/{project}"
-    image_tag = build_agent_image(project, project_image, agent_type)
+    image_tag = build_agent_image(project, project_image)
     logger.info("Agent image built: %s", image_tag)
     return image_tag
 
@@ -625,14 +602,13 @@ def start_merge_container(
     testcases_dir: str,
     build_csv: str | None = None,
     extra_volumes: list[str] | None = None,
-    agent_type: str = "claude",
 ) -> tuple[str, bool]:
     """Start a persistent container at the target commit for merging."""
     container_name = f"bug-merge-{project}"
 
     # Rebuild the project image from the historical OSS-Fuzz commit so the
     # container has the correct compiler, ASAN runtime, and base libraries.
-    image_tag = _rebuild_project_image(project, target_commit, build_csv, agent_type)
+    image_tag = _rebuild_project_image(project, target_commit, build_csv)
 
     # Remove any existing container
     subprocess.call(
@@ -675,22 +651,16 @@ def start_merge_container(
         "-v", f"{work_dir}:/work",
     ]
 
-    # Agent credentials for conflict resolution (login mode)
+    # Codex credentials for conflict resolution (login mode)
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
-    cfg = AGENT_CONFIG.get(agent_type, AGENT_CONFIG["claude"])
-    cred_dir = Path.home() / cfg["credentials_dir"]
+    from bug_transplant import CODEX_CONFIG
+    cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
     if cred_dir.exists():
         docker_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-    cred_config = cfg.get("credentials_config")
-    if cred_config:
-        cred_config_path = Path.home() / cred_config
-        if cred_config_path.exists():
-            docker_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    api_key = os.environ.get(cfg["api_key_env"], "")
+    api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
     if api_key:
-        docker_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+        docker_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
     if extra_volumes:
         for v in extra_volumes:
@@ -819,14 +789,13 @@ def resolve_conflict_with_agent(
     bug_id: str,
     project: str,
     applied_bugs: list[str],
-    agent: str = "claude",
     model: str | None = None,
     conflicting_diffs: list[tuple[str, str]] | None = None,
     dispatch_bit: int | None = None,
     feedback: str | None = None,
     attempt: int = 0,
 ) -> str:
-    """Use a code agent to resolve a merge conflict.
+    """Use codex to resolve a merge conflict.
 
     When *conflicting_diffs* and *dispatch_bit* are provided, the agent is
     instructed to use input-driven dispatch branches for truly contradictory
@@ -837,30 +806,11 @@ def resolve_conflict_with_agent(
       ``"dispatch"``  – dispatch branch(es) used
       ``"failed"``    – could not resolve
     """
-    # Import agent config from bug_transplant
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to resolve conflict...", bug_id, agent)
-
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    logger.info("[%s] Invoking codex to resolve conflict...", bug_id)
+    setup_codex_creds(container)
 
     diff_name = Path(diff_path).name
     applied_list = ", ".join(applied_bugs) if applied_bugs else "none yet"
@@ -899,16 +849,12 @@ def resolve_conflict_with_agent(
 
     _save_prompt_to_container(container, bug_id, "conflict_resolve", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     if ret != 0:
-        logger.error("[%s] %s agent failed (exit %d): %s",
-                     bug_id, agent, ret, output[-500:] if output else "(no output)")
+        logger.error("[%s] codex agent failed (exit %d): %s",
+                     bug_id, ret, output[-500:] if output else "(no output)")
         return "failed"
 
     # Verify it compiles
@@ -934,7 +880,6 @@ def resolve_with_dispatch(
     regressed_bugs: list[dict],
     dispatch_bit: int,
     current_diff_path: str | None = None,
-    agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
     attempt: int = 0,
@@ -950,30 +895,13 @@ def resolve_with_dispatch(
     Returns True if dispatch was applied and build succeeds.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to add dispatch branches (bit %d) "
+    logger.info("[%s] Invoking codex to add dispatch branches (bit %d) "
                 "for %d regressed bugs...",
-                bug_id, agent, dispatch_bit, len(regressed_bugs))
+                bug_id, dispatch_bit, len(regressed_bugs))
 
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     # Copy patches into container for the agent to read
     patch_lines = []
@@ -1015,11 +943,7 @@ def resolve_with_dispatch(
 
     _save_prompt_to_container(container, bug_id, "regression_dispatch", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("[%s] Dispatch agent failed (exit %d): %s",
@@ -1290,7 +1214,6 @@ def resolve_self_trigger_with_dispatch(
     crash_log: str | None,
     current_diff_path: str | None,
     dispatch_bit: int,
-    agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
     attempt: int = 0,
@@ -1306,30 +1229,13 @@ def resolve_self_trigger_with_dispatch(
     Returns True if dispatch was applied and build succeeds.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to unblock self-trigger (bit %d), "
+    logger.info("[%s] Invoking codex to unblock self-trigger (bit %d), "
                 "analyzing %d previous patches...",
-                bug_id, agent, dispatch_bit, len(applied_bugs_data))
+                bug_id, dispatch_bit, len(applied_bugs_data))
 
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     # Copy current bug's patch into container
     patch_lines = []
@@ -1375,11 +1281,7 @@ def resolve_self_trigger_with_dispatch(
 
     _save_prompt_to_container(container, bug_id, "self_trigger_dispatch", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("[%s] Self-trigger dispatch agent failed (exit %d): %s",
@@ -1981,7 +1883,6 @@ def run_merge(args: argparse.Namespace) -> int:
         project, target_commit, str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
-        agent_type=args.agent,
     )
     if not build_ok:
         logger.error("Baseline build failed — cannot merge. "
@@ -2237,7 +2138,7 @@ def run_merge(args: argparse.Namespace) -> int:
 
                     result = resolve_conflict_with_agent(
                         container, diff_path, bug_id, project,
-                        applied_bugs, args.agent, args.model,
+                        applied_bugs, args.model,
                         conflicting_diffs=conflicting_info,
                         dispatch_bit=bit_index,
                         feedback=step_feedback,
@@ -2261,7 +2162,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         if not dispatch_state["harness_modified"]:
                             ok = _modify_harness_for_dispatch(
                                 container, project, bd["fuzzer"],
-                                args.agent, args.model,
+                                args.model,
                             )
                             if ok:
                                 dispatch_state["harness_modified"] = True
@@ -2412,7 +2313,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             container, bug_id, project,
                             prev_bugs_data, bd.get("crash_log"),
                             bd["diff_path"], bit_index,
-                            agent=args.agent, model=args.model,
+                            model=args.model,
                             feedback=step_feedback,
                             attempt=retry_count,
                         )
@@ -2421,7 +2322,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             if not dispatch_state["harness_modified"]:
                                 hok = _modify_harness_for_dispatch(
                                     container, project, bd["fuzzer"],
-                                    args.agent, args.model,
+                                    args.model,
                                 )
                                 if hok:
                                     dispatch_state["harness_modified"] = True
@@ -2527,7 +2428,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         dispatch_ok = resolve_with_dispatch(
                             container, bug_id, project, regressed,
                             bit_index, current_diff_path=bd["diff_path"],
-                            agent=args.agent, model=args.model,
+                            model=args.model,
                             feedback=step_feedback,
                             attempt=retry_count,
                         )
@@ -2537,7 +2438,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             if not dispatch_state["harness_modified"]:
                                 hok = _modify_harness_for_dispatch(
                                     container, project, bd["fuzzer"],
-                                    args.agent, args.model,
+                                    args.model,
                                 )
                                 if hok:
                                     dispatch_state["harness_modified"] = True
@@ -2837,10 +2738,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Bug IDs that already trigger at target (override auto-detection)")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
-                        help="Code agent for conflict resolution (default: claude)")
     parser.add_argument("--model", default=None,
-                        help="Model to use (passed to agent CLI)")
+                        help="Model to use (passed to codex CLI)")
     parser.add_argument("--testcases-dir",
                         default=os.environ.get("TESTCASES", ""),
                         help="Testcase directory (default: $TESTCASES)")

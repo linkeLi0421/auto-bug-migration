@@ -2249,8 +2249,8 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
 
     export LIBRARY_PATH=/Function_instrument:$LIBRARY_PATH
     export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
-    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
-    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -ltrace";
+    export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
+    export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     
     # Checkout buggy commit and set up environment
     cd /src/{args.project.name};

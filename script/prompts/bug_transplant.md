@@ -2,7 +2,7 @@
 
 You are inside an OSS-Fuzz Docker container for project **{project}**.
 
-**IMPORTANT: Start by reading CLAUDE.md** (`/src/{project}/CLAUDE.md`). It contains shared
+**IMPORTANT: Start by reading AGENTS.md** (`/src/{project}/AGENTS.md`). It contains shared
 knowledge from previous bug transplant sessions -- format changes, validation checks,
 testcase patching recipes. Use it to avoid rediscovering things.
 
@@ -17,7 +17,7 @@ The bug triggers at the old commit but not at the new one.
 - `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit{fix_diff_line}
 - `/work/{testcase_name}` -- PoC testcase (you may modify this)
 - `/src/{project}` -- source tree at `{target_commit}`
-- `/src/{project}/CLAUDE.md` -- shared knowledge (read first, update when done)
+- `/src/{project}/AGENTS.md` -- shared knowledge (read first, update when done)
 
 ## Commands
 
@@ -92,7 +92,7 @@ If you modified the testcase, the copy is essential -- the original is still in 
 
 ## Update shared knowledge
 
-After finishing (success or failure), update `/src/{project}/CLAUDE.md` with any
+After finishing (success or failure), update `/src/{project}/AGENTS.md` with any
 discoveries about the **target commit** that would help future bug transplants:
 
 - Target code structure (header layout, key structs, field offsets at the target commit)
