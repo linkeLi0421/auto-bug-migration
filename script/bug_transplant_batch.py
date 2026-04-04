@@ -102,7 +102,12 @@ def select_crash_test_input(bug_id: str, testcases_dir: str) -> str:
 # Target commit selection (adapted from revert_patch_test.py lines 1310-1386)
 # ---------------------------------------------------------------------------
 
-STRONG_TRIGGER_STATUSES = {"1|1", "1|0", "0.5|1", "0.5|0"}
+# Statuses that count toward target-commit selection (high-confidence triggers).
+STRONG_TRIGGER_STATUSES = {"1|1", "1|0", "0.5|1"}
+# Statuses treated as "already triggering" when partitioning bugs at the chosen
+# target commit.  Includes 0.5|0 (crashes but with mismatched signature) so we
+# don't waste agent runs on bugs that already crash locally.
+LOCAL_BUG_STATUSES = {"1|1", "1|0", "0.5|1", "0.5|0"}
 
 
 def _is_ancestor(repo_path: str, older: str, newer: str) -> bool:
@@ -203,11 +208,11 @@ def prepare_transplant(
     data: list[dict],
     repo_path: str | None,
     target_commit_override: str | None = None,
-) -> tuple[set[str], dict[str, dict], dict]:
+) -> tuple[set[str], dict[str, dict], set[str], dict]:
     """Select target commit and partition bugs.
 
     Returns:
-        (bug_ids_trigger, bugs_need_transplant, target_row)
+        (bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row)
     """
     # Recount poc stats (CSV parser may have partial counts)
     for row in data:
@@ -247,7 +252,7 @@ def prepare_transplant(
     bug_ids_trigger: set[str] = set()
     bug_ids_other: set[str] = set()
     for bug_id, status in target_row["osv_statuses"].items():
-        if status in STRONG_TRIGGER_STATUSES:
+        if status in LOCAL_BUG_STATUSES:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
@@ -278,20 +283,7 @@ def prepare_transplant(
         if b not in bugs_need_transplant and b != "poc count"
     }
 
-    logger.info("All bugs count: %d", len(target_row["osv_statuses"]))
-    logger.info(
-        "Target row poc_count=%d weak_poc_count=%d",
-        target_row["poc_count"], target_row["weak_poc_count"],
-    )
-    logger.info("Already triggering: %d %s", len(bug_ids_trigger), bug_ids_trigger)
-    logger.info(
-        "Need transplant: %d %s",
-        len(bugs_need_transplant), set(bugs_need_transplant.keys()),
-    )
-    if bugs_cant_use:
-        logger.info("Cannot use (no triggering commit): %d %s", len(bugs_cant_use), bugs_cant_use)
-
-    return bug_ids_trigger, bugs_need_transplant, target_row
+    return bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +670,7 @@ def main() -> int:
         elif os.path.isdir(args.repo_path):
             repo_path = args.repo_path
 
-    bug_ids_trigger, bugs_need_transplant, target_row = prepare_transplant(
+    bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row = prepare_transplant(
         parsed_data, repo_path, args.target_commit,
     )
     if not target_row:
@@ -707,6 +699,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 3. Resolve metadata and validate
     # ------------------------------------------------------------------
+    skipped_non_asan: list[str] = []
     bug_tasks: list[tuple[str, str, dict]] = []  # (bug_id, buggy_commit, metadata)
     for bug_id, row in bugs_need_transplant.items():
         metadata = resolve_bug_metadata(bug_id, bug_info_dataset, args.testcases_dir)
@@ -717,7 +710,7 @@ def main() -> int:
             logger.warning("Skipping %s: no fuzzer name in metadata", bug_id)
             continue
         if metadata["sanitizer"] != "address":
-            logger.info("Skipping %s: non-ASAN sanitizer (%s)", bug_id, metadata["sanitizer"])
+            skipped_non_asan.append(bug_id)
             continue
         # Check testcase exists
         testcase_path = os.path.join(args.testcases_dir, metadata["testcase"])
@@ -732,13 +725,23 @@ def main() -> int:
             )
             if adjacent:
                 metadata["adjacent_commit"] = adjacent
-                logger.info("[%s] Adjacent CSV commit: %s..%s",
-                            bug_id, buggy_commit[:8], adjacent[:8])
             else:
                 logger.debug("[%s] No adjacent CSV commit found", bug_id)
         bug_tasks.append((bug_id, buggy_commit, metadata))
 
-    logger.info("Bugs to process: %d", len(bug_tasks))
+    # ------------------------------------------------------------------
+    # Summary (printed after all filters applied)
+    # ------------------------------------------------------------------
+    logger.info("All bugs count: %d", len(target_row["osv_statuses"]))
+    logger.info("Target commit: %s (poc_count=%d)",
+                target_commit[:12], target_row["poc_count"])
+    logger.info("Already triggering: %d %s", len(bug_ids_trigger), bug_ids_trigger)
+    if bugs_cant_use:
+        logger.info("Cannot use (no triggering commit): %d %s", len(bugs_cant_use), bugs_cant_use)
+    if skipped_non_asan:
+        logger.info("Skipped non-ASAN: %d %s", len(skipped_non_asan), skipped_non_asan)
+    logger.info("Bugs to transplant: %d %s",
+                len(bug_tasks), {b for b, _, _ in bug_tasks})
 
     # Generate fix diffs upfront so they exist even for --resume skipped bugs
     if repo_path:

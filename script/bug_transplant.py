@@ -103,6 +103,29 @@ MEMORY_TEMPLATE = SCRIPT_DIR / "prompts" / "bug_transplant_memory.md"
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run_quiet(cmd: list[str], label: str = "", **kwargs) -> int:
+    """Run a command, capture output, and only show it on failure.
+
+    On success, output is logged at DEBUG level.
+    On failure, the last 30 lines of combined output are logged at ERROR.
+    """
+    label = label or cmd[0]
+    logger.info("Running: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        tail = "\n".join(combined.splitlines()[-30:])
+        logger.error("[%s] failed (exit %d). Last 30 lines:\n%s",
+                     label, proc.returncode, tail)
+    elif combined.strip():
+        logger.debug("[%s] output:\n%s", label, combined.strip())
+    return proc.returncode
+
+
+# ---------------------------------------------------------------------------
 # Phase 0: Collect crash and trace data
 # ---------------------------------------------------------------------------
 
@@ -130,10 +153,8 @@ def collect_crash_data(args: argparse.Namespace) -> bool:
     if args.runner_image:
         cmd += ["--runner-image", args.runner_image]
 
-    logger.info("Running: %s", " ".join(cmd))
-    ret = subprocess.call(cmd)
+    ret = _run_quiet(cmd, label="collect_crash")
     if ret != 0:
-        logger.error("collect_crash failed (exit %d)", ret)
         return False
 
     if not crash_file.exists():
@@ -168,10 +189,8 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
     if args.runner_image:
         cmd += ["--runner-image", args.runner_image]
 
-    logger.info("Running: %s", " ".join(cmd))
-    ret = subprocess.call(cmd)
+    ret = _run_quiet(cmd, label="collect_trace")
     if ret != 0:
-        logger.error("collect_trace failed (exit %d)", ret)
         return False
 
     if not trace_file.exists():
@@ -258,7 +277,7 @@ def build_project_image(
         ]
         if build_csv:
             cmd += ["--build_csv", build_csv]
-        ret = subprocess.call(cmd)
+        ret = _run_quiet(cmd, label="build_version")
         if ret != 0:
             logger.error("fuzz_helper.py build_version failed for %s", project)
             sys.exit(1)
@@ -275,9 +294,9 @@ def build_project_image(
 
     logger.info("Building OSS-Fuzz project image for %s...", project)
     helper_py = OSS_FUZZ_DIR / "infra" / "helper.py"
-    ret = subprocess.call(
+    ret = _run_quiet(
         [sys.executable, str(helper_py), "build_image", project],
-        cwd=str(OSS_FUZZ_DIR),
+        label="build_image",
     )
     if ret != 0:
         logger.error("Failed to build project image for %s", project)
@@ -359,8 +378,9 @@ def build_agent_image(project: str, project_image: str) -> str:
     with tempfile.TemporaryDirectory() as tmpdir:
         df_path = Path(tmpdir) / "Dockerfile"
         df_path.write_text(dockerfile_content)
-        ret = subprocess.call(
+        ret = _run_quiet(
             ["docker", "build", "-t", tag, "-f", str(df_path), tmpdir],
+            label="build_agent_image",
         )
         if ret != 0:
             logger.error("Failed to build codex agent image")
@@ -534,7 +554,7 @@ def create_shared_container(
     docker_run_cmd += [image_tag, "sleep", "infinity"]
 
     logger.info("Creating shared container: %s", container_name)
-    ret = subprocess.call(docker_run_cmd)
+    ret = _run_quiet(docker_run_cmd, label="docker-run-shared")
     if ret != 0:
         logger.error("Failed to create shared container")
         return 1
@@ -655,7 +675,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         docker_run_cmd += [image_tag, "sleep", "infinity"]
 
         logger.info("Starting container: %s", container_name)
-        ret = subprocess.call(docker_run_cmd)
+        ret = _run_quiet(docker_run_cmd, label="docker-run")
         if ret != 0:
             logger.error("Failed to start container")
             return 1
