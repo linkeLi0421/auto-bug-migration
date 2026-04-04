@@ -102,7 +102,7 @@ def select_crash_test_input(bug_id: str, testcases_dir: str) -> str:
 # Target commit selection (adapted from revert_patch_test.py lines 1310-1386)
 # ---------------------------------------------------------------------------
 
-STRONG_TRIGGER_STATUSES = {"1|1", "1|0", "0.5|1"}
+STRONG_TRIGGER_STATUSES = {"1|1", "1|0", "0.5|1", "0.5|0"}
 
 
 def _is_ancestor(repo_path: str, older: str, newer: str) -> bool:
@@ -715,6 +715,9 @@ def main() -> int:
             continue
         if not metadata["fuzzer"]:
             logger.warning("Skipping %s: no fuzzer name in metadata", bug_id)
+            continue
+        if metadata["sanitizer"] != "address":
+            logger.info("Skipping %s: non-ASAN sanitizer (%s)", bug_id, metadata["sanitizer"])
             continue
         # Check testcase exists
         testcase_path = os.path.join(args.testcases_dir, metadata["testcase"])
