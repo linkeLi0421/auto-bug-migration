@@ -349,7 +349,7 @@ def run_single_bug(
     metadata: dict,
     args: argparse.Namespace,
     container_name: str | None = None,
-    claude_dir: str | None = None,
+    agents_dir: str | None = None,
     repo_path: str | None = None,
 ) -> dict:
     """Run bug_transplant.py for a single bug, return result dict."""
@@ -385,8 +385,6 @@ def run_single_bug(
         cmd += ["--repo-path", repo_path]
     if metadata.get("adjacent_commit"):
         cmd += ["--adjacent-commit", metadata["adjacent_commit"]]
-    if args.agent:
-        cmd += ["--agent", args.agent]
     if args.model:
         cmd += ["--model", args.model]
     if args.timeout:
@@ -398,8 +396,8 @@ def run_single_bug(
     # Shared container mode
     if container_name:
         cmd += ["--container-name", container_name]
-    if claude_dir:
-        cmd += ["--claude-dir", claude_dir]
+    if agents_dir:
+        cmd += ["--agents-dir", agents_dir]
 
     logger.info("[%s] Starting: buggy=%s target=%s fuzzer=%s",
                 bug_id, buggy_commit[:8], target_commit[:8], metadata["fuzzer"])
@@ -417,9 +415,11 @@ def run_single_bug(
             result["status"] = "success"
         else:
             result["status"] = "failed"
-            # Capture last 500 chars of output for diagnostics
             output = (proc.stdout + proc.stderr).strip()
             result["error_message"] = output[-500:] if output else "non-zero exit"
+            # Print full subprocess output so failures are visible in the log
+            if output:
+                logger.error("[%s] Subprocess output:\n%s", bug_id, output)
     except subprocess.TimeoutExpired:
         result["status"] = "error"
         result["error_message"] = "subprocess timeout"
@@ -442,6 +442,19 @@ def run_single_bug(
     crash_path = out_dir / "transplant_crash.txt"
     if crash_path.exists() and crash_path.stat().st_size > 0:
         result["crash_log_path"] = str(crash_path)
+
+    # Collect token usage from per-bug output
+    usage_path = out_dir / "token_usage.json"
+    if usage_path.exists():
+        try:
+            usage = json.loads(usage_path.read_text())
+            result["token_usage"] = usage
+            logger.info("[%s] Token usage: %d in (%d cached) + %d out | Cost: $%.4f",
+                        bug_id, usage.get("input_tokens", 0),
+                        usage.get("cached_input_tokens", 0),
+                        usage.get("output_tokens", 0), usage.get("cost", 0))
+        except Exception:
+            pass
 
     logger.info(
         "[%s] Finished: status=%s exit=%d elapsed=%.0fs diff=%s",
@@ -554,7 +567,7 @@ def write_summary(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Batch bug transplant via Claude Code",
+        description="Batch bug transplant via Codex",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -589,8 +602,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Process specific bug(s) only")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
-                        help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--jobs", type=int, default=1,
@@ -759,7 +770,7 @@ def main() -> int:
     from bug_transplant import build_project_image, build_agent_image
 
     project_image = build_project_image(args.target, target_commit, args.build_csv)
-    agent_image = build_agent_image(args.target, project_image, args.agent)
+    agent_image = build_agent_image(args.target, project_image)
     logger.info("Docker images ready: %s", agent_image)
 
     # ------------------------------------------------------------------
@@ -793,36 +804,35 @@ def main() -> int:
 
     # --- Create shared container for sequential mode ---
     from bug_transplant import (
-        setup_claude_dir, create_shared_container,
+        setup_agents_dir, create_shared_container,
     )
     import shutil
 
     shared_container = None
-    shared_claude_dir = None
+    shared_agents_dir = None
 
     try:
         if args.jobs <= 1:
-            # Create shared container + CLAUDE.md once for all bugs
+            # Create shared container + AGENTS.md once for all bugs
             shared_container = f"bug-transplant-{args.target}-batch"
             first_fuzzer = bug_tasks[0][2]["fuzzer"] if bug_tasks else "unknown"
 
-            # Build a temporary args-like object for setup_claude_dir
+            # Build a temporary args-like object for setup_agents_dir
             class _SetupArgs:
                 pass
             _sa = _SetupArgs()
             _sa.project = args.target
             _sa.target_commit = target_commit
             _sa.fuzzer_name = first_fuzzer
-            shared_claude_path = setup_claude_dir(_sa)
-            shared_claude_dir = str(shared_claude_path)
+            shared_agents_path = setup_agents_dir(_sa)
+            shared_agents_dir = str(shared_agents_path)
 
             # Create the shared container once
             ret = create_shared_container(
                 project=args.target,
                 target_commit=target_commit,
                 container_name=shared_container,
-                claude_dir=shared_claude_path,
-                agent=args.agent,
+                agents_dir=shared_agents_path,
                 testcases_dir=args.testcases_dir,
             )
             if ret != 0:
@@ -843,15 +853,15 @@ def main() -> int:
                     args.target, bug_id, buggy_commit, target_commit,
                     metadata, args,
                     container_name=shared_container,
-                    claude_dir=shared_claude_dir,
+                    agents_dir=shared_agents_dir,
                     repo_path=repo_path,
                 )
                 results.append(result)
                 write_progress(artifacts_root, results, ongoing=[])
-                # Persist CLAUDE.md after each bug so knowledge survives interruption
-                _claude_md = Path(shared_claude_dir) / "CLAUDE.md"
-                if _claude_md.exists():
-                    shutil.copy2(_claude_md, artifacts_root / "CLAUDE.md")
+                # Persist AGENTS.md after each bug so knowledge survives interruption
+                _agents_md = Path(shared_agents_dir) / "AGENTS.md"
+                if _agents_md.exists():
+                    shutil.copy2(_agents_md, artifacts_root / "AGENTS.md")
         else:
             # Parallel via ThreadPoolExecutor
             ongoing: set[str] = set()
@@ -894,15 +904,15 @@ def main() -> int:
         elif shared_container:
             logger.info("Shared container kept: docker exec -it %s bash",
                         shared_container)
-        # Save final CLAUDE.md to artifacts
-        if shared_claude_dir:
-            claude_md = Path(shared_claude_dir) / "CLAUDE.md"
-            if claude_md.exists():
-                dest = artifacts_root / "CLAUDE.md"
-                shutil.copy2(claude_md, dest)
+        # Save final AGENTS.md to artifacts
+        if shared_agents_dir:
+            agents_md = Path(shared_agents_dir) / "AGENTS.md"
+            if agents_md.exists():
+                dest = artifacts_root / "AGENTS.md"
+                shutil.copy2(agents_md, dest)
                 logger.info("Shared knowledge saved: %s", dest)
             # Clean up temp dir
-            shutil.rmtree(Path(shared_claude_dir).parent, ignore_errors=True)
+            shutil.rmtree(shared_agents_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # 6. Write summary
@@ -912,6 +922,12 @@ def main() -> int:
         artifacts_root, results, target_commit, args.target,
         bug_ids_trigger, total_elapsed,
     )
+
+    # Aggregate token usage
+    total_input = sum(r.get("token_usage", {}).get("input_tokens", 0) for r in results)
+    total_cached = sum(r.get("token_usage", {}).get("cached_input_tokens", 0) for r in results)
+    total_output = sum(r.get("token_usage", {}).get("output_tokens", 0) for r in results)
+    total_cost = sum(r.get("token_usage", {}).get("cost", 0) for r in results)
 
     # Print final stats
     succeeded = sum(1 for r in results if r["status"] == "success")
@@ -924,6 +940,9 @@ def main() -> int:
     print(f"  Skipped:   {skipped}")
     print(f"  Already triggering at target: {len(bug_ids_trigger)}")
     print(f"  Total time: {total_elapsed:.0f}s")
+    if total_cost > 0:
+        print(f"  Tokens:    {total_input} in ({total_cached} cached) + {total_output} out")
+        print(f"  Cost:      ${total_cost:.4f}")
     print(f"  Summary:  {artifacts_root / 'summary.json'}")
     print(f"{'='*60}\n")
 

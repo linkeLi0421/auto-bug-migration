@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Bug transplant launcher -- runs Claude Code inside an OSS-Fuzz container.
+"""Bug transplant launcher -- runs Codex inside an OSS-Fuzz container.
 
 Workflow:
   Phase 0: Collect crash log and function trace via fuzz_helper.py
-  Phase 1: Build Claude-layered Docker image on top of the project image
+  Phase 1: Build Codex-layered Docker image on top of the project image
   Phase 2: Start persistent container with proper volumes
-  Phase 3: Run Claude Code with the bug transplant prompt
+  Phase 3: Run Codex with the bug transplant prompt
   Phase 4: Collect output diff
 
 Usage:
-  # Full pipeline (collect data + run Claude Code):
+  # Full pipeline (collect data + run Codex):
   sudo -E python3 script/bug_transplant.py wavpack \\
     --buggy-commit 348ff60b \\
     --target-commit 0b99613e \\
@@ -26,10 +26,10 @@ Usage:
     --testcase testcase-OSV-2020-1006 \\
     --skip-collect
 
-  # Use a specific Claude model:
+  # Use a specific model:
   sudo -E python3 script/bug_transplant.py wavpack \\
     ... \\
-    --claude-model claude-sonnet-4-6
+    --model o3
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import argparse
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,47 +52,41 @@ logger = logging.getLogger(__name__)
 # Lazy-initialized in main(); imported here so the module can be used as a library.
 _usage_tracker = None
 
-# Pin CLI versions for reproducibility.
-# Update deliberately after testing with new versions.
-AGENT_VERSIONS = {
-    "claude": "2.1.81",   # @anthropic-ai/claude-code
-    "codex": "0.116.0",   # @openai/codex
-    "opencode": "latest",  # Go binary, installed via brew/curl
+# Pin CLI version for reproducibility.
+CODEX_VERSION = "0.116.0"  # @openai/codex
+
+# Codex agent configuration
+CODEX_CONFIG = {
+    "npm_package": "@openai/codex",
+    "cli_name": "codex",
+    "cli_entry": "@openai/codex/bin/codex.js",
+    "api_key_env": "OPENAI_API_KEY",
+    "credentials_dir": ".codex",
+    "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
+    "model_flag": "--model",
 }
 
-# Agent-specific configuration
-AGENT_CONFIG = {
-    "claude": {
-        "npm_package": "@anthropic-ai/claude-code",
-        "cli_name": "claude",
-        "cli_entry": "@anthropic-ai/claude-code/cli.js",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "credentials_dir": ".claude",        # ~/.<this> on host
-        "credentials_config": ".claude.json", # ~/.<this> on host
-        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions",
-        "model_flag": "--model",
-    },
-    "codex": {
-        "npm_package": "@openai/codex",
-        "cli_name": "codex",
-        "cli_entry": "@openai/codex/bin/codex.js",
-        "api_key_env": "OPENAI_API_KEY",
-        "credentials_dir": ".codex",
-        "credentials_config": None,
-        "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
-        "model_flag": "--model",
-    },
-    "opencode": {
-        "npm_package": None,                  # Go binary, not npm
-        "cli_name": "opencode",
-        "cli_entry": None,                    # installed as Go binary
-        "api_key_env": "ANTHROPIC_API_KEY",   # default; also supports OPENAI_API_KEY etc.
-        "credentials_dir": ".opencode",
-        "credentials_config": ".opencode.json",
-        "run_cmd": "opencode run {prompt}",   # run subcommand, message as positional arg
-        "model_flag": "-m",                   # -m provider/model format
-    },
-}
+
+def setup_codex_creds(container: str) -> None:
+    """Copy codex credentials into container."""
+    _exec(
+        container,
+        "cp -r /tmp/.agent-creds-src /home/agent/.codex 2>/dev/null; "
+        "rm -rf /home/agent/.codex/projects 2>/dev/null; "
+        "chown -R agent:agent /home/agent/.codex 2>/dev/null; "
+        "true",
+        user="root",
+    )
+
+
+def build_codex_command(prompt: str, model: str | None = None) -> str:
+    """Build the codex CLI command."""
+    escaped = shlex.quote(prompt)
+    cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
+    if model:
+        cmd += f" --model {shlex.quote(model)}"
+    cmd += " --json"
+    return cmd
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -232,7 +227,7 @@ def collect_fix_diff(args: argparse.Namespace) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Build Docker image with Claude Code layered on top
+# Phase 1: Build Docker image with Codex layered on top
 # ---------------------------------------------------------------------------
 
 def build_project_image(
@@ -291,17 +286,14 @@ def build_project_image(
     return image_tag
 
 
-def build_agent_image(project: str, project_image: str, agent: str = "claude") -> str:
-    """Layer a code agent CLI on top of the project image.
+def build_agent_image(project: str, project_image: str) -> str:
+    """Layer the Codex CLI on top of the project image.
 
     Produces ``bug-transplant-<project>:latest``.
-    Supports agent types: ``claude``, ``codex``, ``opencode``.
     """
-    cfg = AGENT_CONFIG[agent]
-    version = AGENT_VERSIONS[agent]
-    npm_pkg = cfg["npm_package"]
-    cli_name = cfg["cli_name"]
-    cli_entry = cfg["cli_entry"]
+    npm_pkg = CODEX_CONFIG["npm_package"]
+    cli_name = CODEX_CONFIG["cli_name"]
+    cli_entry = CODEX_CONFIG["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
 
     # Skip rebuild if the agent image already exists
@@ -310,94 +302,59 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
         capture_output=True,
     )
     if inspect.returncode == 0:
-        logger.info("%s agent image already exists, reusing: %s", agent, tag)
+        logger.info("Agent image already exists, reusing: %s", tag)
         return tag
 
-    logger.info("Building %s agent image '%s' on top of '%s'...", agent, tag, project_image)
+    logger.info("Building codex agent image '%s' on top of '%s'...", tag, project_image)
 
-    if npm_pkg:
-        # Node.js-based agent (claude, codex)
-        dockerfile_content = textwrap.dedent(f"""\
-            # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
-            FROM ubuntu:22.04 AS agent-builder
-            ENV DEBIAN_FRONTEND=noninteractive
-            RUN apt-get update && apt-get install -y --no-install-recommends \\
-                    curl ca-certificates \\
-                && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
-                && apt-get install -y --no-install-recommends nodejs \\
-                && npm install -g {npm_pkg}@{version} \\
-                && rm -rf /var/lib/apt/lists/*
+    dockerfile_content = textwrap.dedent(f"""\
+        # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
+        FROM ubuntu:22.04 AS agent-builder
+        ENV DEBIAN_FRONTEND=noninteractive
+        RUN apt-get update && apt-get install -y --no-install-recommends \\
+                curl ca-certificates \\
+            && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
+            && apt-get install -y --no-install-recommends nodejs \\
+            && npm install -g {npm_pkg}@{CODEX_VERSION} \\
+            && rm -rf /var/lib/apt/lists/*
 
-            # Stage 2: Project image with agent CLI copied in.
-            FROM {project_image}
-            ENV DEBIAN_FRONTEND=noninteractive
+        # Stage 2: Project image with agent CLI copied in.
+        FROM {project_image}
+        ENV DEBIAN_FRONTEND=noninteractive
 
-            # Copy Node.js and agent CLI with all dependencies
-            COPY --from=agent-builder /usr/bin/node /usr/local/bin/node
-            COPY --from=agent-builder /usr/lib/node_modules /usr/local/lib/node_modules
-            # Copy glibc and libstdc++ from builder so node binary works on old bases
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
-            COPY --from=agent-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
-            COPY --from=agent-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
-            COPY --from=agent-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
+        # Copy Node.js and agent CLI with all dependencies
+        COPY --from=agent-builder /usr/bin/node /usr/local/bin/node
+        COPY --from=agent-builder /usr/lib/node_modules /usr/local/lib/node_modules
+        # Copy glibc and libstdc++ from builder so node binary works on old bases
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libc.so.6 /opt/node-libs/libc.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libm.so.6 /opt/node-libs/libm.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libpthread.so.0 /opt/node-libs/libpthread.so.0
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libdl.so.2 /opt/node-libs/libdl.so.2
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/librt.so.1 /opt/node-libs/librt.so.1
+        COPY --from=agent-builder /lib64/ld-linux-x86-64.so.2 /opt/node-libs/ld-linux-x86-64.so.2
+        COPY --from=agent-builder /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /opt/node-libs/libstdc++.so.6
+        COPY --from=agent-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /opt/node-libs/libgcc_s.so.1
 
-            # Create wrapper script that uses the bundled libs
-            RUN echo '#!/bin/bash' > /usr/local/bin/{cli_name} \\
-                && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/{cli_entry} "$@"' >> /usr/local/bin/{cli_name} \\
-                && chmod +x /usr/local/bin/{cli_name}
+        # Create wrapper script that uses the bundled libs
+        RUN echo '#!/bin/bash' > /usr/local/bin/{cli_name} \\
+            && echo 'exec /opt/node-libs/ld-linux-x86-64.so.2 --library-path /opt/node-libs /usr/local/bin/node /usr/local/lib/node_modules/{cli_entry} "$@"' >> /usr/local/bin/{cli_name} \\
+            && chmod +x /usr/local/bin/{cli_name}
 
-            # sudo may not exist on older base images
-            RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
-                && rm -rf /var/lib/apt/lists/* || true
+        # sudo may not exist on older base images
+        RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
+            && rm -rf /var/lib/apt/lists/* || true
 
-            # Create a non-root user (some CLIs refuse to run as root)
-            RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
-                && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
-                && chown -R agent:agent /src/ /out/ /work/ || true
+        # Create a non-root user (some CLIs refuse to run as root)
+        RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
+            && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
+            && chown -R agent:agent /src/ /out/ /work/ || true
 
-            ENV HOME=/home/agent
-            USER agent
+        ENV HOME=/home/agent
+        USER agent
 
-            WORKDIR /src/{project}
-            CMD ["sleep", "infinity"]
-        """)
-    else:
-        # Go-based agent (opencode) — install via curl
-        dockerfile_content = textwrap.dedent(f"""\
-            # Stage 1: Install Go-based agent on a modern base.
-            FROM ubuntu:22.04 AS agent-builder
-            ENV DEBIAN_FRONTEND=noninteractive
-            RUN apt-get update && apt-get install -y --no-install-recommends \\
-                    curl ca-certificates \\
-                && curl -fsSL https://opencode.ai/install | bash \\
-                && rm -rf /var/lib/apt/lists/*
-
-            # Stage 2: Project image with agent binary copied in.
-            FROM {project_image}
-            ENV DEBIAN_FRONTEND=noninteractive
-
-            # Copy opencode binary
-            COPY --from=agent-builder /root/.opencode/bin/{cli_name} /usr/local/bin/{cli_name}
-
-            # sudo may not exist on older base images
-            RUN apt-get update && apt-get install -y --no-install-recommends sudo \\
-                && rm -rf /var/lib/apt/lists/* || true
-
-            # Create a non-root user (some CLIs refuse to run as root)
-            RUN (useradd -m -d /home/agent -s /bin/bash agent 2>/dev/null || true) \\
-                && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
-                && chown -R agent:agent /src/ /out/ /work/ || true
-
-            ENV HOME=/home/agent
-            USER agent
-
-            WORKDIR /src/{project}
-            CMD ["sleep", "infinity"]
-        """)
+        WORKDIR /src/{project}
+        CMD ["sleep", "infinity"]
+    """)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         df_path = Path(tmpdir) / "Dockerfile"
@@ -406,15 +363,15 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
             ["docker", "build", "-t", tag, "-f", str(df_path), tmpdir],
         )
         if ret != 0:
-            logger.error("Failed to build Claude agent image")
+            logger.error("Failed to build codex agent image")
             sys.exit(1)
 
-    logger.info("Claude agent image built: %s", tag)
+    logger.info("Codex agent image built: %s", tag)
     return tag
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 + 3: Run Claude Code inside a persistent container
+# Phase 2 + 3: Run Codex inside a persistent container
 # ---------------------------------------------------------------------------
 
 def build_prompt(args: argparse.Namespace) -> str:
@@ -467,56 +424,41 @@ def _build_minimize_prompt(args: argparse.Namespace) -> str:
     )
 
 
-def setup_claude_dir(args: argparse.Namespace) -> Path:
-    """Prepare a temporary directory containing Claude settings and CLAUDE.md.
+def setup_agents_dir(args: argparse.Namespace) -> Path:
+    """Prepare a temporary directory containing AGENTS.md shared knowledge.
 
-    Returns the path to a temporary .claude/ directory that will be
-    mounted into the container at /src/{project}/.claude/.
+    Returns the path to the temporary directory that will be
+    mounted into the container at /src/{project}/AGENTS.md.
     """
-    tmpdir = Path(tempfile.mkdtemp(prefix="bug_transplant_claude_"))
-    claude_dir = tmpdir / ".claude"
-    claude_dir.mkdir()
+    tmpdir = Path(tempfile.mkdtemp(prefix="bug_transplant_agents_"))
 
-    # Write settings to allow all tools without prompting
-    settings = claude_dir / "settings.json"
-    settings.write_text(
-        '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", '
-        '"Edit(*)", "Glob(*)", "Grep(*)"],'
-        '"deny": ["WebSearch", "WebFetch"]}}\n'
-    )
-
-    # Write opencode.json to allow all tools without prompting (for opencode agent)
-    opencode_cfg = tmpdir / "opencode.json"
-    opencode_cfg.write_text('{"permission": "allow"}\n')
-
-    # Seed CLAUDE.md: use saved knowledge from a previous batch run if available,
+    # Seed AGENTS.md: use saved knowledge from a previous batch run if available,
     # otherwise fall back to the blank template.
-    claude_md = claude_dir / "CLAUDE.md"
-    saved_claude_md = (
+    agents_md = tmpdir / "AGENTS.md"
+    saved_agents_md = (
         DATA_DIR / "bug_transplant"
         / f"batch_{args.project}_{args.target_commit[:8]}"
-        / "CLAUDE.md"
+        / "AGENTS.md"
     )
-    if saved_claude_md.exists():
-        claude_md.write_text(saved_claude_md.read_text())
-        logger.info("Seeding CLAUDE.md from previous run: %s", saved_claude_md)
+    if saved_agents_md.exists():
+        agents_md.write_text(saved_agents_md.read_text())
+        logger.info("Seeding AGENTS.md from previous run: %s", saved_agents_md)
     else:
         template = MEMORY_TEMPLATE.read_text()
-        claude_md.write_text(template.format(
+        agents_md.write_text(template.format(
             project=args.project,
             target_commit=args.target_commit,
             fuzzer_name=args.fuzzer_name,
         ))
 
-    return claude_dir
+    return tmpdir
 
 
 def create_shared_container(
     project: str,
     target_commit: str,
     container_name: str,
-    claude_dir: Path,
-    agent: str = "claude",
+    agents_dir: Path,
     testcases_dir: str = "",
     env: list[str] | None = None,
     volume: list[str] | None = None,
@@ -525,7 +467,6 @@ def create_shared_container(
 
     Returns 0 on success, non-zero on failure.
     """
-    cfg = AGENT_CONFIG[agent]
     image_tag = f"bug-transplant-{project}:latest"
 
     data_dir = str(DATA_DIR)
@@ -571,24 +512,17 @@ def create_shared_container(
         "-v", f"{script_dir}:/script:ro",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
-        "-v", f"{claude_dir}/settings.json:/src/{project}/.claude/settings.json:ro",
-        "-v", f"{claude_dir}/../opencode.json:/src/{project}/opencode.json:ro",
-        "-v", f"{claude_dir}/CLAUDE.md:/src/{project}/CLAUDE.md",
+        "-v", f"{agents_dir}/AGENTS.md:/src/{project}/AGENTS.md",
     ]
 
-    # Mount agent credentials
-    cred_dir = Path.home() / cfg["credentials_dir"]
+    # Mount codex credentials
+    cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
     if cred_dir.exists():
         docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-    cred_config = cfg.get("credentials_config")
-    if cred_config:
-        cred_config_path = Path.home() / cred_config
-        if cred_config_path.exists():
-            docker_run_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    api_key = os.environ.get(cfg["api_key_env"], "")
+    api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
     if api_key:
-        docker_run_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+        docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
     if env:
         for e in env:
@@ -607,50 +541,22 @@ def create_shared_container(
 
     # Initial setup: git safe directory, checkout, credentials
     _exec(container_name, "git config --global --add safe.directory '*'", user="root")
-    _exec(container_name, f"cd /src/{project} && git clean -fdx -e CLAUDE.md -e .claude/", user="root")
+    _exec(container_name, f"cd /src/{project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
     _exec(container_name, f"cd /src/{project} && git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-    # Setup agent credentials
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container_name,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container_name,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
-
-    if agent == "claude":
-        _exec(
-            container_name,
-            f"mkdir -p /home/agent/.claude/projects/-src-{project}/; "
-            f"cp /src/{project}/.claude/settings.json "
-            f"/home/agent/.claude/projects/-src-{project}/settings.json 2>/dev/null; "
-            f"cp /src/{project}/CLAUDE.md "
-            f"/home/agent/.claude/projects/-src-{project}/CLAUDE.md 2>/dev/null; "
-            "true",
-        )
+    # Setup codex credentials
+    setup_codex_creds(container_name)
 
     logger.info("Shared container ready: %s", container_name)
     return 0
 
 
 def run_agent_in_container(args: argparse.Namespace) -> int:
-    """Start container, run code agent, collect results.
+    """Start container, run Codex agent, collect results.
 
     Returns 0 on success, non-zero on failure.
     """
-    agent = getattr(args, "agent", "claude")
-    cfg = AGENT_CONFIG[agent]
-
     image_tag = f"bug-transplant-{args.project}:latest"
     reuse_container = getattr(args, "container_name", None)
     container_name = reuse_container or f"bug-transplant-{args.project}-{args.bug_id}"
@@ -677,10 +583,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         os.makedirs(out_dir, exist_ok=True)
         os.makedirs(work_dir, exist_ok=True)
 
-    # Use shared claude_dir if provided (batch mode), otherwise create new
-    shared_claude_dir = getattr(args, "claude_dir", None)
-    claude_dir = Path(shared_claude_dir) if shared_claude_dir else setup_claude_dir(args)
-    owns_claude_dir = shared_claude_dir is None
+    # Use shared agents_dir if provided (batch mode), otherwise create new
+    shared_agents_dir = getattr(args, "agents_dir", None)
+    agents_dir = Path(shared_agents_dir) if shared_agents_dir else setup_agents_dir(args)
+    owns_agents_dir = shared_agents_dir is None
 
     prompt = build_prompt(args)
 
@@ -722,26 +628,19 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "-v", f"{script_dir}:/script:ro",
             "-v", f"{out_dir}:/out",
             "-v", f"{work_dir}:/work",
-            # Claude settings (ro) + CLAUDE.md as shared memory (rw)
-            "-v", f"{claude_dir}/settings.json:/src/{args.project}/.claude/settings.json:ro",
-            "-v", f"{claude_dir}/../opencode.json:/src/{args.project}/opencode.json:ro",
-            "-v", f"{claude_dir}/CLAUDE.md:/src/{args.project}/CLAUDE.md",
+            # AGENTS.md as shared memory (rw)
+            "-v", f"{agents_dir}/AGENTS.md:/src/{args.project}/AGENTS.md",
         ]
 
-        # Mount agent credentials (login mode)
-        cred_dir = Path.home() / cfg["credentials_dir"]
+        # Mount codex credentials (login mode)
+        cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
         if cred_dir.exists():
             docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-        cred_config = cfg.get("credentials_config")
-        if cred_config:
-            cred_config_path = Path.home() / cred_config
-            if cred_config_path.exists():
-                docker_run_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
         # Environment — pass API key if set (fallback for non-login mode)
-        api_key = os.environ.get(cfg["api_key_env"], "")
+        api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
         if api_key:
-            docker_run_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+            docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
         # Additional user-specified env vars
         if args.env:
@@ -773,8 +672,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         _exec(container_name, "git config --global --add safe.directory '*'", user="root")
         # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
         # before checkout so they don't pollute the git diff later.
-        # Exclude .claude/ and .codex/ — they are bind-mounted for credentials.
-        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e .claude/ -e .codex/", user="root")
+        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
         _exec(container_name, f"cd /src/{args.project} && git checkout -f {args.target_commit}", user="root")
 
         # --- Copy testcase to /work for easier access ---
@@ -785,39 +683,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-        # --- Setup agent credentials (run as root to read host-owned 600 files) ---
-        creds_dir = cfg["credentials_dir"]
-        _exec(
-            container_name,
-            f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-            f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-            f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-            "true",
-            user="root",
-        )
-        if cfg.get("credentials_config"):
-            _exec(
-                container_name,
-                f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-                f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-                user="root",
-            )
-
-        # --- Copy Claude settings into the agent's home (claude only) ---
-        if agent == "claude":
-            _exec(
-                container_name,
-                f"mkdir -p /home/agent/.claude/projects/-src-{args.project}/; "
-                f"cp /src/{args.project}/.claude/settings.json "
-                f"/home/agent/.claude/projects/-src-{args.project}/settings.json 2>/dev/null; "
-                f"cp /src/{args.project}/CLAUDE.md "
-                f"/home/agent/.claude/projects/-src-{args.project}/CLAUDE.md 2>/dev/null; "
-                "true",
-            )
+        # --- Setup codex credentials ---
+        setup_codex_creds(container_name)
 
         # --- Run agent ---
-        logger.info("Running %s agent (this may take a while)...", agent)
-        agent_cmd = _build_agent_command(prompt, args)
+        logger.info("Running codex agent (this may take a while)...")
+        agent_cmd = build_codex_command(prompt, getattr(args, "model", None))
 
         start_time = time.monotonic()
         exit_code, output = _exec_capture(
@@ -825,38 +696,23 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         elapsed = time.monotonic() - start_time
 
-        # claude exits 0 even on max-turns — detect from output text
-        if exit_code == 0 and "Reached max turns" in output:
-            logger.warning("Agent hit max turns limit — treating as failure")
-            exit_code = 1
-
-        if agent == "codex" and _usage_tracker:
+        if _usage_tracker:
             _usage_tracker.log_usage("transplant", output, getattr(args, "model", None))
 
         logger.info(
-            "%s agent finished in %.0fs (exit code %d, %d bytes output)",
-            agent, elapsed, exit_code, len(output),
+            "Codex agent finished in %.0fs (exit code %d, %d bytes output)",
+            elapsed, exit_code, len(output),
         )
 
         # --- Save output ---
         output_dir = DATA_DIR / "bug_transplant" / f"{args.project}_{args.bug_id}"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save raw Claude output
-        (output_dir / "claude_output.txt").write_text(output)
-
-        # Save full conversation JSONL (before next bug overwrites it)
-        _, jsonl_list = _exec_capture(
-            container_name,
-            f"ls -t /home/agent/.claude/projects/-src-{args.project}/*.jsonl 2>/dev/null | head -1",
+        # Save raw JSONL and human-readable transcript
+        (output_dir / "agent_output.jsonl").write_text(output)
+        (output_dir / "agent_output.txt").write_text(
+            _format_codex_output(output)
         )
-        jsonl_path = jsonl_list.strip()
-        if jsonl_path:
-            subprocess.call(
-                ["docker", "cp", f"{container_name}:{jsonl_path}",
-                 str(output_dir / "conversation.jsonl")],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
 
         # Check if agent declared the bug impossible to transplant
         impossible_path = output_dir / "bug_transplant.impossible"
@@ -878,7 +734,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # capturing build artifacts via bare `git diff`.
         diff_path = output_dir / "bug_transplant.diff"
         _git_diff_excludes = (
-            "':(exclude).claude/' ':(exclude).codex/' "
+            "':(exclude).codex/' "
             "':(exclude)CMakeFiles/' ':(exclude)*/CMakeFiles/' "
             "':(exclude)CMakeCache.txt' ':(exclude)cmake_install.cmake' "
             "':(exclude)*/cmake_install.cmake' ':(exclude)CTestTestfile.cmake' "
@@ -1002,13 +858,13 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # --- Phase 2: Minimization (separate agent) ---
                 logger.info("=== Minimization phase ===")
                 minimize_prompt = _build_minimize_prompt(args)
-                minimize_cmd = _build_agent_command(minimize_prompt, args)
+                minimize_cmd = build_codex_command(minimize_prompt, getattr(args, "model", None))
                 min_start = time.monotonic()
                 min_exit, min_output = _exec_capture(
                     container_name, minimize_cmd, timeout=args.timeout,
                 )
                 min_elapsed = time.monotonic() - min_start
-                if agent == "codex" and _usage_tracker:
+                if _usage_tracker:
                     _usage_tracker.log_usage("minimize", min_output, getattr(args, "model", None))
                 logger.info("Minimization finished in %.0fs (exit %d)",
                             min_elapsed, min_exit)
@@ -1094,7 +950,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info("Resetting source tree for next bug...")
             _exec(container_name,
                   f"cd /src/{args.project} && git checkout -f {args.target_commit} && "
-                  f"git clean -fdx -e CLAUDE.md -e .claude/",
+                  f"git clean -fdx -e AGENTS.md -e .codex/",
                   user="root")
         elif not args.keep_container:
             logger.info("Destroying container %s...", container_name)
@@ -1106,32 +962,42 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info(
                 "Container kept alive: docker exec -it %s bash", container_name,
             )
-        # Clean up temp claude directory (only if we own it)
-        if owns_claude_dir:
-            shutil.rmtree(claude_dir.parent, ignore_errors=True)
+        # Clean up temp agents directory (only if we own it)
+        if owns_agents_dir:
+            shutil.rmtree(agents_dir, ignore_errors=True)
 
 
-def _build_agent_command(prompt: str, args: argparse.Namespace) -> str:
-    """Build the CLI command for the selected agent."""
-    import shlex
-
-    agent = getattr(args, "agent", "claude")
-    cfg = AGENT_CONFIG[agent]
-    escaped = shlex.quote(prompt)
-
-    # Build command from template
-    cmd = cfg["run_cmd"].format(prompt=escaped)
-
-    # Add model flag if specified
-    model = getattr(args, "model", None)
-    if model:
-        cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
-    # Enable JSONL output for codex so we can parse token usage
-    if agent == "codex":
-        cmd += " --json"
-
-    return cmd
+def _format_codex_output(jsonl_output: str) -> str:
+    """Convert codex --json JSONL output to a human-readable transcript."""
+    import json as _json
+    lines = []
+    for raw in jsonl_output.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = _json.loads(raw)
+        except _json.JSONDecodeError:
+            continue
+        if ev.get("type") != "item.completed":
+            continue
+        item = ev.get("item", {})
+        itype = item.get("type", "")
+        if itype == "agent_message":
+            text = item.get("text", "")
+            if text:
+                lines.append(f"\n{'='*60}")
+                lines.append(f"AGENT:")
+                lines.append(text)
+        elif itype == "command_execution":
+            cmd = item.get("command", "")
+            out = item.get("aggregated_output", "")
+            code = item.get("exit_code", "")
+            lines.append(f"\n--- CMD (exit {code}) ---")
+            lines.append(f"$ {cmd}")
+            if out:
+                lines.append(out.rstrip())
+    return "\n".join(lines) + "\n" if lines else jsonl_output
 
 
 def _exec(container_name: str, command: str, user: str | None = None) -> int:
@@ -1168,7 +1034,7 @@ def _exec_capture(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bug transplant via Claude Code inside OSS-Fuzz container",
+        description="Bug transplant via Codex inside OSS-Fuzz container",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -1220,8 +1086,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip crash/trace collection (data already exists)")
 
     # Agent
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex", "opencode"],
-                        help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--timeout", type=int, default=3600,
@@ -1232,8 +1096,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Keep container alive after completion for debugging")
     parser.add_argument("--container-name", default=None,
                         help="Reuse an existing container (batch mode)")
-    parser.add_argument("--claude-dir", default=None,
-                        help="Shared CLAUDE.md directory (batch mode)")
+    parser.add_argument("--agents-dir", default=None,
+                        help="Shared AGENTS.md directory (batch mode)")
     parser.add_argument("-e", "--env", action="append",
                         help="Additional env vars for container (VAR=value)")
     parser.add_argument("-v", "--volume", action="append",
@@ -1283,8 +1147,7 @@ def main() -> int:
             logger.error("Failed to collect crash data")
             return 1
         if not collect_trace_data(args):
-            logger.error("Failed to collect trace data")
-            return 1
+            logger.warning("Failed to collect trace data (non-fatal, agent will work without it)")
     else:
         logger.info("=== Phase 0: Skipped (--skip-collect) ===")
         # Verify data exists
@@ -1296,7 +1159,7 @@ def main() -> int:
         if not trace_file.exists():
             missing.append(str(trace_file))
         if missing:
-            logger.warning("Missing data files (Claude Code will work without them):")
+            logger.warning("Missing data files (agent will work without them):")
             for f in missing:
                 logger.warning("  %s", f)
 
@@ -1311,12 +1174,12 @@ def main() -> int:
     # ------------------------------------------------------------------
     logger.info("=== Phase 1: Building Docker images ===")
     project_image = build_project_image(args.project)
-    agent_image = build_agent_image(args.project, project_image, args.agent)
+    agent_image = build_agent_image(args.project, project_image)
 
     # ------------------------------------------------------------------
-    # Phase 2+3: Run Claude Code in container
+    # Phase 2+3: Run Codex in container
     # ------------------------------------------------------------------
-    logger.info("=== Phase 2+3: Running Claude Code in container ===")
+    logger.info("=== Phase 2+3: Running Codex in container ===")
     exit_code = run_agent_in_container(args)
 
     # ------------------------------------------------------------------
@@ -1333,12 +1196,23 @@ def main() -> int:
     elif git_diff_path.exists() and git_diff_path.stat().st_size > 0:
         logger.info("Git diff (fallback): %s", git_diff_path)
     else:
-        logger.warning("No diff produced -- check claude_output.txt for details")
+        logger.warning("No diff produced -- check agent_output.txt for details")
 
-    if (output_dir / "claude_output.txt").exists():
-        logger.info("Claude output: %s", output_dir / "claude_output.txt")
+    if (output_dir / "agent_output.txt").exists():
+        logger.info("Agent output: %s", output_dir / "agent_output.txt")
 
     _usage_tracker.log_session_total()
+
+    # Write usage stats to output dir so batch can aggregate
+    if _usage_tracker.cost > 0 and output_dir.exists():
+        import json
+        usage_path = output_dir / "token_usage.json"
+        usage_path.write_text(json.dumps({
+            "input_tokens": _usage_tracker.input_tokens,
+            "cached_input_tokens": _usage_tracker.cached_input_tokens,
+            "output_tokens": _usage_tracker.output_tokens,
+            "cost": round(_usage_tracker.cost, 6),
+        }, indent=2))
 
     return exit_code
 
