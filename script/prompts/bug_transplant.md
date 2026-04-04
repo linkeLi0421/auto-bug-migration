@@ -58,7 +58,21 @@ sudo -E compile
    to update the input. And do not change other parts of the testcase too much. 
 
 6. **Verify both directions**: the testcase must crash WITH your code change and NOT crash
-   without it. And it should trigger the same bug as original one. Always test clean code against your testcase before saving:
+   without it. The crash must be the same vulnerability -- but it does NOT need an identical
+   stack trace. A crash is a valid match if ALL of these hold:
+   - **Same sanitizer class** (e.g. both `AddressSanitizer: heap-buffer-overflow`)
+   - **Same access direction** (both READ, or both WRITE)
+   - **Same code area**: crash is in the same source file, or in a direct caller/callee
+     within the same subsystem
+   - **Overlapping call chain**: at least one function from the original stack appears
+     anywhere in the new stack (not just the top frames -- check the full chain including
+     callers and the allocating function)
+
+   Code refactoring between commits can shift the exact crash point within the same
+   vulnerable path. What matters is that the same underlying vulnerability is exercised,
+   not that the crash is on the exact same line.
+
+   Always test clean code against your testcase before saving:
    ```bash
    # Save your work
    git stash

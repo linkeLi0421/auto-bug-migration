@@ -830,21 +830,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 crash_matches = True  # assume match if no original to compare
                 if original_crash_file.exists():
                     orig_text = original_crash_file.read_text()
-                    # Extract crashing function (first #0 or #1 in project code)
-                    def _extract_crash_funcs(text):
-                        funcs = []
-                        for m in re.finditer(r'#\d+\s+\S+ in (\S+)\s+/src/', text):
-                            funcs.append(m.group(1))
-                        return funcs[:3]  # top 3 functions in project code
-
-                    orig_funcs = _extract_crash_funcs(orig_text)
-                    new_funcs = _extract_crash_funcs(fuzz_out)
-                    # Check if any of the top crash functions overlap
-                    if orig_funcs and new_funcs and not set(orig_funcs) & set(new_funcs):
-                        crash_matches = False
+                    crash_matches = _crash_stacks_match(orig_text, fuzz_out)
+                    if not crash_matches:
                         logger.warning(
-                            "Crash stack MISMATCH: original=%s new=%s",
-                            orig_funcs, new_funcs,
+                            "Crash stack MISMATCH (see above for details)",
                         )
 
             if has_crash and crash_matches:
@@ -965,6 +954,113 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # Clean up temp agents directory (only if we own it)
         if owns_agents_dir:
             shutil.rmtree(agents_dir, ignore_errors=True)
+
+
+def _extract_crash_funcs(text: str, limit: int = 0) -> list:
+    """Extract function names from crash stack frames in /src/ project code.
+
+    Args:
+        text: ASan/MSan/etc. crash output.
+        limit: Max functions to return (0 = all).
+    """
+    funcs = []
+    for m in re.finditer(r'#\d+\s+\S+ in (\S+)\s+/src/', text):
+        funcs.append(m.group(1))
+    return funcs[:limit] if limit else funcs
+
+
+def _extract_sanitizer_class(text: str):
+    """Extract sanitizer error class and access direction from crash output.
+
+    Returns (error_class, direction) e.g. ("heap-buffer-overflow", "READ")
+    or (None, None) if not found.
+    """
+    m = re.search(
+        r'ERROR:\s*\w+Sanitizer:\s*([\w-]+)\s+on address.*?\n'
+        r'(READ|WRITE)\s+of\s+size',
+        text, re.DOTALL,
+    )
+    if m:
+        return m.group(1), m.group(2)
+    # Fallback: try SUMMARY line for class, separate search for direction
+    m_summary = re.search(r'SUMMARY:\s*\w+Sanitizer:\s*([\w-]+)', text)
+    m_dir = re.search(r'(READ|WRITE)\s+of\s+size', text)
+    return (
+        m_summary.group(1) if m_summary else None,
+        m_dir.group(1) if m_dir else None,
+    )
+
+
+def _extract_crash_files(text: str) -> set:
+    """Extract source file basenames from crash stack frames in /src/."""
+    files = set()
+    for m in re.finditer(r'/src/\S+/([\w._-]+\.\w+):\d+', text):
+        files.add(m.group(1))
+    return files
+
+
+def _crash_stacks_match(orig_text: str, new_text: str) -> bool:
+    """Two-tier crash matching: exact (top-3 overlap) then same-vulnerability.
+
+    Tier 1: Any overlap in top-3 project-code functions (fast, high confidence).
+    Tier 2: Same sanitizer class + same access direction + overlapping call
+            chain (any depth) + same source file area.
+    """
+    # Tier 1: top-3 function overlap (original strict check)
+    orig_top3 = _extract_crash_funcs(orig_text, limit=3)
+    new_top3 = _extract_crash_funcs(new_text, limit=3)
+    if orig_top3 and new_top3 and set(orig_top3) & set(new_top3):
+        return True
+
+    # Tier 2: same-vulnerability match
+    orig_class, orig_dir = _extract_sanitizer_class(orig_text)
+    new_class, new_dir = _extract_sanitizer_class(new_text)
+
+    # 2a. Same sanitizer class
+    if orig_class and new_class and orig_class != new_class:
+        logger.warning(
+            "Crash class mismatch: original=%s new=%s",
+            orig_class, new_class,
+        )
+        return False
+
+    # 2b. Same access direction
+    if orig_dir and new_dir and orig_dir != new_dir:
+        logger.warning(
+            "Crash direction mismatch: original=%s new=%s",
+            orig_dir, new_dir,
+        )
+        return False
+
+    # 2c. Overlapping call chain (full depth, including allocation stack)
+    orig_all = set(_extract_crash_funcs(orig_text))
+    new_all = set(_extract_crash_funcs(new_text))
+    chain_overlap = orig_all & new_all
+    if not chain_overlap:
+        logger.warning(
+            "No overlapping functions in full call chain: "
+            "original=%s new=%s",
+            sorted(orig_all)[:5], sorted(new_all)[:5],
+        )
+        return False
+
+    # 2d. Same source file area
+    orig_files = _extract_crash_files(orig_text)
+    new_files = _extract_crash_files(new_text)
+    if orig_files and new_files and not orig_files & new_files:
+        logger.warning(
+            "No overlapping crash source files: original=%s new=%s",
+            sorted(orig_files), sorted(new_files),
+        )
+        return False
+
+    logger.info(
+        "Crash accepted via same-vulnerability match: class=%s dir=%s "
+        "shared_funcs=%s shared_files=%s",
+        new_class, new_dir, sorted(chain_overlap),
+        sorted(orig_files & new_files) if orig_files and new_files else "n/a",
+    )
+    return True
 
 
 def _format_codex_output(jsonl_output: str) -> str:
