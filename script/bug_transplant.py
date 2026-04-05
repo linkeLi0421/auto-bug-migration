@@ -803,11 +803,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             testcase = args.testcase
 
             # Force official build (delete fuzzer binary to force re-link;
-            # autotools may not re-link when only library sources change)
+            # autotools/cmake may not re-link when only library sources change)
             logger.info("Rebuilding with official compile...")
             _exec_capture(
                 container_name,
-                f"rm -f /out/{fuzzer} /src/{args.project}/src/tests/fuzzing/{fuzzer}",
+                f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                f"rm -f /out/{fuzzer}",
             )
             ret_build, build_out = _exec_capture(
                 container_name, "sudo -E compile 2>&1", timeout=300,
@@ -907,7 +908,18 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                         logger.info("Re-collected testcase from %s", tc_src)
                         break
 
-                # Re-verify after minimization (use agent's testcase)
+                # Re-verify after minimization: force rebuild to avoid
+                # stale binaries (autotools/cmake dependency tracking issue)
+                _exec_capture(
+                    container_name,
+                    f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                    f"rm -f /out/{fuzzer}",
+                )
+                ret_rebuild, _ = _exec_capture(
+                    container_name, "sudo -E compile 2>&1", timeout=300,
+                )
+                if ret_rebuild != 0:
+                    logger.warning("Post-minimize rebuild failed")
                 _exec_capture(
                     container_name,
                     f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "

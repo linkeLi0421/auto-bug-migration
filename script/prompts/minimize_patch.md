@@ -14,6 +14,10 @@ Crash log for reference: `/data/crash/target_crash-{buggy_short}-{testcase_name}
 ## Commands
 
 ```bash
+# IMPORTANT: always delete fuzzer binaries before compile to force re-link.
+# Autotools/cmake may not re-link the fuzzer when only a library source changes.
+find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+rm -f /out/{fuzzer_name}
 sudo -E compile
 /out/{fuzzer_name} /work/{testcase_name}
 ```
@@ -23,7 +27,7 @@ sudo -E compile
 1. Run `git diff --stat` to list all changed files.
 2. For each file, try reverting it:
    `git checkout {target_commit} -- <file>`
-   Then build and test.
+   Then delete fuzzer binaries, build and test.
    - If the bug still triggers → that file was unnecessary, keep it reverted.
    - If the bug stops or build fails → re-apply: `git checkout HEAD -- <file>`
 3. For files that are required, try minimizing within the file:
@@ -38,6 +42,8 @@ sudo -E compile
 ## Rules
 
 - NEVER build with make/gcc/cmake — only `sudo -E compile`.
+- ALWAYS delete the fuzzer binary before compile (`rm -f /out/{fuzzer_name}`)
+  to force re-linking. The build system may have broken dependency tracking.
 - Build and test after every revert.
 - Do not spawn subagents.
 - If the crash is flaky (triggers 2/3 times), keep the change — do not
