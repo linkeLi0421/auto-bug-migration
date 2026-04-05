@@ -802,8 +802,13 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             fuzzer = args.fuzzer_name
             testcase = args.testcase
 
-            # Force official build
+            # Force official build (delete fuzzer binary to force re-link;
+            # autotools may not re-link when only library sources change)
             logger.info("Rebuilding with official compile...")
+            _exec_capture(
+                container_name,
+                f"rm -f /out/{fuzzer} /src/{args.project}/src/tests/fuzzing/{fuzzer}",
+            )
             ret_build, build_out = _exec_capture(
                 container_name, "sudo -E compile 2>&1", timeout=300,
             )

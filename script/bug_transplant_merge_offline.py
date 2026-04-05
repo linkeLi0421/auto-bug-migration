@@ -79,7 +79,7 @@ _DIFF_EXCLUDES = (
 )
 _DIFF_INCLUDES = (
     "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
-    "'CMakeLists.txt'"
+    "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am'"
 )
 
 
@@ -170,6 +170,113 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
         raise RuntimeError(f"failed to restore harness baseline: {out[-500:]}")
 
 _MAX_WRAP_RETRIES = 1
+
+
+def _save_build_sh(container: str, output_dir: Path) -> None:
+    """Snapshot /src/build.sh so it can be restored on resume.
+
+    The agent may modify /src/build.sh to compile __bug_dispatch.c, but
+    that file lives outside the project git repo and isn't captured by
+    ``git diff``.  We save it alongside harness.diff.
+    """
+    ret, content = _exec_capture(container, "cat /src/build.sh 2>/dev/null")
+    if ret != 0:
+        return
+    dst = output_dir / "harness_build.sh"
+    dst.write_text(content)
+    logger.info("Saved /src/build.sh (%d bytes) to %s", len(content), dst)
+
+
+def _restore_build_sh(container: str, output_dir: Path) -> None:
+    """Restore a previously saved /src/build.sh into the container."""
+    src = output_dir / "harness_build.sh"
+    if not src.exists():
+        return
+    content = src.read_text()
+    _exec_capture(
+        container,
+        f"cat > /src/build.sh << 'BUILDEOF'\n{content}BUILDEOF",
+    )
+    _exec_capture(container, "chmod +x /src/build.sh")
+    logger.info("Restored /src/build.sh from %s", src)
+
+
+def _inject_dispatch_deps_fixer(container: str) -> None:
+    """Inject a helper script + build.sh hook that creates autotools dep stubs.
+
+    When Makefile.am references $(top_srcdir)/__bug_dispatch.c, autotools
+    generates ``include .deps/<prefix>__bug_dispatch.P{o,lo}`` but never
+    creates the top-level ``.deps/`` directory.  This writes a helper that
+    scans generated Makefiles for those targets and touches them, then
+    injects a one-line call in build.sh right before ``make``.
+    """
+    _exec_capture(
+        container,
+        "cat > /tmp/_fix_dispatch_deps.sh << 'FIXEOF'\n"
+        "#!/bin/bash\n"
+        "mkdir -p .deps\n"
+        "grep -rh '__bug_dispatch.*\\.Pl\\|__bug_dispatch.*\\.Po' "
+        "  */Makefile */*/Makefile */*/*/Makefile 2>/dev/null | "
+        "grep -oE '[^ ]*__bug_dispatch[^ ]*' | sort -u | "
+        "while read p; do mkdir -p $(dirname \"$p\") && touch \"$p\"; done\n"
+        "FIXEOF\n"
+        "chmod +x /tmp/_fix_dispatch_deps.sh",
+    )
+    _exec_capture(
+        container,
+        "grep -q '_fix_dispatch_deps' /src/build.sh 2>/dev/null || "
+        "sed -i '/^make/i /tmp/_fix_dispatch_deps.sh' /src/build.sh",
+    )
+
+
+def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
+    """Ensure __bug_dispatch.c is compiled into libraries, not just fuzzers.
+
+    Per-bug patches may add ``#include "__bug_dispatch.h"`` to library
+    source files (e.g. libopensc).  Non-fuzzer tools that link the
+    library will fail with undefined ``__bug_dispatch`` unless the
+    object is also part of the library.  This function finds every
+    Makefile.am that builds a library whose sources were patched and
+    adds __bug_dispatch.c to it.
+    """
+    # Find all Makefile.am files in directories containing patched sources
+    # that reference __bug_dispatch.
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"grep -rl '__bug_dispatch' --include='*.c' --include='*.h' "
+        f"src/ 2>/dev/null | "
+        f"xargs -I{{}} dirname {{}} | sort -u",
+    )
+    if ret != 0 or not out.strip():
+        return
+
+    for src_dir in out.strip().splitlines():
+        src_dir = src_dir.strip()
+        if not src_dir:
+            continue
+        # Check if this directory has a Makefile.am with a _la_SOURCES
+        ret2, makefile = _exec_capture(
+            container,
+            f"cat /src/{project}/{src_dir}/Makefile.am 2>/dev/null",
+        )
+        if ret2 != 0 or "__bug_dispatch" in makefile:
+            continue  # already has it or no Makefile.am
+        if "_la_SOURCES" not in makefile:
+            continue  # not a library
+
+        # Add __bug_dispatch.c after the first _la_SOURCES line
+        makefile_path = f"/src/{project}/{src_dir}/Makefile.am"
+        _exec_capture(
+            container,
+            f"awk 'NR==1{{found=0}} /_la_SOURCES/&&!found{{"
+            f"print; print \"\\t$(top_srcdir)/__bug_dispatch.c \\\\\"; "
+            f"found=1; next}} 1' {makefile_path} > {makefile_path}.tmp "
+            f"&& mv {makefile_path}.tmp {makefile_path}",
+        )
+        logger.info("Added __bug_dispatch.c to %s/Makefile.am", src_dir)
+
+    _inject_dispatch_deps_fixer(container)
 
 
 # build_codex_command is now imported from bug_transplant
@@ -538,6 +645,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 logger.error("Failed to apply existing harness.diff")
                 logger.error(out)
                 return 1
+            _restore_build_sh(container, output_dir)
+            _inject_dispatch_deps_fixer(container)
             ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying existing harness.diff")
@@ -573,6 +682,10 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 logger.warning("No harness diff captured after modification!")
                 harness_diff_path = None
 
+            # Save /src/build.sh — the agent may have modified it to
+            # compile __bug_dispatch.c, but it's outside the git repo.
+            _save_build_sh(container, output_dir)
+
         harness_baseline_rev = _create_harness_baseline_commit(container, project)
         logger.info("Harness baseline commit: %s", harness_baseline_rev[:12])
 
@@ -581,19 +694,6 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
                       "cp \"$f\" /out/address/; done; true")
-        # Build UBSAN
-        ret, _ = _exec_capture(container,
-                               "sudo -E SANITIZER=undefined compile 2>&1",
-                               timeout=300)
-        if ret == 0:
-            _exec_capture(container,
-                          "mkdir -p /out/undefined && "
-                          "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                          "[ ! -d \"$f\" ] && cp \"$f\" /out/undefined/; done; true")
-            logger.info("UBSAN build OK")
-        else:
-            logger.warning("UBSAN build failed, skipping")
-
         # Copy testcases (originals + patched)
         _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
@@ -735,6 +835,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             if ret != 0:
                 logger.error("Failed to apply existing combined.diff: %s", out[-500:])
                 return 1
+            _ensure_dispatch_linked_everywhere(container, project)
             ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying combined.diff: %s",
@@ -828,21 +929,14 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                     # If everything succeeded, consider all wrapped diffs merged.
                     applied_bugs = list(wrapped_diffs.keys())
 
-        # Build ASAN + UBSAN with all patches applied
+        # Build ASAN with all patches applied
         logger.info("Building with all patches applied...")
+        _ensure_dispatch_linked_everywhere(container, project)
         _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
                       "cp \"$f\" /out/address/; done; true")
-        ret, _ = _exec_capture(container,
-                               "sudo -E SANITIZER=undefined compile 2>&1",
-                               timeout=300)
-        if ret == 0:
-            _exec_capture(container,
-                          "mkdir -p /out/undefined && "
-                          "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                          "[ ! -d \"$f\" ] && cp \"$f\" /out/undefined/; done; true")
 
         # Restore testcases with dispatch bytes
         _restore_testcases(container, project, all_bugs)
