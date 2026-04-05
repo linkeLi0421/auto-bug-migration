@@ -705,35 +705,31 @@ def start_merge_container(
                     if ret.returncode == 0:
                         logger.info("Copied patched testcase: %s", tc.name)
 
-    # Build ASAN and UBSAN (no MSAN — it taints libc++ permanently).
-    for san in ("address", "undefined"):
-        logger.info("Building %s inside container...", san)
-        _exec_capture(
-            container_name,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        ret, build_output = _exec_capture(
-            container_name,
-            f"sudo -E SANITIZER={san} compile 2>&1",
-            timeout=300,
-        )
-        if ret != 0:
-            logger.error("%s build failed. Tail:", san)
-            logger.error("%s", build_output[-500:] if build_output else "(no output)")
-            if san == "address":
-                return container_name, False
-            logger.warning("Skipping %s, bugs using it won't verify", san)
-            continue
-        # Stash per-sanitizer binaries
-        _exec_capture(
-            container_name,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
-        logger.info("Build OK for %s", san)
+    # Build ASAN only (UBSAN removed to simplify the merge flow).
+    logger.info("Building address inside container...")
+    _exec_capture(
+        container_name,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    ret, build_output = _exec_capture(
+        container_name,
+        "sudo -E SANITIZER=address compile 2>&1",
+        timeout=300,
+    )
+    if ret != 0:
+        logger.error("ASAN build failed. Tail:")
+        logger.error("%s", build_output[-500:] if build_output else "(no output)")
+        return container_name, False
+    # Stash ASAN binaries
+    _exec_capture(
+        container_name,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
+    logger.info("Build OK for address")
 
     # Restore testcases (compile may wipe /work)
     _restore_testcases(container_name, project)
@@ -1156,22 +1152,21 @@ def _revert_and_rebuild(
         container,
         f"cd /src/{project} && git apply --allow-empty /tmp/_snap.diff 2>&1",
     )
-    for san in ("address", "undefined"):
-        _exec_capture(
-            container,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        _exec_capture(
-            container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-        )
-        _exec_capture(
-            container,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
+    _exec_capture(
+        container,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    _exec_capture(
+        container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+    )
+    _exec_capture(
+        container,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
     _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
@@ -1182,25 +1177,24 @@ def _rebuild_and_apply_dispatch(
     project: str,
     dispatch_state: dict,
 ) -> None:
-    """Rebuild ASAN+UBSAN and re-apply dispatch bytes after code changes."""
-    for san in ("address", "undefined"):
-        _exec_capture(
-            container,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        _exec_capture(
-            container,
-            f"sudo -E SANITIZER={san} compile 2>&1",
-            timeout=300,
-        )
-        _exec_capture(
-            container,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
+    """Rebuild ASAN and re-apply dispatch bytes after code changes."""
+    _exec_capture(
+        container,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    _exec_capture(
+        container,
+        "sudo -E SANITIZER=address compile 2>&1",
+        timeout=300,
+    )
+    _exec_capture(
+        container,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
     _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
@@ -1580,11 +1574,7 @@ def verify_bug_triggers(
     falls back to checking for any sanitizer SUMMARY line.
     """
     sym_path = "/out/llvm-symbolizer"
-    san_opts = {
-        "address": f"export ASAN_OPTIONS=detect_leaks=0:external_symbolizer_path={sym_path}; ",
-        "undefined": f"export UBSAN_OPTIONS=external_symbolizer_path={sym_path}:print_stacktrace=1; ",
-    }
-    env_prefix = san_opts.get(sanitizer, "")
+    env_prefix = f"export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16:external_symbolizer_path={sym_path}; "
     fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
 
     cmd = (
@@ -1720,8 +1710,8 @@ def run_merge(args: argparse.Namespace) -> int:
         if not fuzzer:
             logger.warning("No fuzzer for local bug %s, skipping", bug_id)
             continue
-        if sanitizer not in ("address", "undefined"):
-            logger.warning("Skipping %s local bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
+        if sanitizer != "address":
+            logger.info("Skipping %s local bug %s (non-ASAN)", sanitizer, bug_id)
             continue
         testcase = f"testcase-{bug_id}"
         crash_log = _find_crash_log(bug_id, info)
@@ -1779,8 +1769,8 @@ def run_merge(args: argparse.Namespace) -> int:
         reproduce = info.get("reproduce", {})
         fuzzer = reproduce.get("fuzz_target", "")
         sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-        if sanitizer not in ("address", "undefined"):
-            logger.warning("Skipping %s transplant bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
+        if sanitizer != "address":
+            logger.info("Skipping %s transplant bug %s (non-ASAN)", sanitizer, bug_id)
             return
         crash_log = _find_crash_log(bug_id, info)
         seen_bug_ids.add(bug_id)
@@ -1977,29 +1967,28 @@ def run_merge(args: argparse.Namespace) -> int:
                 }:
                     all_verified_bugs.append(bd)
 
-            # Rebuild: build ASAN+UBSAN and set up dispatch bytes
+            # Rebuild ASAN and set up dispatch bytes
             logger.info("Rebuilding from restored state...")
-            for san in ("address", "undefined"):
-                _exec_capture(
-                    container,
-                    f"cd /src/{project} && make clean 2>/dev/null; "
-                    f"rm -rf .obj *.a *.o 2>/dev/null; "
-                    f"rm -f /src/*.o 2>/dev/null; true",
-                )
-                ret, bout = _exec_capture(
-                    container,
-                    f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-                )
-                if ret != 0:
-                    logger.error("Build failed for %s after restore: %s",
-                                 san, bout[-500:] if bout else "")
-                    return 1
-                _exec_capture(
-                    container,
-                    f"mkdir -p /out/{san} && "
-                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                    f"cp \"$f\" /out/{san}/; done; true",
-                )
+            _exec_capture(
+                container,
+                f"cd /src/{project} && make clean 2>/dev/null; "
+                f"rm -rf .obj *.a *.o 2>/dev/null; "
+                f"rm -f /src/*.o 2>/dev/null; true",
+            )
+            ret, bout = _exec_capture(
+                container,
+                "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+            )
+            if ret != 0:
+                logger.error("Build failed for address after restore: %s",
+                             bout[-500:] if bout else "")
+                return 1
+            _exec_capture(
+                container,
+                "mkdir -p /out/address && "
+                "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                "cp \"$f\" /out/address/; done; true",
+            )
             _exec_capture(container,
                           f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null; true")
             _restore_testcases(container, project)
@@ -2198,33 +2187,30 @@ def run_merge(args: argparse.Namespace) -> int:
                         merge_results.append(step)
                         break
 
-                # --- Build ASAN + UBSAN ---
-                logger.info("[%s] Building (ASAN + UBSAN)...", bug_id)
+                # --- Build ASAN ---
+                logger.info("[%s] Building (ASAN)...", bug_id)
                 build_failed = False
                 last_build_output = ""
-                for san in ("address", "undefined"):
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                    f"rm -f /src/*.o 2>/dev/null; true",
+                )
+                ret, build_output = _exec_capture(
+                    container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                )
+                if ret != 0:
+                    logger.error("[%s] Build failed for address. Tail:", bug_id)
+                    logger.error("%s", build_output[-500:] if build_output else "(no output)")
+                    build_failed = True
+                    last_build_output = build_output or ""
+                if not build_failed:
                     _exec_capture(
                         container,
-                        f"cd /src/{project} && make clean 2>/dev/null; "
-                        f"rm -rf .obj *.a *.o 2>/dev/null; "
-                        f"rm -f /src/*.o 2>/dev/null; true",
-                    )
-                    ret, build_output = _exec_capture(
-                        container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-                    )
-                    if ret != 0:
-                        logger.error("[%s] Build failed for %s. Tail:", bug_id, san)
-                        logger.error("%s", build_output[-500:] if build_output else "(no output)")
-                        if san == "address":
-                            build_failed = True
-                            last_build_output = build_output or ""
-                            break
-                        continue
-                    _exec_capture(
-                        container,
-                        f"mkdir -p /out/{san} && "
+                        "mkdir -p /out/address && "
                         "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                        f"cp \"$f\" /out/{san}/; done; true",
+                        "cp \"$f\" /out/address/; done; true",
                     )
                 # Restore testcases (compile may wipe /work)
                 _restore_testcases(container, project)
