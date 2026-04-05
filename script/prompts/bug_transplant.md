@@ -23,6 +23,10 @@ The bug triggers at the old commit but not at the new one.
 
 ```bash
 # Build (the ONLY valid build command -- never use make/gcc/cmake)
+# IMPORTANT: always delete the fuzzer binary before compile to force re-link.
+# Autotools/cmake may not re-link the fuzzer when only a library source changes.
+find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+rm -f /out/{fuzzer_name}
 sudo -E compile
 
 # Test
@@ -76,9 +80,13 @@ sudo -E compile
    ```bash
    # Save your work
    git stash
+   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should NOT crash. Then restore:
    git stash pop
+   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should crash.
    ```
