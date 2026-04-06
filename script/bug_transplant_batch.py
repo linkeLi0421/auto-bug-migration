@@ -385,6 +385,9 @@ def run_single_bug(
         cmd.append("--keep-container")
     if args.verbose:
         cmd.append("--verbose")
+    codex_mode = getattr(args, "codex_mode", "exec")
+    if codex_mode == "interactive":
+        cmd += ["--codex-mode", "interactive"]
     # Shared container mode
     if container_name:
         cmd += ["--container-name", container_name]
@@ -396,22 +399,33 @@ def run_single_bug(
 
     start = time.monotonic()
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=args.timeout + 120 if args.timeout else 3720,
-        )
-        result["exit_code"] = proc.returncode
-        if proc.returncode == 0:
-            result["status"] = "success"
+        if codex_mode == "interactive":
+            # Interactive mode: inherit terminal so tmux can attach
+            rc = subprocess.call(
+                cmd,
+                timeout=args.timeout + 120 if args.timeout else 3720,
+            )
+            result["exit_code"] = rc
+            result["status"] = "success" if rc == 0 else "failed"
+            if rc != 0:
+                result["error_message"] = f"exit code {rc}"
         else:
-            result["status"] = "failed"
-            output = (proc.stdout + proc.stderr).strip()
-            result["error_message"] = output[-500:] if output else "non-zero exit"
-            # Print full subprocess output so failures are visible in the log
-            if output:
-                logger.error("[%s] Subprocess output:\n%s", bug_id, output)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=args.timeout + 120 if args.timeout else 3720,
+            )
+            result["exit_code"] = proc.returncode
+            if proc.returncode == 0:
+                result["status"] = "success"
+            else:
+                result["status"] = "failed"
+                output = (proc.stdout + proc.stderr).strip()
+                result["error_message"] = output[-500:] if output else "non-zero exit"
+                # Print full subprocess output so failures are visible in the log
+                if output:
+                    logger.error("[%s] Subprocess output:\n%s", bug_id, output)
     except subprocess.TimeoutExpired:
         result["status"] = "error"
         result["error_message"] = "subprocess timeout"
@@ -620,6 +634,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Show what would be executed without running")
     parser.add_argument("--keep-containers", action="store_true",
                         help="Keep containers alive for debugging")
+    parser.add_argument("--codex-mode", choices=["exec", "interactive"],
+                        default="exec",
+                        help="Agent invocation mode: exec (default, JSONL) "
+                             "or interactive (TUI via tmux)")
 
     # Logging
     parser.add_argument("--verbose", "-V", action="store_true")
