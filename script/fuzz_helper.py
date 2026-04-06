@@ -671,6 +671,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
                             type=int,
                             help='commit timestamp for automatic image selection (requires --runner-image=auto)',
                             default=None)
+  build_version_parser.add_argument('--oss-fuzz-commit',
+                            help='specific OSS-Fuzz commit to checkout (overrides --build_csv and HEAD fallback)',
+                            default=None)
   _add_architecture_args(build_version_parser)
   _add_engine_args(build_version_parser)
   _add_sanitizer_args(build_version_parser)
@@ -2033,18 +2036,25 @@ def clean(args, out_dir):
 
 def build_version(args):
   """Build in a specific commit."""
-  # Read oss_fuzz_commit from builds.csv
-  oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
-    getattr(args, 'build_csv', None), args.project.name, args.commit)
+  # Determine which OSS-Fuzz commit to use, in priority order:
+  # 1) Explicit --oss-fuzz-commit flag
+  # 2) Mapping from --build_csv
+  # 3) Fall back to OSS-Fuzz master (not HEAD — prepare_repository leaves
+  #    the repo in detached-HEAD state so HEAD may be stale)
+  oss_fuzz_commit = getattr(args, 'oss_fuzz_commit', None)
+  if oss_fuzz_commit:
+    logger.info('Using explicit --oss-fuzz-commit: %s', oss_fuzz_commit)
+  else:
+    oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
+      getattr(args, 'build_csv', None), args.project.name, args.commit)
 
-  # Fall back to current OSS-Fuzz HEAD if no CSV mapping found
   if not oss_fuzz_commit:
-    result = subprocess.run(['git', 'rev-parse', 'HEAD'],
+    result = subprocess.run(['git', 'rev-parse', 'master'],
                           cwd=OSS_FUZZ_DIR,
                           capture_output=True,
                           text=True)
     oss_fuzz_commit = result.stdout.strip()
-    logger.info('No CSV commit mapping, using current OSS-Fuzz HEAD: %s', oss_fuzz_commit)
+    logger.info('No CSV commit mapping, using OSS-Fuzz master: %s', oss_fuzz_commit)
 
   # Determine builder image digest from runner-image args
   # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
@@ -2126,6 +2136,20 @@ def build_version(args):
 
   cd /src/{args.project.name};
   git checkout -f {args.commit};
+  '''
+
+  # ntopng and nDPI are companion repos that must stay in API sync.
+  # Pin nDPI to the latest commit on or before the ntopng commit date.
+  if args.project.name == 'ntopng':
+    build_bash += f'''
+  _TARGET_DATE=$(git log -1 --format=%ci {args.commit});
+  if [ -d /src/nDPI/.git ]; then
+    _NDPI_COMMIT=$(git -C /src/nDPI rev-list -1 --before="$_TARGET_DATE" HEAD 2>/dev/null || true);
+    if [ -n "$_NDPI_COMMIT" ]; then
+      git -C /src/nDPI checkout -f "$_NDPI_COMMIT";
+      echo "Pinned nDPI to $_NDPI_COMMIT (before $_TARGET_DATE)";
+    fi;
+  fi;
   '''
   
   if args.patch:

@@ -426,7 +426,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
             if sanitizer == 'memory' and arch == 'i386':
                 # msan do not support i386
                 continue
-            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str))) > 3:
+            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)):
                 continue
 
             if fixed_builder:
@@ -436,6 +436,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
 
             cmd = [
                 py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
+                "--oss-fuzz-commit", oss_fuzz_commit,
                 *image_args,
                 target
             ]
@@ -488,7 +489,10 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 # Create the destination directory if it doesn't exist
                 dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
+                if os.path.isdir(dest_path) and os.listdir(dest_path):
+                    logger.info(f"Skipping move — destination already exists and is non-empty: {dest_path}")
+                else:
+                    subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
                 build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
