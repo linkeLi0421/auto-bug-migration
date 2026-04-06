@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Bug transplant launcher -- runs Claude Code inside an OSS-Fuzz container.
+"""Bug transplant launcher -- runs Codex inside an OSS-Fuzz container.
 
 Workflow:
   Phase 0: Collect crash log and function trace via fuzz_helper.py
-  Phase 1: Build Claude-layered Docker image on top of the project image
+  Phase 1: Build Codex-layered Docker image on top of the project image
   Phase 2: Start persistent container with proper volumes
-  Phase 3: Run Claude Code with the bug transplant prompt
+  Phase 3: Run Codex with the bug transplant prompt
   Phase 4: Collect output diff
 
 Usage:
-  # Full pipeline (collect data + run Claude Code):
+  # Full pipeline (collect data + run Codex):
   sudo -E python3 script/bug_transplant.py wavpack \\
     --buggy-commit 348ff60b \\
     --target-commit 0b99613e \\
@@ -26,10 +26,10 @@ Usage:
     --testcase testcase-OSV-2020-1006 \\
     --skip-collect
 
-  # Use a specific Claude model:
+  # Use a specific model:
   sudo -E python3 script/bug_transplant.py wavpack \\
     ... \\
-    --claude-model claude-sonnet-4-6
+    --model o3
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ import argparse
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,36 +49,44 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Pin CLI versions for reproducibility.
-# Update deliberately after testing with new versions.
-AGENT_VERSIONS = {
-    "claude": "2.1.81",   # @anthropic-ai/claude-code
-    "codex": "0.116.0",            # @openai/codex
+# Lazy-initialized in main(); imported here so the module can be used as a library.
+_usage_tracker = None
+
+# Pin CLI version for reproducibility.
+CODEX_VERSION = "0.116.0"  # @openai/codex
+
+# Codex agent configuration
+CODEX_CONFIG = {
+    "npm_package": "@openai/codex",
+    "cli_name": "codex",
+    "cli_entry": "@openai/codex/bin/codex.js",
+    "api_key_env": "OPENAI_API_KEY",
+    "credentials_dir": ".codex",
+    "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
+    "model_flag": "--model",
 }
 
-# Agent-specific configuration
-AGENT_CONFIG = {
-    "claude": {
-        "npm_package": "@anthropic-ai/claude-code",
-        "cli_name": "claude",
-        "cli_entry": "@anthropic-ai/claude-code/cli.js",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "credentials_dir": ".claude",        # ~/.<this> on host
-        "credentials_config": ".claude.json", # ~/.<this> on host
-        "run_cmd": "claude -p {prompt} --output-format text --dangerously-skip-permissions",
-        "model_flag": "--model",
-    },
-    "codex": {
-        "npm_package": "@openai/codex",
-        "cli_name": "codex",
-        "cli_entry": "@openai/codex/bin/codex.js",  # npm bin: codex -> bin/codex.js
-        "api_key_env": "OPENAI_API_KEY",
-        "credentials_dir": ".codex",
-        "credentials_config": None,          # codex uses dir only
-        "run_cmd": "codex exec --dangerously-bypass-approvals-and-sandbox {prompt}",
-        "model_flag": "--model",
-    },
-}
+
+def setup_codex_creds(container: str) -> None:
+    """Copy codex credentials into container."""
+    _exec(
+        container,
+        "cp -r /tmp/.agent-creds-src /home/agent/.codex 2>/dev/null; "
+        "rm -rf /home/agent/.codex/projects 2>/dev/null; "
+        "chown -R agent:agent /home/agent/.codex 2>/dev/null; "
+        "true",
+        user="root",
+    )
+
+
+def build_codex_command(prompt: str, model: str | None = None) -> str:
+    """Build the codex CLI command."""
+    escaped = shlex.quote(prompt)
+    cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
+    if model:
+        cmd += f" --model {shlex.quote(model)}"
+    cmd += " --json"
+    return cmd
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -91,6 +100,29 @@ FUZZ_HELPER = SCRIPT_DIR / "fuzz_helper.py"
 PROMPT_TEMPLATE = SCRIPT_DIR / "prompts" / "bug_transplant.md"
 MINIMIZE_TEMPLATE = SCRIPT_DIR / "prompts" / "minimize_patch.md"
 MEMORY_TEMPLATE = SCRIPT_DIR / "prompts" / "bug_transplant_memory.md"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run_quiet(cmd: list[str], label: str = "", **kwargs) -> int:
+    """Run a command, capture output, and only show it on failure.
+
+    On success, output is logged at DEBUG level.
+    On failure, the last 30 lines of combined output are logged at ERROR.
+    """
+    label = label or cmd[0]
+    logger.info("Running: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode != 0:
+        tail = "\n".join(combined.splitlines()[-30:])
+        logger.error("[%s] failed (exit %d). Last 30 lines:\n%s",
+                     label, proc.returncode, tail)
+    elif combined.strip():
+        logger.debug("[%s] output:\n%s", label, combined.strip())
+    return proc.returncode
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +153,8 @@ def collect_crash_data(args: argparse.Namespace) -> bool:
     if args.runner_image:
         cmd += ["--runner-image", args.runner_image]
 
-    logger.info("Running: %s", " ".join(cmd))
-    ret = subprocess.call(cmd)
+    ret = _run_quiet(cmd, label="collect_crash")
     if ret != 0:
-        logger.error("collect_crash failed (exit %d)", ret)
         return False
 
     if not crash_file.exists():
@@ -159,10 +189,8 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
     if args.runner_image:
         cmd += ["--runner-image", args.runner_image]
 
-    logger.info("Running: %s", " ".join(cmd))
-    ret = subprocess.call(cmd)
+    ret = _run_quiet(cmd, label="collect_trace")
     if ret != 0:
-        logger.error("collect_trace failed (exit %d)", ret)
         return False
 
     if not trace_file.exists():
@@ -173,8 +201,52 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
     return True
 
 
+def collect_fix_diff(args: argparse.Namespace) -> bool:
+    """Generate a diff between the buggy commit and the adjacent CSV commit.
+
+    The adjacent commit must be provided via args.adjacent_commit (pre-computed
+    by bug_transplant_batch.py from the CSV row immediately after the buggy row
+    in the direction of the target).
+
+    Saves the diff to DATA_DIR/patch_diffs/fix_hint-<buggy_short>-<testcase>.diff.
+    Returns True if the diff was saved (or already exists), False otherwise.
+    """
+    adjacent_commit = getattr(args, 'adjacent_commit', None)
+    repo_path = getattr(args, 'repo_path', None)
+    if not adjacent_commit or not repo_path:
+        return False
+
+    buggy_short = args.buggy_commit[:8]
+    patch_diffs_dir = DATA_DIR / "patch_diffs"
+    patch_diffs_dir.mkdir(exist_ok=True)
+    out_path = patch_diffs_dir / f"fix_hint-{buggy_short}-{args.testcase}.diff"
+
+    if out_path.exists():
+        logger.info("Fix diff already exists: %s", out_path)
+        return True
+
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", args.buggy_commit, adjacent_commit],
+            cwd=repo_path,
+            capture_output=True, text=True,
+        )
+        diff_text = diff_result.stdout
+    except Exception as exc:
+        logger.debug("collect_fix_diff git diff error: %s", exc)
+        return False
+
+    if not diff_text.strip():
+        logger.info("Fix diff is empty — skipping")
+        return False
+
+    out_path.write_text(diff_text)
+    logger.info("Fix diff saved: %s (adjacent=%s)", out_path, adjacent_commit[:8])
+    return True
+
+
 # ---------------------------------------------------------------------------
-# Phase 1: Build Docker image with Claude Code layered on top
+# Phase 1: Build Docker image with Codex layered on top
 # ---------------------------------------------------------------------------
 
 def build_project_image(
@@ -205,7 +277,7 @@ def build_project_image(
         ]
         if build_csv:
             cmd += ["--build_csv", build_csv]
-        ret = subprocess.call(cmd)
+        ret = _run_quiet(cmd, label="build_version")
         if ret != 0:
             logger.error("fuzz_helper.py build_version failed for %s", project)
             sys.exit(1)
@@ -222,9 +294,9 @@ def build_project_image(
 
     logger.info("Building OSS-Fuzz project image for %s...", project)
     helper_py = OSS_FUZZ_DIR / "infra" / "helper.py"
-    ret = subprocess.call(
+    ret = _run_quiet(
         [sys.executable, str(helper_py), "build_image", project],
-        cwd=str(OSS_FUZZ_DIR),
+        label="build_image",
     )
     if ret != 0:
         logger.error("Failed to build project image for %s", project)
@@ -233,21 +305,26 @@ def build_project_image(
     return image_tag
 
 
-def build_agent_image(project: str, project_image: str, agent: str = "claude") -> str:
-    """Layer a code agent CLI on top of the project image.
+def build_agent_image(project: str, project_image: str) -> str:
+    """Layer the Codex CLI on top of the project image.
 
     Produces ``bug-transplant-<project>:latest``.
-    Supports agent types: ``claude``, ``codex``.
     """
-    cfg = AGENT_CONFIG[agent]
-    version = AGENT_VERSIONS[agent]
-    npm_pkg = cfg["npm_package"]
-    cli_name = cfg["cli_name"]
-    cli_entry = cfg["cli_entry"]
+    npm_pkg = CODEX_CONFIG["npm_package"]
+    cli_name = CODEX_CONFIG["cli_name"]
+    cli_entry = CODEX_CONFIG["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
 
-    # Always rebuild — the base project image may have changed
-    logger.info("Building %s agent image '%s' on top of '%s'...", agent, tag, project_image)
+    # Skip rebuild if the agent image already exists
+    inspect = subprocess.run(
+        ["docker", "image", "inspect", tag],
+        capture_output=True,
+    )
+    if inspect.returncode == 0:
+        logger.info("Agent image already exists, reusing: %s", tag)
+        return tag
+
+    logger.info("Building codex agent image '%s' on top of '%s'...", tag, project_image)
 
     dockerfile_content = textwrap.dedent(f"""\
         # Stage 1: Install agent CLI on a modern base (glibc >= 2.28).
@@ -257,7 +334,7 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
                 curl ca-certificates \\
             && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \\
             && apt-get install -y --no-install-recommends nodejs \\
-            && npm install -g {npm_pkg}@{version} \\
+            && npm install -g {npm_pkg}@{CODEX_VERSION} \\
             && rm -rf /var/lib/apt/lists/*
 
         # Stage 2: Project image with agent CLI copied in.
@@ -301,25 +378,43 @@ def build_agent_image(project: str, project_image: str, agent: str = "claude") -
     with tempfile.TemporaryDirectory() as tmpdir:
         df_path = Path(tmpdir) / "Dockerfile"
         df_path.write_text(dockerfile_content)
-        ret = subprocess.call(
+        ret = _run_quiet(
             ["docker", "build", "-t", tag, "-f", str(df_path), tmpdir],
+            label="build_agent_image",
         )
         if ret != 0:
-            logger.error("Failed to build Claude agent image")
+            logger.error("Failed to build codex agent image")
             sys.exit(1)
 
-    logger.info("Claude agent image built: %s", tag)
+    logger.info("Codex agent image built: %s", tag)
     return tag
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 + 3: Run Claude Code inside a persistent container
+# Phase 2 + 3: Run Codex inside a persistent container
 # ---------------------------------------------------------------------------
 
 def build_prompt(args: argparse.Namespace) -> str:
     """Read the prompt template and fill in parameters."""
     template = PROMPT_TEMPLATE.read_text()
     buggy_short = args.buggy_commit[:8]
+
+    adjacent_commit = getattr(args, 'adjacent_commit', None)
+    if adjacent_commit:
+        fix_diff_line = (
+            f"\n- `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff` -- "
+            f"diff from buggy commit to adjacent CSV commit `{adjacent_commit[:8]}` "
+            f"(the next tested commit toward the fix — read this first)"
+        )
+        adjacent_commit_hint = (
+            f" If available, start by reading"
+            f" `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff`:"
+            f" it is the diff from the buggy commit to the next tested commit"
+            f" `{adjacent_commit[:8]}` and likely contains the fix."
+        )
+    else:
+        fix_diff_line = ""
+        adjacent_commit_hint = ""
 
     prompt = template.format(
         project=args.project,
@@ -329,6 +424,9 @@ def build_prompt(args: argparse.Namespace) -> str:
         buggy_short=buggy_short,
         testcase_name=args.testcase,
         fuzzer_name=args.fuzzer_name,
+        fix_diff_line=fix_diff_line,
+        adjacent_commit=adjacent_commit or "",
+        adjacent_commit_hint=adjacent_commit_hint,
     )
     return prompt
 
@@ -346,42 +444,41 @@ def _build_minimize_prompt(args: argparse.Namespace) -> str:
     )
 
 
-def setup_claude_dir(args: argparse.Namespace) -> Path:
-    """Prepare a temporary directory containing Claude settings and CLAUDE.md.
+def setup_agents_dir(args: argparse.Namespace) -> Path:
+    """Prepare a temporary directory containing AGENTS.md shared knowledge.
 
-    Returns the path to a temporary .claude/ directory that will be
-    mounted into the container at /src/{project}/.claude/.
+    Returns the path to the temporary directory that will be
+    mounted into the container at /src/{project}/AGENTS.md.
     """
-    tmpdir = Path(tempfile.mkdtemp(prefix="bug_transplant_claude_"))
-    claude_dir = tmpdir / ".claude"
-    claude_dir.mkdir()
+    tmpdir = Path(tempfile.mkdtemp(prefix="bug_transplant_agents_"))
 
-    # Write settings to allow all tools without prompting
-    settings = claude_dir / "settings.json"
-    settings.write_text(
-        '{"permissions": {"allow": ["Bash(*)", "Read(*)", "Write(*)", '
-        '"Edit(*)", "Glob(*)", "Grep(*)"],'
-        '"deny": ["WebSearch", "WebFetch"]}}\n'
+    # Seed AGENTS.md: use saved knowledge from a previous batch run if available,
+    # otherwise fall back to the blank template.
+    agents_md = tmpdir / "AGENTS.md"
+    saved_agents_md = (
+        DATA_DIR / "bug_transplant"
+        / f"batch_{args.project}_{args.target_commit[:8]}"
+        / "AGENTS.md"
     )
+    if saved_agents_md.exists():
+        agents_md.write_text(saved_agents_md.read_text())
+        logger.info("Seeding AGENTS.md from previous run: %s", saved_agents_md)
+    else:
+        template = MEMORY_TEMPLATE.read_text()
+        agents_md.write_text(template.format(
+            project=args.project,
+            target_commit=args.target_commit,
+            fuzzer_name=args.fuzzer_name,
+        ))
 
-    # Seed CLAUDE.md with memory template (will be mounted writable)
-    claude_md = claude_dir / "CLAUDE.md"
-    template = MEMORY_TEMPLATE.read_text()
-    claude_md.write_text(template.format(
-        project=args.project,
-        target_commit=args.target_commit,
-        fuzzer_name=args.fuzzer_name,
-    ))
-
-    return claude_dir
+    return tmpdir
 
 
 def create_shared_container(
     project: str,
     target_commit: str,
     container_name: str,
-    claude_dir: Path,
-    agent: str = "claude",
+    agents_dir: Path,
     testcases_dir: str = "",
     env: list[str] | None = None,
     volume: list[str] | None = None,
@@ -390,7 +487,6 @@ def create_shared_container(
 
     Returns 0 on success, non-zero on failure.
     """
-    cfg = AGENT_CONFIG[agent]
     image_tag = f"bug-transplant-{project}:latest"
 
     data_dir = str(DATA_DIR)
@@ -436,23 +532,17 @@ def create_shared_container(
         "-v", f"{script_dir}:/script:ro",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
-        "-v", f"{claude_dir}/settings.json:/src/{project}/.claude/settings.json:ro",
-        "-v", f"{claude_dir}/CLAUDE.md:/src/{project}/CLAUDE.md",
+        "-v", f"{agents_dir}/AGENTS.md:/src/{project}/AGENTS.md",
     ]
 
-    # Mount agent credentials
-    cred_dir = Path.home() / cfg["credentials_dir"]
+    # Mount codex credentials
+    cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
     if cred_dir.exists():
         docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-    cred_config = cfg.get("credentials_config")
-    if cred_config:
-        cred_config_path = Path.home() / cred_config
-        if cred_config_path.exists():
-            docker_run_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    api_key = os.environ.get(cfg["api_key_env"], "")
+    api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
     if api_key:
-        docker_run_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+        docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
     if env:
         for e in env:
@@ -464,57 +554,29 @@ def create_shared_container(
     docker_run_cmd += [image_tag, "sleep", "infinity"]
 
     logger.info("Creating shared container: %s", container_name)
-    ret = subprocess.call(docker_run_cmd)
+    ret = _run_quiet(docker_run_cmd, label="docker-run-shared")
     if ret != 0:
         logger.error("Failed to create shared container")
         return 1
 
     # Initial setup: git safe directory, checkout, credentials
     _exec(container_name, "git config --global --add safe.directory '*'", user="root")
-    _exec(container_name, f"cd /src/{project} && git clean -fdx -e CLAUDE.md -e .claude/", user="root")
+    _exec(container_name, f"cd /src/{project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
     _exec(container_name, f"cd /src/{project} && git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-    # Setup agent credentials
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container_name,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container_name,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
-
-    if agent == "claude":
-        _exec(
-            container_name,
-            f"mkdir -p /home/agent/.claude/projects/-src-{project}/; "
-            f"cp /src/{project}/.claude/settings.json "
-            f"/home/agent/.claude/projects/-src-{project}/settings.json 2>/dev/null; "
-            f"cp /src/{project}/CLAUDE.md "
-            f"/home/agent/.claude/projects/-src-{project}/CLAUDE.md 2>/dev/null; "
-            "true",
-        )
+    # Setup codex credentials
+    setup_codex_creds(container_name)
 
     logger.info("Shared container ready: %s", container_name)
     return 0
 
 
 def run_agent_in_container(args: argparse.Namespace) -> int:
-    """Start container, run code agent, collect results.
+    """Start container, run Codex agent, collect results.
 
     Returns 0 on success, non-zero on failure.
     """
-    agent = getattr(args, "agent", "claude")
-    cfg = AGENT_CONFIG[agent]
-
     image_tag = f"bug-transplant-{args.project}:latest"
     reuse_container = getattr(args, "container_name", None)
     container_name = reuse_container or f"bug-transplant-{args.project}-{args.bug_id}"
@@ -529,15 +591,22 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
 
     # Clean and recreate build directories to avoid stale binaries/artifacts
     # from previous runs (prevents "Text file busy" and wrong test results).
-    shutil.rmtree(out_dir, ignore_errors=True)
-    shutil.rmtree(work_dir, ignore_errors=True)
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(work_dir, exist_ok=True)
+    # When reusing a shared container, do NOT delete the host-side directories:
+    # Docker bind-mount backing directories must not be removed while the
+    # container is running — doing so breaks the mount inside the container.
+    if reuse_container:
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(work_dir, exist_ok=True)
+    else:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(work_dir, exist_ok=True)
 
-    # Use shared claude_dir if provided (batch mode), otherwise create new
-    shared_claude_dir = getattr(args, "claude_dir", None)
-    claude_dir = Path(shared_claude_dir) if shared_claude_dir else setup_claude_dir(args)
-    owns_claude_dir = shared_claude_dir is None
+    # Use shared agents_dir if provided (batch mode), otherwise create new
+    shared_agents_dir = getattr(args, "agents_dir", None)
+    agents_dir = Path(shared_agents_dir) if shared_agents_dir else setup_agents_dir(args)
+    owns_agents_dir = shared_agents_dir is None
 
     prompt = build_prompt(args)
 
@@ -579,25 +648,19 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "-v", f"{script_dir}:/script:ro",
             "-v", f"{out_dir}:/out",
             "-v", f"{work_dir}:/work",
-            # Claude settings (ro) + CLAUDE.md as shared memory (rw)
-            "-v", f"{claude_dir}/settings.json:/src/{args.project}/.claude/settings.json:ro",
-            "-v", f"{claude_dir}/CLAUDE.md:/src/{args.project}/CLAUDE.md",
+            # AGENTS.md as shared memory (rw)
+            "-v", f"{agents_dir}/AGENTS.md:/src/{args.project}/AGENTS.md",
         ]
 
-        # Mount agent credentials (login mode)
-        cred_dir = Path.home() / cfg["credentials_dir"]
+        # Mount codex credentials (login mode)
+        cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
         if cred_dir.exists():
             docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-        cred_config = cfg.get("credentials_config")
-        if cred_config:
-            cred_config_path = Path.home() / cred_config
-            if cred_config_path.exists():
-                docker_run_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
         # Environment — pass API key if set (fallback for non-login mode)
-        api_key = os.environ.get(cfg["api_key_env"], "")
+        api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
         if api_key:
-            docker_run_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+            docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
         # Additional user-specified env vars
         if args.env:
@@ -612,12 +675,16 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         docker_run_cmd += [image_tag, "sleep", "infinity"]
 
         logger.info("Starting container: %s", container_name)
-        ret = subprocess.call(docker_run_cmd)
+        ret = _run_quiet(docker_run_cmd, label="docker-run")
         if ret != 0:
             logger.error("Failed to start container")
             return 1
     else:
         logger.info("Reusing container: %s", container_name)
+        # Wipe /out and /work contents from inside the container so stale
+        # binaries don't bleed across bugs. (We cannot rmtree the host-side
+        # directories while the bind mount is live.)
+        _exec(container_name, "rm -rf /out/* /work/*", user="root")
 
     try:
         # --- Checkout target commit inside container ---
@@ -625,8 +692,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         _exec(container_name, "git config --global --add safe.directory '*'", user="root")
         # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
         # before checkout so they don't pollute the git diff later.
-        # Exclude .claude/ and .codex/ — they are bind-mounted for credentials.
-        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e .claude/ -e .codex/", user="root")
+        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
         _exec(container_name, f"cd /src/{args.project} && git checkout -f {args.target_commit}", user="root")
 
         # --- Copy testcase to /work for easier access ---
@@ -637,39 +703,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
-        # --- Setup agent credentials (run as root to read host-owned 600 files) ---
-        creds_dir = cfg["credentials_dir"]
-        _exec(
-            container_name,
-            f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-            f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-            f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-            "true",
-            user="root",
-        )
-        if cfg.get("credentials_config"):
-            _exec(
-                container_name,
-                f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-                f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-                user="root",
-            )
-
-        # --- Copy Claude settings into the agent's home (claude only) ---
-        if agent == "claude":
-            _exec(
-                container_name,
-                f"mkdir -p /home/agent/.claude/projects/-src-{args.project}/; "
-                f"cp /src/{args.project}/.claude/settings.json "
-                f"/home/agent/.claude/projects/-src-{args.project}/settings.json 2>/dev/null; "
-                f"cp /src/{args.project}/CLAUDE.md "
-                f"/home/agent/.claude/projects/-src-{args.project}/CLAUDE.md 2>/dev/null; "
-                "true",
-            )
+        # --- Setup codex credentials ---
+        setup_codex_creds(container_name)
 
         # --- Run agent ---
-        logger.info("Running %s agent (this may take a while)...", agent)
-        agent_cmd = _build_agent_command(prompt, args)
+        logger.info("Running codex agent (this may take a while)...")
+        agent_cmd = build_codex_command(prompt, getattr(args, "model", None))
 
         start_time = time.monotonic()
         exit_code, output = _exec_capture(
@@ -677,35 +716,23 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         elapsed = time.monotonic() - start_time
 
-        # claude exits 0 even on max-turns — detect from output text
-        if exit_code == 0 and "Reached max turns" in output:
-            logger.warning("Agent hit max turns limit — treating as failure")
-            exit_code = 1
+        if _usage_tracker:
+            _usage_tracker.log_usage("transplant", output, getattr(args, "model", None))
 
         logger.info(
-            "%s agent finished in %.0fs (exit code %d, %d bytes output)",
-            agent, elapsed, exit_code, len(output),
+            "Codex agent finished in %.0fs (exit code %d, %d bytes output)",
+            elapsed, exit_code, len(output),
         )
 
         # --- Save output ---
         output_dir = DATA_DIR / "bug_transplant" / f"{args.project}_{args.bug_id}"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save raw Claude output
-        (output_dir / "claude_output.txt").write_text(output)
-
-        # Save full conversation JSONL (before next bug overwrites it)
-        _, jsonl_list = _exec_capture(
-            container_name,
-            f"ls -t /home/agent/.claude/projects/-src-{args.project}/*.jsonl 2>/dev/null | head -1",
+        # Save raw JSONL and human-readable transcript
+        (output_dir / "agent_output.jsonl").write_text(output)
+        (output_dir / "agent_output.txt").write_text(
+            _format_codex_output(output)
         )
-        jsonl_path = jsonl_list.strip()
-        if jsonl_path:
-            subprocess.call(
-                ["docker", "cp", f"{container_name}:{jsonl_path}",
-                 str(output_dir / "conversation.jsonl")],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
 
         # Check if agent declared the bug impossible to transplant
         impossible_path = output_dir / "bug_transplant.impossible"
@@ -727,7 +754,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # capturing build artifacts via bare `git diff`.
         diff_path = output_dir / "bug_transplant.diff"
         _git_diff_excludes = (
-            "':(exclude).claude/' ':(exclude).codex/' "
+            "':(exclude).codex/' "
             "':(exclude)CMakeFiles/' ':(exclude)*/CMakeFiles/' "
             "':(exclude)CMakeCache.txt' ':(exclude)cmake_install.cmake' "
             "':(exclude)*/cmake_install.cmake' ':(exclude)CTestTestfile.cmake' "
@@ -775,8 +802,14 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             fuzzer = args.fuzzer_name
             testcase = args.testcase
 
-            # Force official build
+            # Force official build (delete fuzzer binary to force re-link;
+            # autotools/cmake may not re-link when only library sources change)
             logger.info("Rebuilding with official compile...")
+            _exec_capture(
+                container_name,
+                f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                f"rm -f /out/{fuzzer}",
+            )
             ret_build, build_out = _exec_capture(
                 container_name, "sudo -E compile 2>&1", timeout=300,
             )
@@ -823,21 +856,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 crash_matches = True  # assume match if no original to compare
                 if original_crash_file.exists():
                     orig_text = original_crash_file.read_text()
-                    # Extract crashing function (first #0 or #1 in project code)
-                    def _extract_crash_funcs(text):
-                        funcs = []
-                        for m in re.finditer(r'#\d+\s+\S+ in (\S+)\s+/src/', text):
-                            funcs.append(m.group(1))
-                        return funcs[:3]  # top 3 functions in project code
-
-                    orig_funcs = _extract_crash_funcs(orig_text)
-                    new_funcs = _extract_crash_funcs(fuzz_out)
-                    # Check if any of the top crash functions overlap
-                    if orig_funcs and new_funcs and not set(orig_funcs) & set(new_funcs):
-                        crash_matches = False
+                    crash_matches = _crash_stacks_match(orig_text, fuzz_out)
+                    if not crash_matches:
                         logger.warning(
-                            "Crash stack MISMATCH: original=%s new=%s",
-                            orig_funcs, new_funcs,
+                            "Crash stack MISMATCH (see above for details)",
                         )
 
             if has_crash and crash_matches:
@@ -851,12 +873,14 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # --- Phase 2: Minimization (separate agent) ---
                 logger.info("=== Minimization phase ===")
                 minimize_prompt = _build_minimize_prompt(args)
-                minimize_cmd = _build_agent_command(minimize_prompt, args)
+                minimize_cmd = build_codex_command(minimize_prompt, getattr(args, "model", None))
                 min_start = time.monotonic()
                 min_exit, min_output = _exec_capture(
                     container_name, minimize_cmd, timeout=args.timeout,
                 )
                 min_elapsed = time.monotonic() - min_start
+                if _usage_tracker:
+                    _usage_tracker.log_usage("minimize", min_output, getattr(args, "model", None))
                 logger.info("Minimization finished in %.0fs (exit %d)",
                             min_elapsed, min_exit)
                 (output_dir / "minimize_output.txt").write_text(min_output)
@@ -884,7 +908,18 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                         logger.info("Re-collected testcase from %s", tc_src)
                         break
 
-                # Re-verify after minimization (use agent's testcase)
+                # Re-verify after minimization: force rebuild to avoid
+                # stale binaries (autotools/cmake dependency tracking issue)
+                _exec_capture(
+                    container_name,
+                    f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                    f"rm -f /out/{fuzzer}",
+                )
+                ret_rebuild, _ = _exec_capture(
+                    container_name, "sudo -E compile 2>&1", timeout=300,
+                )
+                if ret_rebuild != 0:
+                    logger.warning("Post-minimize rebuild failed")
                 _exec_capture(
                     container_name,
                     f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "
@@ -941,7 +976,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info("Resetting source tree for next bug...")
             _exec(container_name,
                   f"cd /src/{args.project} && git checkout -f {args.target_commit} && "
-                  f"git clean -fdx -e CLAUDE.md -e .claude/",
+                  f"git clean -fdx -e AGENTS.md -e .codex/",
                   user="root")
         elif not args.keep_container:
             logger.info("Destroying container %s...", container_name)
@@ -953,28 +988,149 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info(
                 "Container kept alive: docker exec -it %s bash", container_name,
             )
-        # Clean up temp claude directory (only if we own it)
-        if owns_claude_dir:
-            shutil.rmtree(claude_dir.parent, ignore_errors=True)
+        # Clean up temp agents directory (only if we own it)
+        if owns_agents_dir:
+            shutil.rmtree(agents_dir, ignore_errors=True)
 
 
-def _build_agent_command(prompt: str, args: argparse.Namespace) -> str:
-    """Build the CLI command for the selected agent."""
-    import shlex
+def _extract_crash_funcs(text: str, limit: int = 0) -> list:
+    """Extract function names from crash stack frames in /src/ project code.
 
-    agent = getattr(args, "agent", "claude")
-    cfg = AGENT_CONFIG[agent]
-    escaped = shlex.quote(prompt)
+    Args:
+        text: ASan/MSan/etc. crash output.
+        limit: Max functions to return (0 = all).
+    """
+    funcs = []
+    for m in re.finditer(r'#\d+\s+\S+ in (\S+)\s+/src/', text):
+        funcs.append(m.group(1))
+    return funcs[:limit] if limit else funcs
 
-    # Build command from template
-    cmd = cfg["run_cmd"].format(prompt=escaped)
 
-    # Add model flag if specified
-    model = getattr(args, "model", None)
-    if model:
-        cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+def _extract_sanitizer_class(text: str):
+    """Extract sanitizer error class and access direction from crash output.
 
-    return cmd
+    Returns (error_class, direction) e.g. ("heap-buffer-overflow", "READ")
+    or (None, None) if not found.
+    """
+    m = re.search(
+        r'ERROR:\s*\w+Sanitizer:\s*([\w-]+)\s+on address.*?\n'
+        r'(READ|WRITE)\s+of\s+size',
+        text, re.DOTALL,
+    )
+    if m:
+        return m.group(1), m.group(2)
+    # Fallback: try SUMMARY line for class, separate search for direction
+    m_summary = re.search(r'SUMMARY:\s*\w+Sanitizer:\s*([\w-]+)', text)
+    m_dir = re.search(r'(READ|WRITE)\s+of\s+size', text)
+    return (
+        m_summary.group(1) if m_summary else None,
+        m_dir.group(1) if m_dir else None,
+    )
+
+
+def _extract_crash_files(text: str) -> set:
+    """Extract source file basenames from crash stack frames in /src/."""
+    files = set()
+    for m in re.finditer(r'/src/\S+/([\w._-]+\.\w+):\d+', text):
+        files.add(m.group(1))
+    return files
+
+
+def _crash_stacks_match(orig_text: str, new_text: str) -> bool:
+    """Two-tier crash matching: exact (top-3 overlap) then same-vulnerability.
+
+    Tier 1: Any overlap in top-3 project-code functions (fast, high confidence).
+    Tier 2: Same sanitizer class + same access direction + overlapping call
+            chain (any depth) + same source file area.
+    """
+    # Tier 1: top-3 function overlap (original strict check)
+    orig_top3 = _extract_crash_funcs(orig_text, limit=3)
+    new_top3 = _extract_crash_funcs(new_text, limit=3)
+    if orig_top3 and new_top3 and set(orig_top3) & set(new_top3):
+        return True
+
+    # Tier 2: same-vulnerability match
+    orig_class, orig_dir = _extract_sanitizer_class(orig_text)
+    new_class, new_dir = _extract_sanitizer_class(new_text)
+
+    # 2a. Same sanitizer class
+    if orig_class and new_class and orig_class != new_class:
+        logger.warning(
+            "Crash class mismatch: original=%s new=%s",
+            orig_class, new_class,
+        )
+        return False
+
+    # 2b. Same access direction
+    if orig_dir and new_dir and orig_dir != new_dir:
+        logger.warning(
+            "Crash direction mismatch: original=%s new=%s",
+            orig_dir, new_dir,
+        )
+        return False
+
+    # 2c. Overlapping call chain (full depth, including allocation stack)
+    orig_all = set(_extract_crash_funcs(orig_text))
+    new_all = set(_extract_crash_funcs(new_text))
+    chain_overlap = orig_all & new_all
+    if not chain_overlap:
+        logger.warning(
+            "No overlapping functions in full call chain: "
+            "original=%s new=%s",
+            sorted(orig_all)[:5], sorted(new_all)[:5],
+        )
+        return False
+
+    # 2d. Same source file area
+    orig_files = _extract_crash_files(orig_text)
+    new_files = _extract_crash_files(new_text)
+    if orig_files and new_files and not orig_files & new_files:
+        logger.warning(
+            "No overlapping crash source files: original=%s new=%s",
+            sorted(orig_files), sorted(new_files),
+        )
+        return False
+
+    logger.info(
+        "Crash accepted via same-vulnerability match: class=%s dir=%s "
+        "shared_funcs=%s shared_files=%s",
+        new_class, new_dir, sorted(chain_overlap),
+        sorted(orig_files & new_files) if orig_files and new_files else "n/a",
+    )
+    return True
+
+
+def _format_codex_output(jsonl_output: str) -> str:
+    """Convert codex --json JSONL output to a human-readable transcript."""
+    import json as _json
+    lines = []
+    for raw in jsonl_output.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            ev = _json.loads(raw)
+        except _json.JSONDecodeError:
+            continue
+        if ev.get("type") != "item.completed":
+            continue
+        item = ev.get("item", {})
+        itype = item.get("type", "")
+        if itype == "agent_message":
+            text = item.get("text", "")
+            if text:
+                lines.append(f"\n{'='*60}")
+                lines.append(f"AGENT:")
+                lines.append(text)
+        elif itype == "command_execution":
+            cmd = item.get("command", "")
+            out = item.get("aggregated_output", "")
+            code = item.get("exit_code", "")
+            lines.append(f"\n--- CMD (exit {code}) ---")
+            lines.append(f"$ {cmd}")
+            if out:
+                lines.append(out.rstrip())
+    return "\n".join(lines) + "\n" if lines else jsonl_output
 
 
 def _exec(container_name: str, command: str, user: str | None = None) -> int:
@@ -1011,7 +1167,7 @@ def _exec_capture(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Bug transplant via Claude Code inside OSS-Fuzz container",
+        description="Bug transplant via Codex inside OSS-Fuzz container",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -1048,6 +1204,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=os.environ.get("TESTCASES", ""),
                         help="Directory containing testcase files "
                              "(default: $TESTCASES env var)")
+    parser.add_argument("--repo-path",
+                        default=os.environ.get("REPO_PATH", ""),
+                        help="Local git repo of the target project for fix-diff generation "
+                             "(default: $REPO_PATH env var)")
+    parser.add_argument("--adjacent-commit", default=None,
+                        help="First CSV commit after the buggy commit toward target "
+                             "(pre-computed by bug_transplant_batch.py)")
     parser.add_argument("--build-csv", default=None,
                         help="Build CSV mapping commits to OSS-Fuzz versions")
     parser.add_argument("--runner-image", default=None,
@@ -1056,8 +1219,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Skip crash/trace collection (data already exists)")
 
     # Agent
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
-                        help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--timeout", type=int, default=3600,
@@ -1068,8 +1229,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Keep container alive after completion for debugging")
     parser.add_argument("--container-name", default=None,
                         help="Reuse an existing container (batch mode)")
-    parser.add_argument("--claude-dir", default=None,
-                        help="Shared CLAUDE.md directory (batch mode)")
+    parser.add_argument("--agents-dir", default=None,
+                        help="Shared AGENTS.md directory (batch mode)")
     parser.add_argument("-e", "--env", action="append",
                         help="Additional env vars for container (VAR=value)")
     parser.add_argument("-v", "--volume", action="append",
@@ -1083,6 +1244,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    global _usage_tracker
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -1093,6 +1256,10 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Initialize codex token tracker
+    from codex_usage import CodexUsageTracker
+    _usage_tracker = CodexUsageTracker()
 
     # Validate testcases dir
     if not args.testcases_dir:
@@ -1113,8 +1280,7 @@ def main() -> int:
             logger.error("Failed to collect crash data")
             return 1
         if not collect_trace_data(args):
-            logger.error("Failed to collect trace data")
-            return 1
+            logger.warning("Failed to collect trace data (non-fatal, agent will work without it)")
     else:
         logger.info("=== Phase 0: Skipped (--skip-collect) ===")
         # Verify data exists
@@ -1126,21 +1292,27 @@ def main() -> int:
         if not trace_file.exists():
             missing.append(str(trace_file))
         if missing:
-            logger.warning("Missing data files (Claude Code will work without them):")
+            logger.warning("Missing data files (agent will work without them):")
             for f in missing:
                 logger.warning("  %s", f)
+
+    # Fix diff: generate for standalone runs (batch pre-generates these already)
+    if args.repo_path:
+        project_repo = os.path.join(args.repo_path, args.project)
+        args.repo_path = project_repo if os.path.isdir(project_repo) else args.repo_path
+        collect_fix_diff(args)
 
     # ------------------------------------------------------------------
     # Phase 1: Build Docker images
     # ------------------------------------------------------------------
     logger.info("=== Phase 1: Building Docker images ===")
     project_image = build_project_image(args.project)
-    agent_image = build_agent_image(args.project, project_image, args.agent)
+    agent_image = build_agent_image(args.project, project_image)
 
     # ------------------------------------------------------------------
-    # Phase 2+3: Run Claude Code in container
+    # Phase 2+3: Run Codex in container
     # ------------------------------------------------------------------
-    logger.info("=== Phase 2+3: Running Claude Code in container ===")
+    logger.info("=== Phase 2+3: Running Codex in container ===")
     exit_code = run_agent_in_container(args)
 
     # ------------------------------------------------------------------
@@ -1157,10 +1329,23 @@ def main() -> int:
     elif git_diff_path.exists() and git_diff_path.stat().st_size > 0:
         logger.info("Git diff (fallback): %s", git_diff_path)
     else:
-        logger.warning("No diff produced -- check claude_output.txt for details")
+        logger.warning("No diff produced -- check agent_output.txt for details")
 
-    if (output_dir / "claude_output.txt").exists():
-        logger.info("Claude output: %s", output_dir / "claude_output.txt")
+    if (output_dir / "agent_output.txt").exists():
+        logger.info("Agent output: %s", output_dir / "agent_output.txt")
+
+    _usage_tracker.log_session_total()
+
+    # Write usage stats to output dir so batch can aggregate
+    if _usage_tracker.cost > 0 and output_dir.exists():
+        import json
+        usage_path = output_dir / "token_usage.json"
+        usage_path.write_text(json.dumps({
+            "input_tokens": _usage_tracker.input_tokens,
+            "cached_input_tokens": _usage_tracker.cached_input_tokens,
+            "output_tokens": _usage_tracker.output_tokens,
+            "cost": round(_usage_tracker.cost, 6),
+        }, indent=2))
 
     return exit_code
 

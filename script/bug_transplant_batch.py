@@ -31,6 +31,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -101,7 +102,12 @@ def select_crash_test_input(bug_id: str, testcases_dir: str) -> str:
 # Target commit selection (adapted from revert_patch_test.py lines 1310-1386)
 # ---------------------------------------------------------------------------
 
+# Statuses that count toward target-commit selection (high-confidence triggers).
 STRONG_TRIGGER_STATUSES = {"1|1", "1|0", "0.5|1"}
+# Statuses treated as "already triggering" when partitioning bugs at the chosen
+# target commit.  Includes 0.5|0 (crashes but with mismatched signature) so we
+# don't waste agent runs on bugs that already crash locally.
+LOCAL_BUG_STATUSES = {"1|1", "1|0", "0.5|1", "0.5|0"}
 
 
 def _is_ancestor(repo_path: str, older: str, newer: str) -> bool:
@@ -112,6 +118,82 @@ def _is_ancestor(repo_path: str, older: str, newer: str) -> bool:
         capture_output=True,
     )
     return ret.returncode == 0
+
+
+def find_adjacent_csv_commit(
+    data: list[dict],
+    buggy_commit: str,
+    target_commit: str,
+    repo_path: str,
+) -> str | None:
+    """Return the first CSV commit after *buggy_commit* in the direction of
+    *target_commit*, by walking the git ancestry path and checking which
+    commits appear in the CSV.
+
+    This gives the window [buggy_commit, adjacent) that most likely contains
+    the bug fix (or introduction), without scanning every individual git commit.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log",
+             f"{buggy_commit}..{target_commit}",
+             "--ancestry-path", "--reverse", "--format=%H"],
+            cwd=repo_path,
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            return None
+        ordered_commits = [c for c in result.stdout.strip().splitlines() if c]
+    except Exception as exc:
+        logger.debug("find_adjacent_csv_commit git log error: %s", exc)
+        return None
+
+    csv_commit_set = {row["commit_id"] for row in data}
+    for commit in ordered_commits:
+        if commit in csv_commit_set:
+            return commit
+    return None
+
+
+def generate_fix_diffs(
+    bug_tasks: list[tuple[str, str, dict]],
+    repo_path: str,
+) -> None:
+    """Pre-generate fix hint diffs for all bugs in bug_tasks.
+
+    Runs git diff on the host repo and writes results to
+    DATA_DIR/patch_diffs/fix_hint-<buggy_short>-<testcase>.diff.
+    Done upfront so diffs exist even for bugs skipped by --resume.
+    """
+    patch_diffs_dir = DATA_DIR / "patch_diffs"
+    patch_diffs_dir.mkdir(exist_ok=True)
+
+    for bug_id, buggy_commit, metadata in bug_tasks:
+        adjacent_commit = metadata.get("adjacent_commit")
+        if not adjacent_commit:
+            continue
+        testcase = metadata["testcase"]
+        buggy_short = buggy_commit[:8]
+        out_path = patch_diffs_dir / f"fix_hint-{buggy_short}-{testcase}.diff"
+        if out_path.exists():
+            logger.info("[%s] Fix diff already exists: %s", bug_id, out_path.name)
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "diff", buggy_commit, adjacent_commit],
+                cwd=repo_path,
+                capture_output=True, text=True,
+            )
+            diff_text = result.stdout
+        except Exception as exc:
+            logger.warning("[%s] git diff failed: %s", bug_id, exc)
+            continue
+        if not diff_text.strip():
+            logger.info("[%s] Fix diff empty — skipping", bug_id)
+            continue
+        out_path.write_text(diff_text)
+        logger.info("[%s] Fix diff saved: %s (adjacent=%s)",
+                    bug_id, out_path.name, adjacent_commit[:8])
 
 
 def _trigger_rank(status: str | None) -> int:
@@ -126,11 +208,11 @@ def prepare_transplant(
     data: list[dict],
     repo_path: str | None,
     target_commit_override: str | None = None,
-) -> tuple[set[str], dict[str, dict], dict]:
+) -> tuple[set[str], dict[str, dict], set[str], dict]:
     """Select target commit and partition bugs.
 
     Returns:
-        (bug_ids_trigger, bugs_need_transplant, target_row)
+        (bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row)
     """
     # Recount poc stats (CSV parser may have partial counts)
     for row in data:
@@ -170,7 +252,7 @@ def prepare_transplant(
     bug_ids_trigger: set[str] = set()
     bug_ids_other: set[str] = set()
     for bug_id, status in target_row["osv_statuses"].items():
-        if status in STRONG_TRIGGER_STATUSES:
+        if status in LOCAL_BUG_STATUSES:
             bug_ids_trigger.add(bug_id)
         else:
             bug_ids_other.add(bug_id)
@@ -201,20 +283,7 @@ def prepare_transplant(
         if b not in bugs_need_transplant and b != "poc count"
     }
 
-    logger.info("All bugs count: %d", len(target_row["osv_statuses"]))
-    logger.info(
-        "Target row poc_count=%d weak_poc_count=%d",
-        target_row["poc_count"], target_row["weak_poc_count"],
-    )
-    logger.info("Already triggering: %d %s", len(bug_ids_trigger), bug_ids_trigger)
-    logger.info(
-        "Need transplant: %d %s",
-        len(bugs_need_transplant), set(bugs_need_transplant.keys()),
-    )
-    if bugs_cant_use:
-        logger.info("Cannot use (no triggering commit): %d %s", len(bugs_cant_use), bugs_cant_use)
-
-    return bug_ids_trigger, bugs_need_transplant, target_row
+    return bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row
 
 
 # ---------------------------------------------------------------------------
@@ -259,27 +328,9 @@ def resolve_bug_metadata(
 # ---------------------------------------------------------------------------
 
 def is_bug_completed(project: str, bug_id: str) -> bool:
-    """Check if transplant artifacts already exist for this bug.
-
-    A bug is considered completed if it has a diff file (even empty for
-    testcase-only transplants) AND a testcase or crash log, or if the
-    agent declared it impossible.
-    """
+    """Check if the output folder for this bug already exists."""
     out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
-    if not out_dir.exists():
-        return False
-    # Agent declared impossible
-    if (out_dir / "bug_transplant.impossible").exists():
-        return True
-    has_diff = any(
-        (out_dir / name).exists()
-        for name in ("bug_transplant.diff", "git_diff.diff")
-    )
-    has_testcase = any(
-        p.name.startswith("testcase-") for p in out_dir.glob("testcase-*")
-    )
-    has_crash = (out_dir / "transplant_crash.txt").exists()
-    return has_diff and (has_testcase or has_crash)
+    return out_dir.exists()
 
 
 def run_single_bug(
@@ -290,7 +341,8 @@ def run_single_bug(
     metadata: dict,
     args: argparse.Namespace,
     container_name: str | None = None,
-    claude_dir: str | None = None,
+    agents_dir: str | None = None,
+    repo_path: str | None = None,
 ) -> dict:
     """Run bug_transplant.py for a single bug, return result dict."""
     result = {
@@ -321,8 +373,10 @@ def run_single_bug(
         cmd += ["--runner-image", args.runner_image]
     if args.skip_collect:
         cmd.append("--skip-collect")
-    if args.agent:
-        cmd += ["--agent", args.agent]
+    if repo_path:
+        cmd += ["--repo-path", repo_path]
+    if metadata.get("adjacent_commit"):
+        cmd += ["--adjacent-commit", metadata["adjacent_commit"]]
     if args.model:
         cmd += ["--model", args.model]
     if args.timeout:
@@ -334,8 +388,8 @@ def run_single_bug(
     # Shared container mode
     if container_name:
         cmd += ["--container-name", container_name]
-    if claude_dir:
-        cmd += ["--claude-dir", claude_dir]
+    if agents_dir:
+        cmd += ["--agents-dir", agents_dir]
 
     logger.info("[%s] Starting: buggy=%s target=%s fuzzer=%s",
                 bug_id, buggy_commit[:8], target_commit[:8], metadata["fuzzer"])
@@ -353,9 +407,11 @@ def run_single_bug(
             result["status"] = "success"
         else:
             result["status"] = "failed"
-            # Capture last 500 chars of output for diagnostics
             output = (proc.stdout + proc.stderr).strip()
             result["error_message"] = output[-500:] if output else "non-zero exit"
+            # Print full subprocess output so failures are visible in the log
+            if output:
+                logger.error("[%s] Subprocess output:\n%s", bug_id, output)
     except subprocess.TimeoutExpired:
         result["status"] = "error"
         result["error_message"] = "subprocess timeout"
@@ -378,6 +434,19 @@ def run_single_bug(
     crash_path = out_dir / "transplant_crash.txt"
     if crash_path.exists() and crash_path.stat().st_size > 0:
         result["crash_log_path"] = str(crash_path)
+
+    # Collect token usage from per-bug output
+    usage_path = out_dir / "token_usage.json"
+    if usage_path.exists():
+        try:
+            usage = json.loads(usage_path.read_text())
+            result["token_usage"] = usage
+            logger.info("[%s] Token usage: %d in (%d cached) + %d out | Cost: $%.4f",
+                        bug_id, usage.get("input_tokens", 0),
+                        usage.get("cached_input_tokens", 0),
+                        usage.get("output_tokens", 0), usage.get("cost", 0))
+        except Exception:
+            pass
 
     logger.info(
         "[%s] Finished: status=%s exit=%d elapsed=%.0fs diff=%s",
@@ -407,6 +476,25 @@ def write_progress(output_dir: Path, results: list[dict], ongoing: list[str]) ->
     path.write_text(json.dumps(progress, indent=2))
 
 
+def _result_from_folder(project: str, bug_id: str) -> dict:
+    """Derive a result entry from the output folder contents."""
+    out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
+    if (out_dir / "bug_transplant.impossible").exists():
+        reason = (out_dir / "bug_transplant.impossible").read_text().strip()
+        return {"bug_id": bug_id, "status": "impossible", "reason": reason}
+    has_diff = any(
+        (out_dir / name).exists()
+        for name in ("bug_transplant.diff", "git_diff.diff")
+    )
+    has_crash = (out_dir / "transplant_crash.txt").exists()
+    has_testcase = any(out_dir.glob("testcase-*"))
+    if has_diff and (has_crash or has_testcase):
+        return {"bug_id": bug_id, "status": "success"}
+    if has_diff:
+        return {"bug_id": bug_id, "status": "failed", "reason": "diff but no crash/testcase"}
+    return {"bug_id": bug_id, "status": "failed", "reason": "no artifacts"}
+
+
 def write_summary(
     output_dir: Path,
     results: list[dict],
@@ -415,23 +503,52 @@ def write_summary(
     bug_ids_trigger: set[str],
     total_elapsed: float,
 ) -> None:
-    """Write final summary JSON."""
-    completed = [r for r in results if r["status"] != "skipped"]
+    """Write final summary JSON, merging with existing folder-based results."""
+    # Load existing summary to preserve entries not in this run
+    existing: dict[str, dict] = {}
+    path = output_dir / "summary.json"
+    if path.exists():
+        try:
+            old = json.loads(path.read_text())
+            for r in old.get("results", []):
+                bid = r.get("bug_id")
+                if bid:
+                    existing[bid] = r
+        except Exception:
+            pass
+
+    # Scan all folders on disk to build ground-truth results
+    for folder in (DATA_DIR / "bug_transplant").iterdir():
+        if not folder.is_dir():
+            continue
+        prefix = f"{project}_"
+        if not folder.name.startswith(prefix):
+            continue
+        bug_id = folder.name[len(prefix):]
+        existing[bug_id] = _result_from_folder(project, bug_id)
+
+    # Override with fresh results from this run, but let the on-disk
+    # impossible marker win — the agent may exit 0 after writing it.
+    for r in results:
+        bid = r.get("bug_id")
+        if bid and r.get("status") not in ("skipped", None):
+            if existing.get(bid, {}).get("status") != "impossible":
+                existing[bid] = r
+
+    merged_results = sorted(existing.values(), key=lambda r: r.get("bug_id", ""))
+    completed = [r for r in merged_results if r["status"] not in ("skipped",)]
     summary = {
         "type": "bug_transplant_batch",
         "project": project,
         "target_commit": target_commit,
-        "total_bugs_in_csv": None,  # filled below
         "bugs_already_trigger": len(bug_ids_trigger),
         "bugs_already_trigger_ids": sorted(bug_ids_trigger),
         "bugs_attempted": len(completed),
-        "bugs_skipped_resume": sum(1 for r in results if r["status"] == "skipped"),
-        "bugs_succeeded": sum(1 for r in results if r["status"] == "success"),
-        "bugs_failed": sum(1 for r in results if r["status"] in ("failed", "error")),
+        "bugs_succeeded": sum(1 for r in completed if r["status"] == "success"),
+        "bugs_failed": sum(1 for r in completed if r["status"] in ("failed", "error", "impossible")),
         "total_elapsed_seconds": round(total_elapsed, 1),
-        "results": results,
+        "results": merged_results,
     }
-    path = output_dir / "summary.json"
     path.write_text(json.dumps(summary, indent=2))
     logger.info("Summary written: %s", path)
 
@@ -442,7 +559,7 @@ def write_summary(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Batch bug transplant via Claude Code",
+        description="Batch bug transplant via Codex",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
@@ -477,8 +594,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Process specific bug(s) only")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
-                        help="Code agent to use (default: claude)")
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--jobs", type=int, default=1,
@@ -555,7 +670,7 @@ def main() -> int:
         elif os.path.isdir(args.repo_path):
             repo_path = args.repo_path
 
-    bug_ids_trigger, bugs_need_transplant, target_row = prepare_transplant(
+    bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row = prepare_transplant(
         parsed_data, repo_path, args.target_commit,
     )
     if not target_row:
@@ -584,6 +699,7 @@ def main() -> int:
     # ------------------------------------------------------------------
     # 3. Resolve metadata and validate
     # ------------------------------------------------------------------
+    skipped_non_asan: list[str] = []
     bug_tasks: list[tuple[str, str, dict]] = []  # (bug_id, buggy_commit, metadata)
     for bug_id, row in bugs_need_transplant.items():
         metadata = resolve_bug_metadata(bug_id, bug_info_dataset, args.testcases_dir)
@@ -593,14 +709,43 @@ def main() -> int:
         if not metadata["fuzzer"]:
             logger.warning("Skipping %s: no fuzzer name in metadata", bug_id)
             continue
+        if metadata["sanitizer"] != "address":
+            skipped_non_asan.append(bug_id)
+            continue
         # Check testcase exists
         testcase_path = os.path.join(args.testcases_dir, metadata["testcase"])
         if not os.path.exists(testcase_path):
             logger.warning("Skipping %s: testcase not found at %s", bug_id, testcase_path)
             continue
-        bug_tasks.append((bug_id, row["commit_id"], metadata))
+        # Find the adjacent CSV commit (first tested commit after buggy toward target)
+        buggy_commit = row["commit_id"]
+        if repo_path:
+            adjacent = find_adjacent_csv_commit(
+                parsed_data, buggy_commit, target_commit, repo_path,
+            )
+            if adjacent:
+                metadata["adjacent_commit"] = adjacent
+            else:
+                logger.debug("[%s] No adjacent CSV commit found", bug_id)
+        bug_tasks.append((bug_id, buggy_commit, metadata))
 
-    logger.info("Bugs to process: %d", len(bug_tasks))
+    # ------------------------------------------------------------------
+    # Summary (printed after all filters applied)
+    # ------------------------------------------------------------------
+    logger.info("All bugs count: %d", len(target_row["osv_statuses"]))
+    logger.info("Target commit: %s (poc_count=%d)",
+                target_commit[:12], target_row["poc_count"])
+    logger.info("Already triggering: %d %s", len(bug_ids_trigger), bug_ids_trigger)
+    if bugs_cant_use:
+        logger.info("Cannot use (no triggering commit): %d %s", len(bugs_cant_use), bugs_cant_use)
+    if skipped_non_asan:
+        logger.info("Skipped non-ASAN: %d %s", len(skipped_non_asan), skipped_non_asan)
+    logger.info("Bugs to transplant: %d %s",
+                len(bug_tasks), {b for b, _, _ in bug_tasks})
+
+    # Generate fix diffs upfront so they exist even for --resume skipped bugs
+    if repo_path:
+        generate_fix_diffs(bug_tasks, repo_path)
 
     # ------------------------------------------------------------------
     # Dry run
@@ -631,7 +776,7 @@ def main() -> int:
     from bug_transplant import build_project_image, build_agent_image
 
     project_image = build_project_image(args.target, target_commit, args.build_csv)
-    agent_image = build_agent_image(args.target, project_image, args.agent)
+    agent_image = build_agent_image(args.target, project_image)
     logger.info("Docker images ready: %s", agent_image)
 
     # ------------------------------------------------------------------
@@ -640,41 +785,60 @@ def main() -> int:
     artifacts_root = DATA_DIR / "bug_transplant" / f"batch_{args.target}_{target_commit[:8]}"
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
+    # Load previous results from existing summary/progress so --resume
+    # preserves 'success'/'failed' status instead of overwriting with 'skipped'.
+    prev_results: dict[str, dict] = {}
+    for fname in ("summary.json", "progress.json"):
+        prev_path = artifacts_root / fname
+        if prev_path.exists():
+            try:
+                prev_data = json.loads(prev_path.read_text())
+                for r in prev_data.get("results", []):
+                    bid = r.get("bug_id")
+                    if bid and bid not in prev_results:
+                        prev_results[bid] = r
+                if prev_results:
+                    logger.info(
+                        "Loaded %d previous results from %s", len(prev_results), fname
+                    )
+                    break
+            except Exception:
+                pass
+
     results: list[dict] = []
     batch_start = time.monotonic()
 
     # --- Create shared container for sequential mode ---
     from bug_transplant import (
-        setup_claude_dir, create_shared_container,
+        setup_agents_dir, create_shared_container,
     )
     import shutil
 
     shared_container = None
-    shared_claude_dir = None
+    shared_agents_dir = None
 
     try:
         if args.jobs <= 1:
-            # Create shared container + CLAUDE.md once for all bugs
+            # Create shared container + AGENTS.md once for all bugs
             shared_container = f"bug-transplant-{args.target}-batch"
             first_fuzzer = bug_tasks[0][2]["fuzzer"] if bug_tasks else "unknown"
 
-            # Build a temporary args-like object for setup_claude_dir
+            # Build a temporary args-like object for setup_agents_dir
             class _SetupArgs:
                 pass
             _sa = _SetupArgs()
             _sa.project = args.target
             _sa.target_commit = target_commit
             _sa.fuzzer_name = first_fuzzer
-            shared_claude_path = setup_claude_dir(_sa)
-            shared_claude_dir = str(shared_claude_path)
+            shared_agents_path = setup_agents_dir(_sa)
+            shared_agents_dir = str(shared_agents_path)
 
             # Create the shared container once
             ret = create_shared_container(
                 project=args.target,
                 target_commit=target_commit,
                 container_name=shared_container,
-                claude_dir=shared_claude_path,
-                agent=args.agent,
+                agents_dir=shared_agents_path,
                 testcases_dir=args.testcases_dir,
             )
             if ret != 0:
@@ -685,7 +849,9 @@ def main() -> int:
             for bug_id, buggy_commit, metadata in bug_tasks:
                 if args.resume and is_bug_completed(args.target, bug_id):
                     logger.info("[%s] Already completed, skipping (--resume)", bug_id)
-                    results.append({"bug_id": bug_id, "status": "skipped"})
+                    prev = prev_results.get(bug_id)
+                    results.append(prev if prev and prev.get("status") not in ("skipped", None)
+                                   else {"bug_id": bug_id, "status": "skipped"})
                     write_progress(artifacts_root, results, ongoing=[])
                     continue
 
@@ -693,10 +859,15 @@ def main() -> int:
                     args.target, bug_id, buggy_commit, target_commit,
                     metadata, args,
                     container_name=shared_container,
-                    claude_dir=shared_claude_dir,
+                    agents_dir=shared_agents_dir,
+                    repo_path=repo_path,
                 )
                 results.append(result)
                 write_progress(artifacts_root, results, ongoing=[])
+                # Persist AGENTS.md after each bug so knowledge survives interruption
+                _agents_md = Path(shared_agents_dir) / "AGENTS.md"
+                if _agents_md.exists():
+                    shutil.copy2(_agents_md, artifacts_root / "AGENTS.md")
         else:
             # Parallel via ThreadPoolExecutor
             ongoing: set[str] = set()
@@ -705,7 +876,9 @@ def main() -> int:
                 for bug_id, buggy_commit, metadata in bug_tasks:
                     if args.resume and is_bug_completed(args.target, bug_id):
                         logger.info("[%s] Already completed, skipping (--resume)", bug_id)
-                        results.append({"bug_id": bug_id, "status": "skipped"})
+                        prev = prev_results.get(bug_id)
+                        results.append(prev if prev and prev.get("status") not in ("skipped", None)
+                                       else {"bug_id": bug_id, "status": "skipped"})
                         continue
 
                     fut = executor.submit(
@@ -737,16 +910,15 @@ def main() -> int:
         elif shared_container:
             logger.info("Shared container kept: docker exec -it %s bash",
                         shared_container)
-        # Save final CLAUDE.md to artifacts
-        if shared_claude_dir:
-            claude_md = Path(shared_claude_dir) / "CLAUDE.md"
-            if claude_md.exists():
-                import shutil
-                dest = artifacts_root / "CLAUDE.md"
-                shutil.copy2(claude_md, dest)
+        # Save final AGENTS.md to artifacts
+        if shared_agents_dir:
+            agents_md = Path(shared_agents_dir) / "AGENTS.md"
+            if agents_md.exists():
+                dest = artifacts_root / "AGENTS.md"
+                shutil.copy2(agents_md, dest)
                 logger.info("Shared knowledge saved: %s", dest)
             # Clean up temp dir
-            shutil.rmtree(Path(shared_claude_dir).parent, ignore_errors=True)
+            shutil.rmtree(shared_agents_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # 6. Write summary
@@ -756,6 +928,12 @@ def main() -> int:
         artifacts_root, results, target_commit, args.target,
         bug_ids_trigger, total_elapsed,
     )
+
+    # Aggregate token usage
+    total_input = sum(r.get("token_usage", {}).get("input_tokens", 0) for r in results)
+    total_cached = sum(r.get("token_usage", {}).get("cached_input_tokens", 0) for r in results)
+    total_output = sum(r.get("token_usage", {}).get("output_tokens", 0) for r in results)
+    total_cost = sum(r.get("token_usage", {}).get("cost", 0) for r in results)
 
     # Print final stats
     succeeded = sum(1 for r in results if r["status"] == "success")
@@ -768,6 +946,9 @@ def main() -> int:
     print(f"  Skipped:   {skipped}")
     print(f"  Already triggering at target: {len(bug_ids_trigger)}")
     print(f"  Total time: {total_elapsed:.0f}s")
+    if total_cost > 0:
+        print(f"  Tokens:    {total_input} in ({total_cached} cached) + {total_output} out")
+        print(f"  Cost:      ${total_cost:.4f}")
     print(f"  Summary:  {artifacts_root / 'summary.json'}")
     print(f"{'='*60}\n")
 

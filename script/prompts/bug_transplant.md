@@ -2,7 +2,7 @@
 
 You are inside an OSS-Fuzz Docker container for project **{project}**.
 
-**IMPORTANT: Start by reading CLAUDE.md** (`/src/{project}/CLAUDE.md`). It contains shared
+**IMPORTANT: Start by reading AGENTS.md** (`/src/{project}/AGENTS.md`). It contains shared
 knowledge from previous bug transplant sessions -- format changes, validation checks,
 testcase patching recipes. Use it to avoid rediscovering things.
 
@@ -14,15 +14,19 @@ The bug triggers at the old commit but not at the new one.
 ## Files
 
 - `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt` -- original crash log
-- `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit
+- `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit{fix_diff_line}
 - `/work/{testcase_name}` -- PoC testcase (you may modify this)
 - `/src/{project}` -- source tree at `{target_commit}`
-- `/src/{project}/CLAUDE.md` -- shared knowledge (read first, update when done)
+- `/src/{project}/AGENTS.md` -- shared knowledge (read first, update when done)
 
 ## Commands
 
 ```bash
 # Build (the ONLY valid build command -- never use make/gcc/cmake)
+# IMPORTANT: always delete the fuzzer binary before compile to force re-link.
+# Autotools/cmake may not re-link the fuzzer when only a library source changes.
+find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+rm -f /out/{fuzzer_name}
 sudo -E compile
 
 # Test
@@ -40,8 +44,8 @@ sudo -E compile
    the new format) rather than reverting format definitions -- this keeps code changes minimal.
    Use `xxd` or `printf` + `dd` to patch specific bytes in the testcase file.
 
-3. **Diff the two commits to find what differs in the crash path.** Use the crash stack trace
-   to identify the relevant functions, then:
+3. **Diff the two commits to find what differs in the crash path.**{adjacent_commit_hint}
+   Use the crash stack trace to identify the relevant functions, then:
    ```bash
    git diff {buggy_commit} {target_commit} -- <file>
    ```
@@ -58,28 +62,44 @@ sudo -E compile
    to update the input. And do not change other parts of the testcase too much. 
 
 6. **Verify both directions**: the testcase must crash WITH your code change and NOT crash
-   without it. And it should trigger the same bug as original one. Always test clean code against your testcase before saving:
+   without it. The crash must be the same vulnerability -- but it does NOT need an identical
+   stack trace. A crash is a valid match if ALL of these hold:
+   - **Same sanitizer class** (e.g. both `AddressSanitizer: heap-buffer-overflow`)
+   - **Same access direction** (both READ, or both WRITE)
+   - **Same code area**: crash is in the same source file, or in a direct caller/callee
+     within the same subsystem
+   - **Overlapping call chain**: at least one function from the original stack appears
+     anywhere in the new stack (not just the top frames -- check the full chain including
+     callers and the allocating function)
+
+   Code refactoring between commits can shift the exact crash point within the same
+   vulnerable path. What matters is that the same underlying vulnerability is exercised,
+   not that the crash is on the exact same line.
+
+   Always test clean code against your testcase before saving:
    ```bash
    # Save your work
    git stash
+   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should NOT crash. Then restore:
    git stash pop
+   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should crash.
    ```
 
 ## Early exit if impossible
 
-If you determine the bug CANNOT be reintroduced -- for example the crash depends on a
-different version of a vendored/external library (e.g. zstd, zlib, lz4), or the vulnerable
-code path was completely removed and cannot be reached -- stop early and write a reason:
+If you determine the bug CANNOT be reintroduced -- stop early and write a reason:
 
 ```bash
 echo "IMPOSSIBLE: <one-line reason>" > /out/bug_transplant.impossible
 ```
 
-Do not keep trying if the root cause is outside the project's own code.
+Do not keep trying if the root cause is genuinely outside any code the project ships.
 
 ## Saving results
 
@@ -94,7 +114,7 @@ If you modified the testcase, the copy is essential -- the original is still in 
 
 ## Update shared knowledge
 
-After finishing (success or failure), update `/src/{project}/CLAUDE.md` with any
+After finishing (success or failure), update `/src/{project}/AGENTS.md` with any
 discoveries about the **target commit** that would help future bug transplants:
 
 - Target code structure (header layout, key structs, field offsets at the target commit)

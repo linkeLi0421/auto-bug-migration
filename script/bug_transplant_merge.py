@@ -55,6 +55,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 HOME_DIR = SCRIPT_DIR.parent
 DATA_DIR = HOME_DIR / "data"
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
+CONTAINER_TESTCASES_DIR = "/testcases"
 
 
 def _load_prompt(name: str, **kwargs: str) -> str:
@@ -74,6 +75,55 @@ def _load_prompt(name: str, **kwargs: str) -> str:
     # Strip leading blank lines
     text = text.lstrip("\n")
     return textwrap.dedent(text).format(**kwargs)
+
+
+def _prepare_container_testcases_dir(
+    source_dir: str | Path,
+    staged_dir: str | Path,
+    testcase_names: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> Path:
+    """Stage testcase-* files for a specific merge run.
+
+    The container mounts *staged_dir* and should never read testcases
+    directly from the original source directory. This keeps each merge task
+    isolated to its own testcase set.
+    """
+    source = Path(source_dir)
+    staged = Path(staged_dir)
+    staged.mkdir(parents=True, exist_ok=True)
+
+    for old in staged.glob("testcase-*"):
+        if old.is_file():
+            old.unlink()
+
+    selected = set(testcase_names or [])
+    for testcase in source.glob("testcase-*"):
+        if not testcase.is_file():
+            continue
+        if selected and testcase.name not in selected:
+            continue
+        shutil.copy2(testcase, staged / testcase.name)
+
+    return staged
+
+
+def _save_work_testcase_to_host(
+    container: str,
+    testcase_name: str,
+    output_path: str | Path,
+) -> bool:
+    """Copy `/work/<testcase_name>` from the container to a host path."""
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["docker", "exec", container, "bash", "-c", f"cat /work/{testcase_name}"],
+        capture_output=True,
+        timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return False
+    out.write_bytes(result.stdout)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +400,12 @@ def _apply_all_dispatch_bytes(
     container: str,
     dispatch_state: dict,
 ) -> None:
-    """Prepend dispatch bytes to PoCs in /work/ (idempotent — reads from /corpus/)."""
+    """Prepend dispatch bytes to PoCs in /work/.
+
+    This must NOT clobber patched testcases already restored into /work/.
+    It is idempotent: if the testcase already begins with the expected
+    dispatch prefix, it is left unchanged.
+    """
     nbytes = dispatch_state.get("dispatch_bytes", 1)
     for bug_id, dval in dispatch_state["poc_bytes"].items():
         testcase = f"testcase-{bug_id}"
@@ -359,10 +414,13 @@ def _apply_all_dispatch_bytes(
         prefix_list = ",".join(str(b) for b in prefix)
         _exec_capture(
             container,
-            f"cp /corpus/{testcase} /work/{testcase} 2>/dev/null; "
+            # If /work file doesn't exist yet, fall back to the staged testcase dir.
+            f"if [ ! -f /work/{testcase} ]; then "
+            f"cp {CONTAINER_TESTCASES_DIR}/{testcase} /work/{testcase} 2>/dev/null; fi; "
             f"python3 -c \""
+            f"p=bytes([{prefix_list}]); "
             f"d=open('/work/{testcase}','rb').read(); "
-            f"open('/work/{testcase}','wb').write(bytes([{prefix_list}])+d)\"",
+            f"open('/work/{testcase}','wb').write(d if d.startswith(p) else (p+d))\"",
         )
 
 
@@ -386,7 +444,6 @@ def _modify_harness_for_dispatch(
     container: str,
     project: str,
     fuzzer: str,
-    agent: str = "claude",
     model: str | None = None,
 ) -> bool:
     """Use agent to modify the fuzz harness to consume a dispatch byte.
@@ -394,36 +451,14 @@ def _modify_harness_for_dispatch(
     Returns True if harness was modified and builds successfully.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
+    agent_cmd = build_codex_command(prompt, model)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
-    logger.info("Invoking %s to modify harness for dispatch byte...", agent)
+    logger.info("Invoking codex to modify harness for dispatch byte...")
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("Harness modification agent failed (exit %d): %s",
@@ -465,27 +500,58 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
 
 
 
-def _restore_testcases(container: str, project: str) -> None:
-    """Restore testcases to /work: originals from /corpus, then patched from output dirs."""
-    _exec_capture(container, "cp /corpus/testcase-* /work/ 2>/dev/null; true")
-    # Overwrite with patched testcases
+def _restore_testcases(
+    container: str, project: str, bugs: list[dict] | None = None,
+) -> None:
+    """Restore testcases to /work for the given bugs only.
+
+    For each bug: use patched testcase from the per-bug output dir if it
+    exists, otherwise copy the original from the staged testcase dir.
+    If *bugs* is None, falls back to copying all testcases from that dir
+    (legacy behavior).
+    """
+    if bugs is None:
+        _exec_capture(
+            container,
+            f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null; true",
+        )
+        return
+
     bug_transplant_dir = DATA_DIR / "bug_transplant"
-    if bug_transplant_dir.exists():
-        for d in bug_transplant_dir.iterdir():
-            if not d.is_dir() or not d.name.startswith(f"{project}_"):
-                continue
-            for tc in d.glob("testcase-*"):
+    for bug in bugs:
+        tc_name = bug.get("testcase", f"testcase-{bug['bug_id']}")
+        explicit_patched = bug.get("patched_testcase")
+        if explicit_patched and Path(explicit_patched).is_file():
+            subprocess.run(
+                ["docker", "exec", "-i", container,
+                 "bash", "-c", f"cat > /work/{tc_name}"],
+                input=Path(explicit_patched).read_bytes(), timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            continue
+        # Check for patched testcase in per-bug output dir
+        out_dir = bug_transplant_dir / f"{project}_{bug['bug_id']}"
+        patched = None
+        if out_dir.exists():
+            for tc in out_dir.glob(f"{tc_name}*"):
                 if tc.is_file() and tc.stat().st_size > 0:
-                    subprocess.run(
-                        ["docker", "exec", "-i", container,
-                         "bash", "-c", f"cat > /work/{tc.name}"],
-                        input=tc.read_bytes(), timeout=10,
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
+                    patched = tc
+                    break
+        if patched:
+            subprocess.run(
+                ["docker", "exec", "-i", container,
+                 "bash", "-c", f"cat > /work/{tc_name}"],
+                input=patched.read_bytes(), timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            # Copy original from the staged testcase dir.
+            _exec_capture(container,
+                          f"cp {CONTAINER_TESTCASES_DIR}/{tc_name} /work/{tc_name} 2>/dev/null; true")
 
 
 def _rebuild_project_image(project: str, target_commit: str,
-                           build_csv: str | None, agent_type: str) -> str:
+                           build_csv: str | None) -> str:
     """Rebuild the project Docker image from the correct historical OSS-Fuzz commit.
 
     Uses ``fuzz_helper.py build_version --runner-image auto`` to build the
@@ -525,7 +591,7 @@ def _rebuild_project_image(project: str, target_commit: str,
 
     # Layer the agent CLI on top of the freshly built project image
     project_image = f"gcr.io/oss-fuzz/{project}"
-    image_tag = build_agent_image(project, project_image, agent_type)
+    image_tag = build_agent_image(project, project_image)
     logger.info("Agent image built: %s", image_tag)
     return image_tag
 
@@ -536,14 +602,13 @@ def start_merge_container(
     testcases_dir: str,
     build_csv: str | None = None,
     extra_volumes: list[str] | None = None,
-    agent_type: str = "claude",
 ) -> tuple[str, bool]:
     """Start a persistent container at the target commit for merging."""
     container_name = f"bug-merge-{project}"
 
     # Rebuild the project image from the historical OSS-Fuzz commit so the
     # container has the correct compiler, ASAN runtime, and base libraries.
-    image_tag = _rebuild_project_image(project, target_commit, build_csv, agent_type)
+    image_tag = _rebuild_project_image(project, target_commit, build_csv)
 
     # Remove any existing container
     subprocess.call(
@@ -581,27 +646,21 @@ def start_merge_container(
         "-e", "NINJA_STATUS=",
         "-e", "TERM=dumb",
         "-v", f"{data_dir}:/data",
-        "-v", f"{os.path.abspath(testcases_dir)}:/corpus",
+        "-v", f"{os.path.abspath(testcases_dir)}:{CONTAINER_TESTCASES_DIR}",
         "-v", f"{out_dir}:/out",
         "-v", f"{work_dir}:/work",
     ]
 
-    # Agent credentials for conflict resolution (login mode)
+    # Codex credentials for conflict resolution (login mode)
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
-    cfg = AGENT_CONFIG.get(agent_type, AGENT_CONFIG["claude"])
-    cred_dir = Path.home() / cfg["credentials_dir"]
+    from bug_transplant import CODEX_CONFIG
+    cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
     if cred_dir.exists():
         docker_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-    cred_config = cfg.get("credentials_config")
-    if cred_config:
-        cred_config_path = Path.home() / cred_config
-        if cred_config_path.exists():
-            docker_cmd += ["-v", f"{cred_config_path}:/tmp/.agent-config-src:ro"]
 
-    api_key = os.environ.get(cfg["api_key_env"], "")
+    api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
     if api_key:
-        docker_cmd += ["-e", f"{cfg['api_key_env']}={api_key}"]
+        docker_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
     if extra_volumes:
         for v in extra_volumes:
@@ -623,8 +682,11 @@ def start_merge_container(
     _exec(container_name, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
 
-    # Copy all testcases to /work (originals from corpus)
-    _exec(container_name, "cp /corpus/testcase-* /work/ 2>/dev/null || true")
+    # Copy all testcases to /work from the staged testcase dir.
+    _exec(
+        container_name,
+        f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null || true",
+    )
 
     # Overwrite with patched testcases from transplant output dirs
     bug_transplant_dir = DATA_DIR / "bug_transplant"
@@ -643,35 +705,31 @@ def start_merge_container(
                     if ret.returncode == 0:
                         logger.info("Copied patched testcase: %s", tc.name)
 
-    # Build ASAN and UBSAN (no MSAN — it taints libc++ permanently).
-    for san in ("address", "undefined"):
-        logger.info("Building %s inside container...", san)
-        _exec_capture(
-            container_name,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        ret, build_output = _exec_capture(
-            container_name,
-            f"sudo -E SANITIZER={san} compile 2>&1",
-            timeout=300,
-        )
-        if ret != 0:
-            logger.error("%s build failed. Tail:", san)
-            logger.error("%s", build_output[-500:] if build_output else "(no output)")
-            if san == "address":
-                return container_name, False
-            logger.warning("Skipping %s, bugs using it won't verify", san)
-            continue
-        # Stash per-sanitizer binaries
-        _exec_capture(
-            container_name,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
-        logger.info("Build OK for %s", san)
+    # Build ASAN only (UBSAN removed to simplify the merge flow).
+    logger.info("Building address inside container...")
+    _exec_capture(
+        container_name,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    ret, build_output = _exec_capture(
+        container_name,
+        "sudo -E SANITIZER=address compile 2>&1",
+        timeout=300,
+    )
+    if ret != 0:
+        logger.error("ASAN build failed. Tail:")
+        logger.error("%s", build_output[-500:] if build_output else "(no output)")
+        return container_name, False
+    # Stash ASAN binaries
+    _exec_capture(
+        container_name,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
+    logger.info("Build OK for address")
 
     # Restore testcases (compile may wipe /work)
     _restore_testcases(container_name, project)
@@ -727,14 +785,13 @@ def resolve_conflict_with_agent(
     bug_id: str,
     project: str,
     applied_bugs: list[str],
-    agent: str = "claude",
     model: str | None = None,
     conflicting_diffs: list[tuple[str, str]] | None = None,
     dispatch_bit: int | None = None,
     feedback: str | None = None,
     attempt: int = 0,
 ) -> str:
-    """Use a code agent to resolve a merge conflict.
+    """Use codex to resolve a merge conflict.
 
     When *conflicting_diffs* and *dispatch_bit* are provided, the agent is
     instructed to use input-driven dispatch branches for truly contradictory
@@ -745,30 +802,11 @@ def resolve_conflict_with_agent(
       ``"dispatch"``  – dispatch branch(es) used
       ``"failed"``    – could not resolve
     """
-    # Import agent config from bug_transplant
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to resolve conflict...", bug_id, agent)
-
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    logger.info("[%s] Invoking codex to resolve conflict...", bug_id)
+    setup_codex_creds(container)
 
     diff_name = Path(diff_path).name
     applied_list = ", ".join(applied_bugs) if applied_bugs else "none yet"
@@ -807,16 +845,12 @@ def resolve_conflict_with_agent(
 
     _save_prompt_to_container(container, bug_id, "conflict_resolve", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     if ret != 0:
-        logger.error("[%s] %s agent failed (exit %d): %s",
-                     bug_id, agent, ret, output[-500:] if output else "(no output)")
+        logger.error("[%s] codex agent failed (exit %d): %s",
+                     bug_id, ret, output[-500:] if output else "(no output)")
         return "failed"
 
     # Verify it compiles
@@ -842,7 +876,6 @@ def resolve_with_dispatch(
     regressed_bugs: list[dict],
     dispatch_bit: int,
     current_diff_path: str | None = None,
-    agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
     attempt: int = 0,
@@ -858,30 +891,13 @@ def resolve_with_dispatch(
     Returns True if dispatch was applied and build succeeds.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to add dispatch branches (bit %d) "
+    logger.info("[%s] Invoking codex to add dispatch branches (bit %d) "
                 "for %d regressed bugs...",
-                bug_id, agent, dispatch_bit, len(regressed_bugs))
+                bug_id, dispatch_bit, len(regressed_bugs))
 
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     # Copy patches into container for the agent to read
     patch_lines = []
@@ -923,11 +939,7 @@ def resolve_with_dispatch(
 
     _save_prompt_to_container(container, bug_id, "regression_dispatch", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("[%s] Dispatch agent failed (exit %d): %s",
@@ -1140,22 +1152,21 @@ def _revert_and_rebuild(
         container,
         f"cd /src/{project} && git apply --allow-empty /tmp/_snap.diff 2>&1",
     )
-    for san in ("address", "undefined"):
-        _exec_capture(
-            container,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        _exec_capture(
-            container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-        )
-        _exec_capture(
-            container,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
+    _exec_capture(
+        container,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    _exec_capture(
+        container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+    )
+    _exec_capture(
+        container,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
     _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
@@ -1166,25 +1177,24 @@ def _rebuild_and_apply_dispatch(
     project: str,
     dispatch_state: dict,
 ) -> None:
-    """Rebuild ASAN+UBSAN and re-apply dispatch bytes after code changes."""
-    for san in ("address", "undefined"):
-        _exec_capture(
-            container,
-            f"cd /src/{project} && make clean 2>/dev/null; "
-            f"rm -rf .obj *.a *.o 2>/dev/null; "
-            f"rm -f /src/*.o 2>/dev/null; true",
-        )
-        _exec_capture(
-            container,
-            f"sudo -E SANITIZER={san} compile 2>&1",
-            timeout=300,
-        )
-        _exec_capture(
-            container,
-            f"mkdir -p /out/{san} && "
-            "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-            f"cp \"$f\" /out/{san}/; done; true",
-        )
+    """Rebuild ASAN and re-apply dispatch bytes after code changes."""
+    _exec_capture(
+        container,
+        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"rm -rf .obj *.a *.o 2>/dev/null; "
+        f"rm -f /src/*.o 2>/dev/null; true",
+    )
+    _exec_capture(
+        container,
+        "sudo -E SANITIZER=address compile 2>&1",
+        timeout=300,
+    )
+    _exec_capture(
+        container,
+        "mkdir -p /out/address && "
+        "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+        "cp \"$f\" /out/address/; done; true",
+    )
     _restore_testcases(container, project)
     if dispatch_state["poc_bytes"]:
         _apply_all_dispatch_bytes(container, dispatch_state)
@@ -1198,7 +1208,6 @@ def resolve_self_trigger_with_dispatch(
     crash_log: str | None,
     current_diff_path: str | None,
     dispatch_bit: int,
-    agent: str = "claude",
     model: str | None = None,
     feedback: str | None = None,
     attempt: int = 0,
@@ -1214,30 +1223,13 @@ def resolve_self_trigger_with_dispatch(
     Returns True if dispatch was applied and build succeeds.
     """
     sys.path.insert(0, str(SCRIPT_DIR))
-    from bug_transplant import AGENT_CONFIG
+    from bug_transplant import setup_codex_creds, build_codex_command
 
-    cfg = AGENT_CONFIG[agent]
-    logger.info("[%s] Invoking %s to unblock self-trigger (bit %d), "
+    logger.info("[%s] Invoking codex to unblock self-trigger (bit %d), "
                 "analyzing %d previous patches...",
-                bug_id, agent, dispatch_bit, len(applied_bugs_data))
+                bug_id, dispatch_bit, len(applied_bugs_data))
 
-    # Setup agent credentials (run as root to read host-owned 600 files)
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    setup_codex_creds(container)
 
     # Copy current bug's patch into container
     patch_lines = []
@@ -1283,11 +1275,7 @@ def resolve_self_trigger_with_dispatch(
 
     _save_prompt_to_container(container, bug_id, "self_trigger_dispatch", prompt, attempt)
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
-
+    agent_cmd = build_codex_command(prompt, model)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
     if ret != 0:
         logger.error("[%s] Self-trigger dispatch agent failed (exit %d): %s",
@@ -1586,11 +1574,7 @@ def verify_bug_triggers(
     falls back to checking for any sanitizer SUMMARY line.
     """
     sym_path = "/out/llvm-symbolizer"
-    san_opts = {
-        "address": f"export ASAN_OPTIONS=detect_leaks=0:external_symbolizer_path={sym_path}; ",
-        "undefined": f"export UBSAN_OPTIONS=external_symbolizer_path={sym_path}:print_stacktrace=1; ",
-    }
-    env_prefix = san_opts.get(sanitizer, "")
+    env_prefix = f"export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16:external_symbolizer_path={sym_path}; "
     fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
 
     cmd = (
@@ -1726,8 +1710,8 @@ def run_merge(args: argparse.Namespace) -> int:
         if not fuzzer:
             logger.warning("No fuzzer for local bug %s, skipping", bug_id)
             continue
-        if sanitizer not in ("address", "undefined"):
-            logger.warning("Skipping %s local bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
+        if sanitizer != "address":
+            logger.info("Skipping %s local bug %s (non-ASAN)", sanitizer, bug_id)
             continue
         testcase = f"testcase-{bug_id}"
         crash_log = _find_crash_log(bug_id, info)
@@ -1785,8 +1769,8 @@ def run_merge(args: argparse.Namespace) -> int:
         reproduce = info.get("reproduce", {})
         fuzzer = reproduce.get("fuzz_target", "")
         sanitizer = reproduce.get("sanitizer", "address").split(" ")[0]
-        if sanitizer not in ("address", "undefined"):
-            logger.warning("Skipping %s transplant bug %s (only ASAN/UBSAN supported)", sanitizer, bug_id)
+        if sanitizer != "address":
+            logger.info("Skipping %s transplant bug %s (non-ASAN)", sanitizer, bug_id)
             return
         crash_log = _find_crash_log(bug_id, info)
         seen_bug_ids.add(bug_id)
@@ -1874,14 +1858,21 @@ def run_merge(args: argparse.Namespace) -> int:
         print()
         return 0
 
+    testcase_names = [bug["testcase"] for bug in (local_bugs + transplant_diffs)]
+    output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
+    testcase_stage_dir = _prepare_container_testcases_dir(
+        args.testcases_dir,
+        output_dir / "testcases",
+        testcase_names=testcase_names,
+    )
+
     # ------------------------------------------------------------------
     # 4. Start container and run merge
     # ------------------------------------------------------------------
     container, build_ok = start_merge_container(
-        project, target_commit, args.testcases_dir,
+        project, target_commit, str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
-        agent_type=args.agent,
     )
     if not build_ok:
         logger.error("Baseline build failed — cannot merge. "
@@ -1976,31 +1967,30 @@ def run_merge(args: argparse.Namespace) -> int:
                 }:
                     all_verified_bugs.append(bd)
 
-            # Rebuild: build ASAN+UBSAN and set up dispatch bytes
+            # Rebuild ASAN and set up dispatch bytes
             logger.info("Rebuilding from restored state...")
-            for san in ("address", "undefined"):
-                _exec_capture(
-                    container,
-                    f"cd /src/{project} && make clean 2>/dev/null; "
-                    f"rm -rf .obj *.a *.o 2>/dev/null; "
-                    f"rm -f /src/*.o 2>/dev/null; true",
-                )
-                ret, bout = _exec_capture(
-                    container,
-                    f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-                )
-                if ret != 0:
-                    logger.error("Build failed for %s after restore: %s",
-                                 san, bout[-500:] if bout else "")
-                    return 1
-                _exec_capture(
-                    container,
-                    f"mkdir -p /out/{san} && "
-                    "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                    f"cp \"$f\" /out/{san}/; done; true",
-                )
+            _exec_capture(
+                container,
+                f"cd /src/{project} && make clean 2>/dev/null; "
+                f"rm -rf .obj *.a *.o 2>/dev/null; "
+                f"rm -f /src/*.o 2>/dev/null; true",
+            )
+            ret, bout = _exec_capture(
+                container,
+                "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+            )
+            if ret != 0:
+                logger.error("Build failed for address after restore: %s",
+                             bout[-500:] if bout else "")
+                return 1
+            _exec_capture(
+                container,
+                "mkdir -p /out/address && "
+                "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
+                "cp \"$f\" /out/address/; done; true",
+            )
             _exec_capture(container,
-                          "cp /corpus/testcase-* /work/ 2>/dev/null; true")
+                          f"cp {CONTAINER_TESTCASES_DIR}/testcase-* /work/ 2>/dev/null; true")
             _restore_testcases(container, project)
             if dispatch_state["poc_bytes"]:
                 _apply_all_dispatch_bytes(container, dispatch_state)
@@ -2137,7 +2127,7 @@ def run_merge(args: argparse.Namespace) -> int:
 
                     result = resolve_conflict_with_agent(
                         container, diff_path, bug_id, project,
-                        applied_bugs, args.agent, args.model,
+                        applied_bugs, args.model,
                         conflicting_diffs=conflicting_info,
                         dispatch_bit=bit_index,
                         feedback=step_feedback,
@@ -2161,7 +2151,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         if not dispatch_state["harness_modified"]:
                             ok = _modify_harness_for_dispatch(
                                 container, project, bd["fuzzer"],
-                                args.agent, args.model,
+                                args.model,
                             )
                             if ok:
                                 dispatch_state["harness_modified"] = True
@@ -2197,33 +2187,30 @@ def run_merge(args: argparse.Namespace) -> int:
                         merge_results.append(step)
                         break
 
-                # --- Build ASAN + UBSAN ---
-                logger.info("[%s] Building (ASAN + UBSAN)...", bug_id)
+                # --- Build ASAN ---
+                logger.info("[%s] Building (ASAN)...", bug_id)
                 build_failed = False
                 last_build_output = ""
-                for san in ("address", "undefined"):
+                _exec_capture(
+                    container,
+                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"rm -rf .obj *.a *.o 2>/dev/null; "
+                    f"rm -f /src/*.o 2>/dev/null; true",
+                )
+                ret, build_output = _exec_capture(
+                    container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                )
+                if ret != 0:
+                    logger.error("[%s] Build failed for address. Tail:", bug_id)
+                    logger.error("%s", build_output[-500:] if build_output else "(no output)")
+                    build_failed = True
+                    last_build_output = build_output or ""
+                if not build_failed:
                     _exec_capture(
                         container,
-                        f"cd /src/{project} && make clean 2>/dev/null; "
-                        f"rm -rf .obj *.a *.o 2>/dev/null; "
-                        f"rm -f /src/*.o 2>/dev/null; true",
-                    )
-                    ret, build_output = _exec_capture(
-                        container, f"sudo -E SANITIZER={san} compile 2>&1", timeout=300,
-                    )
-                    if ret != 0:
-                        logger.error("[%s] Build failed for %s. Tail:", bug_id, san)
-                        logger.error("%s", build_output[-500:] if build_output else "(no output)")
-                        if san == "address":
-                            build_failed = True
-                            last_build_output = build_output or ""
-                            break
-                        continue
-                    _exec_capture(
-                        container,
-                        f"mkdir -p /out/{san} && "
+                        "mkdir -p /out/address && "
                         "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                        f"cp \"$f\" /out/{san}/; done; true",
+                        "cp \"$f\" /out/address/; done; true",
                     )
                 # Restore testcases (compile may wipe /work)
                 _restore_testcases(container, project)
@@ -2312,7 +2299,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             container, bug_id, project,
                             prev_bugs_data, bd.get("crash_log"),
                             bd["diff_path"], bit_index,
-                            agent=args.agent, model=args.model,
+                            model=args.model,
                             feedback=step_feedback,
                             attempt=retry_count,
                         )
@@ -2321,7 +2308,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             if not dispatch_state["harness_modified"]:
                                 hok = _modify_harness_for_dispatch(
                                     container, project, bd["fuzzer"],
-                                    args.agent, args.model,
+                                    args.model,
                                 )
                                 if hok:
                                     dispatch_state["harness_modified"] = True
@@ -2427,7 +2414,7 @@ def run_merge(args: argparse.Namespace) -> int:
                         dispatch_ok = resolve_with_dispatch(
                             container, bug_id, project, regressed,
                             bit_index, current_diff_path=bd["diff_path"],
-                            agent=args.agent, model=args.model,
+                            model=args.model,
                             feedback=step_feedback,
                             attempt=retry_count,
                         )
@@ -2437,7 +2424,7 @@ def run_merge(args: argparse.Namespace) -> int:
                             if not dispatch_state["harness_modified"]:
                                 hok = _modify_harness_for_dispatch(
                                     container, project, bd["fuzzer"],
-                                    args.agent, args.model,
+                                    args.model,
                                 )
                                 if hok:
                                     dispatch_state["harness_modified"] = True
@@ -2522,7 +2509,6 @@ def run_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 8. Extract combined diff
         # ------------------------------------------------------------------
-        output_dir = DATA_DIR / "bug_transplant" / f"merge_{project}_{target_commit[:8]}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Get combined diff — only include files that the per-bug diffs
@@ -2738,10 +2724,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Bug IDs that already trigger at target (override auto-detection)")
 
     # Execution
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
-                        help="Code agent for conflict resolution (default: claude)")
     parser.add_argument("--model", default=None,
-                        help="Model to use (passed to agent CLI)")
+                        help="Model to use (passed to codex CLI)")
     parser.add_argument("--testcases-dir",
                         default=os.environ.get("TESTCASES", ""),
                         help="Testcase directory (default: $TESTCASES)")

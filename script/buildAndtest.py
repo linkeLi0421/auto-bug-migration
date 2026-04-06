@@ -358,7 +358,7 @@ def find_pocs_in_time_period(pocs, start_time, end_time):
 
 def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build_writer,
                   fixed_builder=None, fixed_runner=None, fixed_ossfuzz_commit=None,
-                  max_retry_months=24, retry_month_step=6):
+                  max_retry_months=24, retry_month_step=6, fuzzer=None):
     '''
     Run helper.py build_image and build_fuzzers
     '''
@@ -394,7 +394,8 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                             fixed_runner=fixed_runner,
                             fixed_ossfuzz_commit=fixed_ossfuzz_commit,
                             max_retry_months=max_retry_months,
-                            retry_month_step=retry_month_step)
+                            retry_month_step=retry_month_step,
+                            fuzzer=fuzzer)
 
     with open(target_dockerfile_path, 'r') as dockerfile:
         dockerfile_content = dockerfile.read()
@@ -425,7 +426,7 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
             if sanitizer == 'memory' and arch == 'i386':
                 # msan do not support i386
                 continue
-            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and len(os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str))) > 3:
+            if os.path.exists(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)) and os.listdir(os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)):
                 continue
 
             if fixed_builder:
@@ -435,32 +436,38 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
 
             cmd = [
                 py3, f"{current_file_path}/fuzz_helper.py", "build_version", "--commit", commit_id, "--sanitizer", sanitizer, "--architecture", arch,
+                "--oss-fuzz-commit", oss_fuzz_commit,
                 *image_args,
                 target
             ]
 
             logger.info(' '.join(cmd))
             result = subprocess.run(cmd, capture_output=True, text=True)
-            if "Sanitizer" not in result.stderr+result.stdout and\
+            fuzzer_binary = os.path.join(oss_fuzz_path, "build", "out", target, fuzzer) if fuzzer else None
+            fuzzer_exists = fuzzer_binary is not None and os.path.exists(fuzzer_binary)
+            build_failed = (
+                "Sanitizer" not in result.stderr + result.stdout and
                 any(error_pattern in result.stderr or error_pattern in result.stdout for error_pattern in [
-                "Building fuzzers failed",
-                "Docker build failed",
-                "clang++: error:",
-                "g++: error:",
-                "cmake: error:",
-                "fatal error:",
-                "undefined reference to",
-                "cannot find -l",
-                "No such file or directory",
-                "error: git",
-                "error: 'struct",
-                "error: conflicting types",
-                "error: invalid conversion",
-                "make: *** [Makefile:",
-                "ninja: build stopped:",
-                "Compilation failed",
-                "failed with exit status"
-            ]) or result.returncode != 0:
+                    "Building fuzzers failed",
+                    "Docker build failed",
+                    "clang++: error:",
+                    "g++: error:",
+                    "cmake: error:",
+                    "fatal error:",
+                    "undefined reference to",
+                    "cannot find -l",
+                    "No such file or directory",
+                    "error: git",
+                    "error: 'struct",
+                    "error: conflicting types",
+                    "error: invalid conversion",
+                    "make: *** [Makefile:",
+                    "ninja: build stopped:",
+                    "Compilation failed",
+                    "failed with exit status"
+                ])
+            ) or result.returncode != 0
+            if build_failed and not fuzzer_exists:
                 logger.info(f"Failed to build {target}-{commit_id} with sanitizer {sanitizer} {arch}, will try newer oss-fuzz again.")
                 if fixed_ossfuzz_commit:
                     return "Build failed with fixed oss-fuzz commit, no retry."
@@ -470,16 +477,22 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                                     fixed_runner=fixed_runner,
                                     fixed_ossfuzz_commit=fixed_ossfuzz_commit,
                                     max_retry_months=max_retry_months,
-                                    retry_month_step=retry_month_step)
+                                    retry_month_step=retry_month_step,
+                                    fuzzer=fuzzer)
             else:
                 # build finish here
+                if build_failed and fuzzer_exists:
+                    logger.info(f"Build had errors but fuzzer '{fuzzer}' exists — treating as success.")
                 logger.info(f"Build finished for {target}-{commit_id} with sanitizer {sanitizer} and architecture {arch}.")
                 # Create directory for storing output files if it doesn't exist
                 os.makedirs(target_storage_path, exist_ok=True)
                 # Create the destination directory if it doesn't exist
                 dest_path = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
                 os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-                subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
+                if os.path.isdir(dest_path) and os.listdir(dest_path):
+                    logger.info(f"Skipping move — destination already exists and is non-empty: {dest_path}")
+                else:
+                    subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
                 build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
@@ -950,7 +963,8 @@ if __name__ == "__main__":
                              fixed_builder=fixed_builder, fixed_runner=fixed_runner,
                              fixed_ossfuzz_commit=fixed_ossfuzz_commit,
                              max_retry_months=args.max_retry_months,
-                             retry_month_step=args.retry_month_step)
+                             retry_month_step=args.retry_month_step,
+                             fuzzer=args.fuzzer)
         
     
     if args.mode in ["test", "both"]:

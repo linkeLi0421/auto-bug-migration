@@ -57,8 +57,11 @@ from bug_transplant_merge import (
     _find_crash_log,
     compute_merge_order,
     files_in_diff,
+    _prepare_container_testcases_dir,
+    _save_work_testcase_to_host,
 )
-from bug_transplant import AGENT_CONFIG
+from bug_transplant import CODEX_CONFIG, setup_codex_creds, build_codex_command
+from codex_usage import CodexUsageTracker
 
 # Pathspecs to exclude build artifacts from git diff
 _DIFF_EXCLUDES = (
@@ -72,8 +75,26 @@ _DIFF_EXCLUDES = (
     "':(exclude)*.d' ':(exclude)*.pc' ':(exclude)config.h' "
     "':(exclude)blosc/config.h' "
     "':(exclude)build/' ':(exclude)_build/' "
-    "':(exclude).claude/' ':(exclude).codex/'"
+    "':(exclude).codex/'"
 )
+_DIFF_INCLUDES = (
+    "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
+    "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am'"
+)
+
+
+# Session-wide token/cost tracker (shared across all codex invocations)
+_usage_tracker = CodexUsageTracker()
+
+
+def _strip_build_artifact_hunks(diff_text: str) -> str:
+    """Remove diff hunks for build-artifact paths (CMakeFiles/, etc.)."""
+    import re
+    # Split into per-file sections on 'diff --git' boundaries
+    parts = re.split(r'(?=^diff --git )', diff_text, flags=re.MULTILINE)
+    _ARTIFACT_PATS = re.compile(r'CMakeFiles/|/CMakeFiles/')
+    kept = [p for p in parts if not _ARTIFACT_PATS.search(p.split('\n', 1)[0])]
+    return ''.join(kept)
 
 
 def _clean_diff(container: str, project: str) -> str:
@@ -81,9 +102,19 @@ def _clean_diff(container: str, project: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd /src/{project} && git diff HEAD -- . {_DIFF_EXCLUDES}",
+        f"cd /src/{project} && git diff HEAD -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
     )
-    return diff
+    return _strip_build_artifact_hunks(diff)
+
+
+def _clean_diff_against(container: str, project: str, base_rev: str) -> str:
+    """Get a clean git diff against a specific baseline revision."""
+    _stage_untracked_source(container, project)
+    _, diff = _exec_capture(
+        container,
+        f"cd /src/{project} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+    )
+    return _strip_build_artifact_hunks(diff)
 
 
 def _save_source_snapshot(container: str, project: str) -> None:
@@ -99,7 +130,156 @@ def _restore_source_snapshot(container: str, project: str) -> None:
                   f"cd /src/{project} && git checkout -f HEAD && "
                   f"git stash pop 2>/dev/null; true")
 
+
+def _clean_container_working_tree_before_harness_diff(container: str, project: str) -> None:
+    """Reset /src/<project> before reapplying a saved harness diff."""
+    _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        "(git reset --hard HEAD 2>/dev/null || true) && "
+        "(git clean -fdx 2>/dev/null || true) && "
+        "rm -f __bug_dispatch.c __bug_dispatch.h 2>/dev/null || true",
+    )
+
+
+def _create_harness_baseline_commit(container: str, project: str) -> str:
+    """Create a temporary commit for the harness-applied baseline."""
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        "git add -A && "
+        "git -c user.name='Codex' -c user.email='codex@example.com' "
+        "commit --allow-empty -m 'codex harness baseline' >/dev/null 2>&1 && "
+        "git rev-parse HEAD",
+    )
+    if ret != 0:
+        raise RuntimeError(f"failed to create harness baseline commit: {out[-500:]}")
+    return out.strip().splitlines()[-1]
+
+
+def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -> None:
+    """Restore the exact harness baseline snapshot."""
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"git checkout -f {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
+        f"git reset --hard {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
+        "git clean -fdx >/dev/null 2>&1 || true",
+    )
+    if ret != 0:
+        raise RuntimeError(f"failed to restore harness baseline: {out[-500:]}")
+
 _MAX_WRAP_RETRIES = 1
+
+
+def _save_build_sh(container: str, output_dir: Path) -> None:
+    """Snapshot /src/build.sh so it can be restored on resume.
+
+    The agent may modify /src/build.sh to compile __bug_dispatch.c, but
+    that file lives outside the project git repo and isn't captured by
+    ``git diff``.  We save it alongside harness.diff.
+    """
+    ret, content = _exec_capture(container, "cat /src/build.sh 2>/dev/null")
+    if ret != 0:
+        return
+    dst = output_dir / "harness_build.sh"
+    dst.write_text(content)
+    logger.info("Saved /src/build.sh (%d bytes) to %s", len(content), dst)
+
+
+def _restore_build_sh(container: str, output_dir: Path) -> None:
+    """Restore a previously saved /src/build.sh into the container."""
+    src = output_dir / "harness_build.sh"
+    if not src.exists():
+        return
+    content = src.read_text()
+    _exec_capture(
+        container,
+        f"cat > /src/build.sh << 'BUILDEOF'\n{content}BUILDEOF",
+    )
+    _exec_capture(container, "chmod +x /src/build.sh")
+    logger.info("Restored /src/build.sh from %s", src)
+
+
+def _inject_dispatch_deps_fixer(container: str) -> None:
+    """Inject a helper script + build.sh hook that creates autotools dep stubs.
+
+    When Makefile.am references $(top_srcdir)/__bug_dispatch.c, autotools
+    generates ``include .deps/<prefix>__bug_dispatch.P{o,lo}`` but never
+    creates the top-level ``.deps/`` directory.  This writes a helper that
+    scans generated Makefiles for those targets and touches them, then
+    injects a one-line call in build.sh right before ``make``.
+    """
+    _exec_capture(
+        container,
+        "cat > /tmp/_fix_dispatch_deps.sh << 'FIXEOF'\n"
+        "#!/bin/bash\n"
+        "mkdir -p .deps\n"
+        "grep -rh '__bug_dispatch.*\\.Pl\\|__bug_dispatch.*\\.Po' "
+        "  */Makefile */*/Makefile */*/*/Makefile 2>/dev/null | "
+        "grep -oE '[^ ]*__bug_dispatch[^ ]*' | sort -u | "
+        "while read p; do mkdir -p $(dirname \"$p\") && touch \"$p\"; done\n"
+        "FIXEOF\n"
+        "chmod +x /tmp/_fix_dispatch_deps.sh",
+    )
+    _exec_capture(
+        container,
+        "grep -q '_fix_dispatch_deps' /src/build.sh 2>/dev/null || "
+        "sed -i '/^make/i /tmp/_fix_dispatch_deps.sh' /src/build.sh",
+    )
+
+
+def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
+    """Ensure __bug_dispatch.c is compiled into libraries, not just fuzzers.
+
+    Per-bug patches may add ``#include "__bug_dispatch.h"`` to library
+    source files (e.g. libopensc).  Non-fuzzer tools that link the
+    library will fail with undefined ``__bug_dispatch`` unless the
+    object is also part of the library.  This function finds every
+    Makefile.am that builds a library whose sources were patched and
+    adds __bug_dispatch.c to it.
+    """
+    # Find all Makefile.am files in directories containing patched sources
+    # that reference __bug_dispatch.
+    ret, out = _exec_capture(
+        container,
+        f"cd /src/{project} && "
+        f"grep -rl '__bug_dispatch' --include='*.c' --include='*.h' "
+        f"src/ 2>/dev/null | "
+        f"xargs -I{{}} dirname {{}} | sort -u",
+    )
+    if ret != 0 or not out.strip():
+        return
+
+    for src_dir in out.strip().splitlines():
+        src_dir = src_dir.strip()
+        if not src_dir:
+            continue
+        # Check if this directory has a Makefile.am with a _la_SOURCES
+        ret2, makefile = _exec_capture(
+            container,
+            f"cat /src/{project}/{src_dir}/Makefile.am 2>/dev/null",
+        )
+        if ret2 != 0 or "__bug_dispatch" in makefile:
+            continue  # already has it or no Makefile.am
+        if "_la_SOURCES" not in makefile:
+            continue  # not a library
+
+        # Add __bug_dispatch.c after the first _la_SOURCES line
+        makefile_path = f"/src/{project}/{src_dir}/Makefile.am"
+        _exec_capture(
+            container,
+            f"awk 'NR==1{{found=0}} /_la_SOURCES/&&!found{{"
+            f"print; print \"\\t$(top_srcdir)/__bug_dispatch.c \\\\\"; "
+            f"found=1; next}} 1' {makefile_path} > {makefile_path}.tmp "
+            f"&& mv {makefile_path}.tmp {makefile_path}",
+        )
+        logger.info("Added __bug_dispatch.c to %s/Makefile.am", src_dir)
+
+    _inject_dispatch_deps_fixer(container)
+
+
+# build_codex_command is now imported from bug_transplant
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +492,12 @@ def wrap_bug_with_dispatch(
     bug: dict,
     bit_index: int,
     dispatch_state: dict,
-    agent: str = "claude",
     model: str | None = None,
 ) -> tuple[bool, str]:
-    """Invoke agent to wrap a bug's patch with dispatch gating.
+    """Invoke codex to wrap a bug's patch with dispatch gating.
 
     Returns (success, output).
     """
-    cfg = AGENT_CONFIG[agent]
     bug_id = bug["bug_id"]
     diff_path = bug["diff_path"]
     dispatch_bit = bit_index % 8
@@ -344,23 +522,8 @@ def wrap_bug_with_dispatch(
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
-    # Setup agent credentials
-    creds_dir = cfg["credentials_dir"]
-    _exec(
-        container,
-        f"cp -r /tmp/.agent-creds-src /home/agent/{creds_dir} 2>/dev/null; "
-        f"rm -rf /home/agent/{creds_dir}/projects 2>/dev/null; "
-        f"chown -R agent:agent /home/agent/{creds_dir} 2>/dev/null; "
-        "true",
-        user="root",
-    )
-    if cfg.get("credentials_config"):
-        _exec(
-            container,
-            f"cp /tmp/.agent-config-src /home/agent/{cfg['credentials_config']} 2>/dev/null; "
-            f"chown agent:agent /home/agent/{cfg['credentials_config']} 2>/dev/null; true",
-            user="root",
-        )
+    # Setup codex credentials
+    setup_codex_creds(container)
 
     prompt = _load_prompt(
         "dispatch_wrap_offline",
@@ -374,14 +537,13 @@ def wrap_bug_with_dispatch(
         output_testcase_path=f"/work/{bug['testcase']}",
     )
 
-    escaped = shlex.quote(prompt)
-    agent_cmd = cfg["run_cmd"].format(prompt=escaped)
-    if model:
-        agent_cmd += f" {cfg['model_flag']} {shlex.quote(model)}"
+    agent_cmd = build_codex_command(prompt, model)
 
-    logger.info("[%s] Invoking %s for dispatch wrapping (bit %d)...",
-                bug_id, agent, bit_index)
+    logger.info("[%s] Invoking codex for dispatch wrapping (bit %d)...",
+                bug_id, bit_index)
     ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+
+    _usage_tracker.log_usage(f"{bug_id} wrap", output, model)
 
     if ret != 0:
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
@@ -429,6 +591,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
     if not all_bugs:
         logger.error("No bugs to merge")
         return 1
+    testcase_stage_dir = _prepare_container_testcases_dir(
+        args.testcases_dir,
+        output_dir / "testcases",
+        testcase_names=[bug["testcase"] for bug in all_bugs],
+    )
 
     # ------------------------------------------------------------------
     # 2. Assign dispatch bits
@@ -450,10 +617,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------
     container, build_ok = start_merge_container(
         project, target_commit,
-        testcases_dir=args.testcases_dir,
+        testcases_dir=str(testcase_stage_dir),
         build_csv=args.build_csv,
         extra_volumes=args.volume,
-        agent_type=args.agent,
     )
     if not build_ok:
         logger.error("Container startup / initial build failed")
@@ -463,41 +629,84 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 4. Inject dispatch files and modify harness
         # ------------------------------------------------------------------
-        _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-        dispatch_state["dispatch_file_injected"] = True
+        # If we already have a harness diff from a previous run, reuse it.
+        # This avoids re-invoking a code agent unnecessarily and keeps resume
+        # behavior deterministic.
+        harness_diff_path = output_dir / "harness.diff"
+        if harness_diff_path.exists() and harness_diff_path.stat().st_size > 0:
+            logger.info("Harness diff already exists, reusing: %s", harness_diff_path)
+            _clean_container_working_tree_before_harness_diff(container, project)
+            hdiff = harness_diff_path.read_text()
+            _exec_capture(container,
+                          f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+            ret, out = _exec_capture(container,
+                                     f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+            if ret != 0:
+                logger.error("Failed to apply existing harness.diff")
+                logger.error(out)
+                return 1
+            _restore_build_sh(container, output_dir)
+            _inject_dispatch_deps_fixer(container)
+            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            if ret != 0:
+                logger.error("Build failed after applying existing harness.diff")
+                logger.error(out[-500:] if out else "(no output)")
+                return 1
+            dispatch_state["dispatch_file_injected"] = True
+            dispatch_state["harness_modified"] = True
+        else:
+            harness_diff_path = None
 
-        # Find the primary fuzzer name (all bugs should share it)
-        primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
-        ok = _modify_harness_for_dispatch(
-            container, project, primary_fuzzer,
-            agent=args.agent, model=args.model,
-        )
-        if not ok:
-            logger.error("Failed to modify harness for dispatch")
-            return 1
-        dispatch_state["harness_modified"] = True
+        if harness_diff_path is None:
+            _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
+            dispatch_state["dispatch_file_injected"] = True
+            # Find the primary fuzzer name (all bugs should share it)
+            primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
+            ok = _modify_harness_for_dispatch(
+                container, project, primary_fuzzer,
+                model=args.model,
+            )
+            if not ok:
+                logger.error("Failed to modify harness for dispatch")
+                return 1
+            dispatch_state["harness_modified"] = True
+
+            # Capture the harness diff immediately so we can re-apply it after
+            # every git checkout -f during phase 1 and phase 2.
+            harness_diff = _clean_diff(container, project)
+            harness_diff_path = output_dir / "harness.diff"
+            if harness_diff.strip():
+                harness_diff_path.write_text(harness_diff)
+                logger.info("Harness diff saved (%d bytes)", len(harness_diff))
+            else:
+                logger.warning("No harness diff captured after modification!")
+                harness_diff_path = None
+
+            # Save /src/build.sh — the agent may have modified it to
+            # compile __bug_dispatch.c, but it's outside the git repo.
+            _save_build_sh(container, output_dir)
+
+        harness_baseline_rev = _create_harness_baseline_commit(container, project)
+        logger.info("Harness baseline commit: %s", harness_baseline_rev[:12])
 
         # Stash ASAN binaries (harness modification already built with ASAN)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
                       "cp \"$f\" /out/address/; done; true")
-        # Build UBSAN
-        ret, _ = _exec_capture(container,
-                               "sudo -E SANITIZER=undefined compile 2>&1",
-                               timeout=300)
-        if ret == 0:
-            _exec_capture(container,
-                          "mkdir -p /out/undefined && "
-                          "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                          "[ ! -d \"$f\" ] && cp \"$f\" /out/undefined/; done; true")
-            logger.info("UBSAN build OK")
-        else:
-            logger.warning("UBSAN build failed, skipping")
-
         # Copy testcases (originals + patched)
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
+
+        # Persist patched local testcases into this run's testcase dir before
+        # local verification. Later restores will prefer these patched files.
+        for bug in local_bugs:
+            tc_name = bug["testcase"]
+            staged_patched = testcase_stage_dir / f"{tc_name}-patched"
+            if _save_work_testcase_to_host(container, tc_name, staged_patched):
+                bug["patched_testcase"] = str(staged_patched)
+                logger.info("[%s] Staged patched local testcase: %s",
+                            bug["bug_id"], staged_patched)
 
         # ------------------------------------------------------------------
         # 5. Verify local bugs at baseline
@@ -566,27 +775,22 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 "success": False,
             }
 
-            # Reset source to clean (dispatch files + harness already applied)
-            _exec_capture(container,
-                          f"cd /src/{project} && "
-                          f"git reset HEAD -- . 2>/dev/null; "
-                          f"git checkout -f HEAD -- . && "
-                          f"git clean -fdx "
-                          f"-e __bug_dispatch.h -e __bug_dispatch.c "
-                          f"2>/dev/null; true")
-            # Re-inject dispatch files (checkout may have removed them)
-            _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
+            # Reset source to the exact harness baseline, then apply only the
+            # bug-specific wrapped delta on top of it.
+            _restore_harness_baseline(container, project, harness_baseline_rev)
 
             output = ""
             for attempt in range(_MAX_WRAP_RETRIES + 1):
                 success, output = wrap_bug_with_dispatch(
                     container, project, bd, bit_index,
-                    dispatch_state, agent=args.agent, model=args.model,
+                    dispatch_state, model=args.model,
                 )
 
                 if success:
-                    # Extract the wrapped diff (source files only, no build artifacts)
-                    wrapped_diff = _clean_diff(container, project)
+                    # Extract only the delta from the harness baseline.
+                    wrapped_diff = _clean_diff_against(
+                        container, project, harness_baseline_rev,
+                    )
                     if wrapped_diff.strip():
                         wrapped_path = output_dir / f"wrapped_{bug_id}.diff"
                         wrapped_path.write_text(wrapped_diff)
@@ -600,9 +804,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                 logger.warning("[%s] Attempt %d failed, retrying...",
                                bug_id, attempt + 1)
-                # Reset for retry
-                _exec_capture(container,
-                              f"cd /src/{project} && git checkout -f HEAD -- .")
+                # Reset for retry to the exact harness baseline.
+                _restore_harness_baseline(container, project, harness_baseline_rev)
 
             if not step["success"]:
                 logger.error("[%s] FAILED after %d attempts, skipping",
@@ -614,61 +817,136 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                            list(wrapped_diffs.keys()))
 
         # ------------------------------------------------------------------
-        # 8. Phase 2: Apply all wrapped diffs together
+        # 8. Phase 2: Merge all wrapped diffs via code agent
         # ------------------------------------------------------------------
-        logger.info("\n=== Applying %d wrapped diffs ===", len(wrapped_diffs))
-
-        # Reset source to clean + dispatch files
-        _exec_capture(container,
-                      f"cd /src/{project} && "
-                      f"git reset HEAD -- . 2>/dev/null; "
-                      f"git checkout -f HEAD -- . && "
-                      f"git clean -fdx 2>/dev/null; true")
-        _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
-
-        applied_bugs: list[str] = []
-        for bug_id, wdiff_path in wrapped_diffs.items():
-            diff_content = Path(wdiff_path).read_text()
-            diff_name = f"wrapped_{bug_id}.diff"
+        combined_path = output_dir / "combined.diff"
+        if combined_path.exists() and combined_path.stat().st_size > 0:
+            # Reuse existing combined diff — skip the agent merge entirely.
+            logger.info("combined.diff already exists, reusing: %s (%d bytes)",
+                        combined_path, combined_path.stat().st_size)
+            _restore_harness_baseline(container, project, harness_baseline_rev)
+            cdiff = combined_path.read_text()
             _exec_capture(container,
-                          f"cat > /tmp/{diff_name} << 'DIFFEOF'\n{diff_content}DIFFEOF")
-
-            ret, apply_out = _exec_capture(
+                          f"cat > /tmp/combined.diff << 'CEOF'\n{cdiff}CEOF")
+            ret, out = _exec_capture(
                 container,
-                f"cd /src/{project} && git apply --3way /tmp/{diff_name} 2>&1",
+                f"cd /src/{project} && git apply /tmp/combined.diff 2>&1",
             )
-            if ret == 0:
-                applied_bugs.append(bug_id)
-                logger.info("[%s] Applied wrapped diff OK", bug_id)
-            else:
-                logger.error("[%s] Failed to apply wrapped diff: %s",
-                             bug_id, apply_out[-300:])
+            if ret != 0:
+                logger.error("Failed to apply existing combined.diff: %s", out[-500:])
+                return 1
+            _ensure_dispatch_linked_everywhere(container, project)
+            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            if ret != 0:
+                logger.error("Build failed after applying combined.diff: %s",
+                             out[-500:] if out else "(no output)")
+                return 1
+            applied_bugs = list(wrapped_diffs.keys())
+        else:
+            logger.info("\n=== Merging %d wrapped diffs ===", len(wrapped_diffs))
 
-        # Build ASAN + UBSAN with all patches applied
+            # Reset source to the exact harness baseline before merging wrapped
+            # bug deltas.
+            _restore_harness_baseline(container, project, harness_baseline_rev)
+
+            # Copy all wrapped patches into container
+            patch_descriptions = []
+            for bug_id, wdiff_path in wrapped_diffs.items():
+                diff_content = Path(wdiff_path).read_text()
+                if not diff_content.strip():
+                    continue
+                fname = f"wrapped_{bug_id}.diff"
+                _exec_capture(container,
+                              f"cat > /tmp/{fname} << 'DIFFEOF'\n{diff_content}DIFFEOF")
+                patch_descriptions.append(f"- `/tmp/{fname}` — {bug_id}")
+
+            if not patch_descriptions:
+                logger.info("No patches to merge (all were dispatch-only)")
+                applied_bugs = list(wrapped_diffs.keys())
+            else:
+                # Use code agent to merge patches in chunks (avoid single huge prompt).
+                # We keep the existing merge prompt/behavior, but run it multiple times.
+                # Each chunk is merged on top of the previous chunk's result.
+                max_chunk = 15
+                total_patches = len(patch_descriptions)
+                logger.info(
+                    "Merging %d patches in chunks of <=%d via codex",
+                    total_patches, max_chunk,
+                )
+
+                applied_bugs = []
+                merge_failed = False
+                for chunk_idx, start in enumerate(range(0, total_patches, max_chunk), start=1):
+                    chunk = patch_descriptions[start:start + max_chunk]
+                    patch_list = "\n".join(chunk)
+                    merge_prompt = _load_prompt(
+                        "merge_wrapped_patches",
+                        project=project,
+                        target_commit=target_commit,
+                        patch_list=patch_list,
+                    )
+
+                    setup_codex_creds(container)
+                    agent_cmd = build_codex_command(merge_prompt, args.model)
+
+                    logger.info(
+                        "Invoking codex to merge chunk %d (%d patches: %d..%d/%d)",
+                        chunk_idx,
+                        len(chunk),
+                        start + 1,
+                        min(start + len(chunk), total_patches),
+                        total_patches,
+                    )
+                    ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+                    _usage_tracker.log_usage(f"merge chunk {chunk_idx}", output, args.model)
+                    if ret != 0:
+                        logger.error(
+                            "Agent failed on chunk %d (exit %d). Output tail: %s",
+                            chunk_idx, ret, output[-500:] if output else "",
+                        )
+                        merge_failed = True
+                        break
+
+                    # Verify build after each chunk so failures are localized.
+                    ret, build_out = _exec_capture(
+                        container, "sudo -E compile 2>&1", timeout=300,
+                    )
+                    if ret != 0:
+                        logger.error(
+                            "Build failed after chunk %d: %s",
+                            chunk_idx, build_out[-500:],
+                        )
+                        merge_failed = True
+                        break
+
+                    # Track which bug IDs were included in this chunk
+                    for desc in chunk:
+                        m = re.search(r"—\s+(OSV-[0-9]{4}-[0-9]+)\s*$", desc)
+                        if m:
+                            applied_bugs.append(m.group(1))
+
+                if not merge_failed:
+                    # If everything succeeded, consider all wrapped diffs merged.
+                    applied_bugs = list(wrapped_diffs.keys())
+
+        # Build ASAN with all patches applied
         logger.info("Building with all patches applied...")
+        _ensure_dispatch_linked_everywhere(container, project)
         _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
                       "cp \"$f\" /out/address/; done; true")
-        ret, _ = _exec_capture(container,
-                               "sudo -E SANITIZER=undefined compile 2>&1",
-                               timeout=300)
-        if ret == 0:
-            _exec_capture(container,
-                          "mkdir -p /out/undefined && "
-                          "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                          "[ ! -d \"$f\" ] && cp \"$f\" /out/undefined/; done; true")
 
         # Restore testcases with dispatch bytes
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
 
         # ------------------------------------------------------------------
         # 9. Final verification
         # ------------------------------------------------------------------
         logger.info("\n=== Final verification ===")
-        _restore_testcases(container, project)
+        _restore_testcases(container, project, all_bugs)
         _apply_all_dispatch_bytes(container, dispatch_state)
 
         final_results = verify_all_bugs(container, all_bugs)
@@ -681,14 +959,20 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # ------------------------------------------------------------------
         # 10. Save combined diff + testcases
         # ------------------------------------------------------------------
-        combined_diff = _clean_diff(container, project)
+        combined_diff = _clean_diff_against(container, project, harness_baseline_rev)
         combined_path = output_dir / "combined.diff"
         combined_path.write_text(combined_diff)
         logger.info("Combined diff: %s (%d bytes)", combined_path, len(combined_diff))
 
-        # Save testcases
+    # Save testcases
         tc_dir = output_dir / "testcases"
         tc_dir.mkdir(exist_ok=True)
+        # Only mark artifacts as "patched" if we actually introduced dispatch
+        # bytes / harness changes. (In this offline pipeline this is normally
+        # true, but keep the check to avoid misleading filenames.)
+        mark_patched = bool(dispatch_state.get("dispatch_bytes", 0)) and bool(
+            dispatch_state.get("harness_modified")
+        )
         for bug in all_bugs:
             tc_name = bug["testcase"]
             tc_ret = subprocess.run(
@@ -697,7 +981,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 capture_output=True, timeout=10,
             )
             if tc_ret.returncode == 0 and tc_ret.stdout:
-                (tc_dir / tc_name).write_bytes(tc_ret.stdout)
+                if mark_patched:
+                    # After rewrite, treat the saved artifact as the patched testcase.
+                    (tc_dir / f"{tc_name}-patched").write_bytes(tc_ret.stdout)
+                else:
+                    (tc_dir / tc_name).write_bytes(tc_ret.stdout)
 
         logger.info("Testcases saved to %s", tc_dir)
 
@@ -719,6 +1007,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         (output_dir / "summary.json").write_text(
             json.dumps(merge_summary, indent=2))
         logger.info("Summary: %s", output_dir / "summary.json")
+
+        _usage_tracker.log_session_total()
 
         return 0 if triggered == total else 1
 
@@ -766,10 +1056,8 @@ def main():
                         help="Directory containing testcase files")
     parser.add_argument("--local-bugs", nargs="*", default=None,
                         help="Bug IDs that already trigger at target")
-    parser.add_argument("--agent", default="claude", choices=["claude", "codex"],
-                        help="Code agent to use")
     parser.add_argument("--model", default=None,
-                        help="Model override for agent")
+                        help="Model override for codex")
     parser.add_argument("-v", "--volume", action="append",
                         help="Extra Docker volume mounts")
     parser.add_argument("--dry-run", action="store_true",

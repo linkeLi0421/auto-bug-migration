@@ -9,9 +9,12 @@ The source in `/src/{project}` is now at newer commit `{target_commit}`, where t
 
 Your task is to make the old testcase at `/work/{testcase_name}` crash again in the current tree by undoing the fix or any added guard that prevents the testcase from reaching the bug.
 
-Target result:
-- same sanitizer class as the original crash
-- same crashing function, or very close in the same call path
+Target result (a crash is valid if ALL hold):
+- same sanitizer class as the original crash (e.g. both heap-buffer-overflow)
+- same access direction (both READ, or both WRITE)
+- same code area (same source file, or direct caller/callee in same subsystem)
+- at least one function from the original stack appears anywhere in the new stack
+  (check the full chain including callers and the allocating function, not just top frames)
 
 ## Files
 

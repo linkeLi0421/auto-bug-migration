@@ -1,4 +1,4 @@
-# CLAUDE.md -- Bug Transplant Container
+# AGENTS.md -- Bug Transplant Container
 
 You are inside an OSS-Fuzz Docker container. Your task is to transplant a bug
 from an old commit into the current version of the code.
