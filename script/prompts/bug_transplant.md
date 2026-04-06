@@ -44,12 +44,13 @@ sudo -E compile
    the new format) rather than reverting format definitions -- this keeps code changes minimal.
    Use `xxd` or `printf` + `dd` to patch specific bytes in the testcase file.
 
-3. **Diff the two commits to find what differs in the crash path.**{adjacent_commit_hint}
-   Use the crash stack trace to identify the relevant functions, then:
+3. **Find what differs in the crash path.**{adjacent_commit_hint}
+   Use the crash stack trace to identify the relevant functions. You can also get the diff
+   between the two commits for specific files using:
    ```bash
    git diff {buggy_commit} {target_commit} -- <file>
    ```
-   on those files. Look for added/removed validation checks, changed function signatures, or
+   Look for added/removed validation checks, changed function signatures, or
    structural changes along the crash path.
 
 4. **The difference may not be a single "fix" commit.** It could be incidental -- a refactor

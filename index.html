@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSS-Fuzz Bug Transplant — Workflow</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #faf8f5; --bg-warm: #f5f0ea; --bg-code: #f0ebe3;
+    --text: #2c2419; --text-secondary: #6b5d4d; --text-muted: #9c8b78;
+    --accent-rust: #c05621; --accent-teal: #0d7377; --accent-indigo: #4338ca;
+    --accent-rose: #be185d; --accent-emerald: #047857;
+    --border: #e2dbd0; --border-strong: #c9bfb0;
+    --shadow: 0 1px 3px rgba(44,36,25,.06), 0 4px 16px rgba(44,36,25,.04);
+    --shadow-lg: 0 4px 12px rgba(44,36,25,.08), 0 12px 40px rgba(44,36,25,.06);
+    --radius: 12px;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html { scroll-behavior: smooth; }
+  body { font-family:'Outfit',sans-serif; background:var(--bg); color:var(--text); min-height:100vh; line-height:1.6; overflow-x:hidden; }
+  body::before { content:''; position:fixed; inset:0; opacity:.025; background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); pointer-events:none; z-index:9999; }
+
+  .page { max-width:1000px; margin:0 auto; padding:40px 24px 60px; }
+
+  /* Header */
+  .header { text-align:center; margin-bottom:36px; }
+  .header::after { content:''; display:block; width:60px; height:3px; background:var(--accent-rust); margin:20px auto 0; border-radius:2px; }
+  h1 { font-family:'DM Serif Display',serif; font-size:34px; font-weight:400; letter-spacing:-.5px; line-height:1.15; margin-bottom:8px; }
+  .header .lead { font-size:15px; color:var(--text-secondary); font-weight:300; max-width:560px; margin:0 auto; }
+
+  /* ===== GRAPH — always visible, compact ===== */
+  .graph-box {
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px 20px 16px;
+    box-shadow: var(--shadow);
+    margin-bottom: 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+
+  .graph-box svg { display:block; margin:0 auto; width:100%; height:auto; }
+
+  /* ===== SLIDE PANEL — appears below graph ===== */
+  .slide-area {
+    min-height: 400px;
+    padding-top: 20px;
+  }
+
+  .slide {
+    display: none;
+    animation: slideIn .3s ease;
+  }
+  .slide.active { display: block; }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Slide header */
+  .slide-header {
+    display:flex; align-items:center; gap:12px;
+    margin-bottom:18px; padding-bottom:10px;
+    border-bottom:2px solid var(--border);
+  }
+  .slide-num {
+    font-family:'JetBrains Mono',monospace; font-size:12px; font-weight:600;
+    width:28px; height:28px; border-radius:7px;
+    display:flex; align-items:center; justify-content:center; flex-shrink:0;
+  }
+  .slide-num.p0 { background:#ecfdf5; color:var(--accent-emerald); border:1.5px solid #a7f3d0; }
+  .slide-num.p1 { background:#eef2ff; color:var(--accent-indigo); border:1.5px solid #c7d2fe; }
+  .slide-num.p2 { background:#fdf2f8; color:var(--accent-rose); border:1.5px solid #fbcfe8; }
+  .slide-num.p3 { background:#f0fdfa; color:var(--accent-teal); border:1.5px solid #99f6e4; }
+  .slide-title { font-family:'DM Serif Display',serif; font-size:20px; font-weight:400; }
+  .slide-sub { font-size:11px; color:var(--text-muted); margin-left:auto; font-family:'JetBrains Mono',monospace; }
+
+  /* Cards */
+  .card-row { display:grid; gap:12px; margin-bottom:12px; }
+  .card-row.cols-2 { grid-template-columns:1fr 1fr; }
+  .card-row.cols-3 { grid-template-columns:1fr 1fr 1fr; }
+  .card {
+    background:#fff; border:1px solid var(--border); border-radius:var(--radius);
+    padding:16px; box-shadow:var(--shadow); transition:box-shadow .2s;
+  }
+  .card:hover { box-shadow:var(--shadow-lg); }
+  .card-label {
+    font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600;
+    text-transform:uppercase; letter-spacing:1.5px; margin-bottom:5px;
+    display:inline-block; padding:2px 7px; border-radius:4px;
+  }
+  .card-label.data { color:var(--accent-emerald); background:#ecfdf5; }
+  .card-label.agent { color:var(--accent-indigo); background:#eef2ff; }
+  .card-label.verify { color:var(--accent-rust); background:#fff7ed; }
+  .card-label.output { color:var(--accent-teal); background:#f0fdfa; }
+  .card-label.dispatch { color:var(--accent-rose); background:#fdf2f8; }
+  .card h3 { font-size:14px; font-weight:600; margin-bottom:5px; }
+  .card p { font-size:12.5px; color:var(--text-secondary); line-height:1.6; }
+  .card code { font-family:'JetBrains Mono',monospace; font-size:10.5px; background:var(--bg-code); color:var(--accent-rust); padding:1px 5px; border-radius:4px; }
+  .card .filepath { font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--text-muted); background:var(--bg-warm); padding:4px 8px; border-radius:5px; margin-top:8px; border:1px solid var(--border); }
+
+  /* Steps */
+  .steps { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+  .step { display:flex; gap:10px; align-items:flex-start; }
+  .step-badge { flex-shrink:0; width:22px; height:22px; border-radius:50%; font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; display:flex; align-items:center; justify-content:center; }
+  .step-badge.indigo { background:#eef2ff; color:var(--accent-indigo); border:1.5px solid #c7d2fe; }
+  .step-badge.rust { background:#fff7ed; color:var(--accent-rust); border:1.5px solid #fed7aa; }
+  .step-badge.rose { background:#fdf2f8; color:var(--accent-rose); border:1.5px solid #fbcfe8; }
+  .step-body { flex:1; font-size:12.5px; color:var(--text-secondary); line-height:1.55; }
+  .step-body strong { color:var(--text); font-weight:600; }
+
+  .connector { display:flex; flex-direction:column; align-items:center; padding:4px 0; }
+  .connector .line { width:2px; height:18px; background:var(--border-strong); border-radius:1px; }
+
+  .loop-wrap { text-align:center; }
+  .loop-pill { font-family:'JetBrains Mono',monospace; font-size:10px; color:var(--accent-rust); padding:4px 12px; background:#fff7ed; border:1px dashed #fed7aa; border-radius:16px; display:inline-block; margin:4px 0; }
+
+  /* Example */
+  .ex { background:var(--bg-warm); border:1px solid var(--border); border-radius:var(--radius); padding:14px 16px; margin-top:12px; }
+  .ex .ex-label { font-family:'JetBrains Mono',monospace; font-size:9px; font-weight:600; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent-teal); margin-bottom:6px; }
+  .ex pre { font-family:'JetBrains Mono',monospace; font-size:11px; line-height:1.65; color:var(--text); overflow-x:auto; white-space:pre; margin:0; }
+  .ex pre .c { color:var(--text-muted); }
+  .ex pre .v { color:var(--accent-indigo); }
+  .ex pre .f { color:var(--accent-rust); }
+
+  .result { background:#fff; border:2px solid #a7f3d0; border-radius:var(--radius); padding:16px; margin-top:12px; }
+  .result .rl { font-family:'JetBrains Mono',monospace; font-size:10px; font-weight:600; color:var(--accent-emerald); margin-bottom:6px; }
+  .result pre { font-family:'JetBrains Mono',monospace; font-size:11.5px; line-height:1.65; color:var(--text); }
+  .result .hl { color:var(--accent-emerald); font-weight:600; }
+
+  .dispatch-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; }
+  .dc { background:#fdf2f8; border:1px solid #fbcfe8; border-radius:8px; padding:10px; }
+  .dc .dt { font-size:11px; font-weight:600; color:var(--accent-rose); margin-bottom:3px; }
+  .dc .dd { font-size:10.5px; color:var(--text-secondary); line-height:1.5; }
+
+  /* Hint text */
+  .hint { text-align:center; font-size:12px; color:var(--text-muted); padding:10px 0 0; font-family:'JetBrains Mono',monospace; }
+
+  /* Legend */
+  .legend { display:flex; gap:20px; justify-content:center; margin-top:32px; padding-top:20px; border-top:1px solid var(--border); flex-wrap:wrap; }
+  .legend-item { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-muted); }
+  .legend-dot { width:9px; height:9px; border-radius:3px; }
+  .legend-dot.emerald { background:var(--accent-emerald); }
+  .legend-dot.indigo { background:var(--accent-indigo); }
+  .legend-dot.rust { background:var(--accent-rust); }
+  .legend-dot.teal { background:var(--accent-teal); }
+  .legend-dot.rose { background:var(--accent-rose); }
+
+  @media (max-width:700px) {
+    .card-row.cols-2,.card-row.cols-3 { grid-template-columns:1fr; }
+    .dispatch-grid { grid-template-columns:1fr; }
+    h1 { font-size:26px; }
+    .page { padding:20px 12px 40px; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header">
+    <h1>OSS-Fuzz Bug Transplant Pipeline</h1>
+    <p class="lead">Collect crash data, transplant each bug via a code agent, dispatch-wrap and merge all patches into a single multi-bug binary.</p>
+  </div>
+
+  <!-- ============================================================ -->
+  <!--  GRAPH — compact, always visible                              -->
+  <!-- ============================================================ -->
+  <div class="graph-box">
+    <svg viewBox="0 0 760 220" xmlns="http://www.w3.org/2000/svg" font-family="Outfit, sans-serif">
+      <defs>
+        <marker id="ar" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0 L10 3.5 L0 7 z" fill="#c9bfb0"/></marker>
+        <filter id="ds" x="-4%" y="-4%" width="108%" height="112%"><feDropShadow dx="0" dy="1" stdDeviation="2" flood-opacity=".06"/></filter>
+        <style>
+          .n { cursor:pointer; transition: transform .1s; }
+          .n:hover rect { stroke-width:2; }
+          .n.on rect { stroke-width:2.5; filter:url(#ds) brightness(.97); }
+        </style>
+      </defs>
+
+      <!-- === Top row: 4 main phases (taller boxes) === -->
+      <g class="n" data-s="s-data">
+        <rect x="6" y="8" width="140" height="68" rx="9" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="76" y="30" text-anchor="middle" font-size="10" font-weight="600" fill="#047857">PHASE 0</text>
+        <text x="76" y="48" text-anchor="middle" font-size="11" font-weight="500" fill="#2c2419">Data Collection</text>
+        <text x="76" y="63" text-anchor="middle" font-size="8" fill="#9c8b78">crash, trace, fix hint</text>
+      </g>
+
+      <line x1="146" y1="42" x2="172" y2="42" stroke="#c9bfb0" stroke-width="1.5" marker-end="url(#ar)"/>
+
+      <g class="n" data-s="s-transplant">
+        <rect x="176" y="8" width="194" height="68" rx="9" fill="#eef2ff" stroke="#c7d2fe" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="273" y="30" text-anchor="middle" font-size="10" font-weight="600" fill="#4338ca">PHASE 1</text>
+        <text x="273" y="48" text-anchor="middle" font-size="11" font-weight="500" fill="#2c2419">Per-Bug Transplant</text>
+        <text x="273" y="63" text-anchor="middle" font-size="8" fill="#9c8b78">Codex agent, sequential</text>
+      </g>
+
+      <line x1="370" y1="42" x2="396" y2="42" stroke="#c9bfb0" stroke-width="1.5" marker-end="url(#ar)"/>
+      <text x="383" y="34" text-anchor="middle" font-size="7" fill="#9c8b78">diffs</text>
+
+      <g class="n" data-s="s-merge">
+        <rect x="400" y="8" width="218" height="68" rx="9" fill="#fdf2f8" stroke="#fbcfe8" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="509" y="30" text-anchor="middle" font-size="10" font-weight="600" fill="#be185d">PHASE 2</text>
+        <text x="509" y="48" text-anchor="middle" font-size="11" font-weight="500" fill="#2c2419">Offline Dispatch Merge</text>
+        <text x="509" y="63" text-anchor="middle" font-size="8" fill="#9c8b78">wrap + merge, no conflicts</text>
+      </g>
+
+      <line x1="618" y1="42" x2="644" y2="42" stroke="#c9bfb0" stroke-width="1.5" marker-end="url(#ar)"/>
+
+      <g class="n" data-s="s-output">
+        <rect x="648" y="8" width="106" height="68" rx="9" fill="#f0fdfa" stroke="#99f6e4" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="701" y="30" text-anchor="middle" font-size="10" font-weight="600" fill="#0d7377">PHASE 3</text>
+        <text x="701" y="48" text-anchor="middle" font-size="11" font-weight="500" fill="#2c2419">Output</text>
+        <text x="701" y="63" text-anchor="middle" font-size="8" fill="#9c8b78">diff + testcases</text>
+      </g>
+
+      <!-- === Bottom row: sub-steps === -->
+      <!-- Phase 1 subs -->
+      <line x1="233" y1="76" x2="233" y2="98" stroke="#c7d2fe" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-method">
+        <rect x="176" y="100" width="114" height="40" rx="7" fill="#fff" stroke="#c7d2fe" stroke-width="1" filter="url(#ds)"/>
+        <text x="233" y="118" text-anchor="middle" font-size="9.5" font-weight="500" fill="#4338ca">Test / Patch</text>
+        <text x="233" y="133" text-anchor="middle" font-size="8" fill="#9c8b78">agent loop</text>
+      </g>
+      <line x1="313" y1="76" x2="313" y2="98" stroke="#fed7aa" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-verify">
+        <rect x="296" y="100" width="114" height="40" rx="7" fill="#fff" stroke="#fed7aa" stroke-width="1" filter="url(#ds)"/>
+        <text x="353" y="118" text-anchor="middle" font-size="9.5" font-weight="500" fill="#c05621">Verify + Min</text>
+        <text x="353" y="133" text-anchor="middle" font-size="8" fill="#9c8b78">2nd agent</text>
+      </g>
+
+      <!-- Phase 2 subs -->
+      <line x1="469" y1="76" x2="469" y2="98" stroke="#fbcfe8" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-wrap">
+        <rect x="412" y="100" width="114" height="40" rx="7" fill="#fff" stroke="#fbcfe8" stroke-width="1" filter="url(#ds)"/>
+        <text x="469" y="118" text-anchor="middle" font-size="9.5" font-weight="500" fill="#be185d">P1: Wrap</text>
+        <text x="469" y="133" text-anchor="middle" font-size="8" fill="#9c8b78">per-bug dispatch</text>
+      </g>
+      <line x1="549" y1="76" x2="549" y2="98" stroke="#fbcfe8" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-compose">
+        <rect x="532" y="100" width="114" height="40" rx="7" fill="#fff" stroke="#fbcfe8" stroke-width="1" filter="url(#ds)"/>
+        <text x="589" y="118" text-anchor="middle" font-size="9.5" font-weight="500" fill="#be185d">P2: Merge</text>
+        <text x="589" y="133" text-anchor="middle" font-size="8" fill="#9c8b78">all diffs</text>
+      </g>
+
+      <!-- Data flow: simplified arrow strip -->
+      <rect x="6" y="160" width="748" height="1" fill="#e2dbd0"/>
+      <text x="380" y="177" text-anchor="middle" font-size="9" font-weight="500" fill="#6b5d4d">
+        Inputs &rarr; crash/trace &rarr; per-bug .diff &rarr; wrapped .diff &rarr; combined.diff &rarr; testcases/ + summary.json
+      </text>
+
+      <!-- AGENTS.md loop -->
+      <path d="M273 76 Q273 88 200 88 Q100 88 76 76" fill="none" stroke="#c7d2fe" stroke-width=".8" stroke-dasharray="3,2" marker-end="url(#ar)"/>
+      <text x="170" y="95" text-anchor="middle" font-size="7" fill="#4338ca" font-style="italic">AGENTS.md</text>
+
+      <!-- Hint -->
+      <text x="380" y="208" text-anchor="middle" font-size="9" fill="#9c8b78" font-family="JetBrains Mono, monospace">click any node above</text>
+    </svg>
+  </div>
+
+  <!-- ============================================================ -->
+  <!--  SLIDES — only one visible at a time                          -->
+  <!-- ============================================================ -->
+  <div class="slide-area">
+
+    <!-- Default: nothing selected yet -->
+    <div class="slide active" id="s-default">
+      <div style="text-align:center; padding:80px 20px; color:var(--text-muted);">
+        <div style="font-size:32px; margin-bottom:12px;">&#x2191;</div>
+        <div style="font-family:'JetBrains Mono',monospace; font-size:13px;">Click a phase or step in the graph to see details</div>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: Data Collection ===== -->
+    <div class="slide" id="s-data">
+      <div class="slide-header">
+        <div class="slide-num p0">0</div>
+        <div class="slide-title">Data Collection</div>
+        <div class="slide-sub">buildAndtest.py &middot; fuzz_helper.py</div>
+      </div>
+      <div class="card-row cols-3">
+        <div class="card"><span class="card-label data">Input</span><h3>OSV Bug Database</h3><p>Per-bug metadata: OSV ID, fuzzer, sanitizer, crash type, PoC testcase.</p><div class="filepath">osv_testcases_summary.json</div></div>
+        <div class="card"><span class="card-label data">Input</span><h3>Commit x Bug Matrix</h3><p>Build each commit, test each bug. Identifies <strong>buggy</strong> and <strong>target</strong> commits.</p><div class="filepath">~/log/&lt;project&gt;.csv</div></div>
+        <div class="card"><span class="card-label data">Input</span><h3>Docker Image Map</h3><p>Commit &rarr; OSS-Fuzz Docker image for pinned builds.</p><div class="filepath">~/log/&lt;project&gt;_builds.csv</div></div>
+      </div>
+      <div class="card-row cols-3">
+        <div class="card"><span class="card-label data">Collected</span><h3>Crash Log &amp; Trace</h3><p>ASAN crash stack + function trace at buggy commit.</p><div class="filepath">data/crash/target_crash-*.txt<br>data/target_trace-*.txt</div></div>
+        <div class="card"><span class="card-label data">Collected</span><h3>Fix Hint Diff</h3><p>Diff from buggy to adjacent commit. Likely contains the actual fix.</p><div class="filepath">data/patch_diffs/fix_hint-*.diff</div></div>
+        <div class="card"><span class="card-label data">Persistent</span><h3>AGENTS.md</h3><p>Shared knowledge across bug sessions: code structure, validation checks, format.</p><div class="filepath">/src/&lt;project&gt;/AGENTS.md</div></div>
+      </div>
+      <div class="ex">
+        <div class="ex-label">Example &mdash; c-blosc2</div>
+<pre><span class="v">source</span> script/setenv.sh
+<span class="v">sudo -E python3</span> script/fuzz_helper.py collect_crash c-blosc2 decompress_fuzzer \
+  <span class="f">--commit</span> 3f57e42a <span class="f">--testcases</span> $TESTCASES <span class="f">--test_input</span> testcase-OSV-2023-826
+<span class="v">sudo -E python3</span> script/fuzz_helper.py collect_trace c-blosc2 decompress_fuzzer \
+  <span class="f">--commit</span> 3f57e42a <span class="f">--testcases</span> $TESTCASES <span class="f">--test_input</span> testcase-OSV-2023-826</pre>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: Transplant overview ===== -->
+    <div class="slide" id="s-transplant">
+      <div class="slide-header">
+        <div class="slide-num p1">1</div>
+        <div class="slide-title">Per-Bug Transplantation</div>
+        <div class="slide-sub">bug_transplant_batch.py &rarr; bug_transplant.py</div>
+      </div>
+      <div class="card">
+        <span class="card-label agent">Codex Agent in Docker</span>
+        <h3>Overview</h3>
+        <p>For each bug, a Codex agent runs inside an OSS-Fuzz container at the target commit. It reads AGENTS.md for shared knowledge, then iterates: <strong>test &rarr; diagnose &rarr; patch &rarr; build &rarr; test</strong>. After triggering, a post-agent verification confirms the crash, then a second agent minimizes the diff.</p>
+      </div>
+      <div class="card-row cols-3" style="margin-top:12px;">
+        <div class="card"><strong style="color:var(--accent-emerald);font-size:12px;">Success</strong><p style="font-size:11px;margin-top:3px;">Minimized <code>bug_transplant.diff</code> + testcase</p></div>
+        <div class="card"><strong style="color:var(--accent-rust);font-size:12px;">Impossible</strong><p style="font-size:11px;margin-top:3px;"><code>bug_transplant.impossible</code> + reason</p></div>
+        <div class="card"><strong style="color:var(--accent-indigo);font-size:12px;">Always</strong><p style="font-size:11px;margin-top:3px;">Update AGENTS.md for next bug</p></div>
+      </div>
+      <div class="ex">
+        <div class="ex-label">Example &mdash; batch transplant</div>
+<pre><span class="c"># Dry run</span>
+<span class="v">python3</span> script/bug_transplant_batch.py ~/log/c-blosc2.csv \
+  <span class="f">--bug_info</span> $BUGINFO_PATH <span class="f">--build_csv</span> ~/log/c-blosc2_builds.csv \
+  <span class="f">--target</span> c-blosc2 <span class="f">--dry-run</span>
+
+<span class="c"># Run all bugs</span>
+<span class="v">sudo -E python3</span> script/bug_transplant_batch.py ~/log/c-blosc2.csv \
+  <span class="f">--bug_info</span> $BUGINFO_PATH <span class="f">--build_csv</span> ~/log/c-blosc2_builds.csv \
+  <span class="f">--target</span> c-blosc2 <span class="f">--resume</span> <span class="f">--keep-containers</span></pre>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: Agent methodology ===== -->
+    <div class="slide" id="s-method">
+      <div class="slide-header">
+        <div class="slide-num p1">1a</div>
+        <div class="slide-title">Test / Diagnose / Patch</div>
+        <div class="slide-sub">script/prompts/bug_transplant.md</div>
+      </div>
+      <div class="card">
+        <span class="card-label agent">Agent Loop</span>
+        <h3>Transplant Methodology</h3>
+        <div class="steps">
+          <div class="step"><div class="step-badge indigo">1</div><div class="step-body"><strong>Test the PoC on target commit.</strong> Build with <code>sudo -E compile</code>, run testcase. Same crash = done. Different crash or no crash = keep going.</div></div>
+          <div class="step"><div class="step-badge indigo">2</div><div class="step-body"><strong>If testcase is rejected early</strong>, input format changed. <strong>Patch the testcase binary</strong> with <code>xxd</code>/<code>dd</code>/<code>printf</code> rather than reverting format definitions.</div></div>
+          <div class="step"><div class="step-badge indigo">3</div><div class="step-body"><strong>Find what differs in the crash path.</strong> Read fix hint diff if available. <code>git diff &lt;buggy&gt; &lt;target&gt; -- &lt;file&gt;</code> on crash stack functions.</div></div>
+          <div class="step"><div class="step-badge indigo">4</div><div class="step-body"><strong>The blocker may not be a single "fix".</strong> Could be incidental validation, format change, or refactoring. Focus on what concretely prevents the crash.</div></div>
+          <div class="step"><div class="step-badge indigo">5</div><div class="step-body"><strong>Verify both directions.</strong> Crash WITH changes, no crash WITHOUT (<code>git stash</code> round-trip). Same sanitizer class, same code area, overlapping call chain.</div></div>
+        </div>
+      </div>
+      <div class="loop-wrap"><div class="loop-pill">&#x21BA; build &amp; test after every change</div></div>
+    </div>
+
+    <!-- ===== SLIDE: Verify + Minimize ===== -->
+    <div class="slide" id="s-verify">
+      <div class="slide-header">
+        <div class="slide-num p1">1b</div>
+        <div class="slide-title">Verify + Minimize</div>
+        <div class="slide-sub">script/prompts/minimize_patch.md</div>
+      </div>
+      <div class="card-row cols-2">
+        <div class="card">
+          <span class="card-label verify">Post-Agent Verification</span>
+          <h3>Official Build Check</h3>
+          <p>Force <code>sudo -E compile</code> (agent may have built non-standard). Run fuzzer, compare crash stack with original to confirm same vulnerability &mdash; not a new bug.</p>
+        </div>
+        <div class="card">
+          <span class="card-label agent">Separate Agent Session</span>
+          <h3>Patch Minimization</h3>
+          <p>Try reverting each file &rarr; if bug still triggers, that file was unnecessary. Then minimize within required files hunk by hunk. Confirm crash stable (3 runs).</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: Merge overview ===== -->
+    <div class="slide" id="s-merge">
+      <div class="slide-header">
+        <div class="slide-num p2">2</div>
+        <div class="slide-title">Offline Dispatch Merge</div>
+        <div class="slide-sub">bug_transplant_merge_offline.py</div>
+      </div>
+      <div class="card">
+        <span class="card-label dispatch">Overview</span>
+        <h3>Two-Phase Approach</h3>
+        <p>Each bug with a code diff gets a unique dispatch bit pre-assigned. <strong>Phase 1</strong> wraps each patch independently on clean source. <strong>Phase 2</strong> merges all wrapped diffs together. Since each bug uses a different bit, they don't interfere at runtime.</p>
+      </div>
+      <div class="card" style="margin-top:12px;">
+        <h3>Dispatch Mechanism</h3>
+        <p>The harness reads <code>__bug_dispatch[]</code> from the first byte(s) of each testcase. Each PoC gets its bit prepended. Local/testcase-only bugs get <code>0x00</code>.</p>
+        <div class="dispatch-grid">
+          <div class="dc"><div class="dt">Runtime code</div><div class="dd"><code>if (__bug_dispatch[B] &amp; (1&lt;&lt;N))</code> &mdash; both old and new code preserved</div></div>
+          <div class="dc"><div class="dt">Macros</div><div class="dd">Ternary: <code>(dispatch ? new : old)</code></div></div>
+          <div class="dc"><div class="dt">Struct/type</div><div class="dd">Applied directly (wider type is backward-compatible)</div></div>
+        </div>
+      </div>
+      <div class="ex">
+        <div class="ex-label">Example</div>
+<pre><span class="v">sudo -E python3</span> script/bug_transplant_merge_offline.py \
+  <span class="f">--summary</span> data/bug_transplant/batch_c-blosc2_79e921d9/summary.json \
+  <span class="f">--bug_info</span> $BUGINFO_PATH <span class="f">--build_csv</span> ~/log/c-blosc2_builds.csv \
+  <span class="f">--target</span> c-blosc2 <span class="f">--keep-container</span></pre>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: P1 Wrap ===== -->
+    <div class="slide" id="s-wrap">
+      <div class="slide-header">
+        <div class="slide-num p2">2a</div>
+        <div class="slide-title">Phase 1: Wrap Each Bug</div>
+        <div class="slide-sub">script/prompts/dispatch_wrap_offline.md</div>
+      </div>
+      <div class="card">
+        <span class="card-label dispatch">Per-Bug Wrapping</span>
+        <h3>Dispatch-Wrap on Clean Source</h3>
+        <div class="steps">
+          <div class="step"><div class="step-badge rose">1</div><div class="step-body">Reset source to harness baseline (clean + harness modification only).</div></div>
+          <div class="step"><div class="step-badge rose">2</div><div class="step-body">Agent reads the standalone patch and rewrites every hunk with dispatch gating.</div></div>
+          <div class="step"><div class="step-badge rose">3</div><div class="step-body">Build with <code>sudo -E compile</code> to verify. Save <code>wrapped_&lt;bug_id&gt;.diff</code>.</div></div>
+          <div class="step"><div class="step-badge rose">4</div><div class="step-body">Reset source again for the next bug. Each wrap is independent.</div></div>
+        </div>
+      </div>
+      <div class="loop-wrap"><div class="loop-pill">&#x21BA; retry up to N times per bug if wrap fails</div></div>
+      <div class="ex">
+        <div class="ex-label">Dispatch wrapping pattern</div>
+<pre><span class="c">// Every runtime code change gets wrapped like this:</span>
+<span class="v">#include</span> "__bug_dispatch.h"
+
+<span class="v">if</span> (__bug_dispatch[<span class="f">B</span>] &amp; (1 &lt;&lt; <span class="f">N</span>)) {
+    <span class="c">// Bug's version (NEW — from the patch)</span>
+} <span class="v">else</span> {
+    <span class="c">// Original version (OLD — before the patch)</span>
+}
+
+<span class="c">// Macros use ternary:</span>
+<span class="v">#define</span> LIMIT ((__bug_dispatch[<span class="f">0</span>] &amp; (1 &lt;&lt; <span class="f">N</span>)) ? 4096 : 4080)</pre>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: P2 Compose ===== -->
+    <div class="slide" id="s-compose">
+      <div class="slide-header">
+        <div class="slide-num p2">2b</div>
+        <div class="slide-title">Phase 2: Merge All</div>
+        <div class="slide-sub">script/prompts/merge_wrapped_patches.md</div>
+      </div>
+      <div class="card">
+        <span class="card-label agent">Code Agent</span>
+        <h3>Compose Wrapped Diffs</h3>
+        <p>All wrapped diffs are copied into the container. A code agent applies them one by one, resolving textual conflicts (duplicate <code>#include</code>, adjacent hunks from different bugs). Since dispatch bits are unique, no semantic conflicts.</p>
+        <div class="steps" style="margin-top:10px;">
+          <div class="step"><div class="step-badge rose">1</div><div class="step-body">Agent applies patches in chunks (max 15 per agent call).</div></div>
+          <div class="step"><div class="step-badge rose">2</div><div class="step-body">Build after each chunk to localize failures.</div></div>
+          <div class="step"><div class="step-badge rose">3</div><div class="step-body">Final verification: all testcases replayed with dispatch bytes.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SLIDE: Output ===== -->
+    <div class="slide" id="s-output">
+      <div class="slide-header">
+        <div class="slide-num p3">3</div>
+        <div class="slide-title">Output</div>
+        <div class="slide-sub">merge_offline_&lt;project&gt;_&lt;commit&gt;/</div>
+      </div>
+      <div class="card-row cols-3">
+        <div class="card"><span class="card-label output">Artifact</span><h3>Combined Diff</h3><p>Target commit &rarr; multi-bug version with dispatch gating.</p><div class="filepath">combined.diff</div></div>
+        <div class="card"><span class="card-label output">Artifact</span><h3>Testcases</h3><p>All PoCs with dispatch bytes prepended.</p><div class="filepath">testcases/</div></div>
+        <div class="card"><span class="card-label output">Artifact</span><h3>Summary</h3><p>Per-bug status, dispatch bits, trigger rate.</p><div class="filepath">summary.json</div></div>
+      </div>
+      <div class="result">
+        <div class="rl">Example &mdash; c-blosc2</div>
+<pre><span class="hl">RESULT:  18 / 21 bugs triggering</span>
+
+  Local bugs:         9/10 verified
+  Testcase-only:      2/2  verified
+  Dispatch-wrapped:   7/9  triggering
+    [  OK] OSV-2023-150  (bit 0)
+    [  OK] OSV-2022-913  (bit 1)
+    [FAIL] OSV-2020-2076 (bit 5, wrap failed)</pre>
+      </div>
+    </div>
+
+  </div><!-- /slide-area -->
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot emerald"></div> Data</div>
+    <div class="legend-item"><div class="legend-dot indigo"></div> Agent</div>
+    <div class="legend-item"><div class="legend-dot rust"></div> Verify</div>
+    <div class="legend-item"><div class="legend-dot teal"></div> Output</div>
+    <div class="legend-item"><div class="legend-dot rose"></div> Dispatch</div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  var nodes = document.querySelectorAll('.n');
+  var slides = document.querySelectorAll('.slide');
+
+  nodes.forEach(function(node) {
+    node.addEventListener('click', function() {
+      var target = this.getAttribute('data-s');
+      if (!target) return;
+
+      // Toggle active node
+      nodes.forEach(function(n) { n.classList.remove('on'); });
+      this.classList.add('on');
+
+      // Switch slide
+      slides.forEach(function(s) { s.classList.remove('active'); });
+      var el = document.getElementById(target);
+      if (el) el.classList.add('active');
+    });
+  });
+})();
+</script>
+</body>
+</html>

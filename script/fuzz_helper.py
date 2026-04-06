@@ -2136,6 +2136,20 @@ def build_version(args):
 
   cd /src/{args.project.name};
   git checkout -f {args.commit};
+
+  # Newer coreutils 'mv -fu' errors on same-file moves (e.g. mv X.h ./X.h).
+  # Install a wrapper that suppresses only that specific error.
+  _real_mv=$(which mv);
+  cat > /usr/local/bin/mv <<'MVWRAP'
+#!/bin/sh
+out=$(/usr/bin/mv "$@" 2>&1)
+rc=$?
+if [ $rc -ne 0 ]; then
+  case "$out" in *"are the same file"*) exit 0;; esac
+  echo "$out" >&2; exit $rc
+fi
+MVWRAP
+  chmod +x /usr/local/bin/mv;
   '''
 
   # ntopng and nDPI are companion repos that must stay in API sync.

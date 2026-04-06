@@ -79,13 +79,24 @@ def setup_codex_creds(container: str) -> None:
     )
 
 
-def build_codex_command(prompt: str, model: str | None = None) -> str:
-    """Build the codex CLI command."""
+def build_codex_command(
+    prompt: str, model: str | None = None, mode: str = "exec",
+) -> str:
+    """Build the codex CLI command.
+
+    *mode* selects the invocation style:
+      - ``"exec"``  (default) — ``codex exec … --json`` (non-interactive, JSONL)
+      - ``"interactive"`` — ``codex … `` (TUI, needs a TTY via tmux)
+    """
     escaped = shlex.quote(prompt)
-    cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
+    if mode == "interactive":
+        cmd = f"codex --dangerously-bypass-approvals-and-sandbox {escaped}"
+    else:
+        cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
     if model:
         cmd += f" --model {shlex.quote(model)}"
-    cmd += " --json"
+    if mode != "interactive":
+        cmd += " --json"
     return cmd
 
 # ---------------------------------------------------------------------------
@@ -707,32 +718,45 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         setup_codex_creds(container_name)
 
         # --- Run agent ---
-        logger.info("Running codex agent (this may take a while)...")
-        agent_cmd = build_codex_command(prompt, getattr(args, "model", None))
+        codex_mode = getattr(args, "codex_mode", "exec")
+        logger.info("Running codex agent (mode=%s, this may take a while)...",
+                     codex_mode)
+        agent_cmd = build_codex_command(
+            prompt, getattr(args, "model", None), mode=codex_mode,
+        )
 
         start_time = time.monotonic()
-        exit_code, output = _exec_capture(
-            container_name, agent_cmd, timeout=args.timeout,
-        )
+        if codex_mode == "interactive":
+            exit_code, output = _exec_interactive(
+                container_name, agent_cmd, timeout=args.timeout,
+            )
+        else:
+            exit_code, output = _exec_capture(
+                container_name, agent_cmd, timeout=args.timeout,
+            )
         elapsed = time.monotonic() - start_time
 
         if _usage_tracker:
             _usage_tracker.log_usage("transplant", output, getattr(args, "model", None))
 
         logger.info(
-            "Codex agent finished in %.0fs (exit code %d, %d bytes output)",
-            elapsed, exit_code, len(output),
+            "Codex agent finished in %.0fs (exit code %d)",
+            elapsed, exit_code,
         )
 
         # --- Save output ---
         output_dir = DATA_DIR / "bug_transplant" / f"{args.project}_{args.bug_id}"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Save raw JSONL and human-readable transcript
-        (output_dir / "agent_output.jsonl").write_text(output)
-        (output_dir / "agent_output.txt").write_text(
-            _format_codex_output(output)
-        )
+        if codex_mode == "interactive":
+            # TUI output captured via tmux pipe-pane (includes ANSI codes)
+            (output_dir / "agent_output_tui.txt").write_text(output)
+        else:
+            # Save raw JSONL and human-readable transcript
+            (output_dir / "agent_output.jsonl").write_text(output)
+            (output_dir / "agent_output.txt").write_text(
+                _format_codex_output(output)
+            )
 
         # Check if agent declared the bug impossible to transplant
         impossible_path = output_dir / "bug_transplant.impossible"
@@ -873,11 +897,19 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # --- Phase 2: Minimization (separate agent) ---
                 logger.info("=== Minimization phase ===")
                 minimize_prompt = _build_minimize_prompt(args)
-                minimize_cmd = build_codex_command(minimize_prompt, getattr(args, "model", None))
-                min_start = time.monotonic()
-                min_exit, min_output = _exec_capture(
-                    container_name, minimize_cmd, timeout=args.timeout,
+                minimize_cmd = build_codex_command(
+                    minimize_prompt, getattr(args, "model", None),
+                    mode=codex_mode,
                 )
+                min_start = time.monotonic()
+                if codex_mode == "interactive":
+                    min_exit, min_output = _exec_interactive(
+                        container_name, minimize_cmd, timeout=args.timeout,
+                    )
+                else:
+                    min_exit, min_output = _exec_capture(
+                        container_name, minimize_cmd, timeout=args.timeout,
+                    )
                 min_elapsed = time.monotonic() - min_start
                 if _usage_tracker:
                     _usage_tracker.log_usage("minimize", min_output, getattr(args, "model", None))
@@ -1161,6 +1193,70 @@ def _exec_capture(
         return 124, f"TIMEOUT after {timeout}s"
 
 
+def _exec_interactive(
+    container_name: str, command: str, timeout: int = 3600,
+) -> tuple[int, str]:
+    """Run *command* inside a container with an interactive TTY via tmux.
+
+    Launches a tmux session that runs ``docker exec -it`` so the Codex TUI
+    gets a proper PTY, then attaches so the user can interact.  Uses
+    ``tmux pipe-pane`` to capture all terminal output for cost tracking.
+
+    Returns ``(exit_code, captured_output)`` — same signature as
+    :func:`_exec_capture` so callers can handle both modes uniformly.
+    """
+    session = f"codex_{os.getpid()}_{int(time.time())}"
+    exit_file = f"/tmp/.codex_exit_{session}"
+    log_file = f"/tmp/.codex_log_{session}"
+    Path(exit_file).unlink(missing_ok=True)
+    Path(log_file).unlink(missing_ok=True)
+
+    docker_cmd = (
+        f"docker exec -it {container_name} bash -c {shlex.quote(command)}"
+    )
+    inner = f"{docker_cmd}; echo $? > {exit_file}"
+
+    try:
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session, "bash", "-c", inner],
+            check=True,
+        )
+    except FileNotFoundError:
+        logger.error("tmux not found — install tmux for interactive mode")
+        return 1, ""
+    except subprocess.CalledProcessError as exc:
+        logger.error("Failed to create tmux session: %s", exc)
+        return 1, ""
+
+    # Capture all pane output to a log file for cost tracking.
+    subprocess.run(
+        ["tmux", "pipe-pane", "-t", session, f"cat >> {log_file}"],
+        check=False,
+    )
+
+    # Attach blocks until the session ends (command finishes).
+    subprocess.call(["tmux", "attach-session", "-t", session])
+
+    # Read captured output
+    output = ""
+    try:
+        output = Path(log_file).read_text(errors="replace")
+    except FileNotFoundError:
+        logger.warning("No captured output from tmux pipe-pane")
+    finally:
+        Path(log_file).unlink(missing_ok=True)
+
+    try:
+        exit_code = int(Path(exit_file).read_text().strip())
+    except (FileNotFoundError, ValueError):
+        logger.warning("Could not read exit code from %s", exit_file)
+        exit_code = 1
+    finally:
+        Path(exit_file).unlink(missing_ok=True)
+
+    return exit_code, output
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1223,6 +1319,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--timeout", type=int, default=3600,
                         help="Timeout in seconds for agent (default: 3600)")
+    parser.add_argument("--codex-mode", choices=["exec", "interactive"],
+                        default="exec",
+                        help="Agent invocation mode: exec (default, JSONL) "
+                             "or interactive (TUI via tmux)")
 
     # Docker
     parser.add_argument("--keep-container", action="store_true",
