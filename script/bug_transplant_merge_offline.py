@@ -60,7 +60,9 @@ from bug_transplant_merge import (
     _prepare_container_testcases_dir,
     _save_work_testcase_to_host,
 )
-from bug_transplant import CODEX_CONFIG, setup_codex_creds, build_codex_command
+from bug_transplant import (
+    CODEX_CONFIG, setup_codex_creds, build_codex_command, _exec_interactive,
+)
 from codex_usage import CodexUsageTracker
 
 # Pathspecs to exclude build artifacts from git diff
@@ -493,6 +495,7 @@ def wrap_bug_with_dispatch(
     bit_index: int,
     dispatch_state: dict,
     model: str | None = None,
+    codex_mode: str = "exec",
 ) -> tuple[bool, str]:
     """Invoke codex to wrap a bug's patch with dispatch gating.
 
@@ -537,11 +540,14 @@ def wrap_bug_with_dispatch(
         output_testcase_path=f"/work/{bug['testcase']}",
     )
 
-    agent_cmd = build_codex_command(prompt, model)
+    agent_cmd = build_codex_command(prompt, model, mode=codex_mode)
 
     logger.info("[%s] Invoking codex for dispatch wrapping (bit %d)...",
                 bug_id, bit_index)
-    ret, output = _exec_capture(container, agent_cmd, timeout=1800)
+    if codex_mode == "interactive":
+        ret, output = _exec_interactive(container, agent_cmd, timeout=1800)
+    else:
+        ret, output = _exec_capture(container, agent_cmd, timeout=1800)
 
     _usage_tracker.log_usage(f"{bug_id} wrap", output, model)
 
@@ -784,6 +790,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 success, output = wrap_bug_with_dispatch(
                     container, project, bd, bit_index,
                     dispatch_state, model=args.model,
+                    codex_mode=getattr(args, "codex_mode", "exec"),
                 )
 
                 if success:
@@ -887,7 +894,10 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                     )
 
                     setup_codex_creds(container)
-                    agent_cmd = build_codex_command(merge_prompt, args.model)
+                    codex_mode = getattr(args, "codex_mode", "exec")
+                    agent_cmd = build_codex_command(
+                        merge_prompt, args.model, mode=codex_mode,
+                    )
 
                     logger.info(
                         "Invoking codex to merge chunk %d (%d patches: %d..%d/%d)",
@@ -897,7 +907,10 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                         min(start + len(chunk), total_patches),
                         total_patches,
                     )
-                    ret, output = _exec_capture(container, agent_cmd, timeout=3600)
+                    if codex_mode == "interactive":
+                        ret, output = _exec_interactive(container, agent_cmd, timeout=3600)
+                    else:
+                        ret, output = _exec_capture(container, agent_cmd, timeout=3600)
                     _usage_tracker.log_usage(f"merge chunk {chunk_idx}", output, args.model)
                     if ret != 0:
                         logger.error(
@@ -1068,6 +1081,10 @@ def main():
                         help="Resume from step N")
     parser.add_argument("--max-steps", type=int, default=None,
                         help="Stop after N steps")
+    parser.add_argument("--codex-mode", choices=["exec", "interactive"],
+                        default="exec",
+                        help="Agent invocation mode: exec (default, JSONL) "
+                             "or interactive (TUI via tmux)")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
