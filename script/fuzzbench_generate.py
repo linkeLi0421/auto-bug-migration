@@ -386,35 +386,6 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
     return crash_lines
 
 
-def collect_crash_lines_from_files(summary: dict, project: str,
-                                   data_dir: Path) -> dict:
-    """Fallback: collect crash lines from existing per-bug crash files.
-
-    Note: these lines may not match the merged binary's line numbers.
-    Use collect_crash_lines_from_image() for accurate post-merge lines.
-
-    Returns dict: {bug_id: {"file": str, "line": int, "function": str}}
-    """
-    crash_lines = {}
-    for bug_id in summary["results"]:
-        bug_dir = data_dir / f"{project}_{bug_id}"
-        crash_file = bug_dir / "transplant_crash.txt"
-        if crash_file.exists():
-            crash_text = crash_file.read_text()
-            parsed = parse_crash_line(crash_text)
-            if parsed["file"] and parsed["line"]:
-                crash_lines[bug_id] = parsed
-                logger.debug("  %s: %s:%d in %s",
-                             bug_id, parsed["file"], parsed["line"],
-                             parsed["function"] or "?")
-            else:
-                logger.warning("  %s: could not parse crash line from %s",
-                               bug_id, crash_file)
-        else:
-            logger.debug("  %s: no crash file at %s", bug_id, crash_file)
-    return crash_lines
-
-
 def generate_bug_metadata(summary: dict, crash_lines: dict = None) -> dict:
     """Generate bug metadata for post-experiment triage."""
     dispatch_state = summary["dispatch_state"]
@@ -479,10 +450,6 @@ def main():
                         help="Override base-builder digest (e.g., sha256:abc...)")
     parser.add_argument("--benchmark-name",
                         help="Custom benchmark name (default: {project}_transplant_{target})")
-    parser.add_argument("--data-dir", default=str(PROJECT_ROOT / "data"),
-                        help="Path to data directory containing per-bug crash files")
-    parser.add_argument("--collect-crashes", action="store_true",
-                        help="Build image and run PoCs to collect accurate post-merge crash lines")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -496,7 +463,6 @@ def main():
     build_csv = Path(args.build_csv)
     oss_fuzz_dir = Path(args.oss_fuzz_dir)
     output_base = Path(args.output_dir)
-    data_dir = Path(args.data_dir)
 
     # 1. Read merge summary
     summary = read_summary(merge_dir)
@@ -553,16 +519,9 @@ def main():
         else:
             logger.warning("Patch not found: %s", src)
 
-    # 10. Collect crash lines
-    if args.collect_crashes:
-        # Build image and run PoCs for accurate post-merge line numbers
-        summary["_merge_dir"] = str(merge_dir)
-        crash_lines = collect_crash_lines_from_image(bench_dir, summary, fuzz_target)
-    else:
-        # Fallback: read from per-bug crash files (pre-merge line numbers)
-        logger.info("Collecting crash lines from %s (use --collect-crashes for post-merge lines)...",
-                     data_dir)
-        crash_lines = collect_crash_lines_from_files(summary, project, data_dir)
+    # 10. Collect crash lines by running PoCs against the merged binary
+    summary["_merge_dir"] = str(merge_dir)
+    crash_lines = collect_crash_lines_from_image(bench_dir, summary, fuzz_target)
     logger.info("Found crash lines for %d/%d bugs", len(crash_lines), len(summary["results"]))
 
     # 11. Generate bug metadata (with crash lines)

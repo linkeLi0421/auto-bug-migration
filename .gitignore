@@ -22,5 +22,6 @@ llvm_build_dirs
 /patch
 /pocs
 /log/
+/fuzzbench-output
 
 /script/setenv.sh
