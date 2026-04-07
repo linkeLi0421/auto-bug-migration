@@ -115,6 +115,9 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 | `script/bug_transplant.py` | Single-bug transplant launcher (runs code agent in Docker) |
 | `script/bug_transplant_batch.py` | Batch orchestrator (shared container, CLAUDE.md memory) |
 | `script/bug_transplant_merge.py` | Merge per-bug diffs + testcase-only bugs + dispatch resolution |
+| `script/fuzzbench_generate.py` | Generate FuzzBench benchmark from merge output |
+| `script/fuzzbench_triage.py` | Post-experiment triage (dispatch bytes + canary logs → bug timeline CSV) |
+| `script/bug_monitor.py` | Shared-memory canary poller (runs alongside fuzzer in FuzzBench trials) |
 | `script/prompts/bug_transplant.md` | Transplant prompt (testcase patching, crash verification) |
 | `script/prompts/bug_transplant_memory.md` | CLAUDE.md template for shared knowledge |
 | `script/prompts/minimize_patch.md` | Patch minimization prompt |
@@ -126,6 +129,45 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 | `script/fuzz_helper.py` | Docker-based build/fuzz/reproduce/trace operations |
 | `script/buildAndtest.py` | Generate CSV files across commit ranges |
 | `data/feedback_bug_transplant.md` | Bug transplant methodology reference |
+| `evaluation_bug_discovery_rate.md` | Evaluation plan: Magma-style bug discovery rate measurement |
+
+## FuzzBench evaluation
+
+After merging, evaluate how well different fuzzers discover the transplanted bugs using [FuzzBench](https://github.com/google/fuzzbench):
+
+```bash
+# 1. Generate FuzzBench benchmark from merge output
+python3 script/fuzzbench_generate.py \
+  --merge-dir data/merge_offline_c-blosc2_79e921d9 \
+  --build-csv data/c-blosc2_builds.csv \
+  --fuzz-target decompress_frame_fuzzer \
+  --output-dir /tmp/fuzzbench_benchmarks
+
+# 2. Copy into FuzzBench and run experiment
+cp -r /tmp/fuzzbench_benchmarks/c-blosc2_transplant_decompress_frame_fuzzer \
+  fuzzbench/benchmarks/
+cd fuzzbench
+PYTHONPATH=. python3 experiment/run_experiment.py \
+  --experiment-config /tmp/fuzzbench_benchmarks/experiment_config.yaml \
+  --benchmarks c-blosc2_transplant_decompress_frame_fuzzer \
+  --fuzzers afl aflplusplus honggfuzz libfuzzer \
+  --experiment-name transplant-cblosc2-24h
+
+# 3. Triage results (after experiment completes)
+python3 script/fuzzbench_triage.py \
+  --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
+  --bug-metadata benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
+  --output results.csv
+```
+
+The generator produces a self-contained benchmark directory with:
+- **Dockerfile** pinned to the exact base-builder digest used during merging
+- **build.sh** that checks out the target commit, applies combined.diff + harness.diff, and compiles with ASAN
+- **Canary instrumentation** (Magma-style) for measuring bug reached vs triggered
+- **Dispatch-prefixed seeds** (28 PoCs + original corpus with zero dispatch bytes)
+- **bug_metadata.json** mapping each bug to its dispatch bit and canary index
+
+The canary monitor (`bug_monitor.py`) runs alongside each fuzzer trial, polling `/dev/shm/bug_canary` and logging per-bug reached/triggered timestamps. The triage script combines canary logs with crash-input dispatch byte analysis to produce a unified timeline for survival analysis (see `evaluation_bug_discovery_rate.md`).
 
 ## Requirements
 

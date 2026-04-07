@@ -69,6 +69,27 @@ sudo -E python3 script/bug_transplant.py <project> \
   --testcase testcase-OSV-XXXX --skip-collect
 ```
 
+### FuzzBench Evaluation
+```bash
+# Generate FuzzBench benchmark from merge output
+python3 script/fuzzbench_generate.py \
+  --merge-dir data/merge_offline_c-blosc2_79e921d9 \
+  --build-csv data/c-blosc2_builds.csv \
+  --fuzz-target decompress_frame_fuzzer \
+  --output-dir /tmp/fuzzbench_benchmarks
+
+# Copy into FuzzBench and build
+cp -r /tmp/fuzzbench_benchmarks/c-blosc2_transplant_decompress_frame_fuzzer \
+  fuzzbench/benchmarks/
+cd fuzzbench && make build-afl-c-blosc2_transplant_decompress_frame_fuzzer
+
+# Post-experiment triage
+python3 script/fuzzbench_triage.py \
+  --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
+  --bug-metadata benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
+  --output results.csv
+```
+
 ### Data Collection
 ```bash
 # Collect crash log
@@ -110,6 +131,14 @@ sudo -E python3 script/fuzz_helper.py reproduce <project> <fuzzer> \
    - `conflict_resolve_dispatch.md` — Resolve conflicts using dispatch branches
    - `bug_transplant_memory.md` — AGENTS.md template for shared knowledge seeding
 
+### FuzzBench Evaluation
+
+7. **`script/fuzzbench_generate.py`**: Generates a self-contained FuzzBench benchmark directory from merge output. Reads `summary.json` + `builds.csv`, produces Dockerfile (pinned base-builder digest), build.sh (checkout + patch + compile), benchmark.yaml, dispatch-prefixed seeds, canary library (`bug_canary.c/h`), and monitor script. Auto-detects new source files from combined.diff and adds them to the library build.
+
+8. **`script/fuzzbench_triage.py`**: Post-experiment analysis. Scans FuzzBench crash dirs and corpus snapshots, reads dispatch bytes from crash inputs to identify triggered bugs, reads canary monitor CSV logs for reached timestamps. Outputs unified CSV: `fuzzer, trial, bug_id, time_first_reached, time_first_triggered`.
+
+9. **`script/bug_monitor.py`**: Lightweight shared-memory poller that runs alongside the fuzzer in each FuzzBench trial. Reads `/dev/shm/bug_canary` (mmap'd canary struct), logs per-bug reached/triggered state changes to CSV. Maps canary array indices to bug IDs via `bug_metadata.json`.
+
 ### Data Infrastructure (shared)
 
 - **`script/fuzz_helper.py`**: Docker-based build/fuzz/reproduce/trace operations. Supports `--runner-image auto` for historical Docker image pinning.
@@ -146,6 +175,16 @@ Each bug with a code diff gets a dispatch bit pre-assigned. The merge has two ph
 
 The harness is modified once to read `__bug_dispatch[]` from the first byte(s) of each testcase. Each PoC gets its dispatch bit prepended. Local bugs and testcase-only bugs get `0x00`.
 
+### FuzzBench Integration
+The evaluation pipeline generates FuzzBench-compatible benchmark directories from merge outputs. Key design:
+- **Reproducible builds**: Base-builder Docker digest pinned via `builds.csv` → `oss_fuzz_commit` → timestamp → `get_base_builder_for_date()`
+- **Canary instrumentation**: Magma-style `bug_canary.c/h` with mmap'd shared memory, bitwise-only ops (no coverage leakage), weird-state guard. `__attribute__((constructor))` for auto-init.
+- **Dispatch-aware seeds**: Original seeds get N zero dispatch bytes prepended; dispatch-modified PoCs from merge output included as-is.
+- **Library source fix**: `build.sh` auto-detects new `.c` files from `combined.diff` (e.g., `zfp_getcell.c`) and adds them to the library's CMakeLists.txt.
+
+### Sanitizer Builds
+The merge script builds with ASAN and UBSAN in the main container. MSAN support was removed to simplify the merge flow (MSAN taints system libraries and required ephemeral containers).
+
 ### Environment Setup
 `source script/setenv.sh` sets:
 - `TESTCASES`: Directory containing PoC testcase files
@@ -165,3 +204,4 @@ The harness is modified once to read `__bug_dispatch[]` from the first byte(s) o
 - Traces: `data/target_trace-<commit>-<testcase>.txt`
 - Crash logs: `data/crash/target_crash-<commit>-<testcase>.txt`
 - Fix hints: `data/patch_diffs/fix_hint-<commit>-<testcase>.diff`
+- FuzzBench benchmark: `<output_dir>/<project>_transplant_<target>/` (Dockerfile, build.sh, benchmark.yaml, patches/, seeds/, monitor/, bug_metadata.json)
