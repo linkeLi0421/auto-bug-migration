@@ -116,8 +116,7 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 | `script/bug_transplant_batch.py` | Batch orchestrator (shared container, CLAUDE.md memory) |
 | `script/bug_transplant_merge.py` | Merge per-bug diffs + testcase-only bugs + dispatch resolution |
 | `script/fuzzbench_generate.py` | Generate FuzzBench benchmark from merge output |
-| `script/fuzzbench_triage.py` | Post-experiment triage (dispatch bytes + canary logs → bug timeline CSV) |
-| `script/bug_monitor.py` | Shared-memory canary poller (runs alongside fuzzer in FuzzBench trials) |
+| `script/fuzzbench_triage.py` | Post-experiment triage (crashes + coverage → bug timeline CSV) |
 | `script/prompts/bug_transplant.md` | Transplant prompt (testcase patching, crash verification) |
 | `script/prompts/bug_transplant_memory.md` | CLAUDE.md template for shared knowledge |
 | `script/prompts/minimize_patch.md` | Patch minimization prompt |
@@ -163,11 +162,10 @@ python3 script/fuzzbench_triage.py \
 The generator produces a self-contained benchmark directory with:
 - **Dockerfile** pinned to the exact base-builder digest used during merging
 - **build.sh** that checks out the target commit, applies combined.diff + harness.diff, and compiles with ASAN
-- **Canary instrumentation** (Magma-style) for measuring bug reached vs triggered
-- **Dispatch-prefixed seeds** (28 PoCs + original corpus with zero dispatch bytes)
-- **bug_metadata.json** mapping each bug to its dispatch bit and canary index
+- **No PoC seeds** -- fuzzers must discover bugs independently; only the project's original seed corpus is used (with dispatch zero bytes prepended)
+- **bug_metadata.json** mapping each bug to its dispatch bit and crash line (file:line from ASAN/UBSAN output)
 
-The canary monitor (`bug_monitor.py`) runs alongside each fuzzer trial, polling `/dev/shm/bug_canary` and logging per-bug reached/triggered timestamps. The triage script combines canary logs with crash-input dispatch byte analysis to produce a unified timeline for survival analysis (see `evaluation_bug_discovery_rate.md`).
+The triage script determines bug discovery using two signals: **triggered** = crash with matching dispatch bytes; **reached** = bug's crash line covered in FuzzBench coverage snapshots. This works uniformly for both transplanted and local bugs (see `evaluation_bug_discovery_rate.md`).
 
 ## Requirements
 
