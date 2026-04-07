@@ -141,6 +141,18 @@
   /* Hint text */
   .hint { text-align:center; font-size:12px; color:var(--text-muted); padding:10px 0 0; font-family:'JetBrains Mono',monospace; }
 
+  /* Project tabs */
+  .proj-tabs { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+  .proj-tab {
+    font-family:'JetBrains Mono',monospace; font-size:11px; font-weight:500;
+    padding:6px 14px; border-radius:8px; cursor:pointer; transition:all .15s;
+    border:1.5px solid var(--border); background:#fff; color:var(--text-secondary);
+  }
+  .proj-tab:hover { border-color:var(--accent-teal); color:var(--accent-teal); }
+  .proj-tab.active { background:#f0fdfa; border-color:#99f6e4; color:var(--accent-teal); font-weight:600; }
+  .proj-result { display:none; animation:slideIn .3s ease; }
+  .proj-result.active { display:block; }
+
   /* Legend */
   .legend { display:flex; gap:20px; justify-content:center; margin-top:32px; padding-top:20px; border-top:1px solid var(--border); flex-wrap:wrap; }
   .legend-item { display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-muted); }
@@ -171,7 +183,7 @@
   <!--  GRAPH — compact, always visible                              -->
   <!-- ============================================================ -->
   <div class="graph-box">
-    <svg viewBox="0 0 760 220" xmlns="http://www.w3.org/2000/svg" font-family="Outfit, sans-serif">
+    <svg viewBox="0 0 760 260" xmlns="http://www.w3.org/2000/svg" font-family="Outfit, sans-serif">
       <defs>
         <marker id="ar" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="7" markerHeight="5" orient="auto"><path d="M0 0 L10 3.5 L0 7 z" fill="#c9bfb0"/></marker>
         <filter id="ds" x="-4%" y="-4%" width="108%" height="112%"><feDropShadow dx="0" dy="1" stdDeviation="2" flood-opacity=".06"/></filter>
@@ -247,9 +259,24 @@
         <text x="589" y="133" text-anchor="middle" font-size="8" fill="#9c8b78">all diffs</text>
       </g>
 
+      <!-- === Row 3: result nodes === -->
+      <line x1="293" y1="140" x2="293" y2="153" stroke="#a7f3d0" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-transplant-result">
+        <rect x="213" y="155" width="160" height="36" rx="7" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="293" y="172" text-anchor="middle" font-size="9.5" font-weight="600" fill="#047857">Transplant Result</text>
+        <text x="293" y="184" text-anchor="middle" font-size="8" fill="#9c8b78">per-bug diffs + cost</text>
+      </g>
+
+      <line x1="529" y1="140" x2="529" y2="153" stroke="#a7f3d0" stroke-width="1" stroke-dasharray="3,2"/>
+      <g class="n" data-s="s-merge-result">
+        <rect x="449" y="155" width="160" height="36" rx="7" fill="#ecfdf5" stroke="#a7f3d0" stroke-width="1.5" filter="url(#ds)"/>
+        <text x="529" y="172" text-anchor="middle" font-size="9.5" font-weight="600" fill="#047857">Merge Result</text>
+        <text x="529" y="184" text-anchor="middle" font-size="8" fill="#9c8b78">wrap + merge + cost</text>
+      </g>
+
       <!-- Data flow: simplified arrow strip -->
-      <rect x="6" y="160" width="748" height="1" fill="#e2dbd0"/>
-      <text x="380" y="177" text-anchor="middle" font-size="9" font-weight="500" fill="#6b5d4d">
+      <rect x="6" y="200" width="748" height="1" fill="#e2dbd0"/>
+      <text x="380" y="217" text-anchor="middle" font-size="9" font-weight="500" fill="#6b5d4d">
         Inputs &rarr; crash/trace &rarr; per-bug .diff &rarr; wrapped .diff &rarr; combined.diff &rarr; testcases/ + summary.json
       </text>
 
@@ -258,7 +285,7 @@
       <text x="170" y="95" text-anchor="middle" font-size="7" fill="#4338ca" font-style="italic">AGENTS.md</text>
 
       <!-- Hint -->
-      <text x="380" y="208" text-anchor="middle" font-size="9" fill="#9c8b78" font-family="JetBrains Mono, monospace">click any node above</text>
+      <text x="380" y="248" text-anchor="middle" font-size="9" fill="#9c8b78" font-family="JetBrains Mono, monospace">click any node above</text>
     </svg>
   </div>
 
@@ -458,6 +485,106 @@
       </div>
     </div>
 
+    <!-- ===== SLIDE: Transplant Result ===== -->
+    <div class="slide" id="s-transplant-result">
+      <div class="slide-header">
+        <div class="slide-num p1">1<span style="font-size:8px;margin-left:1px;">R</span></div>
+        <div class="slide-title">Transplant Result</div>
+        <div class="slide-sub">bug_transplant_batch.py</div>
+      </div>
+
+      <div class="proj-tabs">
+        <div class="proj-tab active" data-proj="opensc-t">opensc</div>
+      </div>
+
+      <div class="proj-result active" id="proj-opensc-t">
+        <div class="card-row cols-3">
+          <div class="card"><span class="card-label data">Input</span><h3>Total Bugs</h3><p><strong style="font-size:20px;">28</strong> bugs in matrix for opensc @ <code>6903aebf</code></p></div>
+          <div class="card"><span class="card-label verify">Local</span><h3>Already Triggering</h3><p><strong style="font-size:20px;">16</strong> bugs trigger on the target commit without any code changes</p></div>
+          <div class="card"><span class="card-label agent">Transplant</span><h3>Agent Sessions</h3><p><strong style="font-size:20px;">7</strong> bugs transplanted &middot; <strong>0</strong> failed &middot; <strong>1</strong> unusable</p></div>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+          <span class="card-label agent">Per-Bug Breakdown</span>
+          <h3>Transplant Agent Sessions</h3>
+          <div class="steps" style="margin-top:10px;">
+            <div class="step"><div class="step-badge indigo">1</div><div class="step-body"><strong>OSV-2020-525</strong> &mdash; 16m 10s &middot; success</div></div>
+            <div class="step"><div class="step-badge indigo">2</div><div class="step-body"><strong>OSV-2020-1046</strong> &mdash; 5m 2s &middot; <code>$1.09</code> &middot; success</div></div>
+            <div class="step"><div class="step-badge indigo">3</div><div class="step-body"><strong>OSV-2020-969</strong> &mdash; 10m 35s &middot; <code>$5.90</code> &middot; success</div></div>
+            <div class="step"><div class="step-badge indigo">4</div><div class="step-body"><strong>OSV-2020-1981</strong> &mdash; 7m 47s &middot; <code>$2.28</code> &middot; success</div></div>
+            <div class="step"><div class="step-badge indigo">5</div><div class="step-body"><strong>OSV-2021-1017</strong> &mdash; 20m 8s &middot; <code>$12.21</code> &middot; success (most complex)</div></div>
+            <div class="step"><div class="step-badge indigo">6</div><div class="step-body"><strong>OSV-2021-915</strong> &mdash; 5m 58s &middot; <code>$2.74</code> &middot; success</div></div>
+            <div class="step"><div class="step-badge indigo">7</div><div class="step-body"><strong>OSV-2020-55</strong> &mdash; 5m 16s &middot; <code>$1.76</code> &middot; success</div></div>
+          </div>
+        </div>
+
+        <div class="result" style="margin-top:12px;">
+          <div class="rl">Transplant summary &mdash; opensc</div>
+<pre>Succeeded:  <span class="hl">7 / 7</span>  (+ 16 local, 1 unusable)
+Total time: ~71 min
+Total cost: <span class="hl">~$25.98</span>  (7 agent sessions)
+Artifacts:  data/bug_transplant/opensc_OSV-*/bug_transplant.diff</pre>
+        </div>
+      </div><!-- /proj-opensc-t -->
+    </div>
+
+    <!-- ===== SLIDE: Merge Result ===== -->
+    <div class="slide" id="s-merge-result">
+      <div class="slide-header">
+        <div class="slide-num p2">2<span style="font-size:8px;margin-left:1px;">R</span></div>
+        <div class="slide-title">Merge Result</div>
+        <div class="slide-sub">bug_transplant_merge_offline.py</div>
+      </div>
+
+      <div class="proj-tabs">
+        <div class="proj-tab active" data-proj="opensc-m">opensc</div>
+      </div>
+
+      <div class="proj-result active" id="proj-opensc-m">
+        <!-- Phase 2a: Wrap -->
+        <div class="card">
+          <span class="card-label dispatch">Phase 2a &mdash; Dispatch Wrap</span>
+          <h3>Per-Bug Wrapping</h3>
+          <p>7 patches wrapped with dispatch gating on clean source. 1 dispatch byte, 7 bits.</p>
+          <div class="steps" style="margin-top:10px;">
+            <div class="step"><div class="step-badge rose">0</div><div class="step-body"><strong>OSV-2020-1046</strong> bit 0 &middot; 2m 5s &middot; <code>$0.50</code></div></div>
+            <div class="step"><div class="step-badge rose">1</div><div class="step-body"><strong>OSV-2020-1981</strong> bit 1 &middot; 2m 18s &middot; <code>$0.78</code></div></div>
+            <div class="step"><div class="step-badge rose">2</div><div class="step-body"><strong>OSV-2020-55</strong> bit 2 &middot; 2m 22s &middot; <code>$0.57</code></div></div>
+            <div class="step"><div class="step-badge rose">3</div><div class="step-body"><strong>OSV-2020-693</strong> bit 3 &middot; 2m 32s &middot; <code>$0.58</code></div></div>
+            <div class="step"><div class="step-badge rose">4</div><div class="step-body"><strong>OSV-2020-969</strong> bit 4 &middot; 2m 18s &middot; <code>$0.59</code></div></div>
+            <div class="step"><div class="step-badge rose">5</div><div class="step-body"><strong>OSV-2021-1017</strong> bit 5 &middot; 2m 52s &middot; <code>$0.79</code></div></div>
+            <div class="step"><div class="step-badge rose">6</div><div class="step-body"><strong>OSV-2021-915</strong> bit 6 &middot; 1m 53s &middot; <code>$0.39</code></div></div>
+          </div>
+          <p style="margin-top:8px;font-size:11px;color:var(--text-muted);">Wrap subtotal: <strong>$4.21</strong> &middot; 16m 20s</p>
+        </div>
+
+        <!-- Phase 2b: Merge -->
+        <div class="card" style="margin-top:12px;">
+          <span class="card-label dispatch">Phase 2b &mdash; Merge</span>
+          <h3>Merge All Wrapped Diffs</h3>
+          <p>7 patches merged in 1 chunk via Codex agent. <code>__bug_dispatch.c</code> added to <code>src/libopensc/Makefile.am</code>.</p>
+          <p style="margin-top:6px;font-size:11px;color:var(--text-muted);">Merge: <strong>$0.53</strong> &middot; 2m 49s</p>
+        </div>
+
+        <!-- Verification -->
+        <div class="card" style="margin-top:12px;">
+          <span class="card-label verify">Final Verification</span>
+          <h3>All 23 Bugs Replayed</h3>
+          <p>16 local bugs verified at baseline, then all 23 (local + dispatched) verified after merge. All pass via stack match.</p>
+        </div>
+
+        <div class="result" style="margin-top:12px;">
+          <div class="rl">Merge summary &mdash; opensc</div>
+<pre>Wraps:       <span class="hl">7 / 7</span>  OK    $4.21   16m 20s
+Merge:       <span class="hl">1 chunk</span>       $0.53    2m 49s
+Verification: <span class="hl">23 / 23</span> bugs triggering
+
+Merge session total: <span class="hl">$4.74</span>  &middot;  20m 41s
+Combined diff: 11,384 bytes</pre>
+        </div>
+      </div><!-- /proj-opensc-m -->
+    </div>
+
     <!-- ===== SLIDE: Output ===== -->
     <div class="slide" id="s-output">
       <div class="slide-header">
@@ -465,22 +592,40 @@
         <div class="slide-title">Output</div>
         <div class="slide-sub">merge_offline_&lt;project&gt;_&lt;commit&gt;/</div>
       </div>
-      <div class="card-row cols-3">
-        <div class="card"><span class="card-label output">Artifact</span><h3>Combined Diff</h3><p>Target commit &rarr; multi-bug version with dispatch gating.</p><div class="filepath">combined.diff</div></div>
-        <div class="card"><span class="card-label output">Artifact</span><h3>Testcases</h3><p>All PoCs with dispatch bytes prepended.</p><div class="filepath">testcases/</div></div>
-        <div class="card"><span class="card-label output">Artifact</span><h3>Summary</h3><p>Per-bug status, dispatch bits, trigger rate.</p><div class="filepath">summary.json</div></div>
-      </div>
-      <div class="result">
-        <div class="rl">Example &mdash; c-blosc2</div>
-<pre><span class="hl">RESULT:  18 / 21 bugs triggering</span>
 
-  Local bugs:         9/10 verified
-  Testcase-only:      2/2  verified
-  Dispatch-wrapped:   7/9  triggering
-    [  OK] OSV-2023-150  (bit 0)
-    [  OK] OSV-2022-913  (bit 1)
-    [FAIL] OSV-2020-2076 (bit 5, wrap failed)</pre>
+      <div class="proj-tabs">
+        <div class="proj-tab active" data-proj="opensc-o">opensc</div>
       </div>
+
+      <div class="proj-result active" id="proj-opensc-o">
+        <div class="card-row cols-3">
+          <div class="card"><span class="card-label output">Artifact</span><h3>Combined Diff</h3><p>Target <code>6903aebf</code> &rarr; multi-bug version. <strong>11,384 bytes</strong>.</p><div class="filepath">combined.diff</div></div>
+          <div class="card"><span class="card-label output">Artifact</span><h3>Testcases</h3><p>23 PoCs with dispatch bytes prepended (1 byte, 7 bits).</p><div class="filepath">testcases/</div></div>
+          <div class="card"><span class="card-label output">Artifact</span><h3>Summary</h3><p>Per-bug status, dispatch bits, trigger rate.</p><div class="filepath">summary.json</div></div>
+        </div>
+
+        <div class="result" style="margin-top:12px;">
+          <div class="rl">Final result &mdash; opensc @ 6903aebf</div>
+<pre><span class="hl">RESULT: 23 / 23 bugs triggering</span>
+
+  Local bugs (already triggering):  16/16 verified
+  Testcase-only bugs:                0
+  Dispatch-wrapped bugs:             7/7  triggering
+    [OK] OSV-2020-1046 (bit 0, value 1)    [OK] OSV-2020-693  (bit 3, value 8)
+    [OK] OSV-2020-1981 (bit 1, value 2)    [OK] OSV-2020-969  (bit 4, value 16)
+    [OK] OSV-2020-55   (bit 2, value 4)    [OK] OSV-2021-1017 (bit 5, value 32)
+                                            [OK] OSV-2021-915  (bit 6, value 64)
+
+<span class="hl">Cost &amp; time totals</span>
+  Transplant (Phase 1):   ~$25.98   ~71 min   7 agent sessions
+  Wrap (Phase 2a):          $4.21   ~16 min   7 dispatch wraps
+  Merge (Phase 2b):         $0.53    ~3 min   1 chunk
+  ──────────────────────────────────────────────
+  Pipeline total:         ~$30.72   ~92 min
+</pre>
+        </div>
+      </div><!-- /proj-opensc-o -->
+
     </div>
 
   </div><!-- /slide-area -->
@@ -513,6 +658,23 @@
       slides.forEach(function(s) { s.classList.remove('active'); });
       var el = document.getElementById(target);
       if (el) el.classList.add('active');
+    });
+  });
+
+  // Project tabs within the Output slide
+  document.querySelectorAll('.proj-tab').forEach(function(tab) {
+    tab.addEventListener('click', function() {
+      var proj = this.getAttribute('data-proj');
+      if (!proj) return;
+
+      // Toggle active tab
+      this.closest('.proj-tabs').querySelectorAll('.proj-tab').forEach(function(t) { t.classList.remove('active'); });
+      this.classList.add('active');
+
+      // Toggle active result panel
+      this.closest('.slide').querySelectorAll('.proj-result').forEach(function(r) { r.classList.remove('active'); });
+      var panel = document.getElementById('proj-' + proj);
+      if (panel) panel.classList.add('active');
     });
   });
 })();
