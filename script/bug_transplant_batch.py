@@ -515,6 +515,7 @@ def write_summary(
     target_commit: str,
     project: str,
     bug_ids_trigger: set[str],
+    bug_info_dataset: dict,
     total_elapsed: float,
 ) -> None:
     """Write final summary JSON, merging with existing folder-based results."""
@@ -549,14 +550,21 @@ def write_summary(
             if existing.get(bid, {}).get("status") != "impossible":
                 existing[bid] = r
 
+    asan_bug_ids_trigger = {
+        bug_id
+        for bug_id in bug_ids_trigger
+        if bug_info_dataset.get(bug_id, {}).get("reproduce", {})
+        .get("sanitizer", "address").split(" ")[0] == "address"
+    }
+
     merged_results = sorted(existing.values(), key=lambda r: r.get("bug_id", ""))
     completed = [r for r in merged_results if r["status"] not in ("skipped",)]
     summary = {
         "type": "bug_transplant_batch",
         "project": project,
         "target_commit": target_commit,
-        "bugs_already_trigger": len(bug_ids_trigger),
-        "bugs_already_trigger_ids": sorted(bug_ids_trigger),
+        "bugs_already_trigger": len(asan_bug_ids_trigger),
+        "bugs_already_trigger_ids": sorted(asan_bug_ids_trigger),
         "bugs_attempted": len(completed),
         "bugs_succeeded": sum(1 for r in completed if r["status"] == "success"),
         "bugs_failed": sum(1 for r in completed if r["status"] in ("failed", "error", "impossible")),
@@ -944,7 +952,7 @@ def main() -> int:
     total_elapsed = time.monotonic() - batch_start
     write_summary(
         artifacts_root, results, target_commit, args.target,
-        bug_ids_trigger, total_elapsed,
+        bug_ids_trigger, bug_info_dataset, total_elapsed,
     )
 
     # Aggregate token usage
