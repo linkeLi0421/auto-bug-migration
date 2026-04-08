@@ -4,3 +4,6 @@
 [submodule "cfg-clang"]
 	path = cfg-clang
 	url = https://github.com/linkeLi0421/cfg-clang.git
+[submodule "fuzzbench"]
+	path = fuzzbench
+	url = https://github.com/linkeLi0421/fuzzbench

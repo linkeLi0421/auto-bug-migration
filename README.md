@@ -115,6 +115,7 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 | `script/bug_transplant_batch.py` | Batch orchestrator (shared container, CLAUDE.md memory) |
 | `script/bug_transplant_merge_offline.py` | Offline dispatch-wrap and merge per-bug diffs + testcase-only bugs |
 | `script/fuzzbench_generate.py` | Generate FuzzBench benchmark from merge output |
+| `script/fuzzbench_run.py` | Build and run FuzzBench benchmark, collect artifacts for triage |
 | `script/fuzzbench_triage.py` | Post-experiment triage (crashes + coverage → bug timeline CSV) |
 | `script/prompts/bug_transplant.md` | Transplant prompt (testcase patching, crash verification) |
 | `script/prompts/bug_transplant_memory.md` | CLAUDE.md template for shared knowledge |
@@ -134,35 +135,128 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 After merging, evaluate how well different fuzzers discover the transplanted bugs using [FuzzBench](https://github.com/google/fuzzbench):
 
 ```bash
-# 1. Generate FuzzBench benchmark from merge output
+# One command: generate benchmark, build for aflplusplus, and run a 20s test
+sudo -E python3 script/fuzzbench_generate.py \
+  --merge-dir data/merge_offline_opensc_6903aebf \
+  --build-csv data/opensc_builds.csv \
+  --fuzz-target fuzz_pkcs15_reader \
+  --output-dir fuzzbench/benchmarks \
+  --merge-container bug-merge-opensc \
+  --fuzzer aflplusplus \
+  --run
+
+# Full 24h run with multiple fuzzers
+sudo -E python3 script/fuzzbench_generate.py \
+  --merge-dir data/merge_offline_opensc_6903aebf \
+  --build-csv data/opensc_builds.csv \
+  --fuzz-target fuzz_pkcs15_reader \
+  --output-dir fuzzbench/benchmarks \
+  --merge-container bug-merge-opensc \
+  --fuzzer aflplusplus libfuzzer \
+  --run --run-time 86400
+```
+
+### `fuzzbench_generate.py` flags
+
+| Flag | Description |
+|---|---|
+| `--merge-dir` | Path to merge output directory (contains summary.json) |
+| `--build-csv` | Builds CSV mapping commits to OSS-Fuzz Docker images |
+| `--fuzz-target` | Fuzz target binary name |
+| `--output-dir` | Output directory (default: `fuzzbench/benchmarks/`) |
+| `--merge-container` | Running merge container name -- commits it as a Docker image and uses as Dockerfile base for identical build environment |
+| `--fuzzer <name> [...]` | Build the benchmark for these fuzzers after generation |
+| `--run` | Run the fuzzer(s) after building (20s test by default) |
+| `--run-time <seconds>` | Fuzzing duration (e.g. `86400` for 24h) |
+| `--benchmark-name` | Custom benchmark name (default: `{project}_transplant_{target}`) |
+| `--use-current-oss-fuzz-checkout` | Use current local oss-fuzz state instead of checking out from builds.csv |
+| `--builder-digest` | Override base-builder image digest |
+
+### Running experiments (`fuzzbench_run.py`)
+
+Once the benchmark is generated, run a full FuzzBench experiment (fuzzing + coverage measurement + crash collection):
+
+```bash
+# 24h experiment with aflplusplus, 3 trials
+sudo -E python3 script/fuzzbench_run.py opensc_transplant_fuzz_pkcs15_reader \
+  --fuzzer aflplusplus \
+  --experiment-name transplant-opensc-24h \
+  --run-time 86400
+
+# Multiple fuzzers, 5 trials, custom output directory
+sudo -E python3 script/fuzzbench_run.py opensc_transplant_fuzz_pkcs15_reader \
+  --fuzzer aflplusplus libfuzzer \
+  --experiment-name transplant-opensc-5t \
+  --trials 5 --run-time 86400 \
+  --output-dir /tmp/fuzzbench-data
+```
+
+| Flag | Description |
+|---|---|
+| `benchmark` | Benchmark name (positional) |
+| `--fuzzer <name> [...]` | Fuzzer(s) to evaluate |
+| `--experiment-name` | Name for this experiment (required) |
+| `--run-time <seconds>` | Fuzzing duration per trial (default: 86400 = 24h) |
+| `--trials <n>` | Number of trials per fuzzer (default: 3) |
+| `--output-dir` | Base directory for experiment data (default: `/tmp/fuzzbench-data`) |
+
+This uses FuzzBench's full infrastructure (`run_experiment.py`), which handles building, fuzzing, periodic corpus snapshots, coverage measurement, and crash collection.
+
+### Triage (`fuzzbench_triage.py`)
+
+After the experiment completes, triage which bugs were reached and triggered:
+
+```bash
+python3 script/fuzzbench_triage.py \
+  --experiment-dir /tmp/fuzzbench-data/transplant-opensc-24h \
+  --bug-metadata fuzzbench/benchmarks/opensc_transplant_fuzz_pkcs15_reader/bug_metadata.json \
+  --benchmark opensc_transplant_fuzz_pkcs15_reader \
+  --output results.csv
+```
+
+This produces:
+- **results.csv** -- Per-bug discovery timeline (fuzzer, trial, bug_id, time_first_reached, time_first_triggered)
+- **results_bug_report.json** -- Detailed per-bug report with crash locations and discovery status
+- **results_bug_report.txt** -- Human-readable summary table
+
+A bug is **reached** when its crash line (from `bug_metadata.json`) appears in FuzzBench's coverage snapshots. A bug is **triggered** when a crash file contains the matching dispatch bytes.
+
+### Manual step-by-step workflow
+
+```bash
+# 1. Generate benchmark only
 python3 script/fuzzbench_generate.py \
   --merge-dir data/merge_offline_c-blosc2_79e921d9 \
   --build-csv data/c-blosc2_builds.csv \
   --fuzz-target decompress_frame_fuzzer \
-  --output-dir /tmp/fuzzbench_benchmarks
+  --output-dir fuzzbench/benchmarks
 
-# 2. Copy into FuzzBench and run experiment
-cp -r /tmp/fuzzbench_benchmarks/c-blosc2_transplant_decompress_frame_fuzzer \
-  fuzzbench/benchmarks/
+# 2. Build and run via make
 cd fuzzbench
+make build-aflplusplus-c-blosc2_transplant_decompress_frame_fuzzer
+make test-run-aflplusplus-c-blosc2_transplant_decompress_frame_fuzzer
+
+# 3. Or run a full FuzzBench experiment
 PYTHONPATH=. python3 experiment/run_experiment.py \
-  --experiment-config /tmp/fuzzbench_benchmarks/experiment_config.yaml \
+  --experiment-config benchmarks/experiment_config.yaml \
   --benchmarks c-blosc2_transplant_decompress_frame_fuzzer \
   --fuzzers afl aflplusplus honggfuzz libfuzzer \
   --experiment-name transplant-cblosc2-24h
 
-# 3. Triage results (after experiment completes)
+# 4. Triage results (after experiment completes)
 python3 script/fuzzbench_triage.py \
   --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
   --bug-metadata benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
   --output results.csv
 ```
 
-The generator produces a self-contained benchmark directory with:
-- **Dockerfile** pinned to the exact base-builder digest used during merging
-- **build.sh** that checks out the target commit, applies combined.diff + harness.diff, and compiles with ASAN
+### What the generator produces
+
+- **Dockerfile** -- When `--merge-container` is used, the image is based on the committed merge container for identical build environment. Otherwise, pinned to the exact base-builder digest used during merging.
+- **build.sh** -- Checks out the target commit, applies combined.diff + harness.diff, and compiles with ASAN (`type: bug` benchmark)
+- **benchmark.yaml** -- With `type: bug` so FuzzBench enables ASAN at build time and sets `ASAN_OPTIONS` (including `detect_stack_use_after_return=1`) at runtime
 - **No PoC seeds** -- fuzzers must discover bugs independently; only the project's original seed corpus is used (with dispatch zero bytes prepended)
-- **bug_metadata.json** mapping each bug to its dispatch bit and crash line (file:line from ASAN/UBSAN output)
+- **bug_metadata.json** -- Maps each bug to its dispatch bit and crash line (file:line from ASAN/UBSAN output), collected by replaying PoCs with `-runs=10`
 
 The triage script determines bug discovery using two signals: **triggered** = crash with matching dispatch bytes; **reached** = bug's crash line covered in FuzzBench coverage snapshots. This works uniformly for both transplanted and local bugs (see `evaluation_bug_discovery_rate.md`).
 
