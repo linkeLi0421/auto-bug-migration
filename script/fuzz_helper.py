@@ -200,10 +200,20 @@ def main():  # pylint: disable=too-many-branches,too-many-return-statements
   parser = get_parser()
   args = parse_args(parser)
 
-  # Need to do this before chdir.
+  # Normalize CLI paths before chdir so relative paths keep the caller's CWD.
   # TODO(https://github.com/google/oss-fuzz/issues/6758): Get rid of chdir.
-  if hasattr(args, 'testcase_path'):
-    args.testcase_path = _get_absolute_path(args.testcase_path)
+  for path_attr in (
+      'testcase_path',
+      'testcases',
+      'source_path',
+      'patch',
+      'build_csv',
+      'signature_changes',
+  ):
+    if hasattr(args, path_attr):
+      path_value = getattr(args, path_attr)
+      if path_value:
+        setattr(args, path_attr, _get_absolute_path(path_value))
   # Note: this has to happen after parse_args above as parse_args needs to know
   # the original CWD for external projects.
   os.chdir(OSS_FUZZ_DIR)

@@ -167,4 +167,3 @@ Only save what is true about the target commit's code.
 
 - NEVER build with make/gcc/cmake -- only `sudo -E compile`.
 - Build and test after every change.
-- Prefer modifying the testcase over reverting format/structural changes in code.
