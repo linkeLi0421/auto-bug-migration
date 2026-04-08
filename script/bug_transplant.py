@@ -851,7 +851,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
             )
 
-            # Run fuzzer with testcase
+            # Run fuzzer with testcase — retry up to 3 times for
+            # non-deterministic bugs (same as fuzz_helper.py reproduce).
             fuzzer_path = f"/out/{fuzzer}"
             sym_path = "/out/llvm-symbolizer"
             verify_cmd = (
@@ -861,30 +862,39 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
                 f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
             )
-            ret_fuzz, fuzz_out = _exec_capture(
-                container_name, verify_cmd, timeout=120,
-            )
-
-            # Check for crash
-            has_crash = bool(re.search(
-                r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
-                fuzz_out,
-            ))
-
-            # Compare crash stack with original to detect wrong-bug triggers
-            if has_crash:
-                original_crash_file = (
-                    DATA_DIR / "crash"
-                    / f"target_crash-{buggy_short}-{testcase}.txt"
+            has_crash = False
+            crash_matches = False
+            fuzz_out = ""
+            for _attempt in range(3):
+                ret_fuzz, fuzz_out = _exec_capture(
+                    container_name, verify_cmd, timeout=120,
                 )
-                crash_matches = True  # assume match if no original to compare
-                if original_crash_file.exists():
-                    orig_text = original_crash_file.read_text()
-                    crash_matches = _crash_stacks_match(orig_text, fuzz_out)
-                    if not crash_matches:
-                        logger.warning(
-                            "Crash stack MISMATCH (see above for details)",
-                        )
+
+                # Check for crash
+                has_crash = bool(re.search(
+                    r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
+                    fuzz_out,
+                ))
+
+                # Compare crash stack with original to detect wrong-bug triggers
+                if has_crash:
+                    original_crash_file = (
+                        DATA_DIR / "crash"
+                        / f"target_crash-{buggy_short}-{testcase}.txt"
+                    )
+                    crash_matches = True  # assume match if no original to compare
+                    if original_crash_file.exists():
+                        orig_text = original_crash_file.read_text()
+                        crash_matches = _crash_stacks_match(orig_text, fuzz_out)
+                        if not crash_matches:
+                            logger.warning(
+                                "Crash stack MISMATCH (see above for details)",
+                            )
+
+                if has_crash and crash_matches:
+                    break
+                logger.debug("Verify attempt %d/3: no crash, retrying...",
+                             _attempt + 1)
 
             if has_crash and crash_matches:
                 logger.info("Post-agent verification PASSED: bug triggers "

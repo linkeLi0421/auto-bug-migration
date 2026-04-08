@@ -1559,6 +1559,9 @@ def _stacks_match(reference: list[str], current: list[str], threshold: float = 0
     return ratio >= threshold
 
 
+_VERIFY_ATTEMPTS = 3
+
+
 def verify_bug_triggers(
     container: str,
     bug_id: str,
@@ -1569,6 +1572,10 @@ def verify_bug_triggers(
 ) -> bool:
     """Run the fuzzer binary for the given sanitizer and check for a crash.
 
+    Retries up to ``_VERIFY_ATTEMPTS`` times to handle non-deterministic
+    bugs (same approach as ``fuzz_helper.py reproduce`` which uses
+    ``-runs=10``).  Returns True as soon as any attempt detects the crash.
+
     If *crash_log* is provided, extracts the reference stack from it and
     compares against the fuzzer output using LCS matching.  Otherwise
     falls back to checking for any sanitizer SUMMARY line.
@@ -1577,23 +1584,27 @@ def verify_bug_triggers(
     env_prefix = f"export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16:external_symbolizer_path={sym_path}; "
     fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
 
-    cmd = (
-        f"{env_prefix}"
-        f"if [ ! -x {fuzzer_path} ]; then "
-        f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
-        f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
-    )
-    logger.debug("[%s] verify cmd: %s", bug_id, cmd)
-    ret, output = _exec_capture(container, cmd, timeout=120)
-    logger.debug("[%s] verify exit=%d output_len=%d tail=%.500s",
-                 bug_id, ret, len(output), output[-500:] if output else "(empty)")
-
-    # Extract current stack from fuzzer output
-    current_stack = _extract_stack_from_text(output)
-
-    # If we have a reference crash log, compare stacks
+    ref_stack = None
     if crash_log:
         ref_stack = _extract_stack_from_file(crash_log)
+
+    for attempt in range(_VERIFY_ATTEMPTS):
+        cmd = (
+            f"{env_prefix}"
+            f"if [ ! -x {fuzzer_path} ]; then "
+            f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
+            f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
+        )
+        logger.debug("[%s] verify cmd (attempt %d/%d): %s",
+                     bug_id, attempt + 1, _VERIFY_ATTEMPTS, cmd)
+        ret, output = _exec_capture(container, cmd, timeout=120)
+        logger.debug("[%s] verify exit=%d output_len=%d tail=%.500s",
+                     bug_id, ret, len(output), output[-500:] if output else "(empty)")
+
+        # Extract current stack from fuzzer output
+        current_stack = _extract_stack_from_text(output)
+
+        # If we have a reference crash log, compare stacks
         if ref_stack:
             if _stacks_match(ref_stack, current_stack):
                 logger.info("[%s] Bug triggers OK (stack match)", bug_id)
@@ -1604,29 +1615,33 @@ def verify_bug_triggers(
                         "[%s] Stack MISMATCH: ref=%s cur=%s",
                         bug_id, ref_stack[:3], current_stack[:3],
                     )
-                else:
+                elif attempt == _VERIFY_ATTEMPTS - 1:
                     logger.warning("[%s] Stack comparison inconclusive (exit=%d)", bug_id, ret)
                 # Fall through to SUMMARY check instead of returning False —
                 # unsymbolized stacks can't match symbolized references, but
                 # the bug may still be triggering.
-        # No reference stack or mismatch — fall through to basic check
 
-    # Fallback: any sanitizer crash is a match
-    has_summary = bool(re.search(
-        r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
-    ))
-    if has_summary:
+        # Fallback: any sanitizer crash is a match
+        has_summary = bool(re.search(
+            r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
+        ))
+        if has_summary:
+            if current_stack:
+                logger.info("[%s] Bug triggers OK (SUMMARY + stack match)", bug_id)
+            else:
+                logger.info("[%s] Bug triggers OK (SUMMARY match, unsymbolized)", bug_id)
+            return True
+
         if current_stack:
-            logger.info("[%s] Bug triggers OK (SUMMARY + stack match)", bug_id)
-        else:
-            logger.info("[%s] Bug triggers OK (SUMMARY match, unsymbolized)", bug_id)
-        return True
+            logger.info("[%s] Bug triggers OK (crash detected)", bug_id)
+            return True
 
-    if current_stack:
-        logger.info("[%s] Bug triggers OK (crash detected)", bug_id)
-        return True
+        if attempt < _VERIFY_ATTEMPTS - 1:
+            logger.debug("[%s] No crash on attempt %d/%d, retrying...",
+                         bug_id, attempt + 1, _VERIFY_ATTEMPTS)
 
-    logger.warning("[%s] Bug does NOT trigger (exit=%d)", bug_id, ret)
+    logger.warning("[%s] Bug does NOT trigger after %d attempts (exit=%d)",
+                   bug_id, _VERIFY_ATTEMPTS, ret)
     return False
 
 

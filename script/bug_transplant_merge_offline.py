@@ -111,6 +111,7 @@ _DIFF_EXCLUDES = (
 )
 _DIFF_INCLUDES = (
     "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
+    "'*.cmake' '*.sh' "
     "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am'"
 )
 
