@@ -36,6 +36,7 @@ import templates
 OSS_FUZZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
 BUILD_DIR = os.path.join(OSS_FUZZ_DIR, 'build')
 HOME_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+FUZZBENCH_OUTPUT_DIR = os.path.join(HOME_DIR, 'fuzzbench-output')
 
 BASE_RUNNER_IMAGE = 'gcr.io/oss-fuzz-base/base-runner'
 
@@ -609,6 +610,9 @@ def get_parser():  # pylint: disable=too-many-statements,too-many-locals
   collect_crash_parser.add_argument('--ignore-leaks',
                             action='store_true',
                             help='disable LeakSanitizer during crash collection by adding ASAN_OPTIONS=detect_leaks=0')
+  collect_crash_parser.add_argument('--detect-stack-use-after-return',
+                            action='store_true',
+                            help='enable ASAN_OPTIONS=detect_stack_use_after_return=1 during crash collection')
   collect_crash_parser.add_argument('--runner-image',
                             help='base-runner image digest (e.g., sha256:...) or "auto" to select based on commit date',
                             default=None)
@@ -848,6 +852,33 @@ def _add_environment_args(parser):
   parser.add_argument('-e',
                       action='append',
                       help="set environment variable e.g. VAR=value")
+
+
+def _append_env_option(env_list, var_name, option):
+  """Append an option to a colon-delimited environment variable."""
+  prefix = f'{var_name}='
+  for index, value in enumerate(env_list):
+    if not value.startswith(prefix):
+      continue
+    current = value[len(prefix):]
+    options = [item for item in current.split(':') if item]
+    if option not in options:
+      options.append(option)
+      env_list[index] = prefix + ':'.join(options)
+    return
+
+  inherited = os.getenv(var_name, '')
+  options = [item for item in inherited.split(':') if item]
+  if option not in options:
+    options.append(option)
+  env_list.append(prefix + ':'.join(options))
+
+
+def _propagate_host_asan_options(env_list):
+  """Forward ASAN_OPTIONS to the container when caller didn't override it."""
+  asan_options = os.getenv('ASAN_OPTIONS')
+  if asan_options and not any(v.startswith('ASAN_OPTIONS=') for v in env_list):
+    env_list.append(f'ASAN_OPTIONS={asan_options}')
 
 
 def build_image_impl(project, cache=True, pull=False, architecture='x86_64'):
@@ -1837,10 +1868,7 @@ def reproduce_impl(  # pylint: disable=too-many-arguments
   if env_to_add:
     env += env_to_add
 
-  # Propagate ASAN_OPTIONS to the container unless caller already set it via -e.
-  asan_options = os.getenv('ASAN_OPTIONS')
-  if asan_options and not any(v.startswith('ASAN_OPTIONS=') for v in env):
-    env.append(f'ASAN_OPTIONS={asan_options}')
+  _propagate_host_asan_options(env)
 
   # Determine base-runner image to use
   if runner_image == 'auto' and commit_date:
@@ -2156,7 +2184,15 @@ def build_version(args):
   _real_mv=$(which mv);
   cat > /usr/local/bin/mv <<'MVWRAP'
 #!/bin/sh
-out=$(/usr/bin/mv "$@" 2>&1)
+if [ -x /usr/bin/mv ]; then
+  REAL_MV=/usr/bin/mv
+elif [ -x /bin/mv ]; then
+  REAL_MV=/bin/mv
+else
+  echo "mv wrapper: no system mv found" >&2
+  exit 127
+fi
+out=$("$REAL_MV" "$@" 2>&1)
 rc=$?
 if [ $rc -ne 0 ]; then
   case "$out" in *"are the same file"*) exit 0;; esac
@@ -2320,6 +2356,37 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
   return bash_trace
 
 
+def _export_collect_crash_artifacts(args, crash_log_path, testcase_path):
+  """Mirror helper crash artifacts into fuzzbench-output for later analysis."""
+  if not os.path.exists(crash_log_path):
+    return
+
+  commit_prefix = (args.commit or 'unknown')[:8]
+  export_dir = os.path.join(
+      FUZZBENCH_OUTPUT_DIR,
+      'helper-crashes',
+      args.project.name,
+      commit_prefix,
+      args.test_input)
+  os.makedirs(export_dir, exist_ok=True)
+
+  shutil.copy2(crash_log_path,
+               os.path.join(export_dir, os.path.basename(crash_log_path)))
+  if testcase_path and os.path.exists(testcase_path):
+    shutil.copy2(testcase_path,
+                 os.path.join(export_dir, os.path.basename(testcase_path)))
+
+  metadata_path = os.path.join(export_dir, 'metadata.txt')
+  with open(metadata_path, 'w') as metadata_file:
+    metadata_file.write(f'project={args.project.name}\n')
+    metadata_file.write(f'commit={args.commit or ""}\n')
+    metadata_file.write(f'fuzzer={args.fuzzer_name}\n')
+    metadata_file.write(f'test_input={args.test_input}\n')
+    metadata_file.write(f'crash_log={os.path.basename(crash_log_path)}\n')
+    if testcase_path and os.path.exists(testcase_path):
+      metadata_file.write(f'testcase={os.path.basename(testcase_path)}\n')
+
+
 def get_allowlist_bash(args):
   # Use short commit IDs (6 chars) for filenames to match trace file naming
   short_bc1 = args.buggy_commit1[:8] if len(args.buggy_commit1) > 8 else args.buggy_commit1
@@ -2446,7 +2513,7 @@ def _read_oss_fuzz_commit_from_csv(build_csv, project_name, target_commit):
   oss_fuzz_commit = None
   for line in csv_lines:
     parts = line.strip().split(',')
-    if len(parts) == 4 and parts[0] == project_name:
+    if len(parts) >= 3 and parts[0] == project_name:
       oss_fuzz_commit = parts[2]
       if parts[1] in target_commit or target_commit in parts[1]:
         logger.info('Found matching commit for base_commit in CSV: %s -> %s',
@@ -2622,7 +2689,7 @@ def get_poc_for_new_version(args):
 
     for line in csv_lines:
       parts = line.strip().split(',')
-      if len(parts) == 4 and parts[0] == args.project.name:
+      if len(parts) >= 3 and parts[0] == args.project.name:
         target_project_commit = parts[1]
         oss_fuzz_commit = parts[2]
 
@@ -2994,8 +3061,11 @@ def collect_crash(args):
   if args.e:
     env += args.e
 
-  if getattr(args, 'ignore_leaks', False) and not any(v.startswith('ASAN_OPTIONS=') for v in env):
-    env.append('ASAN_OPTIONS=detect_leaks=0')
+  _propagate_host_asan_options(env)
+  if getattr(args, 'ignore_leaks', False):
+    _append_env_option(env, 'ASAN_OPTIONS', 'detect_leaks=0')
+  if getattr(args, 'detect_stack_use_after_return', False):
+    _append_env_option(env, 'ASAN_OPTIONS', 'detect_stack_use_after_return=1')
 
   if is_base_image(args.project.name):
     image_project = 'oss-fuzz-base'
@@ -3048,6 +3118,10 @@ def collect_crash(args):
 
   clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
+  crash_log_path = os.path.join(
+      crash_dir, f'target_crash-{args.commit[:8]}-{args.test_input}.txt')
+  testcase_path = os.path.join(testcases_path, args.test_input)
+  _export_collect_crash_artifacts(args, crash_log_path, testcase_path)
   return True
 
 
