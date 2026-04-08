@@ -2092,9 +2092,11 @@ def build_version(args):
       'HELPER=True',
 
       # ↓↓↓ make/ninja/cmake parallelism & output
-      # Use -j1 for compile_commands/preprocess (needs deterministic ordering);
-      # otherwise -j16 (build lock ensures one build at a time).
-      'MAKEFLAGS=--output-sync=line -j1' if (getattr(args, 'compile_commands', False) or getattr(args, 'preprocess', False)) else 'MAKEFLAGS=--output-sync=line -j30',
+      # Don't pass -j in MAKEFLAGS: it leaks into dependency builds (e.g.
+      # CUPS in ghostscript) whose Makefiles are not parallel-safe, silently
+      # breaking the build.  Most build.sh scripts already use explicit
+      # `make -j$(nproc)` for the main build, so parallelism is preserved.
+      'MAKEFLAGS=--output-sync=line -j1' if (getattr(args, 'compile_commands', False) or getattr(args, 'preprocess', False)) else 'MAKEFLAGS=--output-sync=line',
       'CMAKE_BUILD_PARALLEL_LEVEL=1' if (getattr(args, 'compile_commands', False) or getattr(args, 'preprocess', False)) else 'CMAKE_BUILD_PARALLEL_LEVEL=30',
       'NINJA_STATUS=',                      # silence progress bar
       # color off to avoid ANSI control sequences
@@ -2119,9 +2121,9 @@ def build_version(args):
     image_project = 'oss-fuzz'
     out_dir = args.project.out
 
+  workdir = _workdir_from_dockerfile(args.project)
   run_args = _env_to_docker_args(env)
   if args.source_path:
-    workdir = _workdir_from_dockerfile(args.project)
     run_args.extend([
         '-v',
         '%s:%s' % (_get_absolute_path(args.source_path), workdir),
@@ -2143,8 +2145,10 @@ def build_version(args):
     sed -i "s/-Werror//g" {{}} + 2>/dev/null || true;
   find /src -maxdepth 3 -name configure.ac -o -name Makefile.am -o -name Makefile.in | \
     xargs sed -i "s/-Werror//g" 2>/dev/null || true;
+  find /src -maxdepth 3 -name configure -type f | \
+    xargs sed -i 's/-Werror//g' 2>/dev/null || true;
 
-  cd /src/{args.project.name};
+  cd {workdir};
   git checkout -f {args.commit};
 
   # Newer coreutils 'mv -fu' errors on same-file moves (e.g. mv X.h ./X.h).
@@ -2222,7 +2226,7 @@ dirs = set()
 for e in cc:
     d = e['directory']
     # Skip the main project directory
-    if d.startswith('/src/{args.project.name}'):
+    if d.startswith('{workdir}'):
         continue
     # Map /src -> /data/src, /src/other -> /data/other, etc.
     if d.startswith('/src'):
@@ -2270,8 +2274,9 @@ def get_crash_log_bash(commit:str, args):
   patch_snippet = ''
   if getattr(args, 'patch', None):
     patch_snippet = _strict_forward_patch_apply_snippet()
+  workdir = _workdir_from_dockerfile(args.project)
   bash_crash = f'''
-    cd /src/{args.project.name};
+    cd {workdir};
     # Checkout base commit and set up environment
     git checkout -f {commit};
     {patch_snippet}
@@ -2289,6 +2294,7 @@ def get_crash_log_bash(commit:str, args):
 
 
 def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
+  workdir = _workdir_from_dockerfile(args.project)
   bash_trace = f'''
     # cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
     [ -f "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
@@ -2299,17 +2305,17 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     export LD_LIBRARY_PATH=/Function_instrument:$LD_LIBRARY_PATH
     export CFLAGS="${{CFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
     export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
-    
+
     # Checkout buggy commit and set up environment
-    cd /src/{args.project.name};
+    cd {workdir};
     git checkout -f {commit};
-    {_strict_reverse_patch_apply_snippet() if args.patch and apply_patch else ''} 
+    {_strict_reverse_patch_apply_snippet() if args.patch and apply_patch else ''}
     cd -;
-    
+
     # Compile and collect trace
     compile;
     timeout 100 /out/{args.fuzzer_name} /corpus/{args.test_input};
-    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path /src/{args.project.name} /tmp/trace.txt; 
+    python3 /script/symbolizer.py -b /out/{args.fuzzer_name} -o /data/target_trace-{commit[:8]}-{args.test_input}{args.patch.split('/')[-1].split('.diff')[0] if args.patch and apply_patch else ''}.txt --source_path {workdir} /tmp/trace.txt;
   '''
   return bash_trace
 
@@ -2343,12 +2349,13 @@ def get_runfuzzer_bash(args, allowlist_type):
     allowlist_cmd = f'cp /data/allowlist/allowlist-{short_bc1}-{short_bc2}-{args.test_input}.txt /allowlist.txt;'
   elif allowlist_type == 'noselect':
     allowlist_cmd = 'echo -e "fun:*\\nsrc:*" > /allowlist.txt;'
+  workdir = _workdir_from_dockerfile(args.project)
   bash_runfuzzer = f'''
     # Fuzz with base commit
     mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
 
-    cd /src/{args.project.name};
+    cd {workdir};
     git checkout -f {args.base_commit};
     {allowlist_cmd}
     python3 /script/add_revert_entries.py --commit {short_bc1} /allowlist.txt -o /allowlist.txt;
@@ -2367,11 +2374,12 @@ def get_runfuzzer_bash(args, allowlist_type):
 
 def get_cfg_bash(args):
   """Returns the bash commands to generate CFG."""
+  workdir = _workdir_from_dockerfile(args.project)
   bash_cfg = f'''
     apt-get update && apt-get install -y bear;
     bear compile;
     cd /llvm/build ; make install -j$(nproc) &> /dev/null ; cd -;
-    cd /src/{args.project.name};
+    cd {workdir};
     git checkout -f {args.commit}; 
     cd -;
     
@@ -2735,12 +2743,13 @@ def get_poc_for_new_version(args):
   # Fuzzing part
   def get_target_fuzzing_bash(args):
     short_bc = args.buggy_commit[:8] if len(args.buggy_commit) > 8 else args.buggy_commit
+    _workdir = _workdir_from_dockerfile(args.project)
     bash_fuzz = f'''
     # Fuzz with target commit
     mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
 
-    cd /src/{args.project.name};
+    cd {_workdir};
     git checkout -f {args.target_commit};
     cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
     {_strict_reverse_patch_apply_snippet() if args.patch else ''}
@@ -2827,9 +2836,10 @@ def get_dict(args):
         '%s:%s' % (_get_absolute_path(args.source_path), workdir),
     ])
 
+  workdir = _workdir_from_dockerfile(args.project)
   bash_getdict = f'''
     # Using afl to get fuzzing dictionary
-    cd /src/{args.project.name};
+    cd {workdir};
     git checkout -f {args.commit};
     cd /src;
     compile;

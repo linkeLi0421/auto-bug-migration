@@ -492,7 +492,10 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
                 if os.path.isdir(dest_path) and os.listdir(dest_path):
                     logger.info(f"Skipping move — destination already exists and is non-empty: {dest_path}")
                 else:
-                    subprocess.run(["mv", "-f", "-T", oss_fuzz_path + "/build/out/" + target, dest_path], encoding='utf-8')
+                    src_path = oss_fuzz_path + "/build/out/" + target
+                    # Use cp -rL to dereference symlinks (NAS may not support them), then remove source
+                    subprocess.run(["cp", "-rL", "-T", src_path, dest_path], encoding='utf-8')
+                    subprocess.run(["rm", "-rf", src_path], encoding='utf-8')
                 build_writer.writerow([target, commit_id, oss_fuzz_commit, sanitizer])
 
 def is_second_day_or_greater(t1, t2):
@@ -872,6 +875,8 @@ if __name__ == "__main__":
                        help="Month increment per retry when selecting newer oss-fuzz commits.")
     parser.add_argument("--fixed-image", type=int, metavar="YEAR", default=None,
                        help="Use fixed Docker images: latest base-builder/base-runner before YEAR (e.g., 2023)")
+    parser.add_argument("--sanitizer", default=None,
+                       help="Only process bugs that use this sanitizer (e.g., 'address'). Default: all sanitizers.")
     args = parser.parse_args()
     if args.commit_step <= 0:
         parser.error("--commit-step must be >= 1")
@@ -927,6 +932,10 @@ if __name__ == "__main__":
             continue
         if bug_info['reproduce']['fuzz_target'] != args.fuzzer:
             continue
+        if args.sanitizer:
+            bug_san = bug_info['reproduce']['sanitizer'].split(' ')[0]
+            if bug_san != args.sanitizer:
+                continue
         filter_bug_ids.append(bug_id)
     
     checkout_latest_commit(repo_path)
