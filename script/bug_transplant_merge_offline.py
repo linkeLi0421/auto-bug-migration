@@ -46,7 +46,7 @@ from bug_transplant_merge import (
     _exec,
     _exec_capture,
     _inject_dispatch_files,
-    _apply_all_dispatch_bytes,
+    _apply_all_dispatch_bytes as _apply_all_dispatch_bytes_orig,
     _ensure_dispatch_capacity,
     _modify_harness_for_dispatch,
     _restore_testcases,
@@ -59,7 +59,37 @@ from bug_transplant_merge import (
     files_in_diff,
     _prepare_container_testcases_dir,
     _save_work_testcase_to_host,
+    CONTAINER_TESTCASES_DIR,
 )
+
+
+def _apply_all_dispatch_bytes(container, dispatch_state):
+    """Prepend dispatch bytes to PoCs in /work/.
+
+    Idempotent: compares the file size in /work/ against the pristine
+    original in /testcases/.  If the file is already larger (i.e. the
+    prefix was prepended by a previous call), it is left unchanged.
+
+    The old implementation used ``d.startswith(prefix)`` which is a
+    false-positive for zero-valued dispatch bytes (local bugs) when the
+    testcase content naturally starts with 0x00 (e.g. H.264 NAL streams).
+    """
+    nbytes = dispatch_state.get("dispatch_bytes", 1)
+    for bug_id, dval in dispatch_state["poc_bytes"].items():
+        testcase = f"testcase-{bug_id}"
+        prefix = dval.to_bytes(nbytes, "little")
+        prefix_list = ",".join(str(b) for b in prefix)
+        _exec_capture(
+            container,
+            f"if [ ! -f /work/{testcase} ]; then cp "
+            f"{CONTAINER_TESTCASES_DIR}/{testcase} /work/{testcase}"
+            f" 2>/dev/null; fi; python3 -c \""
+            f"import os; p=bytes([{prefix_list}]); "
+            f"orig=os.path.getsize('{CONTAINER_TESTCASES_DIR}/{testcase}') "
+            f"if os.path.exists('{CONTAINER_TESTCASES_DIR}/{testcase}') else -1; "
+            f"d=open('/work/{testcase}','rb').read(); "
+            f"open('/work/{testcase}','wb').write(d if len(d)!=orig else p+d)\"",
+        )
 from bug_transplant import (
     CODEX_CONFIG, setup_codex_creds, build_codex_command, _exec_interactive,
 )

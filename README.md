@@ -30,12 +30,11 @@ sudo -E python3 script/bug_transplant_batch.py ~/log/c-blosc2.csv \
   --testcases-dir ~/oss-fuzz-for-select/pocs/tmp/ \
   --target c-blosc2 --resume --keep-containers
 
-# 4. Merge all per-bug diffs into one version
-sudo -E python3 script/bug_transplant_merge.py \
+# 4. Offline dispatch-wrap and merge all per-bug diffs into one version
+sudo -E python3 script/bug_transplant_merge_offline.py \
   --summary data/bug_transplant/batch_c-blosc2_79e921d9/summary.json \
   --bug_info $BUGINFO_PATH \
   --target c-blosc2 \
-  --testcases-dir ~/oss-fuzz-for-select/pocs/tmp/ \
   --build_csv ~/log/c-blosc2_builds.csv
 ```
 
@@ -114,7 +113,7 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 |---|---|
 | `script/bug_transplant.py` | Single-bug transplant launcher (runs code agent in Docker) |
 | `script/bug_transplant_batch.py` | Batch orchestrator (shared container, CLAUDE.md memory) |
-| `script/bug_transplant_merge.py` | Merge per-bug diffs + testcase-only bugs + dispatch resolution |
+| `script/bug_transplant_merge_offline.py` | Offline dispatch-wrap and merge per-bug diffs + testcase-only bugs |
 | `script/fuzzbench_generate.py` | Generate FuzzBench benchmark from merge output |
 | `script/fuzzbench_triage.py` | Post-experiment triage (crashes + coverage → bug timeline CSV) |
 | `script/prompts/bug_transplant.md` | Transplant prompt (testcase patching, crash verification) |
@@ -204,25 +203,18 @@ For each bug:
 - `--keep-containers` -- keep Docker containers for debugging
 - `--agent claude|codex` -- select code agent
 
-### Step 2: Merge (`bug_transplant_merge.py`)
+### Step 2: Offline merge (`bug_transplant_merge_offline.py`)
 
-Merges per-bug diffs and testcase-only transplants:
-1. Orders diffs by independence (fewest file overlaps first, testcase-only bugs first)
-2. Builds per-sanitizer (ASAN + UBSAN) with `--build_csv` for historical image pinning
-3. Testcase-only bugs: register directly, verify with patched testcase
-4. For each diff:
-   - `git apply --check` then clean apply
-   - Conflict: `git apply --3way` or code agent resolution
-5. After each apply: verify ALL previous bugs still trigger
-6. Regressions: dispatch wrapping via code agent (bitmask gating)
-7. Outputs combined diff + patched testcases
+Two-phase dispatch-wrap and merge:
+1. **Phase 1 -- Wrap**: Each per-bug diff is independently wrapped with dispatch gating on clean source. Each bug gets a bit in `__bug_dispatch[]`; local bugs and testcase-only bugs get `0x00`.
+2. **Phase 2 -- Merge**: All wrapped diffs are merged into one codebase via code agent. Since each bug uses a different bit, they don't interfere at runtime.
+3. The harness is modified once to read `__bug_dispatch[]` from the first byte(s) of each testcase. Each PoC gets its dispatch bit prepended.
+4. Verifies all bugs at baseline and after final merge.
 
 **Key flags:**
-- `--dry-run` -- show merge order and potential conflicts
+- `--dry-run` -- show dispatch bit assignments
 - `--keep-container` -- keep container alive for debugging
 - `--build_csv` -- use historical Docker image (`--runner-image auto`)
-- `--start-step N` -- resume merge from step N
-- `--max-steps N` -- stop after N steps
 
 ### Bug transplant methodology
 
