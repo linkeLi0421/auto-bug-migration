@@ -58,9 +58,17 @@ sudo -E compile
    handling. Focus on what concretely prevents the crash path from being reached on the target
    commit.
 
+   If a fix-hint diff is available, treat it as a clue only. Do not assume it is the full fix
+   or that reverting it is sufficient. You still need to inspect the surrounding target code,
+   testcase reachability, and any unrelated validation or format changes that block the bug path.
+
 5. **If the testcase doesn't exercise the vulnerable code path**, sometimes the fuzzer input
    format change between target commit and buggy commit. If the input header change, may try
    to update the input. And do not change other parts of the testcase too much. 
+
+   Before concluding the path is unreachable, try to localize where execution stops on the target.
+   Use minimal runtime instrumentation or temporary logging if needed to determine whether the PoC
+   reaches header parsing, slice parsing, decode, concealment, display, or other relevant stages.
 
 6. **Verify both directions**: the testcase must crash WITH your code change and NOT crash
    without it. The crash must be the same vulnerability -- but it does NOT need an identical
@@ -94,13 +102,41 @@ sudo -E compile
 
 ## Early exit if impossible
 
-If you determine the bug CANNOT be reintroduced -- stop early and write a reason:
+Use `IMPOSSIBLE` sparingly. It is for cases where you have concrete evidence that reproducing the
+same bug would require changes outside the project-shipped code, or would require replacing the
+PoC with a substantially different synthesized input rather than adapting the provided testcase.
+
+Do NOT declare `IMPOSSIBLE` merely because:
+- the fix-hint diff did not work
+- one revert attempt failed
+- the testcase is rejected before parsing without first investigating why
+- the target needs testcase byte/header adjustments
+- the blocking change appears to be a broader refactor inside project code
+
+Before writing `IMPOSSIBLE`, confirm all of the following:
+- you tested the original testcase on the unmodified target
+- you inspected the relevant crash-path code and at least some surrounding diffs, not just the fix hint
+- if the testcase is rejected early, you investigated whether minimal testcase adaptation can restore reachability
+- you gathered concrete evidence for where execution stops on the target
+
+If you determine the bug truly cannot be reintroduced under those constraints, write a specific one-line reason.
+Make it concrete enough that someone can tell:
+- where the original testcase stopped on the target
+- what testcase/code adaptation you tried
+- what final blocker remained after those attempts
+
+Preferred pattern:
+
+```text
+IMPOSSIBLE: original PoC stops at <stage>; after trying <adaptation>, it reaches <later stage or same stage> but still fails to reproduce because <final blocker>.
+```
 
 ```bash
 echo "IMPOSSIBLE: <one-line reason>" > /out/bug_transplant.impossible
 ```
 
-Do not keep trying if the root cause is genuinely outside any code the project ships.
+Only stop early when the evidence shows the root cause is genuinely outside any reasonable
+project-code transplant or minimal testcase adaptation.
 
 ## Saving results
 

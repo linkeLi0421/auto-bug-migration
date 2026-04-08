@@ -415,13 +415,13 @@ def build_prompt(args: argparse.Namespace) -> str:
         fix_diff_line = (
             f"\n- `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff` -- "
             f"diff from buggy commit to adjacent CSV commit `{adjacent_commit[:8]}` "
-            f"(the next tested commit toward the fix — read this first)"
+            f"(optional hint from the next tested commit toward the fix; use if helpful, not as a required recipe)"
         )
         adjacent_commit_hint = (
-            f" If available, start by reading"
+            f" If available, you may inspect"
             f" `/data/patch_diffs/fix_hint-{buggy_short}-{args.testcase}.diff`:"
             f" it is the diff from the buggy commit to the next tested commit"
-            f" `{adjacent_commit[:8]}` and likely contains the fix."
+            f" `{adjacent_commit[:8]}` and may contain a relevant clue, but it is only a hint."
         )
     else:
         fix_diff_line = ""
