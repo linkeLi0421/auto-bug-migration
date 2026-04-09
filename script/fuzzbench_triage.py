@@ -77,6 +77,8 @@ def _find_fuzzer_dirs(experiment_dir: Path, benchmark: str) -> list:
     """
     exp_folders = experiment_dir / "experiment-folders"
     if not exp_folders.exists():
+        logger.error("experiment-folders not found at %s. "
+                     "Check your --experiment-dir path.", exp_folders)
         return []
 
     # Try nested layout first

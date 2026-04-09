@@ -135,25 +135,20 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 After merging, evaluate how well different fuzzers discover the transplanted bugs using [FuzzBench](https://github.com/google/fuzzbench):
 
 ```bash
-# One command: generate benchmark, build for aflplusplus, and run a 20s test
+# Generate benchmark and build for aflplusplus
 sudo -E python3 script/fuzzbench_generate.py \
   --merge-dir data/merge_offline_opensc_6903aebf \
   --build-csv data/opensc_builds.csv \
   --fuzz-target fuzz_pkcs15_reader \
   --output-dir fuzzbench/benchmarks \
   --merge-container bug-merge-opensc \
-  --fuzzer aflplusplus \
-  --run
+  --fuzzer aflplusplus
 
-# Full 24h run with multiple fuzzers
-sudo -E python3 script/fuzzbench_generate.py \
-  --merge-dir data/merge_offline_opensc_6903aebf \
-  --build-csv data/opensc_builds.csv \
-  --fuzz-target fuzz_pkcs15_reader \
-  --output-dir fuzzbench/benchmarks \
-  --merge-container bug-merge-opensc \
-  --fuzzer aflplusplus libfuzzer \
-  --run --run-time 86400
+# Run a full 24h experiment with fuzzbench_run.py
+sudo -E python3 script/fuzzbench_run.py opensc_transplant_fuzz_pkcs15_reader \
+  --fuzzer aflplusplus \
+  --experiment-name transplant-opensc-24h \
+  --run-time 86400
 ```
 
 ### `fuzzbench_generate.py` flags
@@ -166,8 +161,6 @@ sudo -E python3 script/fuzzbench_generate.py \
 | `--output-dir` | Output directory (default: `fuzzbench/benchmarks/`) |
 | `--merge-container` | Running merge container name -- commits it as a Docker image and uses as Dockerfile base for identical build environment |
 | `--fuzzer <name> [...]` | Build the benchmark for these fuzzers after generation |
-| `--run` | Run the fuzzer(s) after building (20s test by default) |
-| `--run-time <seconds>` | Fuzzing duration (e.g. `86400` for 24h) |
 | `--benchmark-name` | Custom benchmark name (default: `{project}_transplant_{target}`) |
 | `--use-current-oss-fuzz-checkout` | Use current local oss-fuzz state instead of checking out from builds.csv |
 | `--builder-digest` | Override base-builder image digest |

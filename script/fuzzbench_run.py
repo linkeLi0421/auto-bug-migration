@@ -56,9 +56,13 @@ def generate_experiment_config(output_path: Path, experiment_filestore: Path,
                                report_filestore: Path, trials: int,
                                run_time: int) -> None:
     """Write a local experiment config YAML."""
+    # snapshot_period must be shorter than max_total_time, otherwise the
+    # runner sleeps past the deadline and the dispatcher sees 0 snapshots.
+    snapshot_period = min(900, max(10, run_time // 10))
     content = f"""local_experiment: true
 trials: {trials}
 max_total_time: {run_time}
+snapshot_period: {snapshot_period}
 experiment_filestore: {experiment_filestore}
 report_filestore: {report_filestore}
 docker_registry: gcr.io/fuzzbench

@@ -520,17 +520,36 @@ type: bug
 """
 
 
+def _is_runtime_frame(filepath: str) -> bool:
+    """Return True if the file path belongs to sanitizer/fuzzer runtime, not project code."""
+    runtime_markers = ("/compiler-rt/", "/llvm-project/", "/lib/fuzzer/",
+                       "/lib/asan/", "/lib/msan/", "/lib/ubsan/", "/lib/tsan/",
+                       "/lib/lsan/", "/lib/dfsan/")
+    return any(m in filepath for m in runtime_markers)
+
+
 def parse_crash_line(crash_text: str) -> dict:
     """Parse ASAN/UBSAN crash output to extract crash file and line.
 
-    Looks for the SUMMARY line first (most reliable), then falls back
-    to the first stack frame in the project source.
+    Walks the stack trace to find the first frame in project source code,
+    skipping sanitizer/fuzzer runtime frames. Falls back to the SUMMARY
+    line only if no project frame is found.
 
     Returns dict with 'file', 'line', 'function' keys (any may be None).
     """
     result = {"file": None, "line": None, "function": None}
 
-    # Try SUMMARY line first: "SUMMARY: AddressSanitizer: SEGV /src/proj/file.c:123:7 in func"
+    # Walk stack frames: find the first one in project source (not runtime)
+    for m in re.finditer(
+            r"#\d+\s+\S+\s+in\s+(\S+)\s+(/\S+?):(\d+)", crash_text):
+        filepath = m.group(2)
+        if not _is_runtime_frame(filepath):
+            result["function"] = m.group(1)
+            result["file"] = filepath
+            result["line"] = int(m.group(3))
+            return result
+
+    # Fallback: SUMMARY line (may point to runtime, but better than nothing)
     summary_match = re.search(
         r"SUMMARY:\s+\w+Sanitizer:\s+\S+\s+(/\S+?):(\d+)(?::\d+)?\s+in\s+(\S+)",
         crash_text)
@@ -538,16 +557,6 @@ def parse_crash_line(crash_text: str) -> dict:
         result["file"] = summary_match.group(1)
         result["line"] = int(summary_match.group(2))
         result["function"] = summary_match.group(3)
-        return result
-
-    # Fallback: first stack frame with /src/ path
-    frame_match = re.search(
-        r"#\d+\s+\S+\s+in\s+(\S+)\s+(/src/\S+?):(\d+)",
-        crash_text)
-    if frame_match:
-        result["function"] = frame_match.group(1)
-        result["file"] = frame_match.group(2)
-        result["line"] = int(frame_match.group(3))
         return result
 
     return result
@@ -748,15 +757,6 @@ def main():
               "Runs 'make build-{fuzzer}-{benchmark}' in the FuzzBench directory."),
     )
     parser.add_argument(
-        "--run", action="store_true",
-        help=("Run a short test (20s) after building. Requires --fuzzer."),
-    )
-    parser.add_argument(
-        "--run-time", type=int, default=None,
-        help=("Fuzzing duration in seconds for --run (default: 20 for test, "
-              "use e.g. 86400 for a 24h run)."),
-    )
-    parser.add_argument(
         "--fuzzbench-dir",
         help="Path to FuzzBench checkout (default: auto-detect from output-dir or PROJECT_ROOT/fuzzbench)",
     )
@@ -896,7 +896,7 @@ def main():
         logger.info("  Missing crash lines: %s", bugs_missing)
 
     # ------------------------------------------------------------------
-    # 13. Build and optionally run with FuzzBench
+    # 13. Build with FuzzBench
     # ------------------------------------------------------------------
     if args.fuzzer:
         fuzzbench_dir = _resolve_fuzzbench_dir(args.fuzzbench_dir, bench_dir)
@@ -904,13 +904,14 @@ def main():
             logger.error("Cannot find FuzzBench directory. Use --fuzzbench-dir.")
             sys.exit(1)
 
+        failed = []
         for fuzzer in args.fuzzer:
-            _fuzzbench_build(fuzzbench_dir, fuzzer, benchmark_name)
+            if not _fuzzbench_build(fuzzbench_dir, fuzzer, benchmark_name):
+                failed.append(fuzzer)
+        if failed:
+            logger.error("Failed fuzzers: %s", " ".join(failed))
+            sys.exit(1)
 
-        if args.run:
-            for fuzzer in args.fuzzer:
-                _fuzzbench_run(fuzzbench_dir, fuzzer, benchmark_name,
-                               fuzz_target, args.run_time)
     else:
         logger.info("")
         logger.info("Next steps:")
@@ -950,44 +951,9 @@ def _fuzzbench_build(fuzzbench_dir: Path, fuzzer: str, benchmark: str):
     )
     if result.returncode != 0:
         logger.error("Build failed for %s-%s (exit %d)", fuzzer, benchmark, result.returncode)
-        sys.exit(1)
+        return False
     logger.info("Build OK: %s-%s", fuzzer, benchmark)
-
-
-def _fuzzbench_run(fuzzbench_dir: Path, fuzzer: str, benchmark: str,
-                   fuzz_target: str, run_time: int | None):
-    """Run the fuzzer in a Docker container."""
-    runner_image = f"gcr.io/fuzzbench/runners/{fuzzer}/{benchmark}"
-
-    run_time = run_time or 20
-    is_test = run_time <= 60
-
-    logger.info("%s %s-%s for %ds ...",
-                "Test-running" if is_test else "Running",
-                fuzzer, benchmark, run_time)
-
-    cmd = [
-        "docker", "run",
-        "--cpus=1",
-        "--shm-size=2g",
-        "--cap-add", "SYS_NICE",
-        "--cap-add", "SYS_PTRACE",
-        "-e", "FUZZ_OUTSIDE_EXPERIMENT=1",
-        "-e", "FORCE_LOCAL=1",
-        "-e", "TRIAL_ID=1",
-        "-e", f"FUZZER={fuzzer}",
-        "-e", f"BENCHMARK={benchmark}",
-        "-e", f"FUZZ_TARGET={fuzz_target}",
-        "-e", f"MAX_TOTAL_TIME={run_time}",
-        "-e", "SNAPSHOT_PERIOD=10",
-        runner_image,
-    ]
-
-    result = subprocess.run(cmd, cwd=fuzzbench_dir)
-    if result.returncode != 0:
-        logger.error("Run failed for %s-%s (exit %d)", fuzzer, benchmark, result.returncode)
-        sys.exit(1)
-    logger.info("Run OK: %s-%s (%ds)", fuzzer, benchmark, run_time)
+    return True
 
 
 if __name__ == "__main__":
