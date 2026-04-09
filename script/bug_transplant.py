@@ -117,6 +117,43 @@ MEMORY_TEMPLATE = SCRIPT_DIR / "prompts" / "bug_transplant_memory.md"
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _container_repo_dir(project: str) -> str:
+    """Return the git repo root inside the container for a project."""
+    return _source_dir(project)
+
+
+def _container_agents_md_path(project: str) -> str:
+    """Return the shared AGENTS.md mount path inside the container."""
+    return f"/src/{project}/AGENTS.md"
+
+
+def _git_clean_excludes(project: str) -> str:
+    """Return project-specific git-clean exclusions."""
+    excludes = ["-e .codex/"]
+    if _container_agents_md_path(project) == f"{_container_repo_dir(project)}/AGENTS.md":
+        excludes.insert(0, "-e AGENTS.md")
+    return " ".join(excludes)
+
+
+def _build_container_env(language: str) -> list[str]:
+    """Match the default build env used by fuzz_helper.py build_version."""
+    return [
+        "FUZZING_ENGINE=libfuzzer",
+        "SANITIZER=address",
+        "ARCHITECTURE=x86_64",
+        f"FUZZING_LANGUAGE={language}",
+        "HELPER=True",
+        "MAKEFLAGS=--output-sync=line",
+        "CMAKE_BUILD_PARALLEL_LEVEL=30",
+        "NINJA_STATUS=",
+        "TERM=dumb",
+        "CLICOLOR=0",
+        "FORCE_COLOR=0",
+        "GCC_COLORS=",
+        "CLANG_FORCE_COLOR=0",
+        "CMAKE_COLOR_DIAGNOSTICS=OFF",
+    ]
+
 def _run_quiet(cmd: list[str], label: str = "", **kwargs) -> int:
     """Run a command, capture output, and only show it on failure.
 
@@ -338,15 +375,32 @@ def build_agent_image(project: str, project_image: str) -> str:
     cli_name = CODEX_CONFIG["cli_name"]
     cli_entry = CODEX_CONFIG["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
+    repo_dir = _container_repo_dir(project)
 
     # Skip rebuild if the agent image already exists
     inspect = subprocess.run(
         ["docker", "image", "inspect", tag],
         capture_output=True,
+        text=True,
     )
     if inspect.returncode == 0:
-        logger.info("Agent image already exists, reusing: %s", tag)
-        return tag
+        workdir_inspect = subprocess.run(
+            ["docker", "image", "inspect", tag, "--format", "{{.Config.WorkingDir}}"],
+            capture_output=True,
+            text=True,
+        )
+        current_workdir = workdir_inspect.stdout.strip()
+        if workdir_inspect.returncode == 0 and current_workdir == repo_dir:
+            logger.info("Agent image already exists, reusing: %s", tag)
+            return tag
+        logger.info(
+            "Rebuilding agent image %s because working directory is %r, expected %r",
+            tag, current_workdir, repo_dir,
+        )
+        subprocess.call(
+            ["docker", "rmi", "-f", tag],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     logger.info("Building codex agent image '%s' on top of '%s'...", tag, project_image)
 
@@ -401,7 +455,7 @@ def build_agent_image(project: str, project_image: str) -> str:
         ENV PATH="/home/agent:$PATH"
         USER agent
 
-        WORKDIR /src/{project}
+        WORKDIR {repo_dir}
         CMD ["sleep", "infinity"]
     """)
 
@@ -428,6 +482,8 @@ def build_prompt(args: argparse.Namespace) -> str:
     """Read the prompt template and fill in parameters."""
     template = PROMPT_TEMPLATE.read_text()
     buggy_short = args.buggy_commit[:8]
+    repo_dir = _container_repo_dir(args.project)
+    agents_md = _container_agents_md_path(args.project)
 
     adjacent_commit = getattr(args, 'adjacent_commit', None)
     if adjacent_commit:
@@ -455,6 +511,8 @@ def build_prompt(args: argparse.Namespace) -> str:
         buggy_short=buggy_short,
         testcase_name=args.testcase,
         fuzzer_name=args.fuzzer_name,
+        repo_dir=repo_dir,
+        agents_md=agents_md,
         fix_diff_line=fix_diff_line,
         adjacent_commit=adjacent_commit or "",
         adjacent_commit_hint=adjacent_commit_hint,
@@ -552,15 +610,6 @@ def create_shared_container(
         "--name", container_name,
         "--privileged",
         "--shm-size=2g",
-        "-e", "FUZZING_ENGINE=libfuzzer",
-        "-e", "SANITIZER=address",
-        "-e", "ARCHITECTURE=x86_64",
-        "-e", f"FUZZING_LANGUAGE={language}",
-        "-e", "HELPER=True",
-        "-e", "MAKEFLAGS=--output-sync=line -j30",
-        "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
-        "-e", "NINJA_STATUS=",
-        "-e", "TERM=dumb",
         "-v", f"{data_dir}:/data",
         "-v", f"{testcases_dir}:/corpus",
         "-v", f"{script_dir}:/script:ro",
@@ -568,6 +617,8 @@ def create_shared_container(
         "-v", f"{work_dir}:/work",
         "-v", f"{agents_dir}/AGENTS.md:/src/{project}/AGENTS.md",
     ]
+    for env_var in _build_container_env(language):
+        docker_run_cmd += ["-e", env_var]
 
     # Mount codex credentials
     cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
@@ -583,6 +634,8 @@ def create_shared_container(
 
     docker_run_cmd += [image_tag, "sleep", "infinity"]
 
+    repo_dir = _container_repo_dir(project)
+    agents_md_path = _container_agents_md_path(project)
     logger.info("Creating shared container: %s", container_name)
     ret = _run_quiet(docker_run_cmd, label="docker-run-shared")
     if ret != 0:
@@ -591,18 +644,29 @@ def create_shared_container(
 
     # Initial setup: git safe directory, checkout, credentials
     _exec(container_name, "git config --global --add safe.directory '*'", user="root")
-
-    # Detect actual git repo (may differ from project name, e.g. ghostscript → ghostpdl)
-    source_repo = _source_dir(project)
-    _exec(container_name, f"cd {source_repo} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
-    _exec(container_name, f"cd {source_repo} && git checkout -f {target_commit}", user="root")
-
-    # Symlink AGENTS.md into source repo so the agent finds it
-    if source_repo != f"/src/{project}":
-        _exec(container_name,
-              f"ln -sf /src/{project}/AGENTS.md {source_repo}/AGENTS.md 2>/dev/null || true",
-              user="root")
-
+    clean_excludes = _git_clean_excludes(project)
+    clean_ret = _exec(
+        container_name,
+        f"cd {shlex.quote(repo_dir)} && git clean -fdx {clean_excludes}",
+        user="root",
+    )
+    checkout_ret = _exec(
+        container_name,
+        f"cd {shlex.quote(repo_dir)} && git checkout -f {shlex.quote(target_commit)}",
+        user="root",
+    )
+    if clean_ret != 0 or checkout_ret != 0:
+        logger.error(
+            "Failed to prepare repo in container %s (repo_dir=%s)",
+            container_name, repo_dir,
+        )
+        return 1
+    if repo_dir != f"/src/{project}":
+        _exec(
+            container_name,
+            f"ln -sf {shlex.quote(agents_md_path)} {shlex.quote(repo_dir)}/AGENTS.md 2>/dev/null || true",
+            user="root",
+        )
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
     # Setup codex credentials
@@ -647,6 +711,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
     shared_agents_dir = getattr(args, "agents_dir", None)
     agents_dir = Path(shared_agents_dir) if shared_agents_dir else setup_agents_dir(args)
     owns_agents_dir = shared_agents_dir is None
+    repo_dir = _container_repo_dir(args.project)
+    agents_md_path = _container_agents_md_path(args.project)
 
     if not reuse_container:
         # --- Stop any existing container with the same name ---
@@ -670,16 +736,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "--name", container_name,
             "--privileged",
             "--shm-size=2g",
-            # OSS-Fuzz build env vars (required by /usr/local/bin/compile)
-            "-e", "FUZZING_ENGINE=libfuzzer",
-            "-e", "SANITIZER=address",
-            "-e", "ARCHITECTURE=x86_64",
-            "-e", f"FUZZING_LANGUAGE={language}",
-            "-e", "HELPER=True",
-            "-e", "MAKEFLAGS=--output-sync=line -j30",
-            "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
-            "-e", "NINJA_STATUS=",
-            "-e", "TERM=dumb",
             # Volumes
             "-v", f"{data_dir}:/data",
             "-v", f"{testcases_dir}:/corpus",
@@ -689,6 +745,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             # AGENTS.md as shared memory (rw)
             "-v", f"{agents_dir}/AGENTS.md:/src/{args.project}/AGENTS.md",
         ]
+        for env_var in _build_container_env(language):
+            docker_run_cmd += ["-e", env_var]
 
         # Mount codex credentials (login mode)
         cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
@@ -720,24 +778,38 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         _exec(container_name, "rm -rf /out/* /work/*", user="root")
 
     try:
+        args.source_dir = repo_dir
+        prompt = build_prompt(args)
+        repo_dir_q = shlex.quote(repo_dir)
+        clean_excludes = _git_clean_excludes(args.project)
+
         # --- Checkout target commit inside container ---
         logger.info("Checking out target commit %s...", args.target_commit)
         _exec(container_name, "git config --global --add safe.directory '*'", user="root")
-        # Detect actual git repo (may differ from project name)
-        source_repo = _source_dir(args.project)
-        args.source_dir = source_repo
         # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
         # before checkout so they don't pollute the git diff later.
-        _exec(container_name, f"cd {source_repo} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
-        _exec(container_name, f"cd {source_repo} && git checkout -f {args.target_commit}", user="root")
-        # Symlink AGENTS.md into source repo so the agent finds it
-        if source_repo != f"/src/{args.project}":
-            _exec(container_name,
-                  f"ln -sf /src/{args.project}/AGENTS.md {source_repo}/AGENTS.md 2>/dev/null || true",
-                  user="root")
-
-        # --- Build prompt now that source_dir is known ---
-        prompt = build_prompt(args)
+        clean_ret = _exec(
+            container_name,
+            f"cd {repo_dir_q} && git clean -fdx {clean_excludes}",
+            user="root",
+        )
+        checkout_ret = _exec(
+            container_name,
+            f"cd {repo_dir_q} && git checkout -f {shlex.quote(args.target_commit)}",
+            user="root",
+        )
+        if clean_ret != 0 or checkout_ret != 0:
+            logger.error(
+                "Failed to prepare repo in container %s (repo_dir=%s)",
+                container_name, repo_dir,
+            )
+            return 1
+        if repo_dir != f"/src/{args.project}":
+            _exec(
+                container_name,
+                f"ln -sf {shlex.quote(agents_md_path)} {repo_dir_q}/AGENTS.md 2>/dev/null || true",
+                user="root",
+            )
 
         # --- Copy testcase to /work for easier access ---
         _exec(
@@ -757,6 +829,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         agent_cmd = build_codex_command(
             prompt, getattr(args, "model", None), mode=codex_mode,
         )
+        agent_cmd = f"cd {repo_dir_q} && {agent_cmd}"
 
         start_time = time.monotonic()
         if codex_mode == "interactive":
@@ -824,7 +897,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         _, git_diff = _exec_capture(
             container_name,
-            f"cd {source_repo} && "
+            f"cd {repo_dir_q} && "
             f"git diff HEAD -- . {_git_diff_excludes}",
         )
         diff_path.write_text(git_diff)
@@ -864,7 +937,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info("Rebuilding with official compile...")
             _exec_capture(
                 container_name,
-                f"find {source_repo} -name '{fuzzer}' -type f -executable -delete; "
+                f"find {repo_dir_q} -name '{fuzzer}' -type f -executable -delete; "
                 f"rm -f /out/{fuzzer}",
             )
             ret_build, build_out = _exec_capture(
@@ -969,7 +1042,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # Re-save the (now minimized) diff via git diff
                 _, min_diff = _exec_capture(
                     container_name,
-                    f"cd {source_repo} && "
+                    f"cd {repo_dir_q} && "
                     f"git diff HEAD -- . {_git_diff_excludes}",
                 )
                 diff_path.write_text(min_diff)
@@ -993,7 +1066,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # stale binaries (autotools/cmake dependency tracking issue)
                 _exec_capture(
                     container_name,
-                    f"find {source_repo} -name '{fuzzer}' -type f -executable -delete; "
+                    f"find {repo_dir_q} -name '{fuzzer}' -type f -executable -delete; "
                     f"rm -f /out/{fuzzer}",
                 )
                 ret_rebuild, _ = _exec_capture(
@@ -1037,7 +1110,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     # Restore the unminimized diff
                     _, pre_min_diff = _exec_capture(
                         container_name,
-                        f"cd {source_repo} && git diff")
+                        f"cd {repo_dir_q} && git diff")
                     diff_path.write_text(pre_min_diff)
             elif has_crash and not crash_matches:
                 logger.error(
@@ -1072,10 +1145,9 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         if reuse_container:
             # Reused container — reset source for next bug but keep container
             logger.info("Resetting source tree for next bug...")
-            source_repo = _source_dir(args.project)
             _exec(container_name,
-                  f"cd {source_repo} && git checkout -f {args.target_commit} && "
-                  f"git clean -fdx -e AGENTS.md -e .codex/",
+                  f"cd {repo_dir_q} && git checkout -f {shlex.quote(args.target_commit)} && "
+                  f"git clean -fdx {clean_excludes}",
                   user="root")
         elif not args.keep_container:
             logger.info("Destroying container %s...", container_name)
