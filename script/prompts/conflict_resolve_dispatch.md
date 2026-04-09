@@ -45,7 +45,7 @@ Strategy:
        // Existing code (from previously-applied bugs)
    }}
 
-   The header is at /src/{project}/__bug_dispatch.h.
+   The header is at {source_dir}/__bug_dispatch.h.
 
 3. If a hunk can be applied without conflicting with existing
    changes, apply it directly (no dispatch needed for that hunk).

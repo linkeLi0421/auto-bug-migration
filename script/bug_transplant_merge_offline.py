@@ -92,6 +92,7 @@ def _apply_all_dispatch_bytes(container, dispatch_state):
         )
 from bug_transplant import (
     CODEX_CONFIG, setup_codex_creds, build_codex_command, _exec_interactive,
+    _source_dir,
 )
 from codex_usage import CodexUsageTracker
 
@@ -135,7 +136,7 @@ def _clean_diff(container: str, project: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd /src/{project} && git diff HEAD -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+        f"cd {_source_dir(project)} && git diff HEAD -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
     )
     return _strip_build_artifact_hunks(diff)
 
@@ -145,7 +146,7 @@ def _clean_diff_against(container: str, project: str, base_rev: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd /src/{project} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+        f"cd {_source_dir(project)} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
     )
     return _strip_build_artifact_hunks(diff)
 
@@ -153,14 +154,14 @@ def _clean_diff_against(container: str, project: str, base_rev: str) -> str:
 def _save_source_snapshot(container: str, project: str) -> None:
     """Save a git stash snapshot of the source tree."""
     _exec_capture(container,
-                  f"cd /src/{project} && git add -A && "
+                  f"cd {_source_dir(project)} && git add -A && "
                   f"git stash push -m snapshot --include-untracked 2>/dev/null; true")
 
 
 def _restore_source_snapshot(container: str, project: str) -> None:
     """Restore the most recent source snapshot."""
     _exec_capture(container,
-                  f"cd /src/{project} && git checkout -f HEAD && "
+                  f"cd {_source_dir(project)} && git checkout -f HEAD && "
                   f"git stash pop 2>/dev/null; true")
 
 
@@ -168,7 +169,7 @@ def _clean_container_working_tree_before_harness_diff(container: str, project: s
     """Reset /src/<project> before reapplying a saved harness diff."""
     _exec_capture(
         container,
-        f"cd /src/{project} && "
+        f"cd {_source_dir(project)} && "
         "(git reset --hard HEAD 2>/dev/null || true) && "
         "(git clean -fdx 2>/dev/null || true) && "
         "rm -f __bug_dispatch.c __bug_dispatch.h 2>/dev/null || true",
@@ -179,7 +180,7 @@ def _create_harness_baseline_commit(container: str, project: str) -> str:
     """Create a temporary commit for the harness-applied baseline."""
     ret, out = _exec_capture(
         container,
-        f"cd /src/{project} && "
+        f"cd {_source_dir(project)} && "
         "git add -A && "
         "git -c user.name='Codex' -c user.email='codex@example.com' "
         "commit --allow-empty -m 'codex harness baseline' >/dev/null 2>&1 && "
@@ -194,7 +195,7 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
     """Restore the exact harness baseline snapshot."""
     ret, out = _exec_capture(
         container,
-        f"cd /src/{project} && "
+        f"cd {_source_dir(project)} && "
         f"git checkout -f {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
         f"git reset --hard {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
         "git clean -fdx >/dev/null 2>&1 || true",
@@ -276,7 +277,7 @@ def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
     # that reference __bug_dispatch.
     ret, out = _exec_capture(
         container,
-        f"cd /src/{project} && "
+        f"cd {_source_dir(project)} && "
         f"grep -rl '__bug_dispatch' --include='*.c' --include='*.h' "
         f"src/ 2>/dev/null | "
         f"xargs -I{{}} dirname {{}} | sort -u",
@@ -291,7 +292,7 @@ def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
         # Check if this directory has a Makefile.am with a _la_SOURCES
         ret2, makefile = _exec_capture(
             container,
-            f"cat /src/{project}/{src_dir}/Makefile.am 2>/dev/null",
+            f"cat {_source_dir(project)}/{src_dir}/Makefile.am 2>/dev/null",
         )
         if ret2 != 0 or "__bug_dispatch" in makefile:
             continue  # already has it or no Makefile.am
@@ -299,7 +300,7 @@ def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
             continue  # not a library
 
         # Add __bug_dispatch.c after the first _la_SOURCES line
-        makefile_path = f"/src/{project}/{src_dir}/Makefile.am"
+        makefile_path = f"{_source_dir(project)}/{src_dir}/Makefile.am"
         _exec_capture(
             container,
             f"awk 'NR==1{{found=0}} /_la_SOURCES/&&!found{{"
@@ -587,7 +588,7 @@ def wrap_bug_with_dispatch(
         return False, output
 
     # Verify build
-    ret, build_out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    ret, build_out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after wrapping", bug_id)
         return False, build_out
@@ -677,14 +678,14 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             _exec_capture(container,
                           f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
             ret, out = _exec_capture(container,
-                                     f"cd /src/{project} && git apply /tmp/harness.diff 2>&1")
+                                     f"cd {_source_dir(project)} && git apply /tmp/harness.diff 2>&1")
             if ret != 0:
                 logger.error("Failed to apply existing harness.diff")
                 logger.error(out)
                 return 1
             _restore_build_sh(container, output_dir)
             _inject_dispatch_deps_fixer(container)
-            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            ret, out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying existing harness.diff")
                 logger.error(out[-500:] if out else "(no output)")
@@ -868,13 +869,13 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                           f"cat > /tmp/combined.diff << 'CEOF'\n{cdiff}CEOF")
             ret, out = _exec_capture(
                 container,
-                f"cd /src/{project} && git apply /tmp/combined.diff 2>&1",
+                f"cd {_source_dir(project)} && git apply /tmp/combined.diff 2>&1",
             )
             if ret != 0:
                 logger.error("Failed to apply existing combined.diff: %s", out[-500:])
                 return 1
             _ensure_dispatch_linked_everywhere(container, project)
-            ret, out = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+            ret, out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying combined.diff: %s",
                              out[-500:] if out else "(no output)")
@@ -922,6 +923,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                         project=project,
                         target_commit=target_commit,
                         patch_list=patch_list,
+                        source_dir=_source_dir(project),
                     )
 
                     setup_codex_creds(container)
@@ -953,7 +955,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                     # Verify build after each chunk so failures are localized.
                     ret, build_out = _exec_capture(
-                        container, "sudo -E compile 2>&1", timeout=300,
+                        container, "cd /src && sudo -E compile 2>&1", timeout=300,
                     )
                     if ret != 0:
                         logger.error(
@@ -976,7 +978,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # Build ASAN with all patches applied
         logger.info("Building with all patches applied...")
         _ensure_dispatch_linked_everywhere(container, project)
-        _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+        _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "

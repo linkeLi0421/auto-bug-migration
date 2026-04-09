@@ -166,7 +166,7 @@ def generate_fix_diffs(
     Done upfront so diffs exist even for bugs skipped by --resume.
     """
     patch_diffs_dir = DATA_DIR / "patch_diffs"
-    patch_diffs_dir.mkdir(exist_ok=True)
+    patch_diffs_dir.mkdir(parents=True, exist_ok=True)
 
     for bug_id, buggy_commit, metadata in bug_tasks:
         adjacent_commit = metadata.get("adjacent_commit")
@@ -182,7 +182,7 @@ def generate_fix_diffs(
             result = subprocess.run(
                 ["git", "diff", buggy_commit, adjacent_commit],
                 cwd=repo_path,
-                capture_output=True, text=True,
+                capture_output=True, encoding="utf-8", errors="replace",
             )
             diff_text = result.stdout
         except Exception as exc:
@@ -194,6 +194,69 @@ def generate_fix_diffs(
         out_path.write_text(diff_text)
         logger.info("[%s] Fix diff saved: %s (adjacent=%s)",
                     bug_id, out_path.name, adjacent_commit[:8])
+
+
+def collect_all_crash_trace_data(
+    bug_tasks: list[tuple[str, str, dict]],
+    args: argparse.Namespace,
+) -> None:
+    """Pre-collect crash logs and traces for all bugs, grouped by buggy commit.
+
+    Each unique (buggy_commit, fuzzer) pair only needs one build, so this is
+    much faster than letting each bug_transplant.py invocation rebuild.
+    Failures are logged but non-fatal — the agent can still work without
+    crash/trace data.
+    """
+    FUZZ_HELPER = SCRIPT_DIR / "fuzz_helper.py"
+    crash_dir = DATA_DIR / "crash"
+    crash_dir.mkdir(parents=True, exist_ok=True)
+
+    for bug_id, buggy_commit, metadata in bug_tasks:
+        testcase = metadata["testcase"]
+        fuzzer = metadata["fuzzer"]
+        buggy_short = buggy_commit[:8]
+
+        # --- Crash ---
+        crash_file = crash_dir / f"target_crash-{buggy_short}-{testcase}.txt"
+        if not crash_file.exists():
+            logger.info("[%s] Collecting crash data at %s...", bug_id, buggy_short)
+            cmd = [
+                sys.executable, str(FUZZ_HELPER),
+                "collect_crash", args.target, fuzzer,
+                "--commit", buggy_commit,
+                "--testcases", args.testcases_dir,
+                "--test_input", testcase,
+            ]
+            if args.build_csv:
+                cmd += ["--build_csv", args.build_csv]
+            if args.runner_image:
+                cmd += ["--runner-image", args.runner_image]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning("[%s] collect_crash failed (exit %d)", bug_id, result.returncode)
+            elif crash_file.exists():
+                logger.info("[%s] Crash data collected: %s", bug_id, crash_file)
+
+        # --- Trace ---
+        trace_file = DATA_DIR / f"target_trace-{buggy_short}-{testcase}.txt"
+        if not trace_file.exists():
+            logger.info("[%s] Collecting trace data at %s...", bug_id, buggy_short)
+            cmd = [
+                sys.executable, str(FUZZ_HELPER),
+                "collect_trace", args.target, fuzzer,
+                "--commit", buggy_commit,
+                "--testcases", args.testcases_dir,
+                "--test_input", testcase,
+            ]
+            if args.build_csv:
+                cmd += ["--build_csv", args.build_csv]
+            if args.runner_image:
+                cmd += ["--runner-image", args.runner_image]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.warning("[%s] collect_trace failed (exit %d)", bug_id, result.returncode)
+            elif trace_file.exists():
+                logger.info("[%s] Trace data collected: %s", bug_id, trace_file)
 
 
 def _trigger_rank(status: str | None) -> int:
@@ -772,6 +835,12 @@ def main() -> int:
     # Generate fix diffs upfront so they exist even for --resume skipped bugs
     if repo_path:
         generate_fix_diffs(bug_tasks, repo_path)
+
+    # Pre-collect crash/trace data for all bugs (skips already-collected)
+    if not args.skip_collect:
+        collect_all_crash_trace_data(bug_tasks, args)
+    # Always skip per-bug collection since we handled it here
+    args.skip_collect = True
 
     # ------------------------------------------------------------------
     # Dry run

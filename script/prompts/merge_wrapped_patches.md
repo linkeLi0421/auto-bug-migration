@@ -1,7 +1,7 @@
 # Merge Dispatch-Wrapped Patches
 
 You are inside an OSS-Fuzz Docker container for project **{project}**.
-The source at `/src/{project}` is at commit `{target_commit}` with dispatch
+The source at `{source_dir}` is at commit `{target_commit}` with dispatch
 infrastructure already set up (`__bug_dispatch.h`, `__bug_dispatch.c`,
 the fuzz harness modified to read dispatch bytes, and
 `__bug_dispatch.h` copied into the harness source directory).

@@ -102,6 +102,20 @@ logger = logging.getLogger(__name__)
 if sys.version_info[0] >= 3:
   raw_input = input  # pylint: disable=invalid-name
 
+
+# Projects where the git repo directory differs from the project name.
+_SOURCE_REPO_MAP = {
+    'ghostscript': 'ghostpdl',
+    'php': 'php-src',
+}
+
+
+def _source_dir(project_name: str) -> str:
+  """Return the source directory path for a project inside the container."""
+  repo_name = _SOURCE_REPO_MAP.get(project_name, project_name)
+  return f'/src/{repo_name}'
+
+
 # pylint: disable=too-many-lines
 
 
@@ -2176,7 +2190,7 @@ def build_version(args):
   find /src -maxdepth 3 -name configure -type f | \
     xargs sed -i 's/-Werror//g' 2>/dev/null || true;
 
-  cd {workdir};
+  cd {_source_dir(args.project.name)};
   git checkout -f {args.commit};
 
   # Newer coreutils 'mv -fu' errors on same-file moves (e.g. mv X.h ./X.h).
@@ -2311,8 +2325,11 @@ def get_crash_log_bash(commit:str, args):
   if getattr(args, 'patch', None):
     patch_snippet = _strict_forward_patch_apply_snippet()
   workdir = _workdir_from_dockerfile(args.project)
+  # The git repo may be at /src/{project} even when WORKDIR is /src.
+  # Find it at runtime so git checkout lands in the right place.
+  gitdir = _source_dir(args.project.name)
   bash_crash = f'''
-    cd {workdir};
+    cd {gitdir};
     # Checkout base commit and set up environment
     git checkout -f {commit};
     {patch_snippet}
@@ -2324,13 +2341,21 @@ def get_crash_log_bash(commit:str, args):
     mkdir -p /data/crash;
 
     compile;
-    /out/{args.fuzzer_name} /corpus/{args.test_input} &> /data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
+    CRASH_FILE=/data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
+    for attempt in 1 2 3; do
+      /out/{args.fuzzer_name} -runs=10 /corpus/{args.test_input} &> "$CRASH_FILE";
+      if grep -qE 'SUMMARY:.*(Address|Memory|Undefined|Thread|Leak)Sanitizer' "$CRASH_FILE" 2>/dev/null; then
+        break;
+      fi;
+    done;
   '''
   return bash_crash
 
 
 def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
   workdir = _workdir_from_dockerfile(args.project)
+  # The git repo may be at /src/{project} even when WORKDIR is /src.
+  gitdir = _source_dir(args.project.name)
   bash_trace = f'''
     # cd /llvm/build && make install -j$(nproc) &> /dev/null && cd -;
     [ -f "/Function_instrument/libtrace.a" ] && rm /Function_instrument/libtrace.a;
@@ -2343,7 +2368,7 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
     export CXXFLAGS="${{CXXFLAGS:-}} -g -Wno-error -fno-inline-functions -finstrument-functions -Wno-unused-command-line-argument -L/Function_instrument -ltrace";
 
     # Checkout buggy commit and set up environment
-    cd {workdir};
+    cd {gitdir};
     git checkout -f {commit};
     {_strict_reverse_patch_apply_snippet() if args.patch and apply_patch else ''}
     cd -;
@@ -2422,7 +2447,7 @@ def get_runfuzzer_bash(args, allowlist_type):
     mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
 
-    cd {workdir};
+    cd {_source_dir(args.project.name)};
     git checkout -f {args.base_commit};
     {allowlist_cmd}
     python3 /script/add_revert_entries.py --commit {short_bc1} /allowlist.txt -o /allowlist.txt;
@@ -2446,10 +2471,10 @@ def get_cfg_bash(args):
     apt-get update && apt-get install -y bear;
     bear compile;
     cd /llvm/build ; make install -j$(nproc) &> /dev/null ; cd -;
-    cd {workdir};
-    git checkout -f {args.commit}; 
+    cd {_source_dir(args.project.name)};
+    git checkout -f {args.commit};
     cd -;
-    
+
     rm /cfg-clang/build -rf;
     mkdir /cfg-clang/build;
     cd /cfg-clang/build;
@@ -2816,7 +2841,7 @@ def get_poc_for_new_version(args):
     mkdir -p /tmpfolder;
     cp /corpus/{args.test_input} /tmpfolder/;
 
-    cd {_workdir};
+    cd {_source_dir(args.project.name)};
     git checkout -f {args.target_commit};
     cp /data/allowlist/allowlist-{short_bc}-{args.test_input}.txt /allowlist.txt;
     {_strict_reverse_patch_apply_snippet() if args.patch else ''}
@@ -2906,7 +2931,7 @@ def get_dict(args):
   workdir = _workdir_from_dockerfile(args.project)
   bash_getdict = f'''
     # Using afl to get fuzzing dictionary
-    cd {workdir};
+    cd {_source_dir(args.project.name)};
     git checkout -f {args.commit};
     cd /src;
     compile;

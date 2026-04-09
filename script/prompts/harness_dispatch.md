@@ -7,8 +7,8 @@ Modify the fuzz target to consume dispatch bytes from the input.
 I need to modify the fuzz target for project {project} to support
 an input-driven dispatch byte mechanism.
 
-The file __bug_dispatch.h is already at /src/{project}/__bug_dispatch.h
-and __bug_dispatch.c is at /src/{project}/__bug_dispatch.c.
+The file __bug_dispatch.h is already at {source_dir}/__bug_dispatch.h
+and __bug_dispatch.c is at {source_dir}/__bug_dispatch.c.
 
 Please make these changes:
 

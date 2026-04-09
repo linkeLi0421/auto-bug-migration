@@ -57,6 +57,18 @@ DATA_DIR = HOME_DIR / "data"
 PROMPTS_DIR = SCRIPT_DIR / "prompts"
 CONTAINER_TESTCASES_DIR = "/testcases"
 
+# Projects where the git repo directory differs from the project name.
+_SOURCE_REPO_MAP: dict[str, str] = {
+    "ghostscript": "ghostpdl",
+    "php": "php-src",
+}
+
+
+def _source_dir(project: str) -> str:
+    """Return the source directory path for a project inside the container."""
+    repo_name = _SOURCE_REPO_MAP.get(project, project)
+    return f"/src/{repo_name}"
+
 
 def _load_prompt(name: str, **kwargs: str) -> str:
     """Load a prompt template from script/prompts/ and format it.
@@ -339,7 +351,7 @@ def _annotate_diff_ownership(
     for fpath, blocks in file_blocks.items():
         blocks_repr = repr(blocks)
         script_lines.append(
-            f"annotate('/src/{project}/{fpath}', {blocks_repr}, "
+            f"annotate('{_source_dir(project)}/{fpath}', {blocks_repr}, "
             f"{marker_start!r}, {marker_end!r})"
         )
 
@@ -384,13 +396,14 @@ _MAX_STEP_RETRIES = 1
 def _inject_dispatch_files(
     container: str, project: str, dispatch_bytes: int = 1,
 ) -> None:
-    """Create __bug_dispatch.h and __bug_dispatch.c inside /src/{project}."""
+    """Create __bug_dispatch.h and __bug_dispatch.c in the source dir."""
     header = _DISPATCH_HEADER_TEMPLATE.format(dispatch_bytes=dispatch_bytes)
+    src = _source_dir(project)
     for fname, content in (("__bug_dispatch.h", header),
                            ("__bug_dispatch.c", _DISPATCH_SOURCE)):
         _exec_capture(
             container,
-            f"cat > /src/{project}/{fname} << 'DISPATCH_EOF'\n{content}DISPATCH_EOF",
+            f"cat > {src}/{fname} << 'DISPATCH_EOF'\n{content}DISPATCH_EOF",
         )
     logger.info("Injected __bug_dispatch.h/.c into /src/%s (bytes=%d)",
                 project, dispatch_bytes)
@@ -455,7 +468,8 @@ def _modify_harness_for_dispatch(
 
     setup_codex_creds(container)
 
-    prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer)
+    prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer,
+                          source_dir=_source_dir(project))
     agent_cmd = build_codex_command(prompt, model)
 
     logger.info("Invoking codex to modify harness for dispatch byte...")
@@ -465,7 +479,7 @@ def _modify_harness_for_dispatch(
                      ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("Build failed after harness modification")
         return False
@@ -679,7 +693,7 @@ def start_merge_container(
     _exec(container_name, "sudo git config --global --add safe.directory '*'")
 
     # Checkout target commit
-    _exec(container_name, f"cd /src/{project} && sudo git checkout -f {target_commit}", user="root")
+    _exec(container_name, f"cd {_source_dir(project)} && sudo git checkout -f {target_commit}", user="root")
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ 2>/dev/null || true", user="root")
 
     # Copy all testcases to /work from the staged testcase dir.
@@ -709,7 +723,7 @@ def start_merge_container(
     logger.info("Building address inside container...")
     _exec_capture(
         container_name,
-        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"cd {_source_dir(project)} && make clean 2>/dev/null; "
         f"rm -rf .obj *.a *.o 2>/dev/null; "
         f"rm -f /src/*.o 2>/dev/null; true",
     )
@@ -755,13 +769,13 @@ def try_apply_diff(container: str, diff_path: str, project: str) -> str:
     # Try clean apply
     ret, output = _exec_capture(
         container,
-        f"cd /src/{project} && git apply --check /tmp/{diff_name} 2>&1",
+        f"cd {_source_dir(project)} && git apply --check /tmp/{diff_name} 2>&1",
     )
     if ret == 0:
         # Apply cleanly
         ret2, _ = _exec_capture(
             container,
-            f"cd /src/{project} && git apply /tmp/{diff_name} 2>&1",
+            f"cd {_source_dir(project)} && git apply /tmp/{diff_name} 2>&1",
         )
         if ret2 == 0:
             return "clean"
@@ -769,7 +783,7 @@ def try_apply_diff(container: str, diff_path: str, project: str) -> str:
     # Try 3-way merge
     ret, output = _exec_capture(
         container,
-        f"cd /src/{project} && git apply --3way /tmp/{diff_name} 2>&1",
+        f"cd {_source_dir(project)} && git apply --3way /tmp/{diff_name} 2>&1",
     )
     if ret == 0:
         return "3way"
@@ -836,6 +850,7 @@ def resolve_conflict_with_agent(
         project=project, applied_list=applied_list, diff_name=diff_name,
         bug_id=bug_id, conflict_desc=conflict_desc,
         dispatch_byte=dispatch_bit // 8, dispatch_bit=dispatch_bit % 8,
+        source_dir=_source_dir(project),
     )
     if feedback:
         prompt += (
@@ -854,7 +869,7 @@ def resolve_conflict_with_agent(
         return "failed"
 
     # Verify it compiles
-    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after conflict resolution", bug_id)
         return "failed"
@@ -946,7 +961,7 @@ def resolve_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after dispatch resolution", bug_id)
         return False
@@ -964,7 +979,7 @@ def _stage_untracked_source(container: str, project: str) -> None:
     """
     _exec_capture(
         container,
-        f"cd /src/{project} && "
+        f"cd {_source_dir(project)} && "
         f"git ls-files --others --exclude-standard "
         f"'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
         f"| grep -v -e 'CMakeFiles/' -e '\\.obj/' -e '^build/' "
@@ -1013,7 +1028,7 @@ def _save_step_diff(
     step_dir.mkdir(parents=True, exist_ok=True)
     _stage_untracked_source(container, project)
     _, diff_text = _exec_capture(
-        container, f"cd /src/{project} && git diff",
+        container, f"cd {_source_dir(project)} && git diff",
     )
     step_file = step_dir / f"step_{step_index+1:02d}_{bug_id}_{suffix}.diff"
     step_file.write_text(diff_text)
@@ -1117,7 +1132,7 @@ def _save_source_snapshot(container: str, project: str) -> None:
     _stage_untracked_source(container, project)
     _exec_capture(
         container,
-        f"cd /src/{project} && git diff > /tmp/_snap.diff 2>&1",
+        f"cd {_source_dir(project)} && git diff > /tmp/_snap.diff 2>&1",
     )
 
 
@@ -1137,24 +1152,24 @@ def _revert_and_rebuild(
     # Discard failed step's changes and clean up intent-to-add entries
     _exec_capture(
         container,
-        f"cd /src/{project} && git checkout -- . 2>&1",
+        f"cd {_source_dir(project)} && git checkout -- . 2>&1",
     )
     _exec_capture(
         container,
-        f"cd /src/{project} && git reset 2>&1",
+        f"cd {_source_dir(project)} && git reset 2>&1",
     )
     _exec_capture(
         container,
-        f"cd /src/{project} && git clean -fd 2>&1",
+        f"cd {_source_dir(project)} && git clean -fd 2>&1",
     )
     # Re-apply the snapshot diff (includes new files via intent-to-add)
     _exec_capture(
         container,
-        f"cd /src/{project} && git apply --allow-empty /tmp/_snap.diff 2>&1",
+        f"cd {_source_dir(project)} && git apply --allow-empty /tmp/_snap.diff 2>&1",
     )
     _exec_capture(
         container,
-        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"cd {_source_dir(project)} && make clean 2>/dev/null; "
         f"rm -rf .obj *.a *.o 2>/dev/null; "
         f"rm -f /src/*.o 2>/dev/null; true",
     )
@@ -1180,7 +1195,7 @@ def _rebuild_and_apply_dispatch(
     """Rebuild ASAN and re-apply dispatch bytes after code changes."""
     _exec_capture(
         container,
-        f"cd /src/{project} && make clean 2>/dev/null; "
+        f"cd {_source_dir(project)} && make clean 2>/dev/null; "
         f"rm -rf .obj *.a *.o 2>/dev/null; "
         f"rm -f /src/*.o 2>/dev/null; true",
     )
@@ -1282,7 +1297,7 @@ def resolve_self_trigger_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after self-trigger dispatch", bug_id)
         return False
@@ -1377,7 +1392,7 @@ def _diagnose_self_trigger_failure(
 
     # What the agent changed this attempt
     _, diff_stat = _exec_capture(
-        container, f"cd /src/{project} && git diff --stat 2>/dev/null",
+        container, f"cd {_source_dir(project)} && git diff --stat 2>/dev/null",
     )
 
     # Files the current bug's standalone patch touches
@@ -1450,7 +1465,7 @@ def _diagnose_regression(
     """
     # Get files the agent changed
     _, agent_names = _exec_capture(
-        container, f"cd /src/{project} && git diff --name-only 2>/dev/null",
+        container, f"cd {_source_dir(project)} && git diff --name-only 2>/dev/null",
     )
     agent_files = set(agent_names.strip().splitlines()) if agent_names else set()
 
@@ -1559,7 +1574,7 @@ def _stacks_match(reference: list[str], current: list[str], threshold: float = 0
     return ratio >= threshold
 
 
-_VERIFY_ATTEMPTS = 3
+_VERIFY_ATTEMPTS = 10
 
 
 def verify_bug_triggers(
@@ -1941,7 +1956,7 @@ def run_merge(args: argparse.Namespace) -> int:
             )
             ret, out = _exec_capture(
                 container,
-                f"cd /src/{project} && git apply /tmp/_resume.diff",
+                f"cd {_source_dir(project)} && git apply /tmp/_resume.diff",
             )
             if ret != 0:
                 logger.error("Failed to apply resume diff: %s", out[-500:] if out else "")
@@ -1986,7 +2001,7 @@ def run_merge(args: argparse.Namespace) -> int:
             logger.info("Rebuilding from restored state...")
             _exec_capture(
                 container,
-                f"cd /src/{project} && make clean 2>/dev/null; "
+                f"cd {_source_dir(project)} && make clean 2>/dev/null; "
                 f"rm -rf .obj *.a *.o 2>/dev/null; "
                 f"rm -f /src/*.o 2>/dev/null; true",
             )
@@ -2208,7 +2223,7 @@ def run_merge(args: argparse.Namespace) -> int:
                 last_build_output = ""
                 _exec_capture(
                     container,
-                    f"cd /src/{project} && make clean 2>/dev/null; "
+                    f"cd {_source_dir(project)} && make clean 2>/dev/null; "
                     f"rm -rf .obj *.a *.o 2>/dev/null; "
                     f"rm -f /src/*.o 2>/dev/null; true",
                 )
@@ -2542,7 +2557,7 @@ def run_merge(args: argparse.Namespace) -> int:
             # when we use plain `git diff` as fallback; for safety, include
             # all tracked changes if dispatch was used.
             _, all_diff = _exec_capture(
-                container, f"cd /src/{project} && git diff",
+                container, f"cd {_source_dir(project)} && git diff",
             )
             # Parse the full diff to find harness file(s)
             for line in all_diff.splitlines():
@@ -2552,18 +2567,18 @@ def run_merge(args: argparse.Namespace) -> int:
         if touched_files:
             file_args = " ".join(f"'{f}'" for f in sorted(touched_files))
             _, combined_diff = _exec_capture(
-                container, f"cd /src/{project} && git diff -- {file_args}",
+                container, f"cd {_source_dir(project)} && git diff -- {file_args}",
             )
         else:
             _, combined_diff = _exec_capture(
-                container, f"cd /src/{project} && git diff",
+                container, f"cd {_source_dir(project)} && git diff",
             )
         combined_diff_path = output_dir / "combined.diff"
         combined_diff_path.write_text(combined_diff)
         logger.info("Combined diff: %s (%d bytes)", combined_diff_path, len(combined_diff))
 
         # Also copy to /out inside container
-        _exec(container, f"cd /src/{project} && git diff > /out/combined.diff")
+        _exec(container, f"cd {_source_dir(project)} && git diff > /out/combined.diff")
 
         # Save dispatch-modified PoCs to output directory
         if dispatch_state["poc_bytes"]:

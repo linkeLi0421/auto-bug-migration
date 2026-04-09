@@ -2,7 +2,7 @@
 
 You are inside an OSS-Fuzz Docker container for project **{project}**.
 
-**IMPORTANT: Start by reading AGENTS.md** (`/src/{project}/AGENTS.md`). It contains shared
+**IMPORTANT: Start by reading AGENTS.md** (`{source_dir}/AGENTS.md`). It contains shared
 knowledge from previous bug transplant sessions -- format changes, validation checks,
 testcase patching recipes. Use it to avoid rediscovering things.
 
@@ -16,8 +16,8 @@ The bug triggers at the old commit but not at the new one.
 - `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt` -- original crash log
 - `/data/target_trace-{buggy_short}-{testcase_name}.txt` -- function trace from buggy commit{fix_diff_line}
 - `/work/{testcase_name}` -- PoC testcase (you may modify this)
-- `/src/{project}` -- source tree at `{target_commit}`
-- `/src/{project}/AGENTS.md` -- shared knowledge (read first, update when done)
+- `{source_dir}` -- source tree at `{target_commit}`
+- `{source_dir}/AGENTS.md` -- shared knowledge (read first, update when done)
 
 ## Commands
 
@@ -25,7 +25,7 @@ The bug triggers at the old commit but not at the new one.
 # Build (the ONLY valid build command -- never use make/gcc/cmake)
 # IMPORTANT: always delete the fuzzer binary before compile to force re-link.
 # Autotools/cmake may not re-link the fuzzer when only a library source changes.
-find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
 rm -f /out/{fuzzer_name}
 sudo -E compile
 
@@ -89,12 +89,12 @@ sudo -E compile
    ```bash
    # Save your work
    git stash
-   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
    rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should NOT crash. Then restore:
    git stash pop
-   find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+   find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
    rm -f /out/{fuzzer_name}
    sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should crash.
@@ -143,7 +143,7 @@ project-code transplant or minimal testcase adaptation.
 When the bug triggers, save BOTH the diff and the testcase:
 
 ```bash
-cd /src/{project} && git diff > /out/bug_transplant.diff
+cd {source_dir} && git diff > /out/bug_transplant.diff
 cp /work/{testcase_name} /out/{testcase_name}
 ```
 
@@ -151,7 +151,7 @@ If you modified the testcase, the copy is essential -- the original is still in 
 
 ## Update shared knowledge
 
-After finishing (success or failure), update `/src/{project}/AGENTS.md` with any
+After finishing (success or failure), update `{source_dir}/AGENTS.md` with any
 discoveries about the **target commit** that would help future bug transplants:
 
 - Target code structure (header layout, key structs, field offsets at the target commit)

@@ -7,7 +7,7 @@ You are inside an OSS-Fuzz Docker container for project **{project}**.
 Bug **{bug_id}** triggers with the current diff applied. Your job is to
 remove unnecessary changes until only the minimal set remains.
 
-The unminimized diff: `git diff` (already applied in `/src/{project}`)
+The unminimized diff: `git diff` (already applied in `{source_dir}`)
 Testcase: `/work/{testcase_name}` (may have been modified from original)
 Crash log for reference: `/data/crash/target_crash-{buggy_short}-{testcase_name}.txt`
 
@@ -16,7 +16,7 @@ Crash log for reference: `/data/crash/target_crash-{buggy_short}-{testcase_name}
 ```bash
 # IMPORTANT: always delete fuzzer binaries before compile to force re-link.
 # Autotools/cmake may not re-link the fuzzer when only a library source changes.
-find /src/{project} -name '{fuzzer_name}' -type f -executable -delete
+find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
 rm -f /out/{fuzzer_name}
 sudo -E compile
 /out/{fuzzer_name} /work/{testcase_name}
@@ -35,7 +35,7 @@ sudo -E compile
 4. Run the final set 3 times to confirm the crash is stable.
 5. Save:
    ```bash
-   cd /src/{project} && git diff > /out/bug_transplant.diff
+   cd {source_dir} && git diff > /out/bug_transplant.diff
    cp /work/{testcase_name} /out/{testcase_name}
    ```
 

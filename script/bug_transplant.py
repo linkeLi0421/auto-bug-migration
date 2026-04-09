@@ -136,6 +136,19 @@ def _run_quiet(cmd: list[str], label: str = "", **kwargs) -> int:
     return proc.returncode
 
 
+# Projects where the git repo directory differs from the project name.
+_SOURCE_REPO_MAP: dict[str, str] = {
+    "ghostscript": "ghostpdl",
+    "php": "php-src",
+}
+
+
+def _source_dir(project: str) -> str:
+    """Return the source directory path for a project inside the container."""
+    repo_name = _SOURCE_REPO_MAP.get(project, project)
+    return f"/src/{repo_name}"
+
+
 # ---------------------------------------------------------------------------
 # Phase 0: Collect crash and trace data
 # ---------------------------------------------------------------------------
@@ -240,7 +253,7 @@ def collect_fix_diff(args: argparse.Namespace) -> bool:
         diff_result = subprocess.run(
             ["git", "diff", args.buggy_commit, adjacent_commit],
             cwd=repo_path,
-            capture_output=True, text=True,
+            capture_output=True, encoding="utf-8", errors="replace",
         )
         diff_text = diff_result.stdout
     except Exception as exc:
@@ -427,6 +440,7 @@ def build_prompt(args: argparse.Namespace) -> str:
         fix_diff_line = ""
         adjacent_commit_hint = ""
 
+    source_dir = getattr(args, "source_dir", None) or _source_dir(args.project)
     prompt = template.format(
         project=args.project,
         bug_id=args.bug_id,
@@ -438,6 +452,7 @@ def build_prompt(args: argparse.Namespace) -> str:
         fix_diff_line=fix_diff_line,
         adjacent_commit=adjacent_commit or "",
         adjacent_commit_hint=adjacent_commit_hint,
+        source_dir=source_dir,
     )
     return prompt
 
@@ -445,6 +460,7 @@ def build_prompt(args: argparse.Namespace) -> str:
 def _build_minimize_prompt(args: argparse.Namespace) -> str:
     """Read the minimize prompt template and fill in parameters."""
     template = MINIMIZE_TEMPLATE.read_text()
+    source_dir = getattr(args, "source_dir", None) or _source_dir(args.project)
     return template.format(
         project=args.project,
         bug_id=args.bug_id,
@@ -452,6 +468,7 @@ def _build_minimize_prompt(args: argparse.Namespace) -> str:
         target_commit=args.target_commit,
         testcase_name=args.testcase,
         fuzzer_name=args.fuzzer_name,
+        source_dir=source_dir,
     )
 
 
@@ -572,8 +589,18 @@ def create_shared_container(
 
     # Initial setup: git safe directory, checkout, credentials
     _exec(container_name, "git config --global --add safe.directory '*'", user="root")
-    _exec(container_name, f"cd /src/{project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
-    _exec(container_name, f"cd /src/{project} && git checkout -f {target_commit}", user="root")
+
+    # Detect actual git repo (may differ from project name, e.g. ghostscript → ghostpdl)
+    source_repo = _source_dir(project)
+    _exec(container_name, f"cd {source_repo} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
+    _exec(container_name, f"cd {source_repo} && git checkout -f {target_commit}", user="root")
+
+    # Symlink AGENTS.md into source repo so the agent finds it
+    if source_repo != f"/src/{project}":
+        _exec(container_name,
+              f"ln -sf /src/{project}/AGENTS.md {source_repo}/AGENTS.md 2>/dev/null || true",
+              user="root")
+
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
     # Setup codex credentials
@@ -618,8 +645,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
     shared_agents_dir = getattr(args, "agents_dir", None)
     agents_dir = Path(shared_agents_dir) if shared_agents_dir else setup_agents_dir(args)
     owns_agents_dir = shared_agents_dir is None
-
-    prompt = build_prompt(args)
 
     if not reuse_container:
         # --- Stop any existing container with the same name ---
@@ -701,10 +726,21 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # --- Checkout target commit inside container ---
         logger.info("Checking out target commit %s...", args.target_commit)
         _exec(container_name, "git config --global --add safe.directory '*'", user="root")
+        # Detect actual git repo (may differ from project name)
+        source_repo = _source_dir(args.project)
+        args.source_dir = source_repo
         # Clean build artifacts (cmake-generated Makefiles, .o files, etc.)
         # before checkout so they don't pollute the git diff later.
-        _exec(container_name, f"cd /src/{args.project} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
-        _exec(container_name, f"cd /src/{args.project} && git checkout -f {args.target_commit}", user="root")
+        _exec(container_name, f"cd {source_repo} && git clean -fdx -e AGENTS.md -e .codex/", user="root")
+        _exec(container_name, f"cd {source_repo} && git checkout -f {args.target_commit}", user="root")
+        # Symlink AGENTS.md into source repo so the agent finds it
+        if source_repo != f"/src/{args.project}":
+            _exec(container_name,
+                  f"ln -sf /src/{args.project}/AGENTS.md {source_repo}/AGENTS.md 2>/dev/null || true",
+                  user="root")
+
+        # --- Build prompt now that source_dir is known ---
+        prompt = build_prompt(args)
 
         # --- Copy testcase to /work for easier access ---
         _exec(
@@ -791,7 +827,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         )
         _, git_diff = _exec_capture(
             container_name,
-            f"cd /src/{args.project} && "
+            f"cd {source_repo} && "
             f"git diff HEAD -- . {_git_diff_excludes}",
         )
         diff_path.write_text(git_diff)
@@ -831,11 +867,11 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info("Rebuilding with official compile...")
             _exec_capture(
                 container_name,
-                f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                f"find {source_repo} -name '{fuzzer}' -type f -executable -delete; "
                 f"rm -f /out/{fuzzer}",
             )
             ret_build, build_out = _exec_capture(
-                container_name, "sudo -E compile 2>&1", timeout=300,
+                container_name, "cd /src && sudo -E compile 2>&1", timeout=300,
             )
             if ret_build != 0:
                 logger.error("Official compile failed after agent run")
@@ -925,12 +961,18 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     _usage_tracker.log_usage("minimize", min_output, getattr(args, "model", None))
                 logger.info("Minimization finished in %.0fs (exit %d)",
                             min_elapsed, min_exit)
-                (output_dir / "minimize_output.txt").write_text(min_output)
+                if codex_mode == "interactive":
+                    (output_dir / "minimize_output.txt").write_text(min_output)
+                else:
+                    (output_dir / "minimize_output.jsonl").write_text(min_output)
+                    (output_dir / "minimize_output.txt").write_text(
+                        _format_codex_output(min_output)
+                    )
 
                 # Re-save the (now minimized) diff via git diff
                 _, min_diff = _exec_capture(
                     container_name,
-                    f"cd /src/{args.project} && "
+                    f"cd {source_repo} && "
                     f"git diff HEAD -- . {_git_diff_excludes}",
                 )
                 diff_path.write_text(min_diff)
@@ -954,11 +996,11 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # stale binaries (autotools/cmake dependency tracking issue)
                 _exec_capture(
                     container_name,
-                    f"find /src/{args.project} -name '{fuzzer}' -type f -executable -delete; "
+                    f"find {source_repo} -name '{fuzzer}' -type f -executable -delete; "
                     f"rm -f /out/{fuzzer}",
                 )
                 ret_rebuild, _ = _exec_capture(
-                    container_name, "sudo -E compile 2>&1", timeout=300,
+                    container_name, "cd /src && sudo -E compile 2>&1", timeout=300,
                 )
                 if ret_rebuild != 0:
                     logger.warning("Post-minimize rebuild failed")
@@ -967,21 +1009,38 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "
                     f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
                 )
-                ret_fuzz2, fuzz_out2 = _exec_capture(
-                    container_name, verify_cmd, timeout=120)
-                has_crash2 = bool(re.search(
-                    r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
-                    fuzz_out2))
-                if has_crash2:
+                has_crash2 = False
+                crash_matches2 = False
+                for _min_attempt in range(3):
+                    ret_fuzz2, fuzz_out2 = _exec_capture(
+                        container_name, verify_cmd, timeout=120)
+                    has_crash2 = bool(re.search(
+                        r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
+                        fuzz_out2))
+                    if has_crash2:
+                        if original_crash_file.exists():
+                            crash_matches2 = _crash_stacks_match(
+                                orig_text, fuzz_out2)
+                        else:
+                            crash_matches2 = True
+                        if crash_matches2:
+                            break
+                        logger.warning(
+                            "Post-minimize attempt %d: crash is wrong bug, "
+                            "retrying...", _min_attempt + 1)
+                if has_crash2 and crash_matches2:
                     logger.info("Post-minimize verification PASSED")
                     crash_out_path.write_text(fuzz_out2)
+                elif has_crash2 and not crash_matches2:
+                    logger.warning("Post-minimize verification: crash is "
+                                   "WRONG BUG — keeping pre-minimize diff")
                 else:
                     logger.warning("Post-minimize verification FAILED — "
                                    "keeping pre-minimize diff")
                     # Restore the unminimized diff
                     _, pre_min_diff = _exec_capture(
                         container_name,
-                        f"cd /src/{args.project} && git diff")
+                        f"cd {source_repo} && git diff")
                     diff_path.write_text(pre_min_diff)
             elif has_crash and not crash_matches:
                 logger.error(
@@ -1016,8 +1075,9 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         if reuse_container:
             # Reused container — reset source for next bug but keep container
             logger.info("Resetting source tree for next bug...")
+            source_repo = _source_dir(args.project)
             _exec(container_name,
-                  f"cd /src/{args.project} && git checkout -f {args.target_commit} && "
+                  f"cd {source_repo} && git checkout -f {args.target_commit} && "
                   f"git clean -fdx -e AGENTS.md -e .codex/",
                   user="root")
         elif not args.keep_container:
@@ -1091,6 +1151,12 @@ def _crash_stacks_match(orig_text: str, new_text: str) -> bool:
     if orig_top3 and new_top3 and set(orig_top3) & set(new_top3):
         return True
 
+    # If the reference crash log has no usable data (e.g. build failed during
+    # collect_crash), accept any sanitizer crash rather than rejecting it.
+    if not orig_top3 and not _extract_crash_funcs(orig_text):
+        logger.info("Reference crash log has no stack data — accepting any sanitizer crash")
+        return True
+
     # Tier 2: same-vulnerability match
     orig_class, orig_dir = _extract_sanitizer_class(orig_text)
     new_class, new_dir = _extract_sanitizer_class(new_text)
@@ -1142,8 +1208,15 @@ def _crash_stacks_match(orig_text: str, new_text: str) -> bool:
     return True
 
 
+_CMD_OUTPUT_MAX_LINES = 30
+
+
 def _format_codex_output(jsonl_output: str) -> str:
-    """Convert codex --json JSONL output to a human-readable transcript."""
+    """Convert codex --json JSONL output to a human-readable transcript.
+
+    Command outputs are truncated to ``_CMD_OUTPUT_MAX_LINES`` (tail) to
+    keep the file readable.  Full output is always in the .jsonl file.
+    """
     import json as _json
     lines = []
     for raw in jsonl_output.splitlines():
@@ -1171,7 +1244,12 @@ def _format_codex_output(jsonl_output: str) -> str:
             lines.append(f"\n--- CMD (exit {code}) ---")
             lines.append(f"$ {cmd}")
             if out:
-                lines.append(out.rstrip())
+                out_lines = out.rstrip().splitlines()
+                if len(out_lines) > _CMD_OUTPUT_MAX_LINES:
+                    lines.append(f"[... {len(out_lines) - _CMD_OUTPUT_MAX_LINES} lines truncated ...]")
+                    lines.extend(out_lines[-_CMD_OUTPUT_MAX_LINES:])
+                else:
+                    lines.extend(out_lines)
     return "\n".join(lines) + "\n" if lines else jsonl_output
 
 
