@@ -125,7 +125,7 @@ def _run_quiet(cmd: list[str], label: str = "", **kwargs) -> int:
     """
     label = label or cmd[0]
     logger.info("Running: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    proc = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", **kwargs)
     combined = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         tail = "\n".join(combined.splitlines()[-30:])
@@ -392,7 +392,13 @@ def build_agent_image(project: str, project_image: str) -> str:
             && echo "agent ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \\
             && chown -R agent:agent /src/ /out/ /work/ || true
 
+        # Wrapper so the agent can call "compile" without sudo
+        # (codex CLI may block sudo even with --dangerously-bypass-approvals-and-sandbox)
+        RUN printf '#!/bin/bash\\ncd /src && exec sudo -E /usr/local/bin/compile "$@"\\n' \
+            > /home/agent/compile && chmod +x /home/agent/compile
+
         ENV HOME=/home/agent
+        ENV PATH="/home/agent:$PATH"
         USER agent
 
         WORKDIR /src/{project}
@@ -568,10 +574,6 @@ def create_shared_container(
     if cred_dir.exists():
         docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
 
-    api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
-    if api_key:
-        docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
-
     if env:
         for e in env:
             docker_run_cmd += ["-e", e]
@@ -692,11 +694,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         cred_dir = Path.home() / CODEX_CONFIG["credentials_dir"]
         if cred_dir.exists():
             docker_run_cmd += ["-v", f"{cred_dir}:/tmp/.agent-creds-src:ro"]
-
-        # Environment — pass API key if set (fallback for non-login mode)
-        api_key = os.environ.get(CODEX_CONFIG["api_key_env"], "")
-        if api_key:
-            docker_run_cmd += ["-e", f"{CODEX_CONFIG['api_key_env']}={api_key}"]
 
         # Additional user-specified env vars
         if args.env:
@@ -1212,10 +1209,10 @@ _CMD_OUTPUT_MAX_LINES = 30
 
 
 def _format_codex_output(jsonl_output: str) -> str:
-    """Convert codex --json JSONL output to a human-readable transcript.
+    """Convert codex --json JSONL output to agent-message-only summary.
 
-    Command outputs are truncated to ``_CMD_OUTPUT_MAX_LINES`` (tail) to
-    keep the file readable.  Full output is always in the .jsonl file.
+    Only keeps AGENT: messages (the reasoning/status updates).
+    Command outputs are omitted — full output is in the .jsonl file.
     """
     import json as _json
     lines = []
@@ -1230,26 +1227,12 @@ def _format_codex_output(jsonl_output: str) -> str:
         if ev.get("type") != "item.completed":
             continue
         item = ev.get("item", {})
-        itype = item.get("type", "")
-        if itype == "agent_message":
+        if item.get("type") == "agent_message":
             text = item.get("text", "")
             if text:
                 lines.append(f"\n{'='*60}")
                 lines.append(f"AGENT:")
                 lines.append(text)
-        elif itype == "command_execution":
-            cmd = item.get("command", "")
-            out = item.get("aggregated_output", "")
-            code = item.get("exit_code", "")
-            lines.append(f"\n--- CMD (exit {code}) ---")
-            lines.append(f"$ {cmd}")
-            if out:
-                out_lines = out.rstrip().splitlines()
-                if len(out_lines) > _CMD_OUTPUT_MAX_LINES:
-                    lines.append(f"[... {len(out_lines) - _CMD_OUTPUT_MAX_LINES} lines truncated ...]")
-                    lines.extend(out_lines[-_CMD_OUTPUT_MAX_LINES:])
-                else:
-                    lines.extend(out_lines)
     return "\n".join(lines) + "\n" if lines else jsonl_output
 
 
@@ -1271,7 +1254,8 @@ def _exec_capture(
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
         output = result.stdout + result.stderr

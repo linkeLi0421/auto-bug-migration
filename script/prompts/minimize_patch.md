@@ -18,7 +18,7 @@ Crash log for reference: `/data/crash/target_crash-{buggy_short}-{testcase_name}
 # Autotools/cmake may not re-link the fuzzer when only a library source changes.
 find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
 rm -f /out/{fuzzer_name}
-sudo -E compile
+compile
 /out/{fuzzer_name} /work/{testcase_name}
 ```
 
@@ -41,7 +41,7 @@ sudo -E compile
 
 ## Rules
 
-- NEVER build with make/gcc/cmake — only `sudo -E compile`.
+- NEVER build with make/gcc/cmake — only `compile`.
 - ALWAYS delete the fuzzer binary before compile (`rm -f /out/{fuzzer_name}`)
   to force re-linking. The build system may have broken dependency tracking.
 - Build and test after every revert.

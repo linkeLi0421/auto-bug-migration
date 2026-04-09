@@ -27,7 +27,7 @@ The bug triggers at the old commit but not at the new one.
 # Autotools/cmake may not re-link the fuzzer when only a library source changes.
 find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
 rm -f /out/{fuzzer_name}
-sudo -E compile
+compile
 
 # Test
 /out/{fuzzer_name} /work/{testcase_name}
@@ -91,12 +91,12 @@ sudo -E compile
    git stash
    find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
    rm -f /out/{fuzzer_name}
-   sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
+   compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should NOT crash. Then restore:
    git stash pop
    find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
    rm -f /out/{fuzzer_name}
-   sudo -E compile && /out/{fuzzer_name} /work/{testcase_name}
+   compile && /out/{fuzzer_name} /work/{testcase_name}
    # Should crash.
    ```
 
@@ -165,5 +165,5 @@ Only save what is true about the target commit's code.
 
 ## Rules
 
-- NEVER build with make/gcc/cmake -- only `sudo -E compile`.
+- NEVER build with make/gcc/cmake -- only `compile`.
 - Build and test after every change.

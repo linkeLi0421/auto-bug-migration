@@ -66,7 +66,7 @@ Strategy:
    ... your new code ...
    //BUG_END {bug_id}
 
-After making changes, run: sudo -E compile
+After making changes, run: compile
 If there are build errors, fix them.
 
 At the VERY END of your output, write exactly one of these tokens

@@ -16,7 +16,7 @@ Your job is to merge them all into one coherent codebase where:
 - Every patch's changes are present
 - Dispatch if/else blocks from different patches coexist (they use different bits)
 - `#include "__bug_dispatch.h"` appears once per file (not duplicated)
-- The code compiles with `sudo -E compile`
+- The code compiles with `compile`
 
 ## Patches
 
@@ -29,6 +29,6 @@ Your job is to merge them all into one coherent codebase where:
 - When two patches modify the same line, keep BOTH dispatch branches
   (they use different bits so they don't interfere)
 - If a patch adds `#include "__bug_dispatch.h"` and it already exists, skip the duplicate
-- Build after applying all patches: `sudo -E compile`
+- Build after applying all patches: `compile`
 - If build fails, fix the errors (usually missing includes or duplicate definitions)
 - Do NOT modify the dispatch logic — keep the exact if/else conditions from each patch

@@ -32,5 +32,5 @@ Please make these changes:
      and link it explicitly)
    - Or add it to CMakeLists.txt / Makefile
 
-After making changes, run: sudo -E compile
+After making changes, run: compile
 If there are build errors, fix them.

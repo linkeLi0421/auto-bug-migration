@@ -116,4 +116,4 @@ Local bugs (no dispatch bit) get byte value `0x00` prepended.
 - [ ] Struct type changes applied directly (no dispatch)
 - [ ] `#include "__bug_dispatch.h"` added where needed
 - [ ] Testcase has dispatch byte prepended
-- [ ] `sudo -E compile` succeeds after all changes
+- [ ] `compile` succeeds after all changes

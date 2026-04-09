@@ -506,7 +506,7 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
     docker_cmd = ["docker", "exec", container, "bash", "-c", cmd]
     try:
         result = subprocess.run(
-            docker_cmd, capture_output=True, text=True, timeout=timeout,
+            docker_cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
         )
         return result.returncode, result.stdout + result.stderr
     except subprocess.TimeoutExpired:
@@ -595,7 +595,7 @@ def _rebuild_project_image(project: str, target_commit: str,
         cmd += ["--build_csv", build_csv]
 
     logger.info("Building project image via fuzz_helper.py build_version --runner-image auto")
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         logger.error("fuzz_helper.py build_version failed (exit %d)", result.returncode)
         logger.error("Build output (last 40 lines):\n%s",

@@ -476,7 +476,8 @@ def run_single_bug(
             proc = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=args.timeout + 120 if args.timeout else 3720,
             )
             result["exit_code"] = proc.returncode
