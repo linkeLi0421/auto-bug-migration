@@ -811,6 +811,20 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 user="root",
             )
 
+        # Ghostscript: build.sh destructively does
+        #   rm -rf freetype && mv /src/freetype freetype
+        # which fails on repeated compiles.  Patch it to use cp instead of
+        # mv so /src/freetype survives across builds.
+        if args.project == "ghostscript":
+            _exec(
+                container_name,
+                r"""sed -i 's|^rm -rf freetype.*|rm -rf freetype 2>/dev/null; true|; """
+                r"""s|^rm -rf zlib.*|rm -rf zlib 2>/dev/null; true|; """
+                r"""s|^mv \$SRC/freetype freetype|if [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
+                "/src/build.sh",
+                user="root",
+            )
+
         # --- Copy testcase to /work for easier access ---
         _exec(
             container_name,
@@ -895,13 +909,20 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "':(exclude)*.d' ':(exclude)*.pc' ':(exclude)config.h' "
             "':(exclude)build/' ':(exclude)_build/'"
         )
+        # Ghostscript: build.sh replaces freetype/ and zlib/ with external
+        # copies and removes cups/libs/; exclude these build-script artifacts.
+        if args.project == "ghostscript":
+            _git_diff_excludes += (
+                " ':(exclude)freetype/' ':(exclude)zlib/' ':(exclude)cups/libs/'"
+            )
         _, git_diff = _exec_capture(
             container_name,
             f"cd {repo_dir_q} && "
             f"git diff HEAD -- . {_git_diff_excludes}",
         )
         diff_path.write_text(git_diff)
-        if git_diff.strip():
+        has_source_diff = bool(git_diff.strip())
+        if has_source_diff:
             logger.info("Source diff saved: %s (%d bytes)", diff_path, len(git_diff))
         else:
             logger.info("Diff is empty (testcase-only transplant or no changes)")
@@ -941,7 +962,9 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 f"rm -f /out/{fuzzer}",
             )
             ret_build, build_out = _exec_capture(
-                container_name, "cd /src && sudo -E compile 2>&1", timeout=300,
+                container_name,
+                "sudo -E compile 2>&1",
+                timeout=300,
             )
             if ret_build != 0:
                 logger.error("Official compile failed after agent run")
@@ -1010,6 +1033,21 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 crash_out_path.write_text(fuzz_out)
                 logger.info("Crash stack saved: %s", crash_out_path)
 
+                if not has_source_diff:
+                    logger.info("=== Minimization phase ===")
+                    logger.info("Skipping minimization: source diff is empty "
+                                "after post-agent verification")
+                    skip_output = (
+                        "Minimization skipped because the verified source diff is empty.\n"
+                        "This run produced a testcase-only transplant or no-op source "
+                        "transplant, so there is no patch to minimize.\n"
+                        "bug_transplant.diff intentionally remains empty.\n"
+                    )
+                    if codex_mode != "interactive":
+                        (output_dir / "minimize_output.jsonl").write_text(skip_output)
+                    (output_dir / "minimize_output.txt").write_text(skip_output)
+                    return exit_code
+
                 # --- Phase 2: Minimization (separate agent) ---
                 logger.info("=== Minimization phase ===")
                 minimize_prompt = _build_minimize_prompt(args)
@@ -1070,7 +1108,9 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     f"rm -f /out/{fuzzer}",
                 )
                 ret_rebuild, _ = _exec_capture(
-                    container_name, "cd /src && sudo -E compile 2>&1", timeout=300,
+                    container_name,
+                    "sudo -E compile 2>&1",
+                    timeout=300,
                 )
                 if ret_rebuild != 0:
                     logger.warning("Post-minimize rebuild failed")
@@ -1133,11 +1173,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     logger.info("Removed unverified diff: %s", diff_path)
                 return 1
 
-        # Agent failed — remove any partial diff
+        # Agent failed — keep the diff for manual inspection/recovery
         if exit_code != 0 and diff_path.exists():
-            diff_path.unlink()
-            logger.info("Agent failed (exit %d), removed partial diff: %s",
-                        exit_code, diff_path)
+            logger.warning("Agent failed (exit %d), keeping diff for review: %s",
+                           exit_code, diff_path)
 
         return exit_code
 
@@ -1318,10 +1357,16 @@ def _exec(container_name: str, command: str, user: str | None = None) -> int:
 
 
 def _exec_capture(
-    container_name: str, command: str, timeout: int = 3600,
+    container_name: str,
+    command: str,
+    timeout: int = 3600,
+    user: str | None = None,
 ) -> tuple[int, str]:
     """docker exec a command, capturing output."""
-    cmd = ["docker", "exec", container_name, "bash", "-c", command]
+    cmd = ["docker", "exec"]
+    if user:
+        cmd += ["-u", user]
+    cmd += [container_name, "bash", "-c", command]
     try:
         result = subprocess.run(
             cmd,

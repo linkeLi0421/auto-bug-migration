@@ -126,32 +126,77 @@ def find_adjacent_csv_commit(
     target_commit: str,
     repo_path: str,
 ) -> str | None:
-    """Return the first CSV commit after *buggy_commit* in the direction of
-    *target_commit*, by walking the git ancestry path and checking which
-    commits appear in the CSV.
+    """Return the first CSV commit between *buggy_commit* and *target_commit*,
+    walking from buggy toward target.
 
-    This gives the window [buggy_commit, adjacent) that most likely contains
-    the bug fix (or introduction), without scanning every individual git commit.
+    - Buggy older than target: returns the next newer CSV commit (likely
+      contains the fix — agent uses it to know what to revert).
+    - Buggy newer than target: returns the next older CSV commit (likely
+      contains the introduction — agent uses it to know what to apply).
+
+    Uses git ancestry path when possible.  Falls back to CSV row ordering
+    (time-based) when buggy and its CSV neighbors are on different branches.
     """
-    try:
-        result = subprocess.run(
-            ["git", "log",
-             f"{buggy_commit}..{target_commit}",
-             "--ancestry-path", "--reverse", "--format=%H"],
-            cwd=repo_path,
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            return None
-        ordered_commits = [c for c in result.stdout.strip().splitlines() if c]
-    except Exception as exc:
-        logger.debug("find_adjacent_csv_commit git log error: %s", exc)
+    # Try both directions: buggy→target and target→buggy.
+    # Exactly one will have a non-empty ancestry path.
+    for range_spec, reverse in [
+        (f"{buggy_commit}..{target_commit}", True),   # buggy older: oldest-first toward target
+        (f"{target_commit}..{buggy_commit}", False),   # buggy newer: newest-first toward target
+    ]:
+        try:
+            cmd = ["git", "log", range_spec,
+                   "--ancestry-path", "--format=%H"]
+            if reverse:
+                cmd.append("--reverse")
+            result = subprocess.run(
+                cmd, cwd=repo_path,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                continue
+            ordered_commits = [c for c in result.stdout.strip().splitlines() if c]
+        except Exception as exc:
+            logger.debug("find_adjacent_csv_commit git log error: %s", exc)
+            continue
+
+        if not ordered_commits:
+            continue
+
+        csv_commit_set = {row["commit_id"] for row in data}
+        for commit in ordered_commits:
+            if commit != buggy_commit and commit in csv_commit_set:
+                return commit
+        # Ancestry path exists but no CSV commit on it — fall through to
+        # CSV-order fallback below.
+        break
+
+    # Fallback: use CSV row ordering (newest-first).  Find the buggy row and
+    # pick the neighbor in the direction of the target.
+    buggy_idx = None
+    for i, row in enumerate(data):
+        if row["commit_id"] == buggy_commit:
+            buggy_idx = i
+            break
+    if buggy_idx is None:
         return None
 
-    csv_commit_set = {row["commit_id"] for row in data}
-    for commit in ordered_commits:
-        if commit in csv_commit_set:
-            return commit
+    # Determine direction: is buggy newer or older than target?
+    buggy_newer = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", target_commit, buggy_commit],
+        cwd=repo_path, capture_output=True,
+    ).returncode == 0
+
+    if buggy_newer:
+        # Buggy is newer → neighbor toward target is the next row (older, CSV is newest-first)
+        neighbor_idx = buggy_idx + 1
+    else:
+        # Buggy is older → neighbor toward target is the previous row (newer)
+        neighbor_idx = buggy_idx - 1
+
+    if 0 <= neighbor_idx < len(data):
+        return data[neighbor_idx]["commit_id"]
+    return None
+
     return None
 
 
@@ -391,9 +436,14 @@ def resolve_bug_metadata(
 # ---------------------------------------------------------------------------
 
 def is_bug_completed(project: str, bug_id: str) -> bool:
-    """Check if the output folder for this bug already exists."""
+    """Return True only for results that were fully verified already."""
     out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug_id}"
-    return out_dir.exists()
+    if not out_dir.exists():
+        return False
+    return _result_from_folder(project, bug_id)["status"] in {
+        "success",
+        "impossible",
+    }
 
 
 def run_single_bug(
@@ -566,10 +616,26 @@ def _result_from_folder(project: str, bug_id: str) -> dict:
     )
     has_crash = (out_dir / "transplant_crash.txt").exists()
     has_testcase = any(out_dir.glob("testcase-*"))
-    if has_diff and (has_crash or has_testcase):
+    if has_crash:
         return {"bug_id": bug_id, "status": "success"}
+    if has_diff and has_testcase:
+        return {
+            "bug_id": bug_id,
+            "status": "failed",
+            "reason": "diff and testcase but no verified crash",
+        }
     if has_diff:
-        return {"bug_id": bug_id, "status": "failed", "reason": "diff but no crash/testcase"}
+        return {
+            "bug_id": bug_id,
+            "status": "failed",
+            "reason": "diff but no verified crash",
+        }
+    if has_testcase:
+        return {
+            "bug_id": bug_id,
+            "status": "failed",
+            "reason": "testcase but no verified crash",
+        }
     return {"bug_id": bug_id, "status": "failed", "reason": "no artifacts"}
 
 

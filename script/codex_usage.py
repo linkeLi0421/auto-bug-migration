@@ -91,26 +91,53 @@ class CodexUsageTracker:
         Returns the same dict shape as :meth:`parse`.
         """
         clean = _ANSI_RE.sub("", output)
+        number = r"\d[\d\s,]*"
 
         def _parse_num(s: str) -> int:
             """Strip thousands separators and convert to int."""
-            return int(re.sub(r"[\s,]", "", s))
+            normalized = re.sub(r"[\s,]", "", s)
+            if not normalized:
+                return 0
+            return int(normalized)
 
         total_in = 0
+        total_cached = 0
         total_out = 0
         cost = 0.0
 
-        # Look for token counts — various formats:
-        #   "12,345 input ... 4,567 output"
-        #   "input: 12345 ... output: 4567"
-        #   "Tokens: 12 345 input, 4 567 output"
-        m = re.search(
-            r"([\d\s,]+)\s*input.*?([\d\s,]+)\s*output",
-            clean, re.IGNORECASE,
-        )
-        if m:
-            total_in = _parse_num(m.group(1))
-            total_out = _parse_num(m.group(2))
+        # Look for token counts line by line. Requiring a leading digit avoids
+        # false positives such as matching the whitespace in "cached input".
+        token_patterns = [
+            re.compile(
+                rf"Tokens:\s*(?P<input>{number})\s*input\b"
+                rf"(?:.*?(?P<cached>{number})\s*cached input\b)?"
+                rf".*?(?P<output>{number})\s*output\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"\binput:\s*(?P<input>{number})\b.*?"
+                rf"\boutput:\s*(?P<output>{number})\b",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"(?P<input>{number})\s*input\b.*?"
+                rf"(?P<output>{number})\s*output\b",
+                re.IGNORECASE,
+            ),
+        ]
+        for line in clean.splitlines():
+            for pattern in token_patterns:
+                m = pattern.search(line)
+                if not m:
+                    continue
+                total_in = _parse_num(m.group("input"))
+                total_out = _parse_num(m.group("output"))
+                cached_group = m.groupdict().get("cached")
+                if cached_group:
+                    total_cached = _parse_num(cached_group)
+                break
+            if total_in or total_out or total_cached:
+                break
 
         # Look for cost: "$0.1234" or "cost: $1.23"
         m = re.search(r"\$\s*([\d.]+)", clean)
@@ -120,18 +147,21 @@ class CodexUsageTracker:
         # If we found tokens but no explicit cost, compute it
         if total_in + total_out > 0 and cost == 0.0:
             pricing = CODEX_PRICING.get(model or "", CODEX_PRICING_DEFAULT)
+            uncached_in = max(total_in - total_cached, 0)
             cost = (
-                total_in * pricing["input"] / 1_000_000
+                uncached_in * pricing["input"] / 1_000_000
+                + total_cached * pricing["cached_input"] / 1_000_000
                 + total_out * pricing["output"] / 1_000_000
             )
 
         self.input_tokens += total_in
+        self.cached_input_tokens += total_cached
         self.output_tokens += total_out
         self.cost += cost
 
         return {
             "input_tokens": total_in,
-            "cached_input_tokens": 0,
+            "cached_input_tokens": total_cached,
             "output_tokens": total_out,
             "cost": cost,
         }
@@ -141,20 +171,23 @@ class CodexUsageTracker:
 
         Tries JSONL parsing first; falls back to TUI regex extraction.
         """
-        u = self.parse(output, model)
-        if u["input_tokens"] == 0 and u["output_tokens"] == 0:
-            # JSONL parsing found nothing — try TUI output fallback
-            u = self.parse_tui_output(output, model)
-        if u["input_tokens"] == 0 and u["output_tokens"] == 0:
-            return
-        logger.info(
-            "[%s] Tokens: %d in (%d cached) + %d out = %d total  |  "
-            "Cost: $%.4f  |  Session total: $%.4f",
-            label,
-            u["input_tokens"], u["cached_input_tokens"], u["output_tokens"],
-            u["input_tokens"] + u["output_tokens"],
-            u["cost"], self.cost,
-        )
+        try:
+            u = self.parse(output, model)
+            if u["input_tokens"] == 0 and u["output_tokens"] == 0:
+                # JSONL parsing found nothing — try TUI output fallback
+                u = self.parse_tui_output(output, model)
+            if u["input_tokens"] == 0 and u["output_tokens"] == 0:
+                return
+            logger.info(
+                "[%s] Tokens: %d in (%d cached) + %d out = %d total  |  "
+                "Cost: $%.4f  |  Session total: $%.4f",
+                label,
+                u["input_tokens"], u["cached_input_tokens"], u["output_tokens"],
+                u["input_tokens"] + u["output_tokens"],
+                u["cost"], self.cost,
+            )
+        except Exception:
+            logger.warning("Failed to parse Codex usage for %s", label, exc_info=True)
 
     def log_session_total(self) -> None:
         """Log accumulated session totals if any cost was tracked."""
