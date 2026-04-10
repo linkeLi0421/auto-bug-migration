@@ -20,13 +20,14 @@ import argparse
 import json
 import logging
 import os
+import posixpath
 import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR.parent / "data"
@@ -89,6 +90,60 @@ def _apply_all_dispatch_bytes(container, dispatch_state):
             f"if os.path.exists('{CONTAINER_TESTCASES_DIR}/{testcase}') else -1; "
             f"d=open('/work/{testcase}','rb').read(); "
             f"open('/work/{testcase}','wb').write(d if len(d)!=orig else p+d)\"",
+        )
+
+
+def _resolve_host_testcase_bytes(
+    project: str,
+    bug: dict,
+    staged_dir: Path,
+) -> bytes | None:
+    """Return the host testcase bytes that should back `/work/<testcase>`."""
+    testcase_name = bug.get("testcase", f"testcase-{bug['bug_id']}")
+    explicit_patched = bug.get("patched_testcase")
+    if explicit_patched and Path(explicit_patched).is_file():
+        return Path(explicit_patched).read_bytes()
+
+    out_dir = DATA_DIR / "bug_transplant" / f"{project}_{bug['bug_id']}"
+    if out_dir.exists():
+        for tc in out_dir.glob(f"{testcase_name}*"):
+            if tc.is_file() and tc.stat().st_size > 0:
+                return tc.read_bytes()
+
+    staged_path = staged_dir / testcase_name
+    if staged_path.is_file():
+        return staged_path.read_bytes()
+    return None
+
+
+def _restore_testcases_with_dispatch(
+    container: str,
+    project: str,
+    bugs: list[dict],
+    staged_dir: Path,
+    dispatch_state: dict,
+) -> None:
+    """Restore testcases and always write the exact dispatch-prefixed bytes.
+
+    The generic size-based idempotence check breaks when a bug's minimized
+    testcase differs in size from the original staged testcase. In that case
+    it wrongly assumes dispatch bytes are already present and skips prefixing,
+    so the bug-specific gate never turns on during verification.
+    """
+    nbytes = dispatch_state.get("dispatch_bytes", 1)
+    for bug in bugs:
+        testcase_name = bug.get("testcase", f"testcase-{bug['bug_id']}")
+        payload = _resolve_host_testcase_bytes(project, bug, staged_dir)
+        if payload is None:
+            continue
+        prefix = dispatch_state["poc_bytes"][bug["bug_id"]].to_bytes(nbytes, "little")
+        subprocess.run(
+            ["docker", "exec", "-i", container,
+             "bash", "-c", f"cat > /work/{testcase_name}"],
+            input=prefix + payload,
+            timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False,
         )
 from bug_transplant import (
     CODEX_CONFIG, setup_codex_creds, build_codex_command, _exec_interactive,
@@ -206,6 +261,29 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
 _MAX_WRAP_RETRIES = 1
 
 
+def _patch_build_sh_make_tolerant(content: str) -> str:
+    """Replace bare ``make`` with ``make -k || true`` + fuzz target check.
+
+    Dispatch-wrapped library sources reference ``__bug_dispatch`` which is
+    only linked into fuzz targets.  Non-fuzzer binaries (e.g. ndpiReader)
+    will fail to link — but that's harmless.  ``make -k || true`` lets the
+    build continue past those failures, and the fuzz-target existence
+    check ensures we catch real compilation errors.
+    """
+    lines = content.splitlines(keepends=True)
+    patched: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        # Match bare "make" or "make -jN" / "make -j$(nproc)" but not
+        # "make install", "make -C subdir", "make clean", etc.
+        if re.match(r'^make\s*(-j\S*)?\s*$', stripped):
+            indent = line[:len(line) - len(line.lstrip())]
+            patched.append(f"{indent}{stripped} -k 2>&1 || true\n")
+        else:
+            patched.append(line)
+    return "".join(patched)
+
+
 def _save_build_sh(container: str, output_dir: Path) -> None:
     """Snapshot /src/build.sh so it can be restored on resume.
 
@@ -216,6 +294,7 @@ def _save_build_sh(container: str, output_dir: Path) -> None:
     ret, content = _exec_capture(container, "cat /src/build.sh 2>/dev/null")
     if ret != 0:
         return
+    content = _patch_build_sh_make_tolerant(content)
     dst = output_dir / "harness_build.sh"
     dst.write_text(content)
     logger.info("Saved /src/build.sh (%d bytes) to %s", len(content), dst)
@@ -226,7 +305,7 @@ def _restore_build_sh(container: str, output_dir: Path) -> None:
     src = output_dir / "harness_build.sh"
     if not src.exists():
         return
-    content = src.read_text()
+    content = _patch_build_sh_make_tolerant(src.read_text())
     _exec_capture(
         container,
         f"cat > /src/build.sh << 'BUILDEOF'\n{content}BUILDEOF",
@@ -263,6 +342,78 @@ def _inject_dispatch_deps_fixer(container: str) -> None:
     )
 
 
+_MAKEFILE_SOURCES_RE = re.compile(r"^\s*[\w@.-]+_SOURCES\s*(?:\+?=|:=)")
+
+
+def _container_write_text(container: str, path: str, content: str) -> bool:
+    """Write text into a file inside the running container."""
+    result = subprocess.run(
+        ["docker", "exec", "-i", container, "bash", "-c", f"cat > {shlex.quote(path)}"],
+        input=content.encode("utf-8"),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        timeout=30,
+    )
+    if result.returncode == 0:
+        return True
+    logger.warning(
+        "Failed to write %s inside %s: %s",
+        path, container, result.stderr.decode("utf-8", errors="replace")[-200:],
+    )
+    return False
+
+
+def _iter_makefile_source_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    """Return inclusive line ranges for ``*_SOURCES`` assignments."""
+    blocks: list[tuple[int, int]] = []
+    i = 0
+    while i < len(lines):
+        if not _MAKEFILE_SOURCES_RE.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        while lines[i].rstrip().endswith("\\") and i + 1 < len(lines):
+            i += 1
+        blocks.append((start, i))
+        i += 1
+    return blocks
+
+
+def _patch_makefile_dispatch_source(
+    content: str,
+    source_markers: set[str],
+) -> tuple[str, bool]:
+    """Add ``$(top_srcdir)/__bug_dispatch.c`` to matching Makefile blocks."""
+    lines = content.splitlines()
+    changed = False
+
+    for marker in sorted(source_markers):
+        marker_name = PurePosixPath(marker).name
+        for start, end in _iter_makefile_source_blocks(lines):
+            block = lines[start:end + 1]
+            block_text = "\n".join(block)
+            if "__bug_dispatch.c" in block_text:
+                if marker in block_text or marker_name in block_text:
+                    break
+                continue
+            if marker not in block_text and marker_name not in block_text:
+                continue
+
+            if start == end and not lines[end].rstrip().endswith("\\"):
+                lines[start] = f"{lines[start]} $(top_srcdir)/__bug_dispatch.c"
+            else:
+                if not lines[end].rstrip().endswith("\\"):
+                    lines[end] = f"{lines[end]} \\"
+                lines.insert(end + 1, "\t$(top_srcdir)/__bug_dispatch.c")
+            changed = True
+            break
+
+    new_content = "\n".join(lines)
+    if content.endswith("\n"):
+        new_content += "\n"
+    return new_content, changed
+
+
 def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
     """Ensure __bug_dispatch.c is compiled into libraries, not just fuzzers.
 
@@ -273,42 +424,64 @@ def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
     Makefile.am that builds a library whose sources were patched and
     adds __bug_dispatch.c to it.
     """
-    # Find all Makefile.am files in directories containing patched sources
-    # that reference __bug_dispatch.
+    # Find all source files that reference __bug_dispatch after wrapping.
     ret, out = _exec_capture(
         container,
         f"cd {_source_dir(project)} && "
-        f"grep -rl '__bug_dispatch' --include='*.c' --include='*.h' "
-        f"src/ 2>/dev/null | "
-        f"xargs -I{{}} dirname {{}} | sort -u",
+        "git grep -l '__bug_dispatch' -- '*.c' '*.cc' '*.cpp' '*.cxx' "
+        "':(exclude)__bug_dispatch.c' 2>/dev/null",
     )
     if ret != 0 or not out.strip():
         return
 
-    for src_dir in out.strip().splitlines():
-        src_dir = src_dir.strip()
-        if not src_dir:
-            continue
-        # Check if this directory has a Makefile.am with a _la_SOURCES
-        ret2, makefile = _exec_capture(
-            container,
-            f"cat {_source_dir(project)}/{src_dir}/Makefile.am 2>/dev/null",
-        )
-        if ret2 != 0 or "__bug_dispatch" in makefile:
-            continue  # already has it or no Makefile.am
-        if "_la_SOURCES" not in makefile:
-            continue  # not a library
+    repo_root = PurePosixPath(_source_dir(project))
+    makefile_cache: dict[str, str] = {}
+    makefile_sources: dict[str, set[str]] = {}
 
-        # Add __bug_dispatch.c after the first _la_SOURCES line
-        makefile_path = f"{_source_dir(project)}/{src_dir}/Makefile.am"
-        _exec_capture(
-            container,
-            f"awk 'NR==1{{found=0}} /_la_SOURCES/&&!found{{"
-            f"print; print \"\\t$(top_srcdir)/__bug_dispatch.c \\\\\"; "
-            f"found=1; next}} 1' {makefile_path} > {makefile_path}.tmp "
-            f"&& mv {makefile_path}.tmp {makefile_path}",
+    for rel_source in out.strip().splitlines():
+        rel_source = rel_source.strip()
+        if not rel_source:
+            continue
+
+        source_path = PurePosixPath(rel_source)
+        for parent in source_path.parents:
+            makefile_rel = (
+                PurePosixPath("Makefile.am")
+                if str(parent) == "."
+                else parent / "Makefile.am"
+            )
+            makefile_rel_str = makefile_rel.as_posix()
+            makefile_abs = (repo_root / makefile_rel).as_posix()
+            if makefile_rel_str not in makefile_cache:
+                ret2, makefile = _exec_capture(
+                    container,
+                    f"cat {shlex.quote(makefile_abs)} 2>/dev/null",
+                )
+                if ret2 != 0:
+                    continue
+                makefile_cache[makefile_rel_str] = makefile
+            makefile = makefile_cache[makefile_rel_str]
+            if "_SOURCES" not in makefile:
+                continue
+
+            parent_dir = "." if str(parent) == "." else parent.as_posix()
+            rel_from_makefile = posixpath.relpath(source_path.as_posix(), parent_dir)
+            if rel_from_makefile not in makefile and source_path.name not in makefile:
+                continue
+
+            makefile_sources.setdefault(makefile_rel_str, set()).add(rel_from_makefile)
+            break
+
+    for makefile_rel, source_markers in sorted(makefile_sources.items()):
+        updated, changed = _patch_makefile_dispatch_source(
+            makefile_cache[makefile_rel],
+            source_markers,
         )
-        logger.info("Added __bug_dispatch.c to %s/Makefile.am", src_dir)
+        if not changed:
+            continue
+        makefile_abs = (repo_root / PurePosixPath(makefile_rel)).as_posix()
+        if _container_write_text(container, makefile_abs, updated):
+            logger.info("Added __bug_dispatch.c to %s", makefile_rel)
 
     _inject_dispatch_deps_fixer(container)
 
@@ -587,11 +760,19 @@ def wrap_bug_with_dispatch(
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
         return False, output
 
-    # Verify build
+    # Verify build — clear /out/ first so we only see freshly built binaries.
+    _exec_capture(container, "rm -f /out/fuzz_* 2>/dev/null")
     ret, build_out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
-    if ret != 0:
-        logger.error("[%s] Build failed after wrapping", bug_id)
+    ret2, fuzz_bins = _exec_capture(container, "ls /out/fuzz_* 2>/dev/null")
+    if ret2 != 0 or not fuzz_bins.strip():
+        # Fuzz targets didn't build — real failure.
+        logger.error("[%s] Build failed after wrapping (fuzz targets missing)",
+                     bug_id)
+        logger.error("[%s] Build tail: %s",
+                     bug_id, build_out[-1000:] if build_out else "(no output)")
         return False, build_out
+    if ret != 0:
+        logger.warning("[%s] Compile had errors but fuzz targets built OK", bug_id)
 
     logger.info("[%s] Dispatch wrapping OK", bug_id)
     return True, output
@@ -684,6 +865,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 logger.error(out)
                 return 1
             _restore_build_sh(container, output_dir)
+            # If harness_build.sh was lost, re-save from container state.
+            if not (output_dir / "harness_build.sh").exists():
+                _save_build_sh(container, output_dir)
             _inject_dispatch_deps_fixer(container)
             ret, out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
             if ret != 0:
@@ -733,8 +917,9 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
                       "cp \"$f\" /out/address/; done; true")
         # Copy testcases (originals + patched)
-        _restore_testcases(container, project, all_bugs)
-        _apply_all_dispatch_bytes(container, dispatch_state)
+        _restore_testcases_with_dispatch(
+            container, project, all_bugs, testcase_stage_dir, dispatch_state,
+        )
 
         # Persist patched local testcases into this run's testcase dir before
         # local verification. Later restores will prefer these patched files.
@@ -742,7 +927,6 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             tc_name = bug["testcase"]
             staged_patched = testcase_stage_dir / f"{tc_name}-patched"
             if _save_work_testcase_to_host(container, tc_name, staged_patched):
-                bug["patched_testcase"] = str(staged_patched)
                 logger.info("[%s] Staged patched local testcase: %s",
                             bug["bug_id"], staged_patched)
 
@@ -816,6 +1000,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             # Reset source to the exact harness baseline, then apply only the
             # bug-specific wrapped delta on top of it.
             _restore_harness_baseline(container, project, harness_baseline_rev)
+            _restore_build_sh(container, output_dir)
 
             output = ""
             for attempt in range(_MAX_WRAP_RETRIES + 1):
@@ -845,6 +1030,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                                bug_id, attempt + 1)
                 # Reset for retry to the exact harness baseline.
                 _restore_harness_baseline(container, project, harness_baseline_rev)
+                _restore_build_sh(container, output_dir)
 
             if not step["success"]:
                 logger.error("[%s] FAILED after %d attempts, skipping",
@@ -985,15 +1171,17 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                       "cp \"$f\" /out/address/; done; true")
 
         # Restore testcases with dispatch bytes
-        _restore_testcases(container, project, all_bugs)
-        _apply_all_dispatch_bytes(container, dispatch_state)
+        _restore_testcases_with_dispatch(
+            container, project, all_bugs, testcase_stage_dir, dispatch_state,
+        )
 
         # ------------------------------------------------------------------
         # 9. Final verification
         # ------------------------------------------------------------------
         logger.info("\n=== Final verification ===")
-        _restore_testcases(container, project, all_bugs)
-        _apply_all_dispatch_bytes(container, dispatch_state)
+        _restore_testcases_with_dispatch(
+            container, project, all_bugs, testcase_stage_dir, dispatch_state,
+        )
 
         final_results = verify_all_bugs(container, all_bugs)
         triggered = sum(1 for v in final_results.values() if v)

@@ -75,9 +75,16 @@ OR your condition into the existing one — do NOT replace it:
 
 ### Struct / type changes
 
-Struct field type changes (e.g. `UWORD8` → `UWORD32`) cannot be
-dispatched at runtime. Apply them directly — the larger type is
-backward compatible.
+Struct layout is fixed at compile time — you cannot conditionally
+add or change fields with a runtime `if`. Apply these directly
+(no dispatch gating):
+
+- **Field type widening** (e.g. `UWORD8` → `UWORD32`): apply
+  directly — the larger type is backward compatible.
+- **New field additions**: add the field unconditionally — an extra
+  zero-initialized field is harmless. Then dispatch-wrap only the
+  **code that reads/writes** the new field (in `.c` files) using
+  the normal if/else pattern.
 
 ### Header includes
 
@@ -113,7 +120,7 @@ Local bugs (no dispatch bit) get byte value `0x00` prepended.
 - [ ] Both OLD and NEW code are preserved in if/else
 - [ ] Macros use ternary, not if/else
 - [ ] Existing macro ternaries are OR'd into, not replaced
-- [ ] Struct type changes applied directly (no dispatch)
+- [ ] Struct changes (type widening, new fields) applied directly (no dispatch)
 - [ ] `#include "__bug_dispatch.h"` added where needed
 - [ ] Testcase has dispatch byte prepended
 - [ ] `compile` succeeds after all changes

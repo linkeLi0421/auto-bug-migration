@@ -729,7 +729,7 @@ def start_merge_container(
     )
     ret, build_output = _exec_capture(
         container_name,
-        "sudo -E SANITIZER=address compile 2>&1",
+        "cd /src && sudo -E SANITIZER=address compile 2>&1",
         timeout=300,
     )
     if ret != 0:
@@ -1201,7 +1201,7 @@ def _rebuild_and_apply_dispatch(
     )
     _exec_capture(
         container,
-        "sudo -E SANITIZER=address compile 2>&1",
+        "cd /src && sudo -E SANITIZER=address compile 2>&1",
         timeout=300,
     )
     _exec_capture(
@@ -2007,7 +2007,7 @@ def run_merge(args: argparse.Namespace) -> int:
             )
             ret, bout = _exec_capture(
                 container,
-                "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                "cd /src && sudo -E SANITIZER=address compile 2>&1", timeout=300,
             )
             if ret != 0:
                 logger.error("Build failed for address after restore: %s",
