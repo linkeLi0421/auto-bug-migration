@@ -4,8 +4,9 @@
 Analyzes FuzzBench experiment results to determine which transplanted bugs
 were triggered by each fuzzer. Uses two data sources:
 
-1. Crash inputs from FuzzBench crash directories — reads dispatch bytes to
-   identify which bug was active when the crash occurred ("triggered").
+1. Crash logs from FuzzBench's SQLite database — matches stacktrace frames to
+   bug crash file/line/function and uses reference crash logs to disambiguate
+   bugs that share the same top frame.
 2. Coverage snapshots — checks if bug crash lines were covered ("reached").
 
 Outputs a CSV with per-bug discovery timeline for survival analysis.
@@ -23,6 +24,8 @@ import gzip
 import json
 import logging
 import os
+import re
+import sqlite3
 import struct
 import sys
 import tarfile
@@ -30,11 +33,162 @@ from collections import defaultdict
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+STACKTRACE_FRAME_RE = re.compile(
+    r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+in\s+(.+?)\s+(/src/[^:\n]+):(\d+)(?::\d+)?",
+    re.MULTILINE,
+)
+
+
+def bug_ids_with_crashes(crash_results: dict) -> set[str]:
+    """Return bug IDs observed in crash artifacts."""
+    return {bug_id for _, _, bug_id in crash_results}
 
 
 def load_bug_metadata(metadata_path: Path) -> dict:
     with open(metadata_path) as f:
-        return json.load(f)
+        bug_metadata = json.load(f)
+    bug_metadata["_metadata_path"] = str(metadata_path)
+    bug_metadata["_reference_frames"] = load_reference_crash_frames(
+        metadata_path, bug_metadata)
+    return bug_metadata
+
+
+def resolve_local_db_path(experiment_dir: Path) -> Path | None:
+    """Locate the experiment SQLite database."""
+    candidates = [experiment_dir / "local.db", experiment_dir.parent / "local.db"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def parse_stacktrace_frames(stacktrace_text: str) -> list[tuple[str, str, int]]:
+    """Parse stacktrace text into (function, file, line) frames."""
+    frames = []
+    for frame_match in STACKTRACE_FRAME_RE.finditer(stacktrace_text or ""):
+        function_name, filename, line = frame_match.groups()
+        frames.append((function_name, filename, int(line)))
+    return frames
+
+
+def load_reference_crash_frames(metadata_path: Path, bug_metadata: dict) -> dict[str, list[tuple[str, str, int]]]:
+    """Load parsed frames from benchmark reference crash logs if available."""
+    crashes_dir = metadata_path.parent / "crashes"
+    if not crashes_dir.exists():
+        return {}
+
+    reference_frames = {}
+    for bug_id in bug_metadata["bugs"]:
+        crash_txt = crashes_dir / f"{bug_id}.txt"
+        if not crash_txt.exists():
+            continue
+        try:
+            text = crash_txt.read_text(errors="replace")
+        except OSError:
+            continue
+
+        frames = parse_stacktrace_frames(text)
+        # Keep benchmark frames and the harness frame. Sanitizer/libfuzzer
+        # frames are usually identical across unrelated bugs and are not useful
+        # for disambiguation.
+        filtered_frames = [
+            frame for frame in frames
+            if "/src/opensc/" in frame[1]
+        ]
+        reference_frames[bug_id] = filtered_frames or frames
+
+    return reference_frames
+
+
+def _path_matches(actual_path: str, expected_path: str) -> bool:
+    return (
+        actual_path == expected_path
+        or actual_path.endswith(expected_path)
+        or expected_path.endswith(actual_path)
+    )
+
+
+def _bug_targets_from_metadata(bug_metadata: dict,
+                               relevant_bug_ids: set[str] | None = None
+                               ) -> list[tuple[str, str, int, str | None, list[tuple[str, str, int]]]]:
+    """Build bug crash targets as (bug_id, file, line, function, reference_frames)."""
+    targets = []
+    reference_frames_by_bug = bug_metadata.get("_reference_frames", {})
+    for bug_id, info in bug_metadata["bugs"].items():
+        if relevant_bug_ids is not None and bug_id not in relevant_bug_ids:
+            continue
+        crash_file = info.get("crash_file")
+        crash_line = info.get("crash_line")
+        if not crash_file or crash_line is None:
+            continue
+        targets.append((
+            bug_id,
+            crash_file,
+            int(crash_line),
+            info.get("crash_function"),
+            reference_frames_by_bug.get(bug_id, []),
+        ))
+    return targets
+
+
+def _match_bug_ids_in_stacktrace(crash_stacktrace: str,
+                                 bug_targets: list[tuple[str, str, int, str | None, list[tuple[str, str, int]]]]
+                                 ) -> set[str]:
+    """Match bug IDs by stacktrace frame file/line and optional function."""
+    frames = parse_stacktrace_frames(crash_stacktrace)
+    candidates = []
+    for bug_id, crash_file, crash_line, crash_function, reference_frames in bug_targets:
+        for function_name, filename, line in frames:
+            if line != crash_line or not _path_matches(filename, crash_file):
+                continue
+            if crash_function and function_name != crash_function:
+                continue
+            candidates.append((bug_id, crash_file, crash_line, crash_function, reference_frames))
+            break
+
+    if len(candidates) <= 1:
+        return {candidate[0] for candidate in candidates}
+
+    scored_candidates = []
+    for bug_id, crash_file, crash_line, crash_function, reference_frames in candidates:
+        score = 0
+        for ref_function, ref_file, ref_line in reference_frames:
+            if ref_line == crash_line and _path_matches(ref_file, crash_file):
+                if crash_function is None or ref_function == crash_function:
+                    continue
+            for function_name, filename, line in frames:
+                if line != ref_line or function_name != ref_function:
+                    continue
+                if not _path_matches(filename, ref_file):
+                    continue
+                score += 1
+                break
+        scored_candidates.append((bug_id, score))
+
+    best_score = max(score for _, score in scored_candidates)
+    if best_score <= 0:
+        return {bug_id for bug_id, _ in scored_candidates}
+    return {bug_id for bug_id, score in scored_candidates if score == best_score}
+
+
+def load_snapshot_times_by_trial(db_path: Path | None) -> dict[str, list[int]]:
+    """Load snapshot.time values keyed by trial id."""
+    if db_path is None or not db_path.exists():
+        return {}
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            "select trial_id, time from snapshot order by trial_id, time"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    snapshot_times = defaultdict(list)
+    for trial_id, snapshot_time in rows:
+        snapshot_times[str(trial_id)].append(int(snapshot_time))
+    return dict(snapshot_times)
 
 
 def dispatch_bytes_to_bug_ids(dispatch_bytes_data: bytes, bug_metadata: dict) -> list:
@@ -183,48 +337,44 @@ def scan_corpus_snapshots(experiment_dir: Path, benchmark: str,
 
 def scan_crash_dirs(experiment_dir: Path, benchmark: str,
                     bug_metadata: dict) -> dict:
-    """Scan FuzzBench crash directories for triggered bugs.
+    """Scan FuzzBench crash logs for triggered bugs.
 
     Returns:
         dict: {(fuzzer, trial_id, bug_id): earliest_timestamp_seconds}
     """
     results = {}
-    fuzzer_dirs = _find_fuzzer_dirs(experiment_dir, benchmark)
-    if not fuzzer_dirs:
+    db_path = resolve_local_db_path(experiment_dir)
+    if db_path is None:
+        logger.warning("local.db not found for %s; cannot match crashes by crash log", experiment_dir)
         return results
 
-    n_dispatch = bug_metadata["dispatch_bytes"]
+    bug_targets = _bug_targets_from_metadata(bug_metadata)
+    if not bug_targets:
+        logger.info("No crash targets in bug metadata; skipping crash scan")
+        return results
 
-    for fuzzer_name, fuzzer_path in fuzzer_dirs:
-        for trial_dir in sorted(fuzzer_path.iterdir()):
-            if not trial_dir.is_dir():
-                continue
-            trial_id = trial_dir.name.split("-")[-1] if "-" in trial_dir.name else trial_dir.name
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        rows = cur.execute(
+            """
+            select trial.fuzzer, trial.id, crash.time, crash.crash_stacktrace
+            from crash
+            join trial on crash.trial_id = trial.id
+            where trial.benchmark = ? and trial.preempted = 0
+            order by crash.time, trial.id
+            """,
+            (benchmark,),
+        ).fetchall()
+    finally:
+        conn.close()
 
-            crashes_dir = trial_dir / "crashes"
-            if not crashes_dir.exists():
-                continue
-
-            for crash_file in sorted(crashes_dir.iterdir()):
-                if not crash_file.is_file():
-                    continue
-                try:
-                    data = crash_file.read_bytes()
-                except OSError:
-                    continue
-
-                if len(data) < n_dispatch:
-                    continue
-
-                crash_time = int(crash_file.stat().st_mtime)
-
-                active_bugs = dispatch_bytes_to_bug_ids(
-                    data[:n_dispatch], bug_metadata)
-
-                for bug_id in active_bugs:
-                    key = (fuzzer_name, trial_id, bug_id)
-                    if key not in results or crash_time < results[key]:
-                        results[key] = crash_time
+    for fuzzer_name, trial_id, crash_time, crash_stacktrace in rows:
+        matched_bug_ids = _match_bug_ids_in_stacktrace(crash_stacktrace or "", bug_targets)
+        for bug_id in matched_bug_ids:
+            key = (fuzzer_name, str(trial_id), bug_id)
+            if key not in results or int(crash_time) < results[key]:
+                results[key] = int(crash_time)
 
     return results
 
@@ -252,7 +402,9 @@ def _parse_llvm_coverage(coverage_path: Path) -> dict:
 
 
 def scan_coverage_for_bugs(experiment_dir: Path, benchmark: str,
-                           bug_metadata: dict) -> dict:
+                           bug_metadata: dict,
+                           relevant_bug_ids: set[str] | None = None,
+                           crash_results: dict | None = None) -> dict:
     """Scan FuzzBench coverage snapshots to determine when bug crash lines were reached.
 
     Uses crash_file/crash_line from bug_metadata to check if the bug's crash
@@ -263,9 +415,15 @@ def scan_coverage_for_bugs(experiment_dir: Path, benchmark: str,
     """
     results = {}
 
+    if relevant_bug_ids is not None and not relevant_bug_ids:
+        logger.info("No crash-mapped bugs to check in coverage; skipping coverage scan")
+        return results
+
     # Build lookup: normalize file paths and collect bugs with crash line info
     bug_crash_lines = {}  # bug_id -> (file_suffix, line)
     for bug_id, info in bug_metadata["bugs"].items():
+        if relevant_bug_ids is not None and bug_id not in relevant_bug_ids:
+            continue
         crash_file = info.get("crash_file")
         crash_line = info.get("crash_line")
         if crash_file and crash_line:
@@ -275,12 +433,40 @@ def scan_coverage_for_bugs(experiment_dir: Path, benchmark: str,
         logger.info("No bugs have crash line info; skipping coverage scan")
         return results
 
-    logger.info("Checking coverage for %d bugs with crash lines", len(bug_crash_lines))
+    logger.info("Checking coverage for %d relevant bugs with crash lines",
+                len(bug_crash_lines))
+
+    triggered_bug_ids_by_trial = defaultdict(set)
+    if crash_results:
+        for fuzzer_name, trial_id, bug_id in crash_results:
+            if bug_id in bug_crash_lines:
+                triggered_bug_ids_by_trial[(fuzzer_name, trial_id)].add(bug_id)
 
     fuzzer_dirs = _find_fuzzer_dirs(experiment_dir, benchmark)
     if not fuzzer_dirs:
         return results
+    snapshot_times_by_trial = load_snapshot_times_by_trial(resolve_local_db_path(experiment_dir))
 
+    total_coverage_archives = 0
+    for fuzzer_name, fuzzer_path in fuzzer_dirs:
+        for trial_dir in sorted(fuzzer_path.iterdir()):
+            if not trial_dir.is_dir():
+                continue
+            trial_id = trial_dir.name.split("-")[-1] if "-" in trial_dir.name else trial_dir.name
+            coverage_dir = trial_dir / "coverage"
+            if not coverage_dir.exists():
+                continue
+            pending_bug_ids = set(bug_crash_lines) - triggered_bug_ids_by_trial.get(
+                (fuzzer_name, trial_id), set())
+            if not pending_bug_ids:
+                continue
+            coverage_files = [
+                cov_file for cov_file in coverage_dir.iterdir()
+                if cov_file.name.endswith(".json.gz")
+            ]
+            total_coverage_archives += len(coverage_files)
+
+    processed_archives = 0
     for fuzzer_name, fuzzer_path in fuzzer_dirs:
         for trial_dir in sorted(fuzzer_path.iterdir()):
             if not trial_dir.is_dir():
@@ -291,11 +477,38 @@ def scan_coverage_for_bugs(experiment_dir: Path, benchmark: str,
             if not coverage_dir.exists():
                 continue
 
-            for cov_file in sorted(coverage_dir.iterdir()):
-                if not cov_file.name.endswith(".json.gz"):
-                    continue
+            pending_bug_ids = set(bug_crash_lines) - triggered_bug_ids_by_trial.get(
+                (fuzzer_name, trial_id), set())
+            if not pending_bug_ids:
+                continue
 
-                snapshot_time = int(cov_file.stat().st_mtime)
+            coverage_files = sorted(
+                cov_file for cov_file in coverage_dir.iterdir()
+                if cov_file.name.endswith(".json.gz")
+            )
+            trial_snapshot_times = snapshot_times_by_trial.get(trial_id, [])
+            if trial_snapshot_times and len(trial_snapshot_times) == len(coverage_files):
+                coverage_time_pairs = list(zip(coverage_files, trial_snapshot_times))
+            else:
+                if trial_snapshot_times and len(trial_snapshot_times) != len(coverage_files):
+                    logger.warning(
+                        "Coverage archive count (%d) does not match snapshot count (%d) for %s trial %s; "
+                        "falling back to file mtimes",
+                        len(coverage_files), len(trial_snapshot_times), fuzzer_name, trial_id,
+                    )
+                coverage_time_pairs = [
+                    (cov_file, int(cov_file.stat().st_mtime))
+                    for cov_file in coverage_files
+                ]
+
+            for cov_file, snapshot_time in coverage_time_pairs:
+                if not pending_bug_ids:
+                    break
+
+                processed_archives += 1
+                if processed_archives % 250 == 0 or processed_archives == total_coverage_archives:
+                    logger.info("  Coverage scan progress: %d/%d archives",
+                                processed_archives, total_coverage_archives)
 
                 try:
                     file_coverage = _parse_llvm_coverage(cov_file)
@@ -303,17 +516,16 @@ def scan_coverage_for_bugs(experiment_dir: Path, benchmark: str,
                     logger.debug("Skipping %s: %s", cov_file, e)
                     continue
 
-                for bug_id, (crash_file, crash_line) in bug_crash_lines.items():
+                for bug_id in tuple(pending_bug_ids):
+                    crash_file, crash_line = bug_crash_lines[bug_id]
                     key = (fuzzer_name, trial_id, bug_id)
-                    if key in results:
-                        continue  # already found earlier
-
                     # Match file path: coverage uses full /src/ paths
                     for cov_filename, line_counts in file_coverage.items():
                         if cov_filename.endswith(crash_file) or crash_file.endswith(cov_filename) or \
                            cov_filename == crash_file:
                             if crash_line in line_counts:
                                 results[key] = snapshot_time
+                                pending_bug_ids.discard(bug_id)
                             break
 
     return results
@@ -548,13 +760,24 @@ def main():
     crash_results = scan_crash_dirs(experiment_dir, benchmark, bug_metadata)
     logger.info("  Found %d (fuzzer, trial, bug) crash entries", len(crash_results))
 
+    # Write a crash-only report immediately so results are available before the
+    # slower coverage pass completes.
+    crash_only_rows = merge_results(crash_results, {}, {}, bug_metadata)
+    output_path = Path(args.output)
+    write_csv(crash_only_rows, output_path)
+    logger.info("Wrote %d crash-only rows to %s", len(crash_only_rows), output_path)
+
+    crash_report_path = output_path.with_name(output_path.stem + "_crash_only_bug_report.json")
+    write_bug_report(crash_only_rows, bug_metadata, crash_report_path)
+
     logger.info("Scanning coverage snapshots for bug crash lines...")
-    coverage_results = scan_coverage_for_bugs(experiment_dir, benchmark, bug_metadata)
+    logger.info("  Scanning all bug crash lines; per-trial coverage checks will skip bugs already triggered in that same trial")
+    coverage_results = scan_coverage_for_bugs(
+        experiment_dir, benchmark, bug_metadata, None, crash_results)
     logger.info("  Found %d (fuzzer, trial, bug) coverage-reached entries", len(coverage_results))
 
     # Merge and output
     rows = merge_results(crash_results, {}, coverage_results, bug_metadata)
-    output_path = Path(args.output)
     write_csv(rows, output_path)
     logger.info("Wrote %d rows to %s", len(rows), output_path)
 
