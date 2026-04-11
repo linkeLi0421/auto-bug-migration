@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -81,16 +82,23 @@ def setup_codex_creds(container: str) -> None:
 
 def build_codex_command(
     prompt: str, model: str | None = None, mode: str = "exec",
+    resume_session: str | None = None,
 ) -> str:
     """Build the codex CLI command.
 
     *mode* selects the invocation style:
       - ``"exec"``  (default) — ``codex exec … --json`` (non-interactive, JSONL)
       - ``"interactive"`` — ``codex … `` (TUI, needs a TTY via tmux)
+
+    If *resume_session* is given, uses ``codex exec resume <id> <prompt>``
+    to continue the specified session instead of starting a new one.
     """
     escaped = shlex.quote(prompt)
     if mode == "interactive":
         cmd = f"codex --dangerously-bypass-approvals-and-sandbox {escaped}"
+    elif resume_session:
+        cmd = (f"codex exec resume --dangerously-bypass-approvals-and-sandbox"
+               f" {shlex.quote(resume_session)} {escaped}")
     else:
         cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
     if model:
@@ -98,6 +106,25 @@ def build_codex_command(
     if mode != "interactive":
         cmd += " --json"
     return cmd
+
+
+def _extract_session_id(jsonl_output: str) -> str | None:
+    """Extract the session ID from codex exec JSONL output.
+
+    The first ``session_meta`` event contains the session UUID at
+    ``payload.id``.
+    """
+    for line in jsonl_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if obj.get("type") == "session_meta":
+                return obj.get("payload", {}).get("id")
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return None
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1052,12 +1079,24 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     (output_dir / "minimize_output.txt").write_text(skip_output)
                     return exit_code
 
-                # --- Phase 2: Minimization (separate agent) ---
+                # --- Phase 2: Minimization (resume transplant session) ---
                 logger.info("=== Minimization phase ===")
                 minimize_prompt = _build_minimize_prompt(args)
+                # Resume the transplant session so the agent keeps
+                # build-environment context (workarounds, paths, etc.)
+                transplant_session_id = (
+                    _extract_session_id(output) if codex_mode != "interactive"
+                    else None
+                )
+                if transplant_session_id:
+                    logger.info("Resuming transplant session %s for minimization",
+                                transplant_session_id)
+                else:
+                    logger.info("No session ID found, starting fresh minimization session")
                 minimize_cmd = build_codex_command(
                     minimize_prompt, getattr(args, "model", None),
                     mode=codex_mode,
+                    resume_session=transplant_session_id,
                 )
                 min_start = time.monotonic()
                 if codex_mode == "interactive":
