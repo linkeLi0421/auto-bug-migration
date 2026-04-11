@@ -719,6 +719,19 @@ def start_merge_container(
                     if ret.returncode == 0:
                         logger.info("Copied patched testcase: %s", tc.name)
 
+    # Ghostscript: build.sh destructively does
+    #   rm -rf freetype && mv /src/freetype freetype
+    # which fails on repeated compiles.  Patch it to use cp instead of
+    # mv so /src/freetype survives across builds.
+    if project == "ghostscript":
+        _exec_capture(
+            container_name,
+            r"""sed -i 's|^rm -rf freetype.*|rm -rf freetype 2>/dev/null; true|; """
+            r"""s|^rm -rf zlib.*|rm -rf zlib 2>/dev/null; true|; """
+            r"""s|^mv \$SRC/freetype freetype|if [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
+            "/src/build.sh",
+        )
+
     # Build ASAN only (UBSAN removed to simplify the merge flow).
     logger.info("Building address inside container...")
     _exec_capture(
