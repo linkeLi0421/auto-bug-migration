@@ -650,12 +650,14 @@ def create_shared_container(
         f"cd {shlex.quote(repo_dir)} && git clean -fdx {clean_excludes}",
         user="root",
     )
+    if clean_ret != 0:
+        logger.warning("git clean returned %d (transient files?) — continuing", clean_ret)
     checkout_ret = _exec(
         container_name,
         f"cd {shlex.quote(repo_dir)} && git checkout -f {shlex.quote(target_commit)}",
         user="root",
     )
-    if clean_ret != 0 or checkout_ret != 0:
+    if checkout_ret != 0:
         logger.error(
             "Failed to prepare repo in container %s (repo_dir=%s)",
             container_name, repo_dir,
@@ -793,12 +795,14 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             f"cd {repo_dir_q} && git clean -fdx {clean_excludes}",
             user="root",
         )
+        if clean_ret != 0:
+            logger.warning("git clean returned %d (transient files?) — continuing", clean_ret)
         checkout_ret = _exec(
             container_name,
             f"cd {repo_dir_q} && git checkout -f {shlex.quote(args.target_commit)}",
             user="root",
         )
-        if clean_ret != 0 or checkout_ret != 0:
+        if checkout_ret != 0:
             logger.error(
                 "Failed to prepare repo in container %s (repo_dir=%s)",
                 container_name, repo_dir,

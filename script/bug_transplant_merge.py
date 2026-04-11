@@ -655,7 +655,7 @@ def start_merge_container(
         "-e", "ARCHITECTURE=x86_64",
         "-e", f"FUZZING_LANGUAGE={language}",
         "-e", "HELPER=True",
-        "-e", "MAKEFLAGS=--output-sync=line -j30",
+        "-e", "MAKEFLAGS=--output-sync=line",
         "-e", "CMAKE_BUILD_PARALLEL_LEVEL=30",
         "-e", "NINJA_STATUS=",
         "-e", "TERM=dumb",
