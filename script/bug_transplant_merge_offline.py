@@ -58,6 +58,7 @@ from bug_transplant_merge import (
     _find_crash_log,
     compute_merge_order,
     files_in_diff,
+    known_harness_source_paths,
     _prepare_container_testcases_dir,
     _save_work_testcase_to_host,
     CONTAINER_TESTCASES_DIR,
@@ -163,6 +164,10 @@ _DIFF_EXCLUDES = (
     "':(exclude)*.d' ':(exclude)*.pc' ':(exclude)config.h' "
     "':(exclude)blosc/config.h' "
     "':(exclude)build/' ':(exclude)_build/' "
+    "':(exclude)obj/' ':(exclude)obj*' ':(exclude)bin/' "
+    "':(exclude)tiff-config*' "
+    "':(exclude)cups/' ':(exclude)freetype/' ':(exclude)zlib/' "
+    "':(exclude)examples/' "
     "':(exclude).codex/'"
 )
 _DIFF_INCLUDES = (
@@ -181,8 +186,17 @@ def _strip_build_artifact_hunks(diff_text: str) -> str:
     import re
     # Split into per-file sections on 'diff --git' boundaries
     parts = re.split(r'(?=^diff --git )', diff_text, flags=re.MULTILINE)
-    _ARTIFACT_PATS = re.compile(r'CMakeFiles/|/CMakeFiles/')
-    kept = [p for p in parts if not _ARTIFACT_PATS.search(p.split('\n', 1)[0])]
+    artifact_header = re.compile(
+        r"^diff --git a/(?:"
+        r"cups/|freetype/|zlib/|examples/|"
+        r"obj(?:[./-]|$)|obj\.stale-root-[^/]+/|"
+        r"tiff-config(?:[./-]|$)|tiff-config\.stale-root-[^/]+/|"
+        r"(?:.*/)?CMakeFiles/|"
+        r".*\.o$|.*\.a$|.*\.so(?:\..*)?$"
+        r")",
+        re.MULTILINE,
+    )
+    kept = [p for p in parts if not artifact_header.search(p.split('\n', 1)[0])]
     return ''.join(kept)
 
 
@@ -239,11 +253,17 @@ def _create_harness_baseline_commit(container: str, project: str) -> str:
         "git add -A && "
         "git -c user.name='Codex' -c user.email='codex@example.com' "
         "commit --allow-empty -m 'codex harness baseline' >/dev/null 2>&1 && "
-        "git rev-parse HEAD",
+        "git rev-parse HEAD 2>/dev/null",
     )
     if ret != 0:
         raise RuntimeError(f"failed to create harness baseline commit: {out[-500:]}")
-    return out.strip().splitlines()[-1]
+    # Extract the SHA — filter out git warnings (e.g. line-ending messages)
+    # that may appear in captured stderr.
+    for line in reversed(out.strip().splitlines()):
+        line = line.strip()
+        if len(line) >= 40 and all(c in '0123456789abcdef' for c in line[:40]):
+            return line
+    raise RuntimeError(f"no valid SHA found in harness baseline output: {out[-500:]}")
 
 
 def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -> None:
@@ -261,8 +281,39 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
 _MAX_WRAP_RETRIES = 1
 
 
-def _patch_build_sh_make_tolerant(content: str) -> str:
-    """Replace bare ``make`` with ``make -k || true`` + fuzz target check.
+def _patch_build_sh_for_project(content: str, project: str) -> str:
+    """Apply project-specific build.sh hygiene before repeated compiles."""
+    if project != "ghostscript":
+        return content
+
+    patched: list[str] = []
+    for line in content.splitlines(keepends=True):
+        stripped = line.strip()
+        # Ghostscript's OSS-Fuzz build.sh destructively removes tracked source
+        # directories. In merge mode those removals pollute git diff and break
+        # resume, so keep the vendored directories in place.
+        if re.match(r"^rm -rf (cups/libs|freetype|zlib)(?:\s|$)", stripped):
+            continue
+        patched.append(line)
+
+    content = "".join(patched)
+    content = re.sub(
+        r"^mv \$SRC/freetype freetype$",
+        'if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi',
+        content,
+        flags=re.MULTILINE,
+    )
+    content = re.sub(
+        r"^if \[ -d \"\$SRC/freetype\" \]; then cp -a \"\$SRC/freetype\" freetype; fi$",
+        'if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi',
+        content,
+        flags=re.MULTILINE,
+    )
+    return content
+
+
+def _patch_build_sh_make_tolerant(content: str, project: str) -> str:
+    """Patch build.sh for repeated merge compiles.
 
     Dispatch-wrapped library sources reference ``__bug_dispatch`` which is
     only linked into fuzz targets.  Non-fuzzer binaries (e.g. ndpiReader)
@@ -270,6 +321,7 @@ def _patch_build_sh_make_tolerant(content: str) -> str:
     build continue past those failures, and the fuzz-target existence
     check ensures we catch real compilation errors.
     """
+    content = _patch_build_sh_for_project(content, project)
     lines = content.splitlines(keepends=True)
     patched: list[str] = []
     for line in lines:
@@ -284,7 +336,7 @@ def _patch_build_sh_make_tolerant(content: str) -> str:
     return "".join(patched)
 
 
-def _save_build_sh(container: str, output_dir: Path) -> None:
+def _save_build_sh(container: str, output_dir: Path, project: str) -> None:
     """Snapshot /src/build.sh so it can be restored on resume.
 
     The agent may modify /src/build.sh to compile __bug_dispatch.c, but
@@ -294,24 +346,158 @@ def _save_build_sh(container: str, output_dir: Path) -> None:
     ret, content = _exec_capture(container, "cat /src/build.sh 2>/dev/null")
     if ret != 0:
         return
-    content = _patch_build_sh_make_tolerant(content)
+    content = _patch_build_sh_make_tolerant(content, project)
     dst = output_dir / "harness_build.sh"
     dst.write_text(content)
     logger.info("Saved /src/build.sh (%d bytes) to %s", len(content), dst)
 
 
-def _restore_build_sh(container: str, output_dir: Path) -> None:
+def _restore_build_sh(container: str, output_dir: Path, project: str) -> None:
     """Restore a previously saved /src/build.sh into the container."""
     src = output_dir / "harness_build.sh"
     if not src.exists():
         return
-    content = _patch_build_sh_make_tolerant(src.read_text())
+    content = _patch_build_sh_make_tolerant(src.read_text(), project)
     _exec_capture(
         container,
         f"cat > /src/build.sh << 'BUILDEOF'\n{content}BUILDEOF",
     )
     _exec_capture(container, "chmod +x /src/build.sh")
     logger.info("Restored /src/build.sh from %s", src)
+
+
+def _candidate_fuzzer_source_paths(project: str, fuzzer: str) -> list[str]:
+    """Return likely OSS-Fuzz harness source paths for a fuzzer."""
+    exts = ("cc", "cpp", "cxx", "c")
+    roots = ["/src", _source_dir(project), f"/src/{project}"]
+    paths: list[str] = known_harness_source_paths(project, fuzzer)
+    for root in roots:
+        for ext in exts:
+            paths.append(f"{root}/{fuzzer}.{ext}")
+    return list(dict.fromkeys(paths))
+
+
+def _find_harness_source_paths(
+    container: str,
+    project: str,
+    fuzzer: str,
+) -> list[str]:
+    """Find existing harness source files for the primary fuzzer."""
+    candidates = " ".join(
+        shlex.quote(path) for path in _candidate_fuzzer_source_paths(project, fuzzer)
+    )
+    ret, out = _exec_capture(
+        container,
+        "for p in "
+        f"{candidates}"
+        "; do [ -f \"$p\" ] && grep -q 'LLVMFuzzerTestOneInput' \"$p\" "
+        "&& printf '%s\n' \"$p\"; done",
+    )
+    paths = [line.strip() for line in out.splitlines() if line.strip()] if ret == 0 else []
+    if paths:
+        return list(dict.fromkeys(paths))
+
+    ret, out = _exec_capture(
+        container,
+        f"find /src {_source_dir(project)} -maxdepth 3 -type f "
+        f"\\( -name {shlex.quote(fuzzer + '.cc')} "
+        f"-o -name {shlex.quote(fuzzer + '.cpp')} "
+        f"-o -name {shlex.quote(fuzzer + '.cxx')} "
+        f"-o -name {shlex.quote(fuzzer + '.c')} \\) "
+        "-exec grep -l 'LLVMFuzzerTestOneInput' {} \\; 2>/dev/null",
+    )
+    return list(dict.fromkeys(line.strip() for line in out.splitlines() if line.strip()))
+
+
+def _harness_source_sets_dispatch(
+    container: str,
+    source_path: str,
+) -> bool:
+    """Return True when a harness source copies input bytes into __bug_dispatch."""
+    qpath = shlex.quote(source_path)
+    ret, _ = _exec_capture(
+        container,
+        "grep -q 'LLVMFuzzerTestOneInput' "
+        f"{qpath} && grep -q '__bug_dispatch' {qpath} && "
+        "grep -Eq 'memcpy[[:space:]]*\\([^;]*__bug_dispatch|"
+        "__bug_dispatch\\[[^]]+\\][[:space:]]*=' "
+        f"{qpath}",
+    )
+    return ret == 0
+
+
+def _harness_dispatch_consumer_present(
+    container: str,
+    project: str,
+    fuzzer: str,
+) -> bool:
+    """Return True if the primary fuzzer consumes dispatch bytes."""
+    return any(
+        _harness_source_sets_dispatch(container, path)
+        for path in _find_harness_source_paths(container, project, fuzzer)
+    )
+
+
+def _harness_sources_dir(output_dir: Path) -> Path:
+    return output_dir / "harness_sources"
+
+
+def _harness_sources_manifest(output_dir: Path) -> Path:
+    return _harness_sources_dir(output_dir) / "manifest.json"
+
+
+def _snapshot_name(container_path: str) -> str:
+    return container_path.strip("/").replace("/", "__")
+
+
+def _save_harness_sources(
+    container: str,
+    project: str,
+    fuzzer: str,
+    output_dir: Path,
+) -> bool:
+    """Save out-of-repo harness sources that git diff cannot capture."""
+    snapshot_dir = _harness_sources_dir(output_dir)
+    snapshot_dir.mkdir(exist_ok=True)
+    manifest = []
+
+    for source_path in _find_harness_source_paths(container, project, fuzzer):
+        if not _harness_source_sets_dispatch(container, source_path):
+            continue
+        ret, content = _exec_capture(container, f"cat {shlex.quote(source_path)}")
+        if ret != 0:
+            continue
+        snapshot = _snapshot_name(source_path)
+        (snapshot_dir / snapshot).write_text(content)
+        manifest.append({"container_path": source_path, "snapshot": snapshot})
+
+    if not manifest:
+        logger.warning("No dispatch-consuming harness source snapshot saved")
+        return False
+
+    _harness_sources_manifest(output_dir).write_text(json.dumps(manifest, indent=2))
+    logger.info("Saved %d harness source snapshot(s) to %s", len(manifest), snapshot_dir)
+    return True
+
+
+def _restore_harness_sources(container: str, output_dir: Path) -> bool:
+    """Restore saved out-of-repo harness sources into a fresh container."""
+    manifest_path = _harness_sources_manifest(output_dir)
+    if not manifest_path.exists():
+        return False
+
+    restored = 0
+    for entry in json.loads(manifest_path.read_text()):
+        container_path = entry["container_path"]
+        snapshot = _harness_sources_dir(output_dir) / entry["snapshot"]
+        if not snapshot.exists():
+            continue
+        if _container_write_text(container, container_path, snapshot.read_text()):
+            restored += 1
+
+    if restored:
+        logger.info("Restored %d harness source snapshot(s)", restored)
+    return restored > 0
 
 
 def _inject_dispatch_deps_fixer(container: str) -> None:
@@ -760,10 +946,16 @@ def wrap_bug_with_dispatch(
         logger.error("[%s] Agent failed (exit %d)", bug_id, ret)
         return False, output
 
-    # Verify build — clear /out/ first so we only see freshly built binaries.
-    _exec_capture(container, "rm -f /out/fuzz_* 2>/dev/null")
-    ret, build_out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
-    ret2, fuzz_bins = _exec_capture(container, "ls /out/fuzz_* 2>/dev/null")
+    # Verify build — clear /out/ fuzz targets first so we only see freshly built binaries.
+    fuzzer_name = bug.get("fuzzer", "")
+    # Remove known fuzz targets so we can verify they get rebuilt.
+    _exec_capture(container, "rm -f /out/fuzz_* /out/*_fuzzer /out/*_fuzzer_* 2>/dev/null")
+    ret, build_out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    # Check for the specific fuzzer binary, or fall back to any *fuzzer* pattern.
+    if fuzzer_name:
+        ret2, fuzz_bins = _exec_capture(container, f"ls /out/{fuzzer_name} 2>/dev/null")
+    else:
+        ret2, fuzz_bins = _exec_capture(container, "ls /out/fuzz_* /out/*_fuzzer 2>/dev/null")
     if ret2 != 0 or not fuzz_bins.strip():
         # Fuzz targets didn't build — real failure.
         logger.error("[%s] Build failed after wrapping (fuzz targets missing)",
@@ -810,6 +1002,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
     if not all_bugs:
         logger.error("No bugs to merge")
         return 1
+    primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
     testcase_stage_dir = _prepare_container_testcases_dir(
         args.testcases_dir,
         output_dir / "testcases",
@@ -852,24 +1045,40 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # This avoids re-invoking a code agent unnecessarily and keeps resume
         # behavior deterministic.
         harness_diff_path = output_dir / "harness.diff"
-        if harness_diff_path.exists() and harness_diff_path.stat().st_size > 0:
+        if getattr(args, "regenerate_harness", False):
+            logger.info("Ignoring existing harness artifacts because --regenerate-harness was set")
+            harness_diff_path = None
+        elif harness_diff_path.exists() and harness_diff_path.stat().st_size > 0:
             logger.info("Harness diff already exists, reusing: %s", harness_diff_path)
             _clean_container_working_tree_before_harness_diff(container, project)
-            hdiff = harness_diff_path.read_text()
-            _exec_capture(container,
-                          f"cat > /tmp/harness.diff << 'HEOF'\n{hdiff}HEOF")
+            # Use docker cp instead of heredoc to avoid "Argument list too long"
+            # for large diffs (e.g. ghostscript's 56MB harness diff).
+            subprocess.run(
+                ["docker", "cp", str(harness_diff_path), f"{container}:/tmp/harness.diff"],
+                check=True, timeout=30,
+            )
             ret, out = _exec_capture(container,
                                      f"cd {_source_dir(project)} && git apply /tmp/harness.diff 2>&1")
             if ret != 0:
                 logger.error("Failed to apply existing harness.diff")
                 logger.error(out)
                 return 1
-            _restore_build_sh(container, output_dir)
+            _restore_build_sh(container, output_dir, project)
+            _restore_harness_sources(container, output_dir)
             # If harness_build.sh was lost, re-save from container state.
             if not (output_dir / "harness_build.sh").exists():
-                _save_build_sh(container, output_dir)
+                _save_build_sh(container, output_dir, project)
             _inject_dispatch_deps_fixer(container)
-            ret, out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+            if not _harness_dispatch_consumer_present(container, project, primary_fuzzer):
+                logger.error(
+                    "Existing harness artifacts do not restore a dispatch-byte "
+                    "consumer for %s. Rerun with --regenerate-harness or remove "
+                    "%s and the stale wrapped/combined outputs.",
+                    primary_fuzzer,
+                    harness_diff_path,
+                )
+                return 1
+            ret, out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying existing harness.diff")
                 logger.error(out[-500:] if out else "(no output)")
@@ -882,14 +1091,19 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         if harness_diff_path is None:
             _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
             dispatch_state["dispatch_file_injected"] = True
-            # Find the primary fuzzer name (all bugs should share it)
-            primary_fuzzer = (diff_bugs + testcase_only_bugs + local_bugs)[0]["fuzzer"]
             ok = _modify_harness_for_dispatch(
                 container, project, primary_fuzzer,
                 model=args.model,
             )
             if not ok:
                 logger.error("Failed to modify harness for dispatch")
+                return 1
+            if not _harness_dispatch_consumer_present(container, project, primary_fuzzer):
+                logger.error(
+                    "Harness modification completed, but %s still does not "
+                    "write input dispatch bytes into __bug_dispatch",
+                    primary_fuzzer,
+                )
                 return 1
             dispatch_state["harness_modified"] = True
 
@@ -906,7 +1120,8 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
             # Save /src/build.sh — the agent may have modified it to
             # compile __bug_dispatch.c, but it's outside the git repo.
-            _save_build_sh(container, output_dir)
+            _save_build_sh(container, output_dir, project)
+            _save_harness_sources(container, project, primary_fuzzer, output_dir)
 
         harness_baseline_rev = _create_harness_baseline_commit(container, project)
         logger.info("Harness baseline commit: %s", harness_baseline_rev[:12])
@@ -1000,7 +1215,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             # Reset source to the exact harness baseline, then apply only the
             # bug-specific wrapped delta on top of it.
             _restore_harness_baseline(container, project, harness_baseline_rev)
-            _restore_build_sh(container, output_dir)
+            _restore_build_sh(container, output_dir, project)
 
             output = ""
             for attempt in range(_MAX_WRAP_RETRIES + 1):
@@ -1030,7 +1245,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                                bug_id, attempt + 1)
                 # Reset for retry to the exact harness baseline.
                 _restore_harness_baseline(container, project, harness_baseline_rev)
-                _restore_build_sh(container, output_dir)
+                _restore_build_sh(container, output_dir, project)
 
             if not step["success"]:
                 logger.error("[%s] FAILED after %d attempts, skipping",
@@ -1061,7 +1276,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 logger.error("Failed to apply existing combined.diff: %s", out[-500:])
                 return 1
             _ensure_dispatch_linked_everywhere(container, project)
-            ret, out = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+            ret, out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying combined.diff: %s",
                              out[-500:] if out else "(no output)")
@@ -1141,7 +1356,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                     # Verify build after each chunk so failures are localized.
                     ret, build_out = _exec_capture(
-                        container, "cd /src && sudo -E compile 2>&1", timeout=300,
+                        container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300,
                     )
                     if ret != 0:
                         logger.error(
@@ -1164,7 +1379,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # Build ASAN with all patches applied
         logger.info("Building with all patches applied...")
         _ensure_dispatch_linked_everywhere(container, project)
-        _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+        _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
@@ -1298,6 +1513,9 @@ def main():
                         help="Show plan without executing")
     parser.add_argument("--keep-container", action="store_true",
                         help="Keep container for debugging")
+    parser.add_argument("--regenerate-harness", action="store_true",
+                        help="Ignore saved harness artifacts and rebuild the "
+                             "dispatch-consuming fuzz harness")
     parser.add_argument("--start-step", type=int, default=0,
                         help="Resume from step N")
     parser.add_argument("--max-steps", type=int, default=None,

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate a FuzzBench benchmark directory from bug transplant merge output.
 
-Reads the merge output (summary.json, combined.diff, harness.diff, testcases/)
-and the project's OSS-Fuzz build files to produce a self-contained FuzzBench
-benchmark directory that can be dropped into fuzzbench/benchmarks/.
+Reads the merge output (summary.json, combined.diff, harness.diff,
+harness_sources/, testcases/) and the project's OSS-Fuzz build files to
+produce a self-contained FuzzBench benchmark directory that can be dropped into
+fuzzbench/benchmarks/.
 
 Usage:
     python3 script/fuzzbench_generate.py \
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 OSS_FUZZ_DIR = PROJECT_ROOT / "oss-fuzz"
+PROJECT_REPO_NAME_OVERRIDES = {
+    # OSS-Fuzz project name differs from the upstream checkout directory.
+    "ghostscript": "ghostpdl",
+}
 
 
 def commit_merge_container(container_name: str, project: str,
@@ -51,18 +56,20 @@ def commit_merge_container(container_name: str, project: str,
     return tag
 
 
-def generate_dockerfile_from_container(merge_image: str, project: str) -> str:
+def generate_dockerfile_from_container(merge_image: str, project: str,
+                                       project_repo_name: str | None = None) -> str:
     """Generate a Dockerfile that uses a committed merge container as base.
 
     The merge container already has:
     - All apt packages installed
-    - Source code cloned at /src/{project}
+    - Source code cloned at /src/{project_repo_name}
     - Patches previously applied (checkout_commit.py will reset, build.sh re-applies)
 
     FuzzBench's benchmark-builder pipeline will layer the fuzzer's compiler
     on top and run build.sh, which re-applies patches and recompiles with
     the fuzzer's $CC/$CXX.
     """
+    source_dir = project_repo_name or project
     return f"""# Use the committed merge container as base for identical build environment.
 # This image has the exact same OS packages, library versions, and source tree
 # that were used during bug transplant verification.
@@ -77,7 +84,7 @@ USER root
 # Dockerfiles (e.g. AFL++'s builder.Dockerfile) can apt-get install.
 RUN rm -rf /var/lib/apt/lists/* && mkdir -p /var/lib/apt/lists/partial && apt-get update
 
-WORKDIR /src/{project}
+WORKDIR /src/{source_dir}
 
 # Keep ASan stack-use-after-return detection enabled for direct testcase replay.
 ENV ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1"
@@ -122,6 +129,33 @@ def copy_seed_candidates(merge_dir: Path, seeds_dir: Path) -> int:
         shutil.copy2(src, seeds_dir / src.name)
         copied += 1
     return copied
+
+
+def copy_harness_sources(merge_dir: Path, patches_dir: Path) -> int:
+    """Copy harness sources that are outside the project git repository.
+
+    Some OSS-Fuzz projects keep fuzz target sources directly under /src instead
+    of /src/{project}.  Those files cannot be represented in git diffs captured
+    from the project checkout, so merge output snapshots them separately.
+    """
+    harness_sources = merge_dir / "harness_sources"
+    if not harness_sources.is_dir():
+        return 0
+
+    manifest_path = harness_sources / "manifest.json"
+    if not manifest_path.is_file():
+        logger.warning("Harness sources directory has no manifest: %s",
+                       harness_sources)
+        return 0
+
+    dst = patches_dir / "harness_sources"
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(harness_sources, dst)
+
+    with open(manifest_path) as f:
+        manifest = json.load(f)
+    return len(manifest)
 
 
 def read_oss_fuzz_commit(build_csv: Path, project: str, target_commit: str) -> str:
@@ -298,6 +332,9 @@ def generate_dockerfile(project: str, oss_fuzz_dir: Path, builder_digest: str,
 
 def get_project_repo_name(project: str, dockerfile_content: str) -> str:
     """Infer the cloned source directory name from the OSS-Fuzz Dockerfile."""
+    if project in PROJECT_REPO_NAME_OVERRIDES:
+        return PROJECT_REPO_NAME_OVERRIDES[project]
+
     match = re.search(r"git clone\b.*?\s([A-Za-z0-9_.-]+)\s*$", dockerfile_content,
                       flags=re.MULTILINE)
     if match:
@@ -318,8 +355,11 @@ def get_pinned_builder_digest(dockerfile_content: str) -> str | None:
 
 def generate_build_sh(project: str, target_commit: str, fuzz_target: str,
                       oss_fuzz_dir: Path, dispatch_bytes: int,
-                      merge_dir: Path = None) -> str:
+                      merge_dir: Path = None,
+                      project_repo_name: str | None = None) -> str:
     """Generate build.sh that checks out the target commit, applies patches, and builds."""
+    source_dir = project_repo_name or project
+
     # Use harness_build.sh from merge output if available (project-specific build)
     harness_build = merge_dir / "harness_build.sh" if merge_dir else None
     if harness_build and harness_build.exists():
@@ -354,10 +394,26 @@ def generate_build_sh(project: str, target_commit: str, fuzz_target: str,
     build_sh = f"""#!/bin/bash -eu
 # Generated by fuzzbench_generate.py for bug transplant evaluation
 
-cd /src/{project}
+cd /src/{source_dir}
 
 # Checkout target commit
 git checkout {target_commit}
+
+# Restore harness sources that live outside the project git repository.
+if [ -f /src/patches/harness_sources/manifest.json ]; then
+    python3 - <<'PY'
+import json
+import shutil
+from pathlib import Path
+
+root = Path("/src/patches/harness_sources")
+for entry in json.loads((root / "manifest.json").read_text()):
+    source = root / entry["snapshot"]
+    destination = Path(entry["container_path"])
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+PY
+fi
 
 # Apply dispatch harness first (modifies build system), then bug patches
 if ! git apply --check /src/patches/harness.diff 2>/dev/null; then
@@ -924,7 +980,8 @@ def main():
 
     # 6. Generate Dockerfile
     if merge_image:
-        dockerfile = generate_dockerfile_from_container(merge_image, project)
+        dockerfile = generate_dockerfile_from_container(
+            merge_image, project, project_repo_name)
         logger.info("Generated Dockerfile from merge container image %s", merge_image)
     else:
         dockerfile = generate_dockerfile(project, oss_fuzz_dir, builder_digest, dispatch_bytes)
@@ -934,7 +991,8 @@ def main():
     # 7. Generate build.sh
     build_sh = generate_build_sh(project, target_commit, fuzz_target,
                                  oss_fuzz_dir, dispatch_bytes,
-                                 merge_dir=merge_dir)
+                                 merge_dir=merge_dir,
+                                 project_repo_name=project_repo_name)
     (bench_dir / "build.sh").write_text(build_sh)
     os.chmod(bench_dir / "build.sh", 0o755)
     logger.info("Generated build.sh")
@@ -952,6 +1010,11 @@ def main():
             logger.info("Copied %s (%d bytes)", patch_name, src.stat().st_size)
         else:
             logger.warning("Patch not found: %s", src)
+
+    copied_harness_sources = copy_harness_sources(merge_dir, patches_dir)
+    if copied_harness_sources:
+        logger.info("Copied %d external harness source snapshot(s)",
+                    copied_harness_sources)
 
     copied_seed_candidates = copy_seed_candidates(merge_dir, seeds_dir)
     logger.info("Copied %d seed candidate testcases", copied_seed_candidates)

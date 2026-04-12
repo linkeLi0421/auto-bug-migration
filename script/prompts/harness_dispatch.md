@@ -10,6 +10,9 @@ an input-driven dispatch byte mechanism.
 The file __bug_dispatch.h is already at {source_dir}/__bug_dispatch.h
 and __bug_dispatch.c is at {source_dir}/__bug_dispatch.c.
 
+Known harness source path(s) for this project/fuzzer:
+{harness_source_hint}
+
 Please make these changes:
 
 1. Find the fuzz target source file that contains LLVMFuzzerTestOneInput

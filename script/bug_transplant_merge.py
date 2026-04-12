@@ -392,6 +392,27 @@ volatile uint8_t __bug_dispatch[__BUG_DISPATCH_BYTES] = {0};
 
 _MAX_STEP_RETRIES = 1
 
+_HARNESS_SOURCE_TEMPLATES = {
+    # Ghostscript's OSS-Fuzz fuzzer sources are copied to /src next to
+    # build.sh, not inside the /src/ghostpdl git checkout.
+    "ghostscript": ("/src/{fuzzer}.cc",),
+}
+
+
+def known_harness_source_paths(project: str, fuzzer: str) -> list[str]:
+    """Return project-specific out-of-repo harness source paths."""
+    return [
+        template.format(fuzzer=fuzzer)
+        for template in _HARNESS_SOURCE_TEMPLATES.get(project, ())
+    ]
+
+
+def _harness_source_hint(project: str, fuzzer: str) -> str:
+    paths = known_harness_source_paths(project, fuzzer)
+    if not paths:
+        return "No project-specific harness path is registered; find it from the build files."
+    return "\n".join(f"- `{path}`" for path in paths)
+
 
 def _inject_dispatch_files(
     container: str, project: str, dispatch_bytes: int = 1,
@@ -468,8 +489,13 @@ def _modify_harness_for_dispatch(
 
     setup_codex_creds(container)
 
-    prompt = _load_prompt("harness_dispatch", project=project, fuzzer=fuzzer,
-                          source_dir=_source_dir(project))
+    prompt = _load_prompt(
+        "harness_dispatch",
+        project=project,
+        fuzzer=fuzzer,
+        source_dir=_source_dir(project),
+        harness_source_hint=_harness_source_hint(project, fuzzer),
+    )
     agent_cmd = build_codex_command(prompt, model)
 
     logger.info("Invoking codex to modify harness for dispatch byte...")
@@ -479,7 +505,7 @@ def _modify_harness_for_dispatch(
                      ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("Build failed after harness modification")
         return False
@@ -719,16 +745,15 @@ def start_merge_container(
                     if ret.returncode == 0:
                         logger.info("Copied patched testcase: %s", tc.name)
 
-    # Ghostscript: build.sh destructively does
-    #   rm -rf freetype && mv /src/freetype freetype
-    # which fails on repeated compiles.  Patch it to use cp instead of
-    # mv so /src/freetype survives across builds.
+    # Ghostscript: build.sh destructively removes tracked vendored source
+    # directories. Drop those removals so repeated compiles do not pollute
+    # git diff or break resume.
     if project == "ghostscript":
         _exec_capture(
             container_name,
-            r"""sed -i 's|^rm -rf freetype.*|rm -rf freetype 2>/dev/null; true|; """
-            r"""s|^rm -rf zlib.*|rm -rf zlib 2>/dev/null; true|; """
-            r"""s|^mv \$SRC/freetype freetype|if [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
+            r"""sed -i '/^rm -rf cups\/libs/d; /^rm -rf freetype/d; /^rm -rf zlib/d; """
+            r"""s|^mv \$SRC/freetype freetype|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|; """
+            r"""s|^if \[ -d "\$SRC/freetype" \]; then cp -a "\$SRC/freetype" freetype; fi|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
             "/src/build.sh",
         )
 
@@ -742,7 +767,7 @@ def start_merge_container(
     )
     ret, build_output = _exec_capture(
         container_name,
-        "cd /src && sudo -E SANITIZER=address compile 2>&1",
+        f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1",
         timeout=300,
     )
     if ret != 0:
@@ -882,7 +907,7 @@ def resolve_conflict_with_agent(
         return "failed"
 
     # Verify it compiles
-    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after conflict resolution", bug_id)
         return "failed"
@@ -974,7 +999,7 @@ def resolve_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after dispatch resolution", bug_id)
         return False
@@ -1214,7 +1239,7 @@ def _rebuild_and_apply_dispatch(
     )
     _exec_capture(
         container,
-        "cd /src && sudo -E SANITIZER=address compile 2>&1",
+        f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1",
         timeout=300,
     )
     _exec_capture(
@@ -1310,7 +1335,7 @@ def resolve_self_trigger_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, "cd /src && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after self-trigger dispatch", bug_id)
         return False
@@ -2020,7 +2045,7 @@ def run_merge(args: argparse.Namespace) -> int:
             )
             ret, bout = _exec_capture(
                 container,
-                "cd /src && sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1", timeout=300,
             )
             if ret != 0:
                 logger.error("Build failed for address after restore: %s",

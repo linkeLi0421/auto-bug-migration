@@ -475,7 +475,7 @@ def build_agent_image(project: str, project_image: str) -> str:
 
         # Wrapper so the agent can call "compile" without sudo
         # (codex CLI may block sudo even with --dangerously-bypass-approvals-and-sandbox)
-        RUN printf '#!/bin/bash\\ncd /src && exec sudo -E /usr/local/bin/compile "$@"\\n' \
+        RUN printf '#!/bin/bash\\ncd {repo_dir} && exec sudo -E /usr/local/bin/compile "$@"\\n' \
             > /home/agent/compile && chmod +x /home/agent/compile
 
         ENV HOME=/home/agent
@@ -842,16 +842,15 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 user="root",
             )
 
-        # Ghostscript: build.sh destructively does
-        #   rm -rf freetype && mv /src/freetype freetype
-        # which fails on repeated compiles.  Patch it to use cp instead of
-        # mv so /src/freetype survives across builds.
+        # Ghostscript: build.sh destructively removes tracked vendored source
+        # directories. Drop those removals so repeated compiles do not pollute
+        # git diff or break resume.
         if args.project == "ghostscript":
             _exec(
                 container_name,
-                r"""sed -i 's|^rm -rf freetype.*|rm -rf freetype 2>/dev/null; true|; """
-                r"""s|^rm -rf zlib.*|rm -rf zlib 2>/dev/null; true|; """
-                r"""s|^mv \$SRC/freetype freetype|if [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
+                r"""sed -i '/^rm -rf cups\/libs/d; /^rm -rf freetype/d; /^rm -rf zlib/d; """
+                r"""s|^mv \$SRC/freetype freetype|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|; """
+                r"""s|^if \[ -d "\$SRC/freetype" \]; then cp -a "\$SRC/freetype" freetype; fi|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
                 "/src/build.sh",
                 user="root",
             )
