@@ -409,6 +409,27 @@ def build_project_image(
     return image_tag
 
 
+def _image_workdir(image_tag: str) -> str:
+    """Return an image's configured working directory, defaulting to /src.
+
+    ``compile`` only works reliably in the base image's original WORKDIR
+    (e.g. /src for most projects, /src/ghostpdl for ghostscript), so we
+    capture it here to bake into the compile wrapper without overriding
+    the WORKDIR itself.
+    """
+    proc = subprocess.run(
+        ["docker", "image", "inspect", image_tag, "--format", "{{.Config.WorkingDir}}"],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        workdir = proc.stdout.strip()
+        if workdir:
+            return workdir
+    logger.warning("Could not inspect workdir for %s; defaulting to /src", image_tag)
+    return "/src"
+
+
 def build_agent_image(project: str, project_image: str) -> str:
     """Layer the Codex CLI on top of the project image.
 
@@ -418,27 +439,24 @@ def build_agent_image(project: str, project_image: str) -> str:
     cli_name = CODEX_CONFIG["cli_name"]
     cli_entry = CODEX_CONFIG["cli_entry"]
     tag = f"bug-transplant-{project}:latest"
-    repo_dir = _container_repo_dir(project)
+    base_workdir = _image_workdir(project_image)
 
-    # Skip rebuild if the agent image already exists
+    # Skip rebuild if the agent image already exists and was built against
+    # the same base WORKDIR (baked into the compile wrapper).
     inspect = subprocess.run(
-        ["docker", "image", "inspect", tag],
+        ["docker", "image", "inspect", tag, "--format",
+         "{{index .Config.Labels \"bug-transplant.base-workdir\"}}"],
         capture_output=True,
         text=True,
     )
     if inspect.returncode == 0:
-        workdir_inspect = subprocess.run(
-            ["docker", "image", "inspect", tag, "--format", "{{.Config.WorkingDir}}"],
-            capture_output=True,
-            text=True,
-        )
-        current_workdir = workdir_inspect.stdout.strip()
-        if workdir_inspect.returncode == 0 and current_workdir == repo_dir:
+        cached_workdir = inspect.stdout.strip()
+        if cached_workdir == base_workdir:
             logger.info("Agent image already exists, reusing: %s", tag)
             return tag
         logger.info(
-            "Rebuilding agent image %s because working directory is %r, expected %r",
-            tag, current_workdir, repo_dir,
+            "Rebuilding agent image %s because baked base WORKDIR is %r, expected %r",
+            tag, cached_workdir, base_workdir,
         )
         subprocess.call(
             ["docker", "rmi", "-f", tag],
@@ -491,14 +509,16 @@ def build_agent_image(project: str, project_image: str) -> str:
 
         # Wrapper so the agent can call "compile" without sudo
         # (codex CLI may block sudo even with --dangerously-bypass-approvals-and-sandbox)
-        RUN printf '#!/bin/bash\\ncd {repo_dir} && exec sudo -E /usr/local/bin/compile "$@"\\n' \
+        # compile only works reliably from the base image's original
+        # WORKDIR, so cd there explicitly and do not override WORKDIR below.
+        RUN printf '#!/bin/bash\\ncd {base_workdir} && exec sudo -E /usr/local/bin/compile "$@"\\n' \
             > /home/agent/compile && chmod +x /home/agent/compile
 
         ENV HOME=/home/agent
         ENV PATH="/home/agent:$PATH"
         USER agent
 
-        WORKDIR {repo_dir}
+        LABEL bug-transplant.base-workdir="{base_workdir}"
         CMD ["sleep", "infinity"]
     """)
 

@@ -505,7 +505,7 @@ def _modify_harness_for_dispatch(
                      ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, _compile_cmd(container), timeout=300)
     if ret != 0:
         logger.error("Build failed after harness modification")
         return False
@@ -537,6 +537,48 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
         return result.returncode, result.stdout + result.stderr
     except subprocess.TimeoutExpired:
         return 124, f"TIMEOUT after {timeout}s"
+
+
+_CONTAINER_WORKDIR_CACHE: dict[str, str] = {}
+
+
+def _container_initial_workdir(container: str) -> str:
+    """Return the WORKDIR configured for ``container`` (cached).
+
+    ``compile`` only works reliably from the base image's original
+    WORKDIR (e.g. /src for most OSS-Fuzz projects, /src/ghostpdl for
+    ghostscript), because build.sh references files placed there by
+    the image's Dockerfile (vendored tarballs, relative paths, etc.).
+    Callers should cd here in a subshell before invoking ``compile``.
+    """
+    if container in _CONTAINER_WORKDIR_CACHE:
+        return _CONTAINER_WORKDIR_CACHE[container]
+    proc = subprocess.run(
+        ["docker", "container", "inspect", container, "--format",
+         "{{.Config.WorkingDir}}"],
+        capture_output=True, text=True,
+    )
+    workdir = "/src"
+    if proc.returncode == 0:
+        out = proc.stdout.strip()
+        if out:
+            workdir = out
+    _CONTAINER_WORKDIR_CACHE[container] = workdir
+    return workdir
+
+
+def _compile_cmd(container: str, env: str = "") -> str:
+    """Return a ``compile`` command that runs in the container's initial WORKDIR.
+
+    Uses a subshell so the caller's shell cwd is unaffected.  ``env`` may
+    contain additional env assignments (e.g. ``SANITIZER=address``) that
+    are prepended to ``compile``.
+    """
+    workdir = _container_initial_workdir(container)
+    env_prefix = f"{env} " if env else ""
+    return (
+        f"(cd {shlex.quote(workdir)} && sudo -E {env_prefix}compile 2>&1)"
+    )
 
 
 
@@ -767,7 +809,7 @@ def start_merge_container(
     )
     ret, build_output = _exec_capture(
         container_name,
-        f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1",
+        _compile_cmd(container, "SANITIZER=address"),
         timeout=300,
     )
     if ret != 0:
@@ -907,7 +949,7 @@ def resolve_conflict_with_agent(
         return "failed"
 
     # Verify it compiles
-    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, _compile_cmd(container), timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after conflict resolution", bug_id)
         return "failed"
@@ -999,7 +1041,7 @@ def resolve_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, _compile_cmd(container), timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after dispatch resolution", bug_id)
         return False
@@ -1212,7 +1254,7 @@ def _revert_and_rebuild(
         f"rm -f /src/*.o 2>/dev/null; true",
     )
     _exec_capture(
-        container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+        container, _compile_cmd(container, "SANITIZER=address"), timeout=300,
     )
     _exec_capture(
         container,
@@ -1239,7 +1281,7 @@ def _rebuild_and_apply_dispatch(
     )
     _exec_capture(
         container,
-        f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1",
+        _compile_cmd(container, "SANITIZER=address"),
         timeout=300,
     )
     _exec_capture(
@@ -1335,7 +1377,7 @@ def resolve_self_trigger_with_dispatch(
                      bug_id, ret, output[-500:] if output else "(no output)")
         return False
 
-    ret, _ = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    ret, _ = _exec_capture(container, _compile_cmd(container), timeout=300)
     if ret != 0:
         logger.error("[%s] Build failed after self-trigger dispatch", bug_id)
         return False
@@ -2045,7 +2087,7 @@ def run_merge(args: argparse.Namespace) -> int:
             )
             ret, bout = _exec_capture(
                 container,
-                f"cd {_source_dir(project)} && sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                _compile_cmd(container, "SANITIZER=address"), timeout=300,
             )
             if ret != 0:
                 logger.error("Build failed for address after restore: %s",
@@ -2266,7 +2308,7 @@ def run_merge(args: argparse.Namespace) -> int:
                     f"rm -f /src/*.o 2>/dev/null; true",
                 )
                 ret, build_output = _exec_capture(
-                    container, "sudo -E SANITIZER=address compile 2>&1", timeout=300,
+                    container, _compile_cmd(container, "SANITIZER=address"), timeout=300,
                 )
                 if ret != 0:
                     logger.error("[%s] Build failed for address. Tail:", bug_id)

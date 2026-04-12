@@ -46,6 +46,7 @@ from bug_transplant_merge import (
     _load_prompt,
     _exec,
     _exec_capture,
+    _compile_cmd,
     _inject_dispatch_files,
     _apply_all_dispatch_bytes as _apply_all_dispatch_bytes_orig,
     _ensure_dispatch_capacity,
@@ -965,7 +966,7 @@ def wrap_bug_with_dispatch(
     fuzzer_name = bug.get("fuzzer", "")
     # Remove known fuzz targets so we can verify they get rebuilt.
     _exec_capture(container, "rm -f /out/fuzz_* /out/*_fuzzer /out/*_fuzzer_* 2>/dev/null")
-    ret, build_out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+    ret, build_out = _exec_capture(container, _compile_cmd(container), timeout=300)
     # Check for the specific fuzzer binary, or fall back to any *fuzzer* pattern.
     if fuzzer_name:
         ret2, fuzz_bins = _exec_capture(container, f"ls /out/{fuzzer_name} 2>/dev/null")
@@ -1109,7 +1110,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                     harness_diff_path,
                 )
                 return 1
-            ret, out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+            ret, out = _exec_capture(container, _compile_cmd(container), timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying existing harness.diff")
                 logger.error(out[-500:] if out else "(no output)")
@@ -1313,7 +1314,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
                 logger.error("Failed to apply existing combined.diff: %s", out[-500:])
                 return 1
             _ensure_dispatch_linked_everywhere(container, project)
-            ret, out = _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+            ret, out = _exec_capture(container, _compile_cmd(container), timeout=300)
             if ret != 0:
                 logger.error("Build failed after applying combined.diff: %s",
                              out[-500:] if out else "(no output)")
@@ -1393,7 +1394,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
 
                     # Verify build after each chunk so failures are localized.
                     ret, build_out = _exec_capture(
-                        container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300,
+                        container, _compile_cmd(container), timeout=300,
                     )
                     if ret != 0:
                         logger.error(
@@ -1416,7 +1417,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # Build ASAN with all patches applied
         logger.info("Building with all patches applied...")
         _ensure_dispatch_linked_everywhere(container, project)
-        _exec_capture(container, f"cd {_source_dir(project)} && sudo -E compile 2>&1", timeout=300)
+        _exec_capture(container, _compile_cmd(container), timeout=300)
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
