@@ -539,46 +539,18 @@ def _exec_capture(container: str, cmd: str, timeout: int = 600) -> tuple[int, st
         return 124, f"TIMEOUT after {timeout}s"
 
 
-_CONTAINER_WORKDIR_CACHE: dict[str, str] = {}
+def _compile_cmd(container: str, env: str = "") -> str:  # noqa: ARG001 - kept for API symmetry
+    """Return a ``compile`` invocation that runs in the image's initial WORKDIR.
 
-
-def _container_initial_workdir(container: str) -> str:
-    """Return the WORKDIR configured for ``container`` (cached).
-
-    ``compile`` only works reliably from the base image's original
-    WORKDIR (e.g. /src for most OSS-Fuzz projects, /src/ghostpdl for
-    ghostscript), because build.sh references files placed there by
-    the image's Dockerfile (vendored tarballs, relative paths, etc.).
-    Callers should cd here in a subshell before invoking ``compile``.
+    The agent image (built by ``bug_transplant.build_agent_image``)
+    ships a ``/home/agent/compile`` wrapper earlier in PATH that does
+    ``cd <base_workdir> && exec sudo -E /usr/local/bin/compile "$@"``.
+    Because ``docker exec`` runs as the image's ``USER agent`` and that
+    wrapper handles both the cd and sudo, we just invoke ``compile``.
+    ``env`` is passed through sudo via the wrapper's ``-E``.
     """
-    if container in _CONTAINER_WORKDIR_CACHE:
-        return _CONTAINER_WORKDIR_CACHE[container]
-    proc = subprocess.run(
-        ["docker", "container", "inspect", container, "--format",
-         "{{.Config.WorkingDir}}"],
-        capture_output=True, text=True,
-    )
-    workdir = "/src"
-    if proc.returncode == 0:
-        out = proc.stdout.strip()
-        if out:
-            workdir = out
-    _CONTAINER_WORKDIR_CACHE[container] = workdir
-    return workdir
-
-
-def _compile_cmd(container: str, env: str = "") -> str:
-    """Return a ``compile`` command that runs in the container's initial WORKDIR.
-
-    Uses a subshell so the caller's shell cwd is unaffected.  ``env`` may
-    contain additional env assignments (e.g. ``SANITIZER=address``) that
-    are prepended to ``compile``.
-    """
-    workdir = _container_initial_workdir(container)
     env_prefix = f"{env} " if env else ""
-    return (
-        f"(cd {shlex.quote(workdir)} && sudo -E {env_prefix}compile 2>&1)"
-    )
+    return f"{env_prefix}compile 2>&1"
 
 
 
@@ -809,7 +781,7 @@ def start_merge_container(
     )
     ret, build_output = _exec_capture(
         container_name,
-        _compile_cmd(container, "SANITIZER=address"),
+        _compile_cmd(container_name, "SANITIZER=address"),
         timeout=300,
     )
     if ret != 0:
