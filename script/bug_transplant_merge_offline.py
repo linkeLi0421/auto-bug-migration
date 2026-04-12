@@ -240,7 +240,7 @@ def _clean_container_working_tree_before_harness_diff(container: str, project: s
         container,
         f"cd {_source_dir(project)} && "
         "(git reset --hard HEAD 2>/dev/null || true) && "
-        "(git clean -fdx 2>/dev/null || true) && "
+        "(git clean -fdx -e '*.tar.gz' -e '*.tar.bz2' -e '*.tar.xz' -e '*.zip' 2>/dev/null || true) && "
         "rm -f __bug_dispatch.c __bug_dispatch.h 2>/dev/null || true",
     )
 
@@ -273,7 +273,7 @@ def _restore_harness_baseline(container: str, project: str, baseline_rev: str) -
         f"cd {_source_dir(project)} && "
         f"git checkout -f {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
         f"git reset --hard {shlex.quote(baseline_rev)} >/dev/null 2>&1 && "
-        "git clean -fdx >/dev/null 2>&1 || true",
+        "git clean -fdx -e '*.tar.gz' -e '*.tar.bz2' -e '*.tar.xz' -e '*.zip' >/dev/null 2>&1 || true",
     )
     if ret != 0:
         raise RuntimeError(f"failed to restore harness baseline: {out[-500:]}")
@@ -679,6 +679,18 @@ def _ensure_dispatch_linked_everywhere(container: str, project: str) -> None:
 # Bug loading and categorization
 # ---------------------------------------------------------------------------
 
+_OSV_ID_RE = re.compile(r"^OSV-(\d+)-(\d+)$")
+
+
+def _bug_id_sort_key(bug: dict) -> tuple[int, int, str]:
+    """Sort OSV IDs numerically so dispatch bit assignment is stable."""
+    bug_id = bug.get("bug_id", "")
+    match = _OSV_ID_RE.match(bug_id)
+    if not match:
+        return (sys.maxsize, sys.maxsize, bug_id)
+    return (int(match.group(1)), int(match.group(2)), bug_id)
+
+
 def load_and_categorize_bugs(
     summary_path: str,
     bug_info_path: str,
@@ -839,6 +851,9 @@ def load_and_categorize_bugs(
         else:
             testcase_only_bugs.append(entry)
 
+    local_bugs.sort(key=_bug_id_sort_key)
+    testcase_only_bugs.sort(key=_bug_id_sort_key)
+    diff_bugs.sort(key=_bug_id_sort_key)
     return local_bugs, testcase_only_bugs, diff_bugs
 
 
@@ -1020,6 +1035,22 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         logger.info("  bit %d → %s (value %d)",
                      i, bug["bug_id"], dispatch_state["poc_bytes"][bug["bug_id"]])
 
+    dispatch_order = [
+        dispatch_state["bits"][i]["bug_id"]
+        for i in sorted(dispatch_state["bits"])
+    ]
+    dispatch_order_path = output_dir / "dispatch_order.json"
+    reuse_wrapped_cache = False
+    if dispatch_order_path.exists():
+        try:
+            reuse_wrapped_cache = json.loads(dispatch_order_path.read_text()) == dispatch_order
+        except Exception:
+            reuse_wrapped_cache = False
+    if not reuse_wrapped_cache:
+        logger.info(
+            "Dispatch order changed or not recorded; regenerating wrapped diffs"
+        )
+
     if args.dry_run:
         logger.info("Dry run — exiting")
         return 0
@@ -1177,14 +1208,16 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         wrapped_diffs: dict[str, str] = {}  # bug_id -> wrapped diff path
         merge_results: list[dict] = []
 
-        # Load previously wrapped diffs from disk (for --start-step resume)
-        for bd in diff_bugs:
-            bid = bd["bug_id"]
-            existing = output_dir / f"wrapped_{bid}.diff"
-            if existing.exists() and existing.stat().st_size > 0:
-                wrapped_diffs[bid] = str(existing)
-                logger.info("[%s] Loaded existing wrapped diff (%d bytes)",
-                            bid, existing.stat().st_size)
+        # Load previously wrapped diffs from disk only if the dispatch bit
+        # order is unchanged. Otherwise stale wrappers check the wrong bit.
+        if reuse_wrapped_cache:
+            for bd in diff_bugs:
+                bid = bd["bug_id"]
+                existing = output_dir / f"wrapped_{bid}.diff"
+                if existing.exists() and existing.stat().st_size > 0:
+                    wrapped_diffs[bid] = str(existing)
+                    logger.info("[%s] Loaded existing wrapped diff (%d bytes)",
+                                bid, existing.stat().st_size)
 
         start_step = getattr(args, "start_step", 0)
         for i, bd in enumerate(diff_bugs):
@@ -1260,7 +1293,11 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         # 8. Phase 2: Merge all wrapped diffs via code agent
         # ------------------------------------------------------------------
         combined_path = output_dir / "combined.diff"
-        if combined_path.exists() and combined_path.stat().st_size > 0:
+        if (
+            reuse_wrapped_cache
+            and combined_path.exists()
+            and combined_path.stat().st_size > 0
+        ):
             # Reuse existing combined diff — skip the agent merge entirely.
             logger.info("combined.diff already exists, reusing: %s (%d bytes)",
                         combined_path, combined_path.stat().st_size)
@@ -1455,6 +1492,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         }
         (output_dir / "summary.json").write_text(
             json.dumps(merge_summary, indent=2))
+        dispatch_order_path.write_text(json.dumps(dispatch_order, indent=2) + "\n")
         logger.info("Summary: %s", output_dir / "summary.json")
 
         _usage_tracker.log_session_total()

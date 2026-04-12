@@ -1198,7 +1198,7 @@ def _revert_and_rebuild(
     )
     _exec_capture(
         container,
-        f"cd {_source_dir(project)} && git clean -fd 2>&1",
+        f"cd {_source_dir(project)} && git clean -fd -e '*.tar.gz' -e '*.tar.bz2' -e '*.tar.xz' -e '*.zip' 2>&1",
     )
     # Re-apply the snapshot diff (includes new files via intent-to-add)
     _exec_capture(

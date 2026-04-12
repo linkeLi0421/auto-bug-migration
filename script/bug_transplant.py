@@ -155,11 +155,27 @@ def _container_agents_md_path(project: str) -> str:
 
 
 def _git_clean_excludes(project: str) -> str:
-    """Return project-specific git-clean exclusions."""
-    excludes = ["-e .codex/"]
+    """Return project-specific git-clean exclusions.
+
+    Preserve vendored tarballs/zips placed by the Docker image but not
+    tracked by git (e.g. libpcap-1.9.1.tar.gz for ndpi).  Without this
+    ``git clean -fdx`` deletes them and subsequent ``compile`` fails.
+    """
+    excludes = [
+        "-e .codex/",
+        "-e '*.tar.gz'",
+        "-e '*.tar.bz2'",
+        "-e '*.tar.xz'",
+        "-e '*.zip'",
+    ]
     if _container_agents_md_path(project) == f"{_container_repo_dir(project)}/AGENTS.md":
         excludes.insert(0, "-e AGENTS.md")
     return " ".join(excludes)
+
+
+def _container_in_dir(directory: str, command: str) -> str:
+    """Run a shell command in a directory without changing caller cwd."""
+    return f"(cd {shlex.quote(directory)} && {command})"
 
 
 def _build_container_env(language: str) -> list[str]:
@@ -674,14 +690,14 @@ def create_shared_container(
     clean_excludes = _git_clean_excludes(project)
     clean_ret = _exec(
         container_name,
-        f"cd {shlex.quote(repo_dir)} && git clean -fdx {clean_excludes}",
+        _container_in_dir(repo_dir, f"git clean -fdx {clean_excludes}"),
         user="root",
     )
     if clean_ret != 0:
         logger.warning("git clean returned %d (transient files?) — continuing", clean_ret)
     checkout_ret = _exec(
         container_name,
-        f"cd {shlex.quote(repo_dir)} && git checkout -f {shlex.quote(target_commit)}",
+        _container_in_dir(repo_dir, f"git checkout -f {shlex.quote(target_commit)}"),
         user="root",
     )
     if checkout_ret != 0:
@@ -819,14 +835,14 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # before checkout so they don't pollute the git diff later.
         clean_ret = _exec(
             container_name,
-            f"cd {repo_dir_q} && git clean -fdx {clean_excludes}",
+            _container_in_dir(repo_dir, f"git clean -fdx {clean_excludes}"),
             user="root",
         )
         if clean_ret != 0:
             logger.warning("git clean returned %d (transient files?) — continuing", clean_ret)
         checkout_ret = _exec(
             container_name,
-            f"cd {repo_dir_q} && git checkout -f {shlex.quote(args.target_commit)}",
+            _container_in_dir(repo_dir, f"git checkout -f {shlex.quote(args.target_commit)}"),
             user="root",
         )
         if checkout_ret != 0:
@@ -873,7 +889,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         agent_cmd = build_codex_command(
             prompt, getattr(args, "model", None), mode=codex_mode,
         )
-        agent_cmd = f"cd {repo_dir_q} && {agent_cmd}"
+        agent_cmd = _container_in_dir(repo_dir, agent_cmd)
 
         start_time = time.monotonic()
         if codex_mode == "interactive":
@@ -947,8 +963,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             )
         _, git_diff = _exec_capture(
             container_name,
-            f"cd {repo_dir_q} && "
-            f"git diff HEAD -- . {_git_diff_excludes}",
+            _container_in_dir(repo_dir, f"git diff HEAD -- . {_git_diff_excludes}"),
         )
         diff_path.write_text(git_diff)
         has_source_diff = bool(git_diff.strip())
@@ -1122,8 +1137,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 # Re-save the (now minimized) diff via git diff
                 _, min_diff = _exec_capture(
                     container_name,
-                    f"cd {repo_dir_q} && "
-                    f"git diff HEAD -- . {_git_diff_excludes}",
+                    _container_in_dir(repo_dir, f"git diff HEAD -- . {_git_diff_excludes}"),
                 )
                 diff_path.write_text(min_diff)
                 logger.info("Minimized diff saved: %s (%d bytes)",
@@ -1192,7 +1206,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     # Restore the unminimized diff
                     _, pre_min_diff = _exec_capture(
                         container_name,
-                        f"cd {repo_dir_q} && git diff")
+                        _container_in_dir(repo_dir, "git diff"))
                     diff_path.write_text(pre_min_diff)
             elif has_crash and not crash_matches:
                 logger.error(
@@ -1227,8 +1241,11 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             # Reused container — reset source for next bug but keep container
             logger.info("Resetting source tree for next bug...")
             _exec(container_name,
-                  f"cd {repo_dir_q} && git checkout -f {shlex.quote(args.target_commit)} && "
-                  f"git clean -fdx {clean_excludes}",
+                  _container_in_dir(
+                      repo_dir,
+                      f"git checkout -f {shlex.quote(args.target_commit)} && "
+                      f"git clean -fdx {clean_excludes}",
+                  ),
                   user="root")
         elif not args.keep_container:
             logger.info("Destroying container %s...", container_name)
