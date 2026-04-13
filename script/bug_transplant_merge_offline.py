@@ -284,6 +284,16 @@ _MAX_WRAP_RETRIES = 1
 
 def _patch_build_sh_for_project(content: str, project: str) -> str:
     """Apply project-specific build.sh hygiene before repeated compiles."""
+    if project == "ntopng":
+        # json-c's side build directory can survive between compiles when
+        # containers are reused.
+        content = re.sub(
+            r"^(\s*)mkdir\s+build\s*$",
+            r"\1mkdir -p build",
+            content,
+            flags=re.MULTILINE,
+        )
+
     if project != "ghostscript":
         return content
 
@@ -1100,7 +1110,19 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             # If harness_build.sh was lost, re-save from container state.
             if not (output_dir / "harness_build.sh").exists():
                 _save_build_sh(container, output_dir, project)
+            # The harness diff references the global __bug_dispatch[] symbol,
+            # but the .c/.h that defines it live outside git and weren't
+            # restored above. Inject them before the dispatch-deps Makefile
+            # fixer / build, otherwise the link fails with
+            # "undefined reference to __bug_dispatch".
+            _inject_dispatch_files(container, project, dispatch_state["dispatch_bytes"])
             _inject_dispatch_deps_fixer(container)
+            # ntopng's hand-written fuzz Makefile doesn't pick up __bug_dispatch.c
+            # automatically; the saved harness_build.sh restored above doesn't
+            # contain the compile+link patch either. Re-apply it on resume.
+            if project == "ntopng":
+                from bug_transplant_merge import _patch_ntopng_build_sh_for_dispatch
+                _patch_ntopng_build_sh_for_dispatch(container)
             if not _harness_dispatch_consumer_present(container, project, primary_fuzzer):
                 logger.error(
                     "Existing harness artifacts do not restore a dispatch-byte "
@@ -1162,7 +1184,15 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                      "cp \"$f\" /out/address/; done; true")
+                      "cp \"$f\" /out/address/; done; "
+                      # Mirror auxiliary directories (ntopng's install/,
+                      # data-dir/, docs/, scripts/) so the stashed binary
+                      # can find them when run from /out/address/.
+                      "for d in /out/*/; do "
+                      "name=$(basename \"$d\"); "
+                      "[ \"$name\" = address ] && continue; "
+                      "[ \"$name\" = ubsan ] && continue; "
+                      "ln -sfn \"$d\" \"/out/address/$name\"; done; true")
         # Copy testcases (originals + patched)
         _restore_testcases_with_dispatch(
             container, project, all_bugs, testcase_stage_dir, dispatch_state,
@@ -1421,7 +1451,15 @@ def run_offline_merge(args: argparse.Namespace) -> int:
         _exec_capture(container,
                       "mkdir -p /out/address && "
                       "for f in /out/*; do [ -f \"$f\" ] && [ -x \"$f\" ] && "
-                      "cp \"$f\" /out/address/; done; true")
+                      "cp \"$f\" /out/address/; done; "
+                      # Mirror auxiliary directories (ntopng's install/,
+                      # data-dir/, docs/, scripts/) so the stashed binary
+                      # can find them when run from /out/address/.
+                      "for d in /out/*/; do "
+                      "name=$(basename \"$d\"); "
+                      "[ \"$name\" = address ] && continue; "
+                      "[ \"$name\" = ubsan ] && continue; "
+                      "ln -sfn \"$d\" \"/out/address/$name\"; done; true")
 
         # Restore testcases with dispatch bytes
         _restore_testcases_with_dispatch(

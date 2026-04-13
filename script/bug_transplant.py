@@ -178,6 +178,38 @@ def _container_in_dir(directory: str, command: str) -> str:
     return f"(cd {shlex.quote(directory)} && {command})"
 
 
+def _patch_build_sh_for_repeated_compile(
+    container_name: str, project: str,
+) -> None:
+    """Apply project-specific /src/build.sh hygiene for reused containers."""
+    # Ghostscript: build.sh destructively removes tracked vendored source
+    # directories. Drop those removals so repeated compiles do not pollute
+    # git diff or break resume.
+    if project == "ghostscript":
+        ret = _exec(
+            container_name,
+            r"""sed -i '/^rm -rf cups\/libs/d; /^rm -rf freetype/d; /^rm -rf zlib/d; """
+            r"""s|^mv \$SRC/freetype freetype|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|; """
+            r"""s|^if \[ -d "\$SRC/freetype" \]; then cp -a "\$SRC/freetype" freetype; fi|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
+            "/src/build.sh",
+            user="root",
+        )
+        if ret != 0:
+            logger.warning("Failed to patch ghostscript /src/build.sh")
+
+    if project == "ntopng":
+        # ntopng's OSS-Fuzz build.sh creates the json-c CMake build dir with
+        # bare `mkdir build`. Shared --keep-containers runs can keep that
+        # directory between compiles, so make the command idempotent.
+        ret = _exec(
+            container_name,
+            r"""sed -i -E 's|^([[:space:]]*)mkdir[[:space:]]+build[[:space:]]*$|\1mkdir -p build|' /src/build.sh""",
+            user="root",
+        )
+        if ret != 0:
+            logger.warning("Failed to patch ntopng /src/build.sh")
+
+
 def _build_container_env(language: str) -> list[str]:
     """Match the default build env used by fuzz_helper.py build_version."""
     return [
@@ -732,6 +764,7 @@ def create_shared_container(
             f"ln -sf {shlex.quote(agents_md_path)} {shlex.quote(repo_dir)}/AGENTS.md 2>/dev/null || true",
             user="root",
         )
+    _patch_build_sh_for_repeated_compile(container_name, project)
     _exec(container_name, "sudo chown -R agent:agent /src/ /out/ /work/ /data/ 2>/dev/null || true", user="root")
 
     # Setup codex credentials
@@ -878,18 +911,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 user="root",
             )
 
-        # Ghostscript: build.sh destructively removes tracked vendored source
-        # directories. Drop those removals so repeated compiles do not pollute
-        # git diff or break resume.
-        if args.project == "ghostscript":
-            _exec(
-                container_name,
-                r"""sed -i '/^rm -rf cups\/libs/d; /^rm -rf freetype/d; /^rm -rf zlib/d; """
-                r"""s|^mv \$SRC/freetype freetype|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|; """
-                r"""s|^if \[ -d "\$SRC/freetype" \]; then cp -a "\$SRC/freetype" freetype; fi|if [ ! -d freetype ] && [ -d "$SRC/freetype" ]; then cp -a "$SRC/freetype" freetype; fi|' """
-                "/src/build.sh",
-                user="root",
-            )
+        _patch_build_sh_for_repeated_compile(container_name, args.project)
 
         # --- Copy testcase to /work for easier access ---
         _exec(
@@ -980,6 +1002,14 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         if args.project == "ghostscript":
             _git_diff_excludes += (
                 " ':(exclude)freetype/' ':(exclude)zlib/' ':(exclude)cups/libs/'"
+            )
+        # ntopng's Docker/image setup can leave submodule gitlinks checked out
+        # at revisions different from the target commit. Those are not source
+        # edits from the transplant and must not force a minimization pass for
+        # testcase-only results.
+        if args.project == "ntopng":
+            _git_diff_excludes += (
+                " ':(exclude)httpdocs/dist' ':(exclude)tests/e2e'"
             )
         _, git_diff = _exec_capture(
             container_name,

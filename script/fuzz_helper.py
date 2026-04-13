@@ -2656,6 +2656,14 @@ def prepare_repository(oss_fuzz_dir, oss_fuzz_commit, target, builder_image_dige
         r'\1\n./configure\n\2',
         build_content,
     )
+    # json-c is built in a side directory under /src. Reused builders keep
+    # that directory around, so make the creation idempotent.
+    build_content = re.sub(
+        r'^(\s*)mkdir\s+build\s*$',
+        r'\1mkdir -p build',
+        build_content,
+        flags=re.MULTILINE,
+    )
   # Tolerate sample/test link failures in projects that build non-essential
   # targets alongside the library (e.g. unicorn's make.sh builds samples
   # that fail with undefined sanitizer due to missing compiler-rt symbols).

@@ -58,11 +58,54 @@ Please make these changes:
 
    Then use `__fuzz_copy` and `size` for the rest of the harness.
 
-5. Make sure __bug_dispatch.c is compiled and linked into ALL fuzz
-   targets.  Depending on the build system you may need to:
-   - Add it to build.sh (e.g. add to a SOURCES list, or compile
-     and link it explicitly)
-   - Or add it to CMakeLists.txt / Makefile
+5. **Make sure `__bug_dispatch.c` is compiled and linked into the
+   fuzzer binary.**  Many projects' OBJECTS lists are produced by a
+   `wildcard src/*.cpp` pattern or by autotools `*_SOURCES` blocks
+   that will silently skip a stray `.c` file at the source root, so
+   adding the header reference in the harness is NOT enough — you
+   must wire the build system.
 
-After making changes, run: compile
-If there are build errors, fix them.
+   First, identify the build system in use (run `ls`, `cat build.sh`,
+   `find . -maxdepth 3 -name 'Makefile.am' -o -name 'CMakeLists.txt'
+   -o -name 'BUILD.bazel'`). Then apply the matching recipe:
+
+   - **Hand-written Makefile / build.sh `make` invocation:**
+     edit `/src/build.sh` to compile the dispatch object and append
+     it to the link rule's prereqs *after* `./configure` (so the
+     generated Makefile exists), e.g.:
+     ```
+     clang $CFLAGS -c __bug_dispatch.c -o __bug_dispatch.o
+     sed -i '/^<fuzzer-target>:/ s| *$| __bug_dispatch.o|' <path/to/Makefile>
+     ```
+     where `<fuzzer-target>` is the rule name from the generated
+     Makefile (e.g. `fuzz/fuzz_<name>`). Do this *before* the line
+     that runs `make`.
+
+   - **Autotools (`Makefile.am`):** add `$(top_srcdir)/__bug_dispatch.c`
+     to the relevant `*_SOURCES` block (or `noinst_LTLIBRARIES` /
+     `lib_LTLIBRARIES` source list) so it gets compiled into the same
+     `.la` the fuzzer links against. Re-run `./autogen.sh` /
+     `./configure` if needed.
+
+   - **CMake:** in the `CMakeLists.txt` that defines the fuzzer
+     target, either append `__bug_dispatch.c` to that target's source
+     list, or `add_library(bug_dispatch STATIC __bug_dispatch.c)` +
+     `target_link_libraries(<fuzzer-target> PRIVATE bug_dispatch)`.
+
+   - **Bazel:** add `__bug_dispatch.c` to the fuzzer rule's `srcs`.
+
+6. After making the source/build changes, run: `compile`
+
+   Then VERIFY the symbol actually got linked. Run:
+   ```
+   nm -D /out/{fuzzer} 2>/dev/null | grep ' __bug_dispatch$' || \
+     nm /out/{fuzzer} 2>/dev/null | grep ' __bug_dispatch$'
+   ```
+   The expected output contains a line ending in ` D __bug_dispatch`
+   (defined data symbol). If it shows ` U __bug_dispatch` (undefined)
+   or nothing, the link is broken — the build system change in step 5
+   did not take effect. Fix and rebuild before declaring done.
+
+   Likewise, the build is NOT successful if the link step printed
+   `undefined reference to '__bug_dispatch'` even when an old binary
+   from a previous build is still on disk.

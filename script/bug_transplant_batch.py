@@ -446,6 +446,23 @@ def is_bug_completed(project: str, bug_id: str) -> bool:
     }
 
 
+def completed_resume_result(
+    project: str, bug_id: str, prev: dict | None,
+) -> dict:
+    """Return a result entry for a bug skipped by --resume."""
+    folder_result = _result_from_folder(project, bug_id)
+    if prev and prev.get("status") in {"success", "impossible"}:
+        return prev
+    if prev:
+        merged = dict(prev)
+        merged.update(folder_result)
+        if folder_result.get("status") in {"success", "impossible"}:
+            merged["exit_code"] = 0
+            merged["error_message"] = None
+        return merged
+    return folder_result
+
+
 def run_single_bug(
     project: str,
     bug_id: str,
@@ -1016,8 +1033,7 @@ def main() -> int:
                 if args.resume and is_bug_completed(args.target, bug_id):
                     logger.info("[%s] Already completed, skipping (--resume)", bug_id)
                     prev = prev_results.get(bug_id)
-                    results.append(prev if prev and prev.get("status") not in ("skipped", None)
-                                   else {"bug_id": bug_id, "status": "skipped"})
+                    results.append(completed_resume_result(args.target, bug_id, prev))
                     write_progress(artifacts_root, results, ongoing=[])
                     continue
 
@@ -1043,8 +1059,7 @@ def main() -> int:
                     if args.resume and is_bug_completed(args.target, bug_id):
                         logger.info("[%s] Already completed, skipping (--resume)", bug_id)
                         prev = prev_results.get(bug_id)
-                        results.append(prev if prev and prev.get("status") not in ("skipped", None)
-                                       else {"bug_id": bug_id, "status": "skipped"})
+                        results.append(completed_resume_result(args.target, bug_id, prev))
                         continue
 
                     fut = executor.submit(
