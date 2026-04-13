@@ -494,6 +494,8 @@ def run_single_bug(
         cmd += ["--model", args.model]
     if args.timeout:
         cmd += ["--timeout", str(args.timeout)]
+    if args.minimize_timeout:
+        cmd += ["--minimize-timeout", str(args.minimize_timeout)]
     if args.keep_containers:
         cmd.append("--keep-container")
     if args.verbose:
@@ -516,7 +518,7 @@ def run_single_bug(
             # Interactive mode: inherit terminal so tmux can attach
             rc = subprocess.call(
                 cmd,
-                timeout=args.timeout + 120 if args.timeout else 3720,
+                timeout=(args.timeout or 3600) + (args.minimize_timeout or 1200) + 120,
             )
             result["exit_code"] = rc
             result["status"] = "success" if rc == 0 else "failed"
@@ -528,7 +530,7 @@ def run_single_bug(
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=args.timeout + 120 if args.timeout else 3720,
+                timeout=(args.timeout or 3600) + (args.minimize_timeout or 1200) + 120,
             )
             result["exit_code"] = proc.returncode
             if proc.returncode == 0:
@@ -751,7 +753,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jobs", type=int, default=1,
                         help="Parallel bug count (default: 1)")
     parser.add_argument("--timeout", type=int, default=3600,
-                        help="Per-bug timeout in seconds (default: 3600)")
+                        help="Transplant agent timeout in seconds (default: 3600)")
+    parser.add_argument("--minimize-timeout", type=int, default=1200,
+                        help="Minimize agent timeout in seconds (default: 1200)")
 
     # Data collection
     parser.add_argument("--testcases-dir",

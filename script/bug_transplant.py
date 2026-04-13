@@ -251,11 +251,11 @@ def collect_crash_data(args: argparse.Namespace) -> bool:
         "--commit", args.buggy_commit,
         "--testcases", args.testcases_dir,
         "--test_input", args.testcase,
+        "--ignore-leaks",
     ]
     if args.build_csv:
         cmd += ["--build_csv", args.build_csv]
-    if args.runner_image:
-        cmd += ["--runner-image", args.runner_image]
+    cmd += ["--runner-image", args.runner_image or "auto"]
 
     ret = _run_quiet(cmd, label="collect_crash")
     if ret != 0:
@@ -290,8 +290,7 @@ def collect_trace_data(args: argparse.Namespace) -> bool:
     ]
     if args.build_csv:
         cmd += ["--build_csv", args.build_csv]
-    if args.runner_image:
-        cmd += ["--runner-image", args.runner_image]
+    cmd += ["--runner-image", args.runner_image or "auto"]
 
     ret = _run_quiet(cmd, label="collect_trace")
     if ret != 0:
@@ -378,6 +377,7 @@ def build_project_image(
             "build_version", project,
             "--commit", target_commit,
             "--no_corpus",
+            "--runner-image", "auto",
         ]
         if build_csv:
             cmd += ["--build_csv", build_csv]
@@ -1135,11 +1135,11 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 min_start = time.monotonic()
                 if codex_mode == "interactive":
                     min_exit, min_output = _exec_interactive(
-                        container_name, minimize_cmd, timeout=args.timeout,
+                        container_name, minimize_cmd, timeout=args.minimize_timeout,
                     )
                 else:
                     min_exit, min_output = _exec_capture(
-                        container_name, minimize_cmd, timeout=args.timeout,
+                        container_name, minimize_cmd, timeout=args.minimize_timeout,
                     )
                 min_elapsed = time.monotonic() - min_start
                 if _usage_tracker:
@@ -1586,7 +1586,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=None,
                         help="Model to use (passed to agent CLI)")
     parser.add_argument("--timeout", type=int, default=3600,
-                        help="Timeout in seconds for agent (default: 3600)")
+                        help="Timeout in seconds for transplant agent (default: 3600)")
+    parser.add_argument("--minimize-timeout", type=int, default=1200,
+                        help="Timeout in seconds for minimize agent (default: 1200)")
     parser.add_argument("--codex-mode", choices=["exec", "interactive"],
                         default="exec",
                         help="Agent invocation mode: exec (default, JSONL) "

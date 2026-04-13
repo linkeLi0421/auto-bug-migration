@@ -2342,9 +2342,11 @@ def get_crash_log_bash(commit:str, args):
 
     compile;
     CRASH_FILE=/data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
+    FUZZER_EXTRA_ARGS="{'-detect_leaks=0' if getattr(args, 'ignore_leaks', False) else ''}";
+    SUMMARY_RE='{"SUMMARY:.*(Address|Memory|Undefined|Thread)Sanitizer" if getattr(args, "ignore_leaks", False) else "SUMMARY:.*(Address|Memory|Undefined|Thread|Leak)Sanitizer"}';
     for attempt in 1 2 3; do
-      /out/{args.fuzzer_name} -runs=10 /corpus/{args.test_input} &> "$CRASH_FILE";
-      if grep -qE 'SUMMARY:.*(Address|Memory|Undefined|Thread|Leak)Sanitizer' "$CRASH_FILE" 2>/dev/null; then
+      /out/{args.fuzzer_name} -runs=10 $FUZZER_EXTRA_ARGS /corpus/{args.test_input} &> "$CRASH_FILE";
+      if grep -qE "$SUMMARY_RE" "$CRASH_FILE" 2>/dev/null; then
         break;
       fi;
     done;
