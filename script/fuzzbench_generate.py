@@ -4,7 +4,9 @@
 Reads the merge output (summary.json, combined.diff, harness.diff,
 harness_sources/, testcases/) and the project's OSS-Fuzz build files to
 produce a self-contained FuzzBench benchmark directory that can be dropped into
-fuzzbench/benchmarks/.
+fuzzbench/benchmarks/. The benchmark Dockerfile always uses the project's
+bug-merge-<project> container as its base image, creating that container from
+merge_dir/testcases first if it does not already exist.
 
 Usage:
     python3 script/fuzzbench_generate.py \
@@ -54,6 +56,47 @@ def commit_merge_container(container_name: str, project: str,
             f"docker commit failed: {result.stderr.strip()}")
     logger.info("Committed image: %s", tag)
     return tag
+
+
+def docker_container_exists(container_name: str) -> bool:
+    """Return True if a Docker container with this name exists."""
+    result = subprocess.run(
+        ["docker", "container", "inspect", container_name],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def ensure_merge_container(project: str, target_commit: str, merge_dir: Path,
+                           build_csv: Path | None) -> str:
+    """Ensure bug-merge-<project> exists, creating it from merge output if needed."""
+    container_name = f"bug-merge-{project}"
+    if docker_container_exists(container_name):
+        logger.info("Using existing merge container: %s", container_name)
+        return container_name
+
+    testcases_dir = merge_dir / "testcases"
+    if not testcases_dir.is_dir():
+        raise RuntimeError(
+            f"Cannot create merge container: testcase directory not found: {testcases_dir}"
+        )
+
+    logger.info("Merge container %s not found; creating it from %s ...",
+                container_name, testcases_dir)
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from bug_transplant_merge import start_merge_container
+
+    created_container, build_ok = start_merge_container(
+        project,
+        target_commit,
+        testcases_dir=str(testcases_dir),
+        build_csv=str(build_csv) if build_csv else None,
+    )
+    if not build_ok:
+        raise RuntimeError(
+            f"Created merge container {created_container}, but its initial build failed."
+        )
+    return created_container
 
 
 def generate_dockerfile_from_container(merge_image: str, project: str,
@@ -528,6 +571,8 @@ def patch_project_build_commands(project: str, original_build: str,
     """Apply repo-specific fixes to benchmark build commands."""
     if project == "opensc":
         return patch_opensc_build_commands(original_build, fuzz_target)
+    if project == "ndpi":
+        return patch_ndpi_build_commands(original_build, fuzz_target)
 
     # Patch cmake to disable tests/benchmarks (they fail because
     # __bug_dispatch is only linked into fuzz targets, not the main library).
@@ -537,6 +582,38 @@ def patch_project_build_commands(project: str, original_build: str,
             "-DBUILD_FUZZERS=ON",
             "-DBUILD_FUZZERS=ON -DBUILD_TESTS=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_EXAMPLES=OFF",
         )
+    return patched
+
+
+def patch_ndpi_build_commands(original_build: str, fuzz_target: str) -> str:  # noqa: ARG001 - API symmetry
+    """Adapt nDPI's OSS-Fuzz build script for our generated project cwd.
+
+    The original OSS-Fuzz script starts in /src, builds /src/libpcap-1.9.1,
+    then cd's into ndpi. Our generated build.sh starts in /src/ndpi so that
+    patch application happens in the project git checkout.
+    """
+    patched = original_build
+    patched = re.sub(
+        r"^tar -xvzf libpcap-1\.9\.1\.tar\.gz$",
+        "cd /src\ntar -xvzf /src/libpcap-1.9.1.tar.gz",
+        patched,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    patched = re.sub(
+        r"^cd libpcap-1\.9\.1$",
+        "cd /src/libpcap-1.9.1",
+        patched,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    patched = re.sub(
+        r"^cd ndpi$",
+        "cd /src/ndpi",
+        patched,
+        count=1,
+        flags=re.MULTILINE,
+    )
     return patched
 
 
@@ -875,8 +952,6 @@ def main():
                         help="Output directory for generated benchmark(s) (default: fuzzbench-output/)")
     parser.add_argument("--oss-fuzz-dir", default=str(OSS_FUZZ_DIR),
                         help="Path to local oss-fuzz checkout")
-    parser.add_argument("--builder-digest",
-                        help="Override base-builder digest (e.g., sha256:abc...)")
     parser.add_argument("--benchmark-name",
                         help="Custom benchmark name (default: {project}_transplant_{target})")
     parser.add_argument(
@@ -885,13 +960,6 @@ def main():
         help=("Use the current local oss-fuzz checkout exactly as-is instead of "
               "checking out the commit from builds.csv. This is useful when the "
               "merge workflow already prepared a historical OSS-Fuzz environment."),
-    )
-    parser.add_argument(
-        "--merge-container",
-        help=("Name of a running merge container (e.g. 'bug-merge-opensc') to "
-              "commit as a Docker image and use as the benchmark's Dockerfile "
-              "base.  This guarantees the FuzzBench build environment is "
-              "identical to the one that verified the bugs."),
     )
     parser.add_argument(
         "--fuzzer", nargs="+",
@@ -924,11 +992,14 @@ def main():
     logger.info("Project: %s, commit: %s, dispatch_bytes: %d, bugs: %d",
                 project, target_commit[:8], dispatch_bytes, len(summary["results"]))
 
-    # 2. Commit merge container if requested (before any OSS-Fuzz checkout).
-    merge_image = None
-    if args.merge_container:
-        merge_image = commit_merge_container(
-            args.merge_container, project, target_commit)
+    # 2. Always use the merge container environment as the benchmark base.
+    merge_container = ensure_merge_container(
+        project,
+        target_commit,
+        merge_dir,
+        build_csv,
+    )
+    merge_image = commit_merge_container(merge_container, project, target_commit)
 
     # 3. Select the OSS-Fuzz project files to mirror into the benchmark.
     if args.use_current_oss_fuzz_checkout:
@@ -956,18 +1027,6 @@ def main():
             "Project source repo for %s not found locally, falling back to OSS-Fuzz commit date %s",
             target_commit[:12], commit_date)
 
-    # 4. Preserve the same builder image the selected OSS-Fuzz project uses.
-    if not merge_image:
-        pinned_builder_digest = get_pinned_builder_digest(dockerfile_content)
-        builder_digest = (
-            args.builder_digest
-            or pinned_builder_digest
-            or get_builder_digest(oss_fuzz_dir, oss_fuzz_commit)
-        )
-        if not builder_digest.startswith("sha256:"):
-            builder_digest = f"sha256:{builder_digest}"
-        logger.info("Builder digest: %s", builder_digest)
-
     # 5. Create benchmark directory
     fuzz_target = args.fuzz_target
     benchmark_name = args.benchmark_name or f"{project}_transplant_{fuzz_target}"
@@ -979,13 +1038,9 @@ def main():
     seeds_dir.mkdir(exist_ok=True)
 
     # 6. Generate Dockerfile
-    if merge_image:
-        dockerfile = generate_dockerfile_from_container(
-            merge_image, project, project_repo_name)
-        logger.info("Generated Dockerfile from merge container image %s", merge_image)
-    else:
-        dockerfile = generate_dockerfile(project, oss_fuzz_dir, builder_digest, dispatch_bytes)
-        logger.info("Generated Dockerfile from OSS-Fuzz template")
+    dockerfile = generate_dockerfile_from_container(
+        merge_image, project, project_repo_name)
+    logger.info("Generated Dockerfile from merge container image %s", merge_image)
     (bench_dir / "Dockerfile").write_text(dockerfile)
 
     # 7. Generate build.sh

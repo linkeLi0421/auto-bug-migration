@@ -30,6 +30,7 @@ import struct
 import sys
 import tarfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,33 @@ STACKTRACE_FRAME_RE = re.compile(
     r"^\s*#\d+\s+0x[0-9a-fA-F]+\s+in\s+(.+?)\s+(/src/[^:\n]+):(\d+)(?::\d+)?",
     re.MULTILINE,
 )
+SANITIZER_ERROR_RE = re.compile(r"ERROR:\s+([^:]+):\s+([^\s]+)")
+SANITIZER_ACCESS_RE = re.compile(r"\b(READ|WRITE) of size (\d+)\b")
+SANITIZER_REGION_RE = re.compile(
+    r"\bis located\s+(\d+)\s+bytes?\s+((?:to the )?(?:left|right)|inside)\s+of\s+(\d+)-byte region"
+)
+SANITIZER_SIGNATURE_FIELDS = (
+    "sanitizer",
+    "error_type",
+    "access_type",
+    "access_size",
+    "region_offset",
+    "region_relation",
+    "region_size",
+)
+
+
+SanitizerSignature = dict[str, str | int]
+
+
+@dataclass(frozen=True)
+class BugTarget:
+    bug_id: str
+    crash_file: str
+    crash_line: int
+    crash_function: str | None
+    reference_frames: list[tuple[str, str, int]]
+    sanitizer_signature: SanitizerSignature
 
 
 def bug_ids_with_crashes(crash_results: dict) -> set[str]:
@@ -49,6 +77,8 @@ def load_bug_metadata(metadata_path: Path) -> dict:
         bug_metadata = json.load(f)
     bug_metadata["_metadata_path"] = str(metadata_path)
     bug_metadata["_reference_frames"] = load_reference_crash_frames(
+        metadata_path, bug_metadata)
+    bug_metadata["_reference_sanitizer_signatures"] = load_reference_crash_signatures(
         metadata_path, bug_metadata)
     return bug_metadata
 
@@ -69,6 +99,30 @@ def parse_stacktrace_frames(stacktrace_text: str) -> list[tuple[str, str, int]]:
         function_name, filename, line = frame_match.groups()
         frames.append((function_name, filename, int(line)))
     return frames
+
+
+def parse_sanitizer_signature(stacktrace_text: str) -> SanitizerSignature:
+    """Parse stable sanitizer crash details from a crash log."""
+    signature: SanitizerSignature = {}
+    text = stacktrace_text or ""
+
+    if match := SANITIZER_ERROR_RE.search(text):
+        sanitizer, error_type = match.groups()
+        signature["sanitizer"] = sanitizer
+        signature["error_type"] = error_type
+
+    if match := SANITIZER_ACCESS_RE.search(text):
+        access_type, access_size = match.groups()
+        signature["access_type"] = access_type
+        signature["access_size"] = int(access_size)
+
+    if match := SANITIZER_REGION_RE.search(text):
+        region_offset, region_relation, region_size = match.groups()
+        signature["region_offset"] = int(region_offset)
+        signature["region_relation"] = region_relation.replace("to the ", "")
+        signature["region_size"] = int(region_size)
+
+    return signature
 
 
 def load_reference_crash_frames(metadata_path: Path, bug_metadata: dict) -> dict[str, list[tuple[str, str, int]]]:
@@ -100,6 +154,30 @@ def load_reference_crash_frames(metadata_path: Path, bug_metadata: dict) -> dict
     return reference_frames
 
 
+def load_reference_crash_signatures(metadata_path: Path,
+                                    bug_metadata: dict) -> dict[str, SanitizerSignature]:
+    """Load sanitizer signatures from benchmark reference crash logs."""
+    crashes_dir = metadata_path.parent / "crashes"
+    if not crashes_dir.exists():
+        return {}
+
+    reference_signatures = {}
+    for bug_id in bug_metadata["bugs"]:
+        crash_txt = crashes_dir / f"{bug_id}.txt"
+        if not crash_txt.exists():
+            continue
+        try:
+            text = crash_txt.read_text(errors="replace")
+        except OSError:
+            continue
+
+        signature = parse_sanitizer_signature(text)
+        if signature:
+            reference_signatures[bug_id] = signature
+
+    return reference_signatures
+
+
 def _path_matches(actual_path: str, expected_path: str) -> bool:
     return (
         actual_path == expected_path
@@ -110,10 +188,11 @@ def _path_matches(actual_path: str, expected_path: str) -> bool:
 
 def _bug_targets_from_metadata(bug_metadata: dict,
                                relevant_bug_ids: set[str] | None = None
-                               ) -> list[tuple[str, str, int, str | None, list[tuple[str, str, int]]]]:
-    """Build bug crash targets as (bug_id, file, line, function, reference_frames)."""
+                               ) -> list[BugTarget]:
+    """Build bug crash targets from metadata and reference crash logs."""
     targets = []
     reference_frames_by_bug = bug_metadata.get("_reference_frames", {})
+    reference_signatures_by_bug = bug_metadata.get("_reference_sanitizer_signatures", {})
     for bug_id, info in bug_metadata["bugs"].items():
         if relevant_bug_ids is not None and bug_id not in relevant_bug_ids:
             continue
@@ -121,54 +200,94 @@ def _bug_targets_from_metadata(bug_metadata: dict,
         crash_line = info.get("crash_line")
         if not crash_file or crash_line is None:
             continue
-        targets.append((
-            bug_id,
-            crash_file,
-            int(crash_line),
-            info.get("crash_function"),
-            reference_frames_by_bug.get(bug_id, []),
+        targets.append(BugTarget(
+            bug_id=bug_id,
+            crash_file=crash_file,
+            crash_line=int(crash_line),
+            crash_function=info.get("crash_function"),
+            reference_frames=reference_frames_by_bug.get(bug_id, []),
+            sanitizer_signature=reference_signatures_by_bug.get(bug_id, {}),
         ))
     return targets
 
 
+def _sanitizer_signature_score(crash_signature: SanitizerSignature,
+                               reference_signature: SanitizerSignature) -> int:
+    """Score sanitizer detail similarity; unknown is neutral, mismatches are negative."""
+    if not crash_signature or not reference_signature:
+        return 0
+
+    matches = 0
+    mismatches = 0
+    for field in SANITIZER_SIGNATURE_FIELDS:
+        if field not in crash_signature or field not in reference_signature:
+            continue
+        if crash_signature[field] == reference_signature[field]:
+            matches += 1
+        else:
+            mismatches += 1
+
+    if mismatches:
+        return -mismatches
+    return matches
+
+
 def _match_bug_ids_in_stacktrace(crash_stacktrace: str,
-                                 bug_targets: list[tuple[str, str, int, str | None, list[tuple[str, str, int]]]]
+                                 bug_targets: list[BugTarget]
                                  ) -> set[str]:
-    """Match bug IDs by stacktrace frame file/line and optional function."""
+    """Match bug IDs by stack frames, then sanitizer details for tie-breaking."""
     frames = parse_stacktrace_frames(crash_stacktrace)
+    crash_signature = parse_sanitizer_signature(crash_stacktrace)
     candidates = []
-    for bug_id, crash_file, crash_line, crash_function, reference_frames in bug_targets:
+    for target in bug_targets:
         for function_name, filename, line in frames:
-            if line != crash_line or not _path_matches(filename, crash_file):
+            if line != target.crash_line or not _path_matches(filename, target.crash_file):
                 continue
-            if crash_function and function_name != crash_function:
+            if target.crash_function and function_name != target.crash_function:
                 continue
-            candidates.append((bug_id, crash_file, crash_line, crash_function, reference_frames))
+            candidates.append(target)
             break
 
     if len(candidates) <= 1:
-        return {candidate[0] for candidate in candidates}
+        return {candidate.bug_id for candidate in candidates}
 
     scored_candidates = []
-    for bug_id, crash_file, crash_line, crash_function, reference_frames in candidates:
-        score = 0
-        for ref_function, ref_file, ref_line in reference_frames:
-            if ref_line == crash_line and _path_matches(ref_file, crash_file):
-                if crash_function is None or ref_function == crash_function:
+    for target in candidates:
+        stack_score = 0
+        for ref_function, ref_file, ref_line in target.reference_frames:
+            if ref_line == target.crash_line and _path_matches(ref_file, target.crash_file):
+                if target.crash_function is None or ref_function == target.crash_function:
                     continue
             for function_name, filename, line in frames:
                 if line != ref_line or function_name != ref_function:
                     continue
                 if not _path_matches(filename, ref_file):
                     continue
-                score += 1
+                stack_score += 1
                 break
-        scored_candidates.append((bug_id, score))
+        sanitizer_score = _sanitizer_signature_score(
+            crash_signature, target.sanitizer_signature)
+        scored_candidates.append((target.bug_id, stack_score, sanitizer_score))
 
-    best_score = max(score for _, score in scored_candidates)
-    if best_score <= 0:
-        return {bug_id for bug_id, _ in scored_candidates}
-    return {bug_id for bug_id, score in scored_candidates if score == best_score}
+    best_sanitizer_score = 0
+    if crash_signature:
+        best_sanitizer_score = max(
+            sanitizer_score for _, _, sanitizer_score in scored_candidates)
+        if best_sanitizer_score < 0:
+            return set()
+        scored_candidates = [
+            candidate for candidate in scored_candidates
+            if candidate[2] == best_sanitizer_score
+        ]
+
+    best_stack_score = max(stack_score for _, stack_score, _ in scored_candidates)
+    if best_stack_score <= 0 and best_sanitizer_score <= 0:
+        return {bug_id for bug_id, _, _ in scored_candidates}
+    return {
+        bug_id
+        for bug_id, stack_score, _ in scored_candidates
+        if stack_score == best_stack_score
+    }
 
 
 def load_snapshot_times_by_trial(db_path: Path | None) -> dict[str, list[int]]:
@@ -584,12 +703,14 @@ def write_bug_report(rows: list, bug_metadata: dict, output_path: Path):
     """Write a detailed per-bug JSON report with crash line info and discovery status."""
     # Aggregate across all fuzzers/trials: best result per bug
     bug_status = {}
+    reference_signatures_by_bug = bug_metadata.get("_reference_sanitizer_signatures", {})
     for bug_id, info in bug_metadata["bugs"].items():
         bug_status[bug_id] = {
             "crash_file": info.get("crash_file"),
             "crash_line": info.get("crash_line"),
             "crash_function": info.get("crash_function"),
             "dispatch_value": info.get("dispatch_value"),
+            "sanitizer_signature": reference_signatures_by_bug.get(bug_id, {}),
             "reached_by": [],   # list of {fuzzer, trial, time}
             "triggered_by": [], # list of {fuzzer, trial, time}
         }
@@ -719,6 +840,8 @@ def main():
                         help="Benchmark name (auto-detected from bug_metadata if omitted)")
     parser.add_argument("--output", required=True,
                         help="Output CSV path")
+    parser.add_argument("--crash-only", action="store_true",
+                        help="Stop after sanitizer-aware crash matching and skip coverage scanning")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -767,8 +890,14 @@ def main():
     write_csv(crash_only_rows, output_path)
     logger.info("Wrote %d crash-only rows to %s", len(crash_only_rows), output_path)
 
-    crash_report_path = output_path.with_name(output_path.stem + "_crash_only_bug_report.json")
+    crash_report_stem = output_path.stem
+    if not crash_report_stem.endswith("_crash_only"):
+        crash_report_stem += "_crash_only"
+    crash_report_path = output_path.with_name(crash_report_stem + "_bug_report.json")
     write_bug_report(crash_only_rows, bug_metadata, crash_report_path)
+    if args.crash_only:
+        print_summary(crash_only_rows, bug_metadata)
+        return
 
     logger.info("Scanning coverage snapshots for bug crash lines...")
     logger.info("  Scanning all bug crash lines; per-trial coverage checks will skip bugs already triggered in that same trial")

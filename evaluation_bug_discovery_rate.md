@@ -82,17 +82,37 @@ Empirically, this was too weak for `opensc_transplant_fuzz_pkcs15_reader`. The o
 
 The current OpenSC benchmark uses **PoC-derived structural seed material**, but it still excludes exact crashing PoCs from the final seed corpus.
 
-The benchmark build now:
+There are two different seed sources, and they are handled differently:
 
-1. Copies benchmark-local seed candidates from `fuzzbench/benchmarks/opensc_transplant_fuzz_pkcs15_reader/seeds/`.
-2. Uses the 23 `testcase-*-patched` files from `data/merge_offline_opensc_6903aebf/testcases/` as source material.
-3. Generates non-crashing variants from each candidate:
-   - `dispatch_zero`: zero byte 0 to deactivate dispatch-gated patches while preserving the APDU/card routing structure.
-   - `head_1`, `head_2`, `head_8`, `head_16`, `head_64`, `head_256`, `head_1024`: truncated structural prefixes.
-   - `trim_1`: full input minus the last byte.
-   - `zero_last`, `ff_last`, `zero_mid`, `ff_mid`: simple single-byte mutations.
-   - `exact`: generated as a candidate only, then filtered by replay.
-4. Replays every candidate once against the built target and adds only candidates that exit cleanly.
+| Seed source | Dispatch-byte handling | Why |
+|-------------|------------------------|-----|
+| Original OSS-Fuzz seeds | Prepend one dispatch byte to each original seed. We create variants with byte 0 set to `00`, `01`, `02`, `04`, `08`, `10`, `20`, and `40`. | These original seeds do not know about our dispatch harness, so they need the extra byte at the front. |
+| PoC-derived `testcase-*-patched` seeds | Do **not** prepend another byte. These files already include the dispatch byte at byte 0. | Adding another byte would shift the smart-card/APDU structure and make the testcase layout wrong. |
+
+Examples from the current PoC-derived seed files:
+
+| Seed | First bytes | Meaning |
+|------|-------------|---------|
+| `testcase-OSV-2020-1046-patched` | `01 02 00 90 ...` | Byte 0 is dispatch value `0x01`. |
+| `testcase-OSV-2020-1981-patched` | `02 14 00 3b ...` | Byte 0 is dispatch value `0x02`. |
+| `testcase-OSV-2020-55-patched` | `04 13 00 3b ...` | Byte 0 is dispatch value `0x04`. |
+| `testcase-OSV-2021-915-patched` | `40 00 00 2b ...` | Byte 0 is dispatch value `0x40`. |
+| `testcase-OSV-2020-1720-patched` | `00 19 00 3b ...` | Byte 0 is `0x00`, so this is an always-active/default-path bug. |
+
+For the 23 PoC-derived `testcase-*-patched` files copied from `data/merge_offline_opensc_6903aebf/testcases/`, the benchmark build generates candidate variants:
+
+| Variant | Exact operation |
+|---------|-----------------|
+| `exact` | Copy the testcase unchanged. This is generated only as a candidate and is expected to be filtered out if it crashes. |
+| `dispatch_zero` | Copy the testcase, then set byte 0 to `0x00`. This deactivates dispatch-gated patches while preserving the rest of the smart-card/APDU conversation. |
+| `head_1`, `head_2`, `head_8`, `head_16`, `head_64`, `head_256`, `head_1024` | Keep only the first N bytes of the testcase. These are structural prefixes, not extra bytes. |
+| `trim_1` | Remove the last byte from the testcase. |
+| `zero_last` | Copy the testcase, then set the last byte to `0x00`. |
+| `ff_last` | Copy the testcase, then set the last byte to `0xff`. |
+| `zero_mid` | Copy the testcase, then set the middle byte to `0x00`. |
+| `ff_mid` | Copy the testcase, then set the middle byte to `0xff`. |
+
+After generating candidates, the build replays every candidate once against `$OUT/fuzz_pkcs15_reader` with a 10-second timeout. A candidate is copied into the final seed corpus only if the target exits cleanly. This is the key guardrail: exact crashing PoCs and any mutated candidate that still crashes are rejected before packaging.
 
 Validation for the rebuilt libFuzzer runner:
 

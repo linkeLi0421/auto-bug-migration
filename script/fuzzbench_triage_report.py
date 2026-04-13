@@ -131,6 +131,22 @@ def read_trial_ids_by_fuzzer(db_path: Path | None) -> dict[str, set[str]]:
     return dict(result)
 
 
+def read_max_snapshot_time(db_path: Path | None) -> int | None:
+    if db_path is None or not db_path.exists():
+        return None
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        row = cur.execute("select max(time) from snapshot").fetchone()
+    finally:
+        conn.close()
+
+    if not row or row[0] is None:
+        return None
+    return int(row[0])
+
+
 def detect_time_mode(rows: list[dict]) -> str:
     values = [
         value
@@ -168,6 +184,17 @@ def _format_hours_cell(timestamp: int | None, experiment_start_epoch: float | No
     if value == "-":
         return value
     return f"{value}h"
+
+
+def _relative_seconds(timestamp: int | None, experiment_start_epoch: float | None,
+                      time_mode: str) -> int | None:
+    if timestamp is None:
+        return None
+    if time_mode == "relative":
+        return timestamp
+    if experiment_start_epoch is None:
+        return None
+    return int(timestamp - experiment_start_epoch)
 
 
 def build_summaries(rows: list[dict], all_bug_ids: set[str],
@@ -238,6 +265,85 @@ def build_summaries(rows: list[dict], all_bug_ids: set[str],
     return fuzzer_summaries, bug_fuzzer_rows
 
 
+def build_survival_rows(rows: list[dict], all_bug_ids: set[str],
+                        bug_locations: dict[str, str],
+                        trial_ids_by_fuzzer: dict[str, set[str]],
+                        experiment_start_epoch: float | None,
+                        time_mode: str,
+                        censor_time_seconds: int | None) -> tuple[list[dict], list[dict]]:
+    rows_by_key = {
+        (row["fuzzer"], row["trial"], row["bug_id"]): row
+        for row in rows
+    }
+    fuzzer_names = set(trial_ids_by_fuzzer) | {row["fuzzer"] for row in rows}
+    observed_times = [
+        seconds
+        for row in rows
+        for seconds in (
+            _relative_seconds(row["time_first_reached"], experiment_start_epoch, time_mode),
+            _relative_seconds(row["time_first_triggered"], experiment_start_epoch, time_mode),
+        )
+        if seconds is not None
+    ]
+    if censor_time_seconds is None:
+        censor_time_seconds = max(observed_times, default=24 * 60 * 60)
+
+    wide_rows = []
+    long_rows = []
+    for fuzzer in sorted(fuzzer_names):
+        if fuzzer in trial_ids_by_fuzzer:
+            trials = sorted(trial_ids_by_fuzzer[fuzzer], key=int)
+        else:
+            trials = sorted({row["trial"] for row in rows if row["fuzzer"] == fuzzer}, key=int)
+        for trial in trials:
+            for bug_id in sorted(all_bug_ids):
+                row = rows_by_key.get((fuzzer, trial, bug_id), {})
+                reached_seconds = _relative_seconds(
+                    row.get("time_first_reached"), experiment_start_epoch, time_mode)
+                triggered_seconds = _relative_seconds(
+                    row.get("time_first_triggered"), experiment_start_epoch, time_mode)
+                reached_event = reached_seconds is not None
+                triggered_event = triggered_seconds is not None
+                reached_time = reached_seconds if reached_event else censor_time_seconds
+                triggered_time = triggered_seconds if triggered_event else censor_time_seconds
+                crash_location = bug_locations.get(bug_id, "-")
+
+                wide_rows.append({
+                    "bug_id": bug_id,
+                    "crash_location": crash_location,
+                    "fuzzer": fuzzer,
+                    "trial": trial,
+                    "reached_event": int(reached_event),
+                    "reached_time_seconds": reached_time,
+                    "reached_time_hours": f"{reached_time / 3600:.4f}",
+                    "time_first_reached_seconds": reached_seconds if reached_event else "",
+                    "triggered_event": int(triggered_event),
+                    "triggered_time_seconds": triggered_time,
+                    "triggered_time_hours": f"{triggered_time / 3600:.4f}",
+                    "time_first_triggered_seconds": triggered_seconds if triggered_event else "",
+                    "censored_at_seconds": censor_time_seconds,
+                    "censored_at_hours": f"{censor_time_seconds / 3600:.4f}",
+                })
+
+                for event_type, observed, event_time in (
+                        ("reached", reached_event, reached_time),
+                        ("triggered", triggered_event, triggered_time)):
+                    long_rows.append({
+                        "bug_id": bug_id,
+                        "crash_location": crash_location,
+                        "fuzzer": fuzzer,
+                        "trial": trial,
+                        "event_type": event_type,
+                        "event_observed": int(observed),
+                        "time_seconds": event_time,
+                        "time_hours": f"{event_time / 3600:.4f}",
+                        "censored_at_seconds": censor_time_seconds,
+                        "censored_at_hours": f"{censor_time_seconds / 3600:.4f}",
+                    })
+
+    return wide_rows, long_rows
+
+
 def write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -248,7 +354,8 @@ def write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
 def write_markdown(path: Path, input_path: Path, db_path: Path | None,
                    experiment_start_epoch: float | None, total_bugs: int,
                    bug_locations: dict[str, str], fuzzer_summaries: list[dict],
-                   bug_fuzzer_rows: list[dict], time_mode: str) -> None:
+                   bug_fuzzer_rows: list[dict], survival_csv_path: Path,
+                   survival_long_csv_path: Path) -> None:
     lines = [
         "# FuzzBench Triage Summary",
         "",
@@ -265,8 +372,8 @@ def write_markdown(path: Path, input_path: Path, db_path: Path | None,
         "",
         "## By Fuzzer",
         "",
-        "| Fuzzer | Trials | Unique Triggered | Unique Reached | Mean Triggered/Trial | Mean Reached/Trial | Bugs Triggered In All Trials | First Trigger |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        "| Fuzzer | Trials | Unique Triggered | Unique Reached | Mean Triggered/Trial | Mean Reached/Trial | Bugs Triggered In All Trials |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
     for summary in fuzzer_summaries:
         lines.append(
@@ -277,9 +384,21 @@ def write_markdown(path: Path, input_path: Path, db_path: Path | None,
             f"{summary['unique_reached']}/{total_bugs} | "
             f"{summary['mean_triggered_per_trial']:.1f} | "
             f"{summary['mean_reached_per_trial']:.1f} | "
-            f"{summary['bugs_triggered_all_trials']} | "
-            f"{_format_hours_cell(summary['first_triggered_time'], experiment_start_epoch, time_mode)} |"
+            f"{summary['bugs_triggered_all_trials']} |"
         )
+
+    lines.extend([
+        "",
+        "## Survival Data",
+        "",
+        f"Per-trial wide CSV: `{survival_csv_path}`",
+        "",
+        f"Per-trial long CSV for plotting reached vs triggered curves: `{survival_long_csv_path}`",
+        "",
+        "These files contain one row per fuzzer/trial/bug combination. Missing events are right-censored at the experiment time limit, so they are the correct inputs for Kaplan-Meier survival curves.",
+        "",
+        "The summary below intentionally reports counts only. Do not use the old best/first trigger times for survival analysis, because they collapse multiple trials into a single earliest time and over-emphasize FuzzBench's 15-minute measurement granularity.",
+    ])
 
     bug_rows_by_fuzzer = defaultdict(list)
     for row in bug_fuzzer_rows:
@@ -301,8 +420,8 @@ def write_markdown(path: Path, input_path: Path, db_path: Path | None,
             lines.append("")
 
         lines.extend([
-            "| Bug ID | Crash Location | Triggered Trials | Reached Trials | Best Trigger | Best Reach |",
-            "| --- | --- | ---: | ---: | --- | --- |",
+            "| Bug ID | Crash Location | Triggered Trials | Reached Trials |",
+            "| --- | --- | ---: | ---: |",
         ])
         for row in sorted(
                 bug_rows_by_fuzzer[fuzzer],
@@ -319,9 +438,7 @@ def write_markdown(path: Path, input_path: Path, db_path: Path | None,
                 f"{row['bug_id']} | "
                 f"{bug_locations.get(row['bug_id'], '-')} | "
                 f"{row['triggered_trial_count']} | "
-                f"{row['reached_trial_count']} | "
-                f"{_format_hours_cell(row['best_triggered_time'], experiment_start_epoch, time_mode)} | "
-                f"{_format_hours_cell(row['best_reached_time'], experiment_start_epoch, time_mode)} |"
+                f"{row['reached_trial_count']} |"
             )
 
     with open(path, "w") as f:
@@ -381,9 +498,13 @@ def main() -> None:
     db_path = Path(args.db).resolve() if args.db else input_path.parent / "local.db"
     experiment_start_epoch = read_experiment_start(db_path)
     trial_ids_by_fuzzer = read_trial_ids_by_fuzzer(db_path)
+    max_snapshot_time = read_max_snapshot_time(db_path)
     time_mode = detect_time_mode(rows)
 
     fuzzer_summaries, bug_fuzzer_rows = build_summaries(rows, all_bug_ids, trial_ids_by_fuzzer)
+    survival_rows, survival_long_rows = build_survival_rows(
+        rows, all_bug_ids, bug_locations, trial_ids_by_fuzzer,
+        experiment_start_epoch, time_mode, max_snapshot_time)
 
     by_fuzzer_rows = []
     for summary in fuzzer_summaries:
@@ -424,10 +545,12 @@ def main() -> None:
     markdown_path = output_dir / f"{stem}_summary.md"
     by_fuzzer_csv_path = output_dir / f"{stem}_by_fuzzer.csv"
     by_bug_fuzzer_csv_path = output_dir / f"{stem}_by_bug_fuzzer.csv"
+    survival_csv_path = output_dir / f"{stem}_survival.csv"
+    survival_long_csv_path = output_dir / f"{stem}_survival_long.csv"
 
     write_markdown(markdown_path, input_path, db_path, experiment_start_epoch,
                    total_bugs, bug_locations, fuzzer_summaries, bug_fuzzer_rows,
-                   time_mode)
+                   survival_csv_path, survival_long_csv_path)
     write_csv(
         by_fuzzer_csv_path,
         [
@@ -450,10 +573,33 @@ def main() -> None:
         ],
         detailed_rows,
     )
+    write_csv(
+        survival_csv_path,
+        [
+            "bug_id", "crash_location", "fuzzer", "trial",
+            "reached_event", "reached_time_seconds", "reached_time_hours",
+            "time_first_reached_seconds",
+            "triggered_event", "triggered_time_seconds", "triggered_time_hours",
+            "time_first_triggered_seconds",
+            "censored_at_seconds", "censored_at_hours",
+        ],
+        survival_rows,
+    )
+    write_csv(
+        survival_long_csv_path,
+        [
+            "bug_id", "crash_location", "fuzzer", "trial", "event_type",
+            "event_observed", "time_seconds", "time_hours",
+            "censored_at_seconds", "censored_at_hours",
+        ],
+        survival_long_rows,
+    )
 
     logger.info("Wrote markdown summary: %s", markdown_path)
     logger.info("Wrote per-fuzzer CSV: %s", by_fuzzer_csv_path)
     logger.info("Wrote per-bug/fuzzer CSV: %s", by_bug_fuzzer_csv_path)
+    logger.info("Wrote survival CSV: %s", survival_csv_path)
+    logger.info("Wrote long-format survival CSV: %s", survival_long_csv_path)
 
 
 if __name__ == "__main__":

@@ -89,6 +89,12 @@ def main():
                         help="Base directory for experiment data (default: /tmp/fuzzbench-data)")
     parser.add_argument("--fuzzbench-dir",
                         help="Path to FuzzBench checkout (default: auto-detect)")
+    parser.add_argument("--concurrent-builds", type=int,
+                        help="Maximum concurrent FuzzBench builds")
+    parser.add_argument("--runners-cpus", type=int,
+                        help="CPUs available to local trial runners")
+    parser.add_argument("--measurers-cpus", type=int,
+                        help="CPUs available to local coverage measurers")
     parser.add_argument("-v", "--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -125,6 +131,12 @@ def main():
         "--benchmarks", args.benchmark,
         "--fuzzers", *args.fuzzer,
     ]
+    if args.concurrent_builds is not None:
+        cmd.extend(["--concurrent-builds", str(args.concurrent_builds)])
+    if args.runners_cpus is not None:
+        cmd.extend(["--runners-cpus", str(args.runners_cpus)])
+    if args.measurers_cpus is not None:
+        cmd.extend(["--measurers-cpus", str(args.measurers_cpus)])
     # Always allow uncommitted changes — the benchmark itself is generated code
     cmd.append("--allow-uncommitted-changes")
 
@@ -133,6 +145,12 @@ def main():
     logger.info("  Fuzzers: %s", " ".join(args.fuzzer))
     logger.info("  Trials: %d", args.trials)
     logger.info("  Run time: %ds (%dh)", args.run_time, args.run_time // 3600)
+    if args.concurrent_builds is not None:
+        logger.info("  Concurrent builds: %d", args.concurrent_builds)
+    if args.runners_cpus is not None:
+        logger.info("  Runner CPUs: %d", args.runners_cpus)
+    if args.measurers_cpus is not None:
+        logger.info("  Measurer CPUs: %d", args.measurers_cpus)
     logger.info("  Data: %s", experiment_filestore)
     logger.info("")
 
