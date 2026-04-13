@@ -508,20 +508,26 @@ def is_second_day_or_greater(t1, t2):
 
 def is_ancestor(repo_path, commit_id, ancestor_id):
     '''
-    check if ancestor_id is an ancestor of commit_id
+    Check if ancestor_id is an ancestor of commit_id.
+
+    Uses ``git merge-base --is-ancestor`` plumbing rather than
+    ``repo.commit(...)``. GitPython's ``repo.commit`` dispatches to
+    ``rev_parse("<sha>^0")`` which touches ``repo.head.ref`` — that
+    raises TypeError whenever the working tree is on a detached HEAD
+    (common after a build checkout).
     '''
     repo = git.Repo(repo_path)
-    # Get commit objects
     try:
-        start_commit = repo.commit(commit_id)
-        end_commit = repo.commit(ancestor_id)
-    except (ValueError, BadName):
-        logger.warning(f"Could not resolve commits for ancestry check: {commit_id} / {ancestor_id}")
-        return False
-    common_ancestor = repo.git.merge_base(start_commit, end_commit)
-    if common_ancestor == end_commit.hexsha:
+        repo.git.merge_base("--is-ancestor", ancestor_id, commit_id)
         return True
-    else:
+    except git.GitCommandError as e:
+        # Exit 1 == "not an ancestor"; anything else is a real error.
+        if e.status == 1:
+            return False
+        logger.warning(
+            f"Could not resolve commits for ancestry check: "
+            f"{commit_id} / {ancestor_id}: {e}"
+        )
         return False
 
 def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos,
