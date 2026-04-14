@@ -442,7 +442,10 @@ def do_bug_build(target_path, target_bug_ids, bug_infos, commit_id, month, build
             ]
 
             logger.info(' '.join(cmd))
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd, capture_output=True,
+                encoding="utf-8", errors="replace",
+            )
             fuzzer_binary = os.path.join(oss_fuzz_path, "build", "out", target, fuzzer) if fuzzer else None
             fuzzer_exists = fuzzer_binary is not None and os.path.exists(fuzzer_binary)
             build_failed = (

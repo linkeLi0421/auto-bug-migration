@@ -1108,7 +1108,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     )
                     crash_matches = True  # assume match if no original to compare
                     if original_crash_file.exists():
-                        orig_text = original_crash_file.read_text()
+                        orig_text = original_crash_file.read_text(errors="replace")
                         crash_matches = _crash_stacks_match(orig_text, fuzz_out)
                         if not crash_matches:
                             logger.warning(
