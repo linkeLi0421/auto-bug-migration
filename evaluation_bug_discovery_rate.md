@@ -154,6 +154,7 @@ Select OSS-Fuzz C/C++ projects with sufficient transplantable bugs (target: 10+ 
 | Project | Domain | Expected bugs | Input type |
 |---------|--------|---------------|------------|
 | opensc | Smart-card / PKCS#15 parsing | 23 | APDU-like binary conversations for `fuzz_pkcs15_reader` |
+| ndpi | Network protocol classifier | 35 | Pcap captures for `fuzz_ndpi_reader` |
 | c-blosc2 | Compression | 28 | Binary blobs |
 | (additional projects TBD) | | | |
 
@@ -167,6 +168,17 @@ Current OpenSC benchmark:
 - Dispatch bytes: 1
 - Dispatch-gated bugs: 7 (`dispatch_value` = `1`, `2`, `4`, `8`, `16`, `32`, `64`)
 - Always-active/default bugs: 16 (`dispatch_value` = `0`)
+
+Current ndpi benchmark:
+
+- Benchmark name: `ndpi_transplant_fuzz_ndpi_reader`
+- Target commit: `5cad39f0e88c03b3cb4f78addf56e217b3d372f2` (2020-02-07)
+- Target: `fuzz_ndpi_reader`
+- Bug metadata: `fuzzbench/benchmarks/ndpi_transplant_fuzz_ndpi_reader/bug_metadata.json`
+- Total bugs: 35
+- Dispatch bytes: 3
+
+Both benchmarks now base directly on `gcr.io/oss-fuzz-base/base-builder@sha256:87ca1e9e19235e731fac8de8d1892ebe8d55caf18e7aa131346fc582a2034fdd` (Ubuntu 20.04 focal), the same pinned digest used by 29 of 32 canonical FuzzBench benchmarks. This replaced the earlier xenial-rooted `*-merge:<sha>` base images. See Section 10 for the rebase procedure.
 
 The large number of always-active OpenSC bugs is important: a crash can be caused by a `dispatch_value=0` bug even when byte 0 selects a non-zero dispatch-gated path. This is why trigger attribution now uses crash stack traces instead of dispatch bytes alone.
 
@@ -588,3 +600,214 @@ Compare these outputs against the original `transplant-opensc-24h` campaign to q
 - Time-to-first-trigger per bug.
 - Whether the two CoolKey bugs still dominate after 24 hours.
 - Which bugs remain unfound despite the structural seed variants.
+
+---
+
+## 10. Rebasing a Transplant Benchmark Onto a Stable OSS-Fuzz Base Image
+
+This section documents how to move a transplant benchmark off a locally-built
+`<project>-merge:<sha>` image and onto a publicly pinned OSS-Fuzz base-builder
+digest, so the benchmark can be cloned and rebuilt on any other machine
+without the original merge artifacts.
+
+### 10.1 Why Rebase
+
+`script/buildAndtest.py:get_base_builder_for_date()` selects a base-builder
+image by matching the target commit's date against the `BASE_BUILDER_IMAGES`
+table. Target commits from before OSS-Fuzz's mid-2022 switch to Ubuntu 20.04
+land on the xenial-rooted `2021-08-23` digest. Xenial (Ubuntu 16.04) ships
+gcc 5.4 and lacks `apt.llvm.org` coverage for modern LLVM versions, so:
+
+- `libafl` fails to build (needs Rust nightly + LLVM 17 + C++17 default).
+- `hastefuzz` fails to build (AFL-LLVM mode needs `<optional>`, a C++17 header).
+- `aflplusplus` and `honggfuzz` build but consistently exit with `exitCode=1`
+  at the first FuzzBench snapshot cycle (~15 minutes, `execDuration≈915s`).
+
+Rebasing onto a focal base (Ubuntu 20.04, gcc 9.4, clang 15) removes those
+constraints and lets all six reference fuzzers coexist on the same benchmark.
+
+### 10.2 Chosen Base Image
+
+We use the canonical digest used by most FuzzBench benchmarks:
+
+```text
+gcr.io/oss-fuzz-base/base-builder@sha256:87ca1e9e19235e731fac8de8d1892ebe8d55caf18e7aa131346fc582a2034fdd
+```
+
+Key properties:
+
+- Ubuntu 20.04.5 LTS (focal)
+- gcc 9.4.0, clang 15.0.0
+- 29 of 32 mainline FuzzBench benchmarks pin this same digest — tracking it
+  keeps our benchmarks inside the validated FuzzBench compatibility set.
+- Content-addressed, so identical bits pull on any machine.
+
+Do **not** use `:latest`; drift breaks reproducibility.
+
+### 10.3 Rewriting the Benchmark Dockerfile
+
+Replace the `FROM <project>-merge:<sha>` line with the pinned digest and move
+everything the merge image used to provide into explicit `RUN` and `COPY`
+directives. The generalised template looks like this:
+
+```Dockerfile
+FROM gcr.io/oss-fuzz-base/base-builder@sha256:87ca1e9e19235e731fac8de8d1892ebe8d55caf18e7aa131346fc582a2034fdd
+
+# 1. Build-time dependencies that the merge image used to ship preinstalled.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake libtool pkg-config \
+        flex bison gettext \
+        <project-specific-dev-packages> \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Full clone of the upstream project; build.sh does `git checkout <target>`.
+RUN git clone https://github.com/<org>/<project>.git /src/<project>
+
+WORKDIR /src/<project>
+
+# 3. ASan knobs needed for direct testcase replay.
+ENV ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1"
+
+# 4. Any vendored artifacts the build needs that are not on GitHub (tarballs,
+#    prebuilt blobs). Copy them from the benchmark directory, not the internet.
+COPY <vendored_tarball>.tar.gz /src/
+
+# 5. Transplant patches + seeds + build.sh (unchanged from the merge-image version).
+COPY patches/ /src/patches/
+COPY seeds/ /src/benchmark_seeds/
+COPY build.sh $SRC/
+```
+
+Concrete deps that were needed for our two benchmarks:
+
+| Benchmark | Extra apt packages | Vendored files |
+|-----------|--------------------|----------------|
+| `ndpi_transplant_fuzz_ndpi_reader` | `libbison-dev libfl-dev libjson-c-dev zlib1g-dev` | `libpcap-1.9.1.tar.gz` (861 KB, sha256 `635237637c5b619bcceba91900666b64d56ecb7be63f298f601ec786ce087094`) |
+| `opensc_transplant_fuzz_pkcs15_reader` | `libssl-dev libreadline-dev libpcsclite-dev zlib1g-dev` | none (builds entirely from its own repo) |
+
+To extract a vendored tarball from the old merge image for offline builds:
+
+```bash
+CID=$(docker create --entrypoint '' <project>-merge:<sha> /bin/true)
+docker cp "$CID":/src/<tarball>.tar.gz \
+  fuzzbench/benchmarks/<benchmark>/<tarball>.tar.gz
+docker rm "$CID" >/dev/null
+```
+
+Nothing in `build.sh` needs to change: it already does
+`git checkout <target_commit>`, applies `patches/harness.diff` and
+`patches/combined.diff`, and runs the project's native build.
+
+### 10.4 Build and Validate
+
+```bash
+cd fuzzbench
+make build-coverage-<benchmark>
+make build-libfuzzer-<benchmark>
+```
+
+Confirm the fuzz target binary exists and the base image really is focal:
+
+```bash
+docker run --rm --entrypoint "" \
+  gcr.io/fuzzbench/builders/coverage/<benchmark> \
+  bash -c 'grep PRETTY /etc/os-release; ls -la /out/<fuzz_target>'
+```
+
+### 10.5 Regenerating Crash Files and `bug_metadata.json`
+
+Crash locations (file/line) captured under the xenial base may shift on focal
+because of different optimizer output, different libstdc++, different libpcap
+build-time defaults, etc. The triage step relies on the values in
+`bug_metadata.json`, so they must match the rebased binary.
+
+Use `/tmp/regen_crashes.py` (kept in `script/` or recreate from the snippet
+below) to re-run every PoC and rewrite the per-bug crash artifacts in one
+pass:
+
+```bash
+python3 script/regen_crashes.py \
+  fuzzbench/benchmarks/<benchmark> \
+  gcr.io/fuzzbench/builders/coverage/<benchmark>
+```
+
+The script, for each bug in `bug_metadata.json`:
+
+1. Runs the matching `seeds/testcase-<bug_id>-patched` inside the coverage
+   builder image (`docker run ... /out/<fuzz_target> /tmp/testcase`).
+2. Captures ASan output and writes it to `crashes/<bug_id>.txt`.
+3. Parses the first stack frame inside `/src/<project>/` and updates
+   `crash_file`, `crash_line`, `crash_function` for that bug.
+
+Key points when writing / reusing this script:
+
+- Filter stack frames to only those containing `/src/<project>/` so ASan
+  interceptors (`strlen` inside `sanitizer_common_interceptors.inc`) do not
+  become the recorded crash location.
+- The frame regex must exclude newlines (e.g. `/[^:\n]+` instead of
+  `/[^:]+`), otherwise a frame with no `:line` will let the match span into
+  the next frame.
+
+### 10.6 Sanity Check
+
+```bash
+python3 - <<'PY'
+import json
+path = "fuzzbench/benchmarks/<benchmark>/bug_metadata.json"
+data = json.load(open(path))
+bad = [bid for bid, info in data["bugs"].items()
+       if "\n" in info.get("crash_file", "")
+       or "llvm-project" in info.get("crash_file", "")
+       or "/src/<project>/" not in info.get("crash_file", "")]
+print(f"bugs={len(data['bugs'])}, anomalies={len(bad)}: {bad}")
+PY
+```
+
+This should print `anomalies=0`. Anything else means a frame in
+`sanitizer_common_interceptors.inc` or a multi-line match leaked into
+`bug_metadata.json` — fix the regex and re-run.
+
+### 10.7 Commit and Push for Reproducibility on Another Machine
+
+The rebased benchmark is fully reproducible on a fresh machine once these
+artifacts live in git:
+
+1. Updated `benchmarks/<benchmark>/Dockerfile` (new `FROM`, explicit apt deps,
+   `git clone`, vendored tarball `COPY`).
+2. Any vendored tarballs copied into `benchmarks/<benchmark>/` (e.g.
+   `libpcap-1.9.1.tar.gz`).
+3. Regenerated `benchmarks/<benchmark>/crashes/*.txt`.
+4. Regenerated `benchmarks/<benchmark>/bug_metadata.json`.
+
+Commit those into the `fuzzbench/` submodule, push to the fork, then bump the
+submodule pointer in the parent `auto-bug-migration` repo and push that too.
+
+On the new machine:
+
+```bash
+git clone --recurse-submodules <auto-bug-migration-fork>
+cd auto-bug-migration/fuzzbench
+make build-libfuzzer-<benchmark>   # or any other fuzzer
+```
+
+All the inputs the build needs are either in the repo (patches, seeds,
+vendored tarballs, build.sh) or fetched from public URLs (the pinned
+`gcr.io/oss-fuzz-base/base-builder` digest and the upstream GitHub clone), so
+no local merge image or private cache is required.
+
+### 10.8 What to Verify After Rebase
+
+- Target binary still produces a crash for every PoC in `seeds/` (the
+  regen script above already checks this — every bug should produce at
+  least one ASan frame inside `/src/<project>/`).
+- Number of bugs whose `crash_file:crash_line` *did* shift is small and
+  explicable. For our two benchmarks we observed:
+  - ndpi: 2 of 35 bugs shifted line numbers (different inlining); 33
+    reproduced at the identical location.
+  - opensc: 0 of 23 bugs shifted.
+- Modern fuzzers build: `make build-libafl-<benchmark>` and
+  `make build-hastefuzz-<benchmark>` should succeed end-to-end on the
+  rebased benchmark.
+- aflplusplus/honggfuzz trials no longer exit at cycle 1
+  (`execDuration≈900s` with `exitCode=1` under `docker events`). A full
+  FuzzBench run should keep all 60 trials alive past the 15-minute mark.
