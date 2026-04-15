@@ -11,6 +11,3 @@ libclang>=16.0.0
 # Template rendering
 jinja2>=3.1.0
 
-# FuzzBench experiment runner (fuzzbench/common/logs.py)
-google-cloud-logging>=3.0.0
-

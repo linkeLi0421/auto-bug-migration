@@ -123,9 +123,16 @@ def main():
         config_path, experiment_filestore, report_filestore,
         args.trials, args.run_time)
 
+    # Use fuzzbench's venv python if available; it has the pinned
+    # google-cloud-* deps that run_experiment.py imports. Falling back to
+    # sys.executable (system python3) fails with ImportError because those
+    # deps aren't installed system-wide.
+    venv_python = fuzzbench_dir / ".venv" / "bin" / "python3"
+    python_bin = str(venv_python) if venv_python.exists() else sys.executable
+
     # Build the run_experiment.py command
     cmd = [
-        sys.executable, "-u", "experiment/run_experiment.py",
+        python_bin, "-u", "experiment/run_experiment.py",
         "--experiment-config", str(config_path),
         "--experiment-name", args.experiment_name,
         "--benchmarks", args.benchmark,
