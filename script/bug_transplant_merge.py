@@ -936,7 +936,7 @@ def start_merge_container(
     ret, build_output = _exec_capture(
         container_name,
         _compile_cmd(container_name, "SANITIZER=address"),
-        timeout=300,
+        timeout=1800,
     )
     if ret != 0:
         logger.error("ASAN build failed. Tail:")
