@@ -368,7 +368,7 @@ def _restore_build_sh(container: str, output_dir: Path, project: str) -> None:
     src = output_dir / "harness_build.sh"
     if not src.exists():
         return
-    content = _patch_build_sh_make_tolerant(src.read_text(), project)
+    content = _patch_build_sh_make_tolerant(src.read_text(errors='replace'), project)
     _exec_capture(
         container,
         f"cat > /src/build.sh << 'BUILDEOF'\n{content}BUILDEOF",
@@ -503,7 +503,7 @@ def _restore_harness_sources(container: str, output_dir: Path) -> bool:
         snapshot = _harness_sources_dir(output_dir) / entry["snapshot"]
         if not snapshot.exists():
             continue
-        if _container_write_text(container, container_path, snapshot.read_text()):
+        if _container_write_text(container, container_path, snapshot.read_text(errors='replace')):
             restored += 1
 
     if restored:
@@ -925,7 +925,7 @@ def wrap_bug_with_dispatch(
     dispatch_value = 1 << bit_index
 
     # Copy diff into container
-    diff_content = Path(diff_path).read_text()
+    diff_content = Path(diff_path).read_text(errors='replace')
     _exec_capture(
         container,
         f"cat > /tmp/patch_{bug_id}.diff << 'PATCH_EOF'\n{diff_content}PATCH_EOF",
@@ -1333,7 +1333,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             logger.info("combined.diff already exists, reusing: %s (%d bytes)",
                         combined_path, combined_path.stat().st_size)
             _restore_harness_baseline(container, project, harness_baseline_rev)
-            cdiff = combined_path.read_text()
+            cdiff = combined_path.read_text(errors='replace')
             _exec_capture(container,
                           f"cat > /tmp/combined.diff << 'CEOF'\n{cdiff}CEOF")
             ret, out = _exec_capture(
@@ -1360,7 +1360,7 @@ def run_offline_merge(args: argparse.Namespace) -> int:
             # Copy all wrapped patches into container
             patch_descriptions = []
             for bug_id, wdiff_path in wrapped_diffs.items():
-                diff_content = Path(wdiff_path).read_text()
+                diff_content = Path(wdiff_path).read_text(errors='replace')
                 if not diff_content.strip():
                     continue
                 fname = f"wrapped_{bug_id}.diff"
