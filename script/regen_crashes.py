@@ -19,6 +19,7 @@ def run_poc(image: str, fuzz_target: str, poc_host_path: Path,
         "docker", "run", "--rm", "--entrypoint", "",
         "-v", f"{poc_host_path}:/tmp/testcase:ro",
         "-e", f"ASAN_OPTIONS={asan_options}",
+        "-e", "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1",
         image,
         f"/out/{fuzz_target}", "/tmp/testcase",
     ]
@@ -45,7 +46,7 @@ def main() -> int:
     if len(sys.argv) != 3:
         print("Usage: regen_crashes.py <benchmark_dir> <runner_image>")
         return 2
-    bench_dir = Path(sys.argv[1])
+    bench_dir = Path(sys.argv[1]).resolve()
     image = sys.argv[2]
 
     metadata_path = bench_dir / "bug_metadata.json"
