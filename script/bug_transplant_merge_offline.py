@@ -924,11 +924,14 @@ def wrap_bug_with_dispatch(
     dispatch_byte = bit_index // 8
     dispatch_value = 1 << bit_index
 
-    # Copy diff into container
-    diff_content = Path(diff_path).read_text(errors='replace')
-    _exec_capture(
-        container,
-        f"cat > /tmp/patch_{bug_id}.diff << 'PATCH_EOF'\n{diff_content}PATCH_EOF",
+    # Copy diff into container via stdin (heredoc-inlining would blow past
+    # ARG_MAX for multi-MB diffs).
+    diff_bytes = Path(diff_path).read_bytes()
+    subprocess.run(
+        ["docker", "exec", "-i", container,
+         "bash", "-c", f"cat > /tmp/patch_{bug_id}.diff"],
+        input=diff_bytes, timeout=60,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
     # Copy testcase (patched if available, else original)
