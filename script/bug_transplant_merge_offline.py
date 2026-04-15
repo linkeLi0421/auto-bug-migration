@@ -992,8 +992,84 @@ def wrap_bug_with_dispatch(
     if ret != 0:
         logger.warning("[%s] Compile had errors but fuzz targets built OK", bug_id)
 
-    logger.info("[%s] Dispatch wrapping OK", bug_id)
+    if not _verify_wrapped_dispatch(container, bug, bit_index, dispatch_state):
+        logger.error("[%s] Wrapped patch failed dispatch verification", bug_id)
+        return False, output
+
+    logger.info("[%s] Dispatch wrapping OK (verified bit-on triggers, bit-off does not)", bug_id)
     return True, output
+
+
+_SANITIZER_SUMMARY_RE = re.compile(
+    r"SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer"
+)
+
+
+def _verify_wrapped_dispatch(
+    container: str,
+    bug: dict,
+    bit_index: int,
+    dispatch_state: dict,
+) -> bool:
+    """Run the freshly built fuzzer with bit-on / bit-off and check trigger asymmetry.
+
+    Returns True iff bit-on produces a sanitizer SUMMARY and bit-off does not.
+    Skips with warning (returns True) when no payload is available.
+    """
+    bug_id = bug["bug_id"]
+    fuzzer = bug.get("fuzzer", "")
+    if not fuzzer:
+        logger.warning("[%s] No fuzzer name; skipping dispatch verification", bug_id)
+        return True
+
+    ptc = bug.get("patched_testcase")
+    if not ptc or not Path(ptc).is_file():
+        logger.warning("[%s] No payload available; skipping dispatch verification", bug_id)
+        return True
+    payload = Path(ptc).read_bytes()
+
+    nbytes = dispatch_state.get("dispatch_bytes", 1)
+    prefix_on = (1 << bit_index).to_bytes(nbytes, "little")
+    prefix_off = b"\x00" * nbytes
+
+    for tag, blob in (("on", prefix_on + payload), ("off", prefix_off + payload)):
+        path = f"/tmp/_verify_{bug_id}_{tag}"
+        proc = subprocess.run(
+            ["docker", "exec", "-i", container, "bash", "-c", f"cat > {path}"],
+            input=blob, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if proc.returncode != 0:
+            logger.warning("[%s] Failed to stage verify input (%s)", bug_id, tag)
+            return False
+
+    fuzzer_path = f"/out/{fuzzer}"
+    env_prefix = (
+        "export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:"
+        "max_uar_stack_size_log=16:external_symbolizer_path=/out/llvm-symbolizer; "
+    )
+    results = {}
+    for tag in ("on", "off"):
+        cmd = (
+            f"{env_prefix}{fuzzer_path} -runs=10 /tmp/_verify_{bug_id}_{tag} 2>&1"
+        )
+        _, out = _exec_capture(container, cmd, timeout=120)
+        results[tag] = out
+
+    crashed_on = bool(_SANITIZER_SUMMARY_RE.search(results["on"]))
+    crashed_off = bool(_SANITIZER_SUMMARY_RE.search(results["off"]))
+
+    if crashed_on and not crashed_off:
+        return True
+
+    logger.warning(
+        "[%s] Dispatch verification FAIL: bit-on crashed=%s, bit-off crashed=%s",
+        bug_id, crashed_on, crashed_off,
+    )
+    logger.warning("[%s] bit-on tail: %s", bug_id, results["on"][-500:])
+    logger.warning("[%s] bit-off tail: %s", bug_id, results["off"][-500:])
+    return False
 
 
 # ---------------------------------------------------------------------------
