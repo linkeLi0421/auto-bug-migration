@@ -21,7 +21,6 @@ Please make these changes:
 2. Add at the top of that file:
       #include "__bug_dispatch.h"
       #include <string.h>
-      #include <stdlib.h>
 
 3. At the VERY START of LLVMFuzzerTestOneInput (before any existing
    logic), add:
@@ -30,35 +29,17 @@ Please make these changes:
       data += __BUG_DISPATCH_BYTES;
       size -= __BUG_DISPATCH_BYTES;
 
-4. **Tight-copy the remaining data** into a fresh allocation so that
-   ASAN can detect overflows at the exact boundary.  Without this,
-   the dispatch prefix bytes inflate the libFuzzer allocation and
-   small overflows (READ 1, READ 2) past the logical `size` can land
-   inside the padding instead of hitting ASAN redzones.
+   Do NOT allocate a copy of the remaining data (no malloc/memcpy).
+   The rest of the harness continues to use the original `data` pointer
+   and `size`.  An extra malloc would perturb the heap layout before
+   the real code runs, which can suppress bugs sensitive to allocator
+   state (use-after-free, heap-buffer-overflow, double-free).  The
+   dispatch prefix is only a few bytes, so the worst-case effect of
+   skipping the tight copy is that a 1–4 byte overflow at the very end
+   of the input may land inside the prefix padding rather than an ASAN
+   redzone — a minor trade-off compared to silently masking heap bugs.
 
-   Right after the dispatch-stripping code from step 3, add:
-      uint8_t *__fuzz_copy = (uint8_t *)malloc(size);
-      if (!__fuzz_copy) return 0;
-      memcpy(__fuzz_copy, data, size);
-
-   Then replace every reference to `data` in the rest of the function
-   with `__fuzz_copy` (or rename appropriately).
-
-   Finally, add `free(__fuzz_copy);` just before `return 0;` at the
-   end of the function (and before any other return after the copy).
-
-   The complete dispatch preamble should look like:
-      if (size < __BUG_DISPATCH_BYTES) return 0;
-      memcpy((void*)__bug_dispatch, data, __BUG_DISPATCH_BYTES);
-      data += __BUG_DISPATCH_BYTES;
-      size -= __BUG_DISPATCH_BYTES;
-      uint8_t *__fuzz_copy = (uint8_t *)malloc(size);
-      if (!__fuzz_copy) return 0;
-      memcpy(__fuzz_copy, data, size);
-
-   Then use `__fuzz_copy` and `size` for the rest of the harness.
-
-5. **Make sure `__bug_dispatch.c` is compiled and linked into the
+4. **Make sure `__bug_dispatch.c` is compiled and linked into the
    fuzzer binary.**  Many projects' OBJECTS lists are produced by a
    `wildcard src/*.cpp` pattern or by autotools `*_SOURCES` blocks
    that will silently skip a stray `.c` file at the source root, so
@@ -94,7 +75,7 @@ Please make these changes:
 
    - **Bazel:** add `__bug_dispatch.c` to the fuzzer rule's `srcs`.
 
-6. After making the source/build changes, run: `compile`
+5. After making the source/build changes, run: `compile`
 
    Then VERIFY the symbol actually got linked. Run:
    ```
@@ -103,7 +84,7 @@ Please make these changes:
    ```
    The expected output contains a line ending in ` D __bug_dispatch`
    (defined data symbol). If it shows ` U __bug_dispatch` (undefined)
-   or nothing, the link is broken — the build system change in step 5
+   or nothing, the link is broken — the build system change in step 4
    did not take effect. Fix and rebuild before declaring done.
 
    Likewise, the build is NOT successful if the link step printed
