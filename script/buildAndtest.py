@@ -565,11 +565,10 @@ def do_bug_test(target_path, commit_id, writer, filter_bug_ids, bug_infos,
 
         source_dir = os.path.join(target_storage_path, target + '-' + commit_id + '-' + sanitizer + arch_str)
 
-        if os.path.exists(source_dir):
-            pass
-        else:
+        if not os.path.exists(source_dir):
             logger.error(f"Source directory or file does not exist: {source_dir}")
-            return
+            row.append('')
+            continue
 
         # Use fixed runner image or auto-select based on commit time
         if fixed_runner:

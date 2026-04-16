@@ -167,10 +167,26 @@ _DIFF_EXCLUDES = (
     "':(exclude)build/' ':(exclude)_build/' "
     "':(exclude)obj/' ':(exclude)obj*' ':(exclude)bin/' "
     "':(exclude)tiff-config*' "
-    "':(exclude)cups/' ':(exclude)freetype/' ':(exclude)zlib/' "
     "':(exclude)examples/' "
     "':(exclude).codex/'"
 )
+
+# Per-project extra exclusions. Use for vendored source trees that the
+# project's build.sh removes at build time (so the resulting git deletion
+# noise would otherwise pollute harness.diff / combined.diff).
+_PROJECT_DIFF_EXCLUDES: dict[str, tuple[str, ...]] = {
+    "ghostscript": ("cups/", "freetype/", "zlib/", "libpng/"),
+}
+
+
+def _diff_excludes(project: str) -> str:
+    extras = _PROJECT_DIFF_EXCLUDES.get(project, ())
+    if not extras:
+        return _DIFF_EXCLUDES
+    extra_str = " ".join(f"':(exclude){p}'" for p in extras)
+    return f"{_DIFF_EXCLUDES} {extra_str}"
+
+
 _DIFF_INCLUDES = (
     "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
     "'*.spec' "
@@ -207,7 +223,7 @@ def _clean_diff(container: str, project: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd {_source_dir(project)} && git diff HEAD -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+        f"cd {_source_dir(project)} && git diff HEAD -- {_DIFF_INCLUDES} {_diff_excludes(project)}",
     )
     return _strip_build_artifact_hunks(diff)
 
@@ -217,7 +233,7 @@ def _clean_diff_against(container: str, project: str, base_rev: str) -> str:
     _stage_untracked_source(container, project)
     _, diff = _exec_capture(
         container,
-        f"cd {_source_dir(project)} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_DIFF_EXCLUDES}",
+        f"cd {_source_dir(project)} && git diff {shlex.quote(base_rev)} -- {_DIFF_INCLUDES} {_diff_excludes(project)}",
     )
     return _strip_build_artifact_hunks(diff)
 
