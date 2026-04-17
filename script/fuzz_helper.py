@@ -2963,11 +2963,29 @@ def collect_trace(args):
     logger.error('collect_trace requires --commit to be specified.')
     return False
 
-  # Read oss_fuzz_commit from builds.csv
+  # Pin oss-fuzz toolchain via builds.csv. Without this, the rebuild can
+  # run against a different base-builder digest than the one that produced
+  # the reference artifacts for this commit, so layout-fragile behaviour
+  # silently diverges. Fail loudly instead of silently falling back to
+  # `args.commit` as a pseudo oss-fuzz commit.
+  build_csv = getattr(args, 'build_csv', None)
+  if not build_csv:
+    logger.error(
+        'collect_trace requires --build_csv to pin the oss-fuzz commit. '
+        'Without it the rebuild may use the wrong base-builder digest and '
+        'produce a binary whose layout differs from the reference build.'
+    )
+    return False
   oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
-    getattr(args, 'build_csv', None), args.project.name, args.commit)
+    build_csv, args.project.name, args.commit)
   if not oss_fuzz_commit:
-    oss_fuzz_commit = args.commit
+    logger.error(
+        'No oss_fuzz_commit mapping for %s@%s in %s. Either add the row '
+        'or rerun `buildAndtest.py` to populate the CSV before collecting '
+        'traces.',
+        args.project.name, args.commit, build_csv,
+    )
+    return False
 
   # Determine builder image digest from runner-image args
   # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
@@ -3061,11 +3079,31 @@ def collect_crash(args):
     logger.error('collect_crash requires both --testcases and --test_input.')
     return False
 
-  # Read oss_fuzz_commit from builds.csv
+  # Pin oss-fuzz toolchain via builds.csv. Without this, the rebuild can
+  # run against a different base-builder digest than the one that produced
+  # the reference binary for this commit, so layout-fragile crashes
+  # silently stop reproducing and the saved target_crash log is empty.
+  # Fail loudly instead of silently falling back to `args.commit` as a
+  # pseudo oss-fuzz commit.
+  build_csv = getattr(args, 'build_csv', None)
+  if not build_csv:
+    logger.error(
+        'collect_crash requires --build_csv to pin the oss-fuzz commit. '
+        'Without it the rebuild may use the wrong base-builder digest and '
+        'produce a binary whose layout differs from the reference build, '
+        'leaving target_crash-*.txt empty for layout-fragile bugs.'
+    )
+    return False
   oss_fuzz_commit, _ = _read_oss_fuzz_commit_from_csv(
-    getattr(args, 'build_csv', None), args.project.name, args.commit)
+    build_csv, args.project.name, args.commit)
   if not oss_fuzz_commit:
-    oss_fuzz_commit = args.commit
+    logger.error(
+        'No oss_fuzz_commit mapping for %s@%s in %s. Either add the row '
+        'or rerun `buildAndtest.py` to populate the CSV before collecting '
+        'crash logs.',
+        args.project.name, args.commit, build_csv,
+    )
+    return False
 
   # Determine builder image digest from runner-image args
   # When --runner-image auto is used without --commit-date, derive date from oss_fuzz_commit
