@@ -473,23 +473,49 @@ def build_agent_image(project: str, project_image: str) -> str:
     tag = f"bug-transplant-{project}:latest"
     base_workdir = _image_workdir(project_image)
 
-    # Skip rebuild if the agent image already exists and was built against
-    # the same base WORKDIR (baked into the compile wrapper).
+    # Resolve the current project image's content ID so we can invalidate
+    # the agent-image cache whenever the project image has been rebuilt
+    # (e.g. by fuzz_helper.py build_version pinning a new base-builder
+    # digest). Without this check, the agent image keeps the stale project
+    # layers it was first built against, silently diverging from the base
+    # image used for original crash classification.
+    project_id_result = subprocess.run(
+        ["docker", "image", "inspect", project_image, "--format", "{{.Id}}"],
+        capture_output=True, text=True,
+    )
+    if project_id_result.returncode != 0:
+        logger.error(
+            "Failed to inspect project image %s: %s",
+            project_image, project_id_result.stderr.strip(),
+        )
+        sys.exit(1)
+    project_image_id = project_id_result.stdout.strip()
+
+    # Skip rebuild only when BOTH the base WORKDIR and the underlying
+    # project image ID match what the cached agent image was built from.
     inspect = subprocess.run(
         ["docker", "image", "inspect", tag, "--format",
-         "{{index .Config.Labels \"bug-transplant.base-workdir\"}}"],
+         '{{index .Config.Labels "bug-transplant.base-workdir"}}|'
+         '{{index .Config.Labels "bug-transplant.project-image-id"}}'],
         capture_output=True,
         text=True,
     )
     if inspect.returncode == 0:
-        cached_workdir = inspect.stdout.strip()
-        if cached_workdir == base_workdir:
+        cached_workdir, _, cached_project_id = inspect.stdout.strip().partition("|")
+        if cached_workdir == base_workdir and cached_project_id == project_image_id:
             logger.info("Agent image already exists, reusing: %s", tag)
             return tag
-        logger.info(
-            "Rebuilding agent image %s because baked base WORKDIR is %r, expected %r",
-            tag, cached_workdir, base_workdir,
-        )
+        if cached_workdir != base_workdir:
+            logger.info(
+                "Rebuilding agent image %s because baked base WORKDIR is %r, expected %r",
+                tag, cached_workdir, base_workdir,
+            )
+        else:
+            logger.info(
+                "Rebuilding agent image %s because project image ID changed "
+                "(cached %s..., current %s...)",
+                tag, cached_project_id[:19], project_image_id[:19],
+            )
         subprocess.call(
             ["docker", "rmi", "-f", tag],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -551,6 +577,7 @@ def build_agent_image(project: str, project_image: str) -> str:
         USER agent
 
         LABEL bug-transplant.base-workdir="{base_workdir}"
+        LABEL bug-transplant.project-image-id="{project_image_id}"
         CMD ["sleep", "infinity"]
     """)
 
