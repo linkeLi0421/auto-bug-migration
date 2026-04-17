@@ -1,0 +1,68 @@
+OSV-2021-495, OSV-2023-416 is a timeout 0.5|1 in target commit.
+Not a real bug, but it make the real bug harder to migrate here.
+
+# Harness dispatch: malloc tight-copy removed in favor of pointer arithmetic
+
+## What changed
+
+`script/prompts/harness_dispatch.md` previously instructed the agent to
+allocate a fresh copy of the fuzz input after stripping the dispatch
+prefix:
+
+```c
+// OLD — tight-copy approach
+if (size < __BUG_DISPATCH_BYTES) return 0;
+memcpy((void*)__bug_dispatch, data, __BUG_DISPATCH_BYTES);
+data += __BUG_DISPATCH_BYTES;
+size -= __BUG_DISPATCH_BYTES;
+uint8_t *__fuzz_copy = (uint8_t *)malloc(size);
+if (!__fuzz_copy) return 0;
+memcpy(__fuzz_copy, data, size);
+// ... use __fuzz_copy ...
+free(__fuzz_copy);
+```
+
+Now it uses pointer arithmetic only:
+
+```c
+// NEW — pointer arithmetic, no allocation
+if (size < __BUG_DISPATCH_BYTES) return 0;
+memcpy((void*)__bug_dispatch, data, __BUG_DISPATCH_BYTES);
+data += __BUG_DISPATCH_BYTES;
+size -= __BUG_DISPATCH_BYTES;
+// ... use data/size directly ...
+```
+
+## Why
+
+The tight-copy `malloc` was introduced so ASAN redzones sit at the
+exact boundary of the payload (without it, a 1–4 byte overflow at the
+end of the input lands in the dispatch prefix padding instead of a
+redzone).
+
+However, the extra `malloc`/`free` on every fuzz iteration perturbs
+the heap layout *before* any real code runs. Bugs sensitive to
+allocator state — use-after-free, double-free, heap-buffer-overflow on
+internal allocations — depend on which slot the allocator hands out.
+An extra allocation shifts that state systematically and can suppress
+these bugs entirely.
+
+**Trade-off:**
+
+| Approach | Cost | Scope |
+|---|---|---|
+| malloc tight-copy | Perturbs heap state, can mask allocator-sensitive bugs | Systematic: affects all heap bugs, every iteration |
+| Pointer arithmetic | 1–4 byte overflow/underflow at input buffer boundary misses ASAN redzone | Edge-case: only affects bugs that overflow the input buffer itself (not internal allocations) by exactly 1–4 bytes |
+
+The pointer arithmetic cost is theoretical — fuzz targets pass the
+input to a parser; overflows happen on internal heap allocations
+derived from the input, not on the input buffer itself. The malloc
+cost is real and demonstrated.
+
+## Scope
+
+- Only affects new harness generation (fresh runs of the harness
+  dispatch agent).
+- Existing runs with a cached `harness.diff` and `harness_sources/`
+  will continue using the old tight-copy harness until those cached
+  files are deleted and the merge is re-run.

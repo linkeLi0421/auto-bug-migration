@@ -573,6 +573,8 @@ def patch_project_build_commands(project: str, original_build: str,
         return patch_opensc_build_commands(original_build, fuzz_target)
     if project == "ndpi":
         return patch_ndpi_build_commands(original_build, fuzz_target)
+    if project == "libredwg":
+        return patch_libredwg_build_commands(original_build, fuzz_target)
 
     # Patch cmake to disable tests/benchmarks (they fail because
     # __bug_dispatch is only linked into fuzz targets, not the main library).
@@ -583,6 +585,29 @@ def patch_project_build_commands(project: str, original_build: str,
             "-DBUILD_FUZZERS=ON -DBUILD_TESTS=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_EXAMPLES=OFF",
         )
     return patched
+
+
+def patch_libredwg_build_commands(original_build: str, fuzz_target: str) -> str:  # noqa: ARG001 - API symmetry
+    """Disable -Werror in libredwg's configure.
+
+    libredwg's configure.ac defaults to enable_werror=yes and adds -Werror
+    to WARN_CFLAGS. Some fuzzer toolchains (notably honggfuzz's hfuzz-clang)
+    inject flag combinations that trigger warnings plain clang doesn't —
+    e.g. -Wsign-compare firing in out_dxf.c under hfuzz-clang — and -Werror
+    then aborts the build. Pass --disable-werror so the benchmark builds
+    cleanly across every fuzzer toolchain.
+    """
+    def _inject(m: re.Match) -> str:
+        line = m.group(0)
+        return line if "--disable-werror" in line else line + " --disable-werror"
+
+    return re.sub(
+        r"^\./configure\b[^\n]*$",
+        _inject,
+        original_build,
+        count=1,
+        flags=re.MULTILINE,
+    )
 
 
 def patch_ndpi_build_commands(original_build: str, fuzz_target: str) -> str:  # noqa: ARG001 - API symmetry
