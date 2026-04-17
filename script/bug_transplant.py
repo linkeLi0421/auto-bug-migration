@@ -998,10 +998,12 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             "':(exclude)build/' ':(exclude)_build/'"
         )
         # Ghostscript: build.sh replaces freetype/ and zlib/ with external
-        # copies and removes cups/libs/; exclude these build-script artifacts.
+        # copies and removes cups/libs/ and libpng/; exclude these
+        # build-script artifacts so they do not pollute bug_transplant.diff.
         if args.project == "ghostscript":
             _git_diff_excludes += (
-                " ':(exclude)freetype/' ':(exclude)zlib/' ':(exclude)cups/libs/'"
+                " ':(exclude)freetype/' ':(exclude)zlib/'"
+                " ':(exclude)cups/libs/' ':(exclude)libpng/'"
             )
         # ntopng's Docker/image setup can leave submodule gitlinks checked out
         # at revisions different from the target commit. Those are not source
