@@ -2320,15 +2320,39 @@ for d in dirs:
   return docker_run(run_args, architecture=args.architecture)
 
 
-def get_crash_log_bash(commit:str, args):
+def get_crash_log_bash(commit:str, args, skip_compile: bool = False):
+  """Bash script run inside the collect_crash container.
+
+  When *skip_compile* is True we assume ``/out/<fuzzer>`` is already a
+  valid pre-built binary (typically mounted from a cached build-artifact
+  directory) and skip the in-container ``git checkout`` + ``compile``
+  steps. In that case we also route the run through OSS-Fuzz's
+  ``run_fuzzer`` helper so the libFuzzer args (``-rss_limit_mb=2560
+  -timeout=25``) and env (``RUN_FUZZER_MODE``, ``SKIP_SEED_CORPUS``)
+  match what ``fuzz_helper.py reproduce`` uses, keeping the saved
+  crash log stack aligned with manual reproduce output.
+  """
   patch_snippet = ''
-  if getattr(args, 'patch', None):
+  if getattr(args, 'patch', None) and not skip_compile:
     patch_snippet = _strict_forward_patch_apply_snippet()
   workdir = _workdir_from_dockerfile(args.project)
   # The git repo may be at /src/{project} even when WORKDIR is /src.
   # Find it at runtime so git checkout lands in the right place.
   gitdir = _source_dir(args.project.name)
-  bash_crash = f'''
+  if skip_compile:
+    build_phase = "mkdir -p /data/crash;"
+    # Match `fuzz_helper.py reproduce` exactly: go through run_fuzzer
+    # (which appends -rss_limit_mb=2560 -timeout=25 and feeds /dev/null
+    # on stdin). Export the env vars run_fuzzer reads with `set -u`.
+    run_cmd = (
+        f'export RUN_FUZZER_MODE=interactive; '
+        f'export SKIP_SEED_CORPUS=1; '
+        f'export FUZZING_ENGINE=libfuzzer; '
+        f'run_fuzzer {args.fuzzer_name} -runs=10 $FUZZER_EXTRA_ARGS '
+        f'/corpus/{args.test_input}'
+    )
+  else:
+    build_phase = f'''
     cd {gitdir};
     # Checkout base commit and set up environment
     git checkout -f {commit};
@@ -2338,12 +2362,18 @@ def get_crash_log_bash(commit:str, args):
     cd -;
     mkdir -p /data/crash;
 
-    compile;
+    compile;'''
+    run_cmd = (
+        f'/out/{args.fuzzer_name} -runs=10 $FUZZER_EXTRA_ARGS '
+        f'/corpus/{args.test_input}'
+    )
+  bash_crash = f'''
+    {build_phase}
     CRASH_FILE=/data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
     FUZZER_EXTRA_ARGS="{'-detect_leaks=0' if getattr(args, 'ignore_leaks', False) else ''}";
     SUMMARY_RE='{"SUMMARY:.*(Address|Memory|Undefined|Thread)Sanitizer" if getattr(args, "ignore_leaks", False) else "SUMMARY:.*(Address|Memory|Undefined|Thread|Leak)Sanitizer"}';
     for attempt in 1 2 3; do
-      /out/{args.fuzzer_name} -runs=10 $FUZZER_EXTRA_ARGS /corpus/{args.test_input} &> "$CRASH_FILE";
+      {run_cmd} &> "$CRASH_FILE";
       if grep -qE "$SUMMARY_RE" "$CRASH_FILE" 2>/dev/null; then
         break;
       fi;
@@ -3116,8 +3146,6 @@ def collect_crash(args):
   builder_digest = _get_builder_image_digest(runner_image, commit_date)
 
   prepare_repository(OSS_FUZZ_DIR, oss_fuzz_commit, args.project.name, builder_digest)
-  if not build_image_impl(args.project):
-    return False
 
   env = [
       'FUZZING_ENGINE=' + args.engine,
@@ -3144,6 +3172,76 @@ def collect_crash(args):
   else:
     image_project = 'oss-fuzz'
     out_dir = args.project.out
+
+  # Prefer a pre-built binary from buildAndtest.py at
+  # $STORAGE_PATH/<project>/<project>-<commit>-<sanitizer>[-<arch>] over
+  # rebuilding in-container. A fresh rebuild can drift (Docker build cache,
+  # apt/vendored-dep versions) from the reference binary even with a pinned
+  # base-builder, and that drift silently masks layout-fragile crashes
+  # (global-buffer-overflow, narrow heap overflow, wild-pointer SEGV). The
+  # cached artifact is byte-identical to what `fuzz_helper.py reproduce
+  # --fuzzer_path` uses, so the saved target_crash log matches what a
+  # manual reproduce produces.
+  storage_path = os.environ.get('STORAGE_PATH')
+  arch_str = (
+      f'-{args.architecture}' if args.architecture and args.architecture != 'x86_64' else ''
+  )
+  cached_out = None
+  if storage_path and not getattr(args, 'patch', None):
+    candidate = os.path.join(
+        storage_path, args.project.name,
+        f'{args.project.name}-{args.commit}-{args.sanitizer}{arch_str}',
+    )
+    if os.path.isfile(os.path.join(candidate, args.fuzzer_name)):
+      cached_out = candidate
+      logger.info('Using cached pre-built fuzzer: %s', cached_out)
+    else:
+      logger.info(
+          'No cached pre-built fuzzer at %s; will rebuild in container',
+          candidate,
+      )
+  if cached_out is not None:
+    out_dir = cached_out
+
+  # Only build the project image when we actually need to compile inside
+  # it. The cached-binary path uses base-runner and doesn't need the
+  # project image at all, so skipping build_image_impl both saves time
+  # and avoids invalidating downstream image caches (e.g. the merge
+  # pipeline's bug-transplant-<project> layer).
+  if cached_out is None:
+    if not build_image_impl(args.project):
+      return False
+
+  # Pick the crash-run image. For the cached-binary path, run in the same
+  # base-runner image that `fuzz_helper.py reproduce` uses, so the saved
+  # target_crash log contains byte-identical stacks (same libc, same ASAN
+  # runtime ordering) to a manual reproduce. The pinned digest is resolved
+  # from commit_date -- which came from the oss_fuzz_commit mapping in
+  # --build_csv. For the rebuild path keep the project image (it has the
+  # compiler toolchain that `compile` requires).
+  crash_run_image = f'gcr.io/{image_project}/{args.project.name}'
+  if cached_out is not None:
+    runner_digest_for_run = None
+    if commit_date:
+      try:
+        script_dir = os.path.dirname(os.path.realpath(__file__))
+        if script_dir not in sys.path:
+          sys.path.insert(0, script_dir)
+        from buildAndtest import get_base_runner_for_date
+        runner_digest_for_run = get_base_runner_for_date(commit_date)
+      except Exception as e:  # pylint: disable=broad-except
+        logger.warning(
+            'Could not resolve base-runner digest for commit_date=%s: %s; '
+            'falling back to %s',
+            commit_date, e, BASE_RUNNER_IMAGE,
+        )
+    if runner_digest_for_run:
+      crash_run_image = f'gcr.io/oss-fuzz-base/base-runner@{runner_digest_for_run}'
+    else:
+      crash_run_image = BASE_RUNNER_IMAGE
+    logger.info(
+        'Using base-runner image for cached binary: %s', crash_run_image,
+    )
 
   result_dir = os.path.join(HOME_DIR, 'data')
   os.makedirs(result_dir, exist_ok=True)
@@ -3183,11 +3281,14 @@ def collect_crash(args):
       '-v', f'{Function_instrument}:/Function_instrument',
       '-v', f'{LLVM_PROJECT}:/llvm',
       '-v', f'{result_dir}:/data',
-      '-t', f'gcr.io/{image_project}/{args.project.name}',
-      '/bin/bash', '-c', get_crash_log_bash(args.commit, args)
+      '-t', crash_run_image,
+      '/bin/bash', '-c',
+      get_crash_log_bash(args.commit, args, skip_compile=(cached_out is not None)),
   ])
 
-  clean(args, out_dir)
+  # Never wipe the cached artifact dir — clean() does `rm -rf /out/*`.
+  if cached_out is None:
+    clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   crash_log_path = os.path.join(
       crash_dir, f'target_crash-{args.commit[:8]}-{args.test_input}.txt')
