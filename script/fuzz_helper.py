@@ -2320,15 +2320,26 @@ for d in dirs:
   return docker_run(run_args, architecture=args.architecture)
 
 
-def get_crash_log_bash(commit:str, args):
+def get_crash_log_bash(commit:str, args, skip_compile: bool = False):
+  """Bash script run inside the collect_crash container.
+
+  When *skip_compile* is True we assume ``/out/<fuzzer>`` is already a
+  valid pre-built binary (typically mounted from a cached build-artifact
+  directory) and skip the in-container ``git checkout`` + ``compile``
+  steps. That avoids a fresh rebuild whose output may drift from the
+  reference binary for layout-fragile bugs.
+  """
   patch_snippet = ''
-  if getattr(args, 'patch', None):
+  if getattr(args, 'patch', None) and not skip_compile:
     patch_snippet = _strict_forward_patch_apply_snippet()
   workdir = _workdir_from_dockerfile(args.project)
   # The git repo may be at /src/{project} even when WORKDIR is /src.
   # Find it at runtime so git checkout lands in the right place.
   gitdir = _source_dir(args.project.name)
-  bash_crash = f'''
+  if skip_compile:
+    build_phase = "mkdir -p /data/crash;"
+  else:
+    build_phase = f'''
     cd {gitdir};
     # Checkout base commit and set up environment
     git checkout -f {commit};
@@ -2338,7 +2349,9 @@ def get_crash_log_bash(commit:str, args):
     cd -;
     mkdir -p /data/crash;
 
-    compile;
+    compile;'''
+  bash_crash = f'''
+    {build_phase}
     CRASH_FILE=/data/crash/target_crash-{commit[:8]}-{args.test_input}.txt;
     FUZZER_EXTRA_ARGS="{'-detect_leaks=0' if getattr(args, 'ignore_leaks', False) else ''}";
     SUMMARY_RE='{"SUMMARY:.*(Address|Memory|Undefined|Thread)Sanitizer" if getattr(args, "ignore_leaks", False) else "SUMMARY:.*(Address|Memory|Undefined|Thread|Leak)Sanitizer"}';
@@ -3145,6 +3158,36 @@ def collect_crash(args):
     image_project = 'oss-fuzz'
     out_dir = args.project.out
 
+  # Prefer a pre-built binary from buildAndtest.py at
+  # $STORAGE_PATH/<project>/<project>-<commit>-<sanitizer>[-<arch>] over
+  # rebuilding in-container. A fresh rebuild can drift (Docker build cache,
+  # apt/vendored-dep versions) from the reference binary even with a pinned
+  # base-builder, and that drift silently masks layout-fragile crashes
+  # (global-buffer-overflow, narrow heap overflow, wild-pointer SEGV). The
+  # cached artifact is byte-identical to what `fuzz_helper.py reproduce
+  # --fuzzer_path` uses, so the saved target_crash log matches what a
+  # manual reproduce produces.
+  storage_path = os.environ.get('STORAGE_PATH')
+  arch_str = (
+      f'-{args.architecture}' if args.architecture and args.architecture != 'x86_64' else ''
+  )
+  cached_out = None
+  if storage_path and not getattr(args, 'patch', None):
+    candidate = os.path.join(
+        storage_path, args.project.name,
+        f'{args.project.name}-{args.commit}-{args.sanitizer}{arch_str}',
+    )
+    if os.path.isfile(os.path.join(candidate, args.fuzzer_name)):
+      cached_out = candidate
+      logger.info('Using cached pre-built fuzzer: %s', cached_out)
+    else:
+      logger.info(
+          'No cached pre-built fuzzer at %s; will rebuild in container',
+          candidate,
+      )
+  if cached_out is not None:
+    out_dir = cached_out
+
   result_dir = os.path.join(HOME_DIR, 'data')
   os.makedirs(result_dir, exist_ok=True)
   crash_dir = os.path.join(result_dir, 'crash')
@@ -3184,10 +3227,13 @@ def collect_crash(args):
       '-v', f'{LLVM_PROJECT}:/llvm',
       '-v', f'{result_dir}:/data',
       '-t', f'gcr.io/{image_project}/{args.project.name}',
-      '/bin/bash', '-c', get_crash_log_bash(args.commit, args)
+      '/bin/bash', '-c',
+      get_crash_log_bash(args.commit, args, skip_compile=(cached_out is not None)),
   ])
 
-  clean(args, out_dir)
+  # Never wipe the cached artifact dir — clean() does `rm -rf /out/*`.
+  if cached_out is None:
+    clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
   crash_log_path = os.path.join(
       crash_dir, f'target_crash-{args.commit[:8]}-{args.test_input}.txt')
