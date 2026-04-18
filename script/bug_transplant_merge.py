@@ -1817,76 +1817,129 @@ def verify_bug_triggers(
 ) -> bool:
     """Run the fuzzer binary for the given sanitizer and check for a crash.
 
-    Retries up to ``_VERIFY_ATTEMPTS`` times to handle non-deterministic
-    bugs (same approach as ``fuzz_helper.py reproduce`` which uses
-    ``-runs=10``).  Returns True as soon as any attempt detects the crash.
+    Retries up to ``_VERIFY_ATTEMPTS`` times per ASAN configuration to
+    handle non-deterministic bugs (same approach as ``fuzz_helper.py
+    reproduce`` which uses ``-runs=10``).  Tries two ASAN_OPTIONS
+    configurations and returns True as soon as either detects the crash:
 
-    If *crash_log* is provided, extracts the reference stack from it and
-    compares against the fuzzer output using LCS matching.  Otherwise
-    falls back to checking for any sanitizer SUMMARY line.
+      * **UAR-off** (default ASAN behavior, matches ``fuzz_helper.py
+        reproduce`` and ``collect_crash``). Required for some
+        heap/global overflows whose detection depends on the allocator
+        landing a buffer at a specific address — turning on
+        ``detect_stack_use_after_return`` reserves a large per-thread
+        fake-stack ``mmap`` region that shifts those allocations and
+        moves the overread out of any ASAN-instrumented redzone, so the
+        crash silently disappears.
+      * **UAR-on** (``detect_stack_use_after_return=1``). Needed to
+        catch actual stack-use-after-return bugs, which ASAN cannot see
+        with the feature disabled.
+
+    Accepting a crash under either configuration preserves coverage of
+    both bug classes. If neither reports, the bug genuinely fails to
+    trigger against this binary + testcase.
+
+    If *crash_log* is provided, extracts the reference stack from it
+    and compares against the fuzzer output using LCS matching.
+    Otherwise falls back to checking for any sanitizer SUMMARY line.
     """
     sym_path = "/out/llvm-symbolizer"
-    env_prefix = f"export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16:external_symbolizer_path={sym_path}; "
     fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
 
     ref_stack = None
     if crash_log:
         ref_stack = _extract_stack_from_file(crash_log)
 
-    for attempt in range(_VERIFY_ATTEMPTS):
-        cmd = (
-            f"{env_prefix}"
-            f"if [ ! -x {fuzzer_path} ]; then "
-            f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
-            f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
-        )
-        logger.debug("[%s] verify cmd (attempt %d/%d): %s",
-                     bug_id, attempt + 1, _VERIFY_ATTEMPTS, cmd)
-        ret, output = _exec_capture(container, cmd, timeout=120)
-        logger.debug("[%s] verify exit=%d output_len=%d tail=%.500s",
-                     bug_id, ret, len(output), output[-500:] if output else "(empty)")
+    # Try UAR-off first: matches the options used at classification /
+    # collect_crash time, so reference stacks tend to align. Fall back
+    # to UAR-on for stack-use-after-return bugs that only ASAN-report
+    # with the feature enabled.
+    asan_variants = (
+        (
+            "UAR-off",
+            f"detect_leaks=0:external_symbolizer_path={sym_path}",
+        ),
+        (
+            "UAR-on",
+            f"detect_leaks=0:detect_stack_use_after_return=1"
+            f":max_uar_stack_size_log=16:external_symbolizer_path={sym_path}",
+        ),
+    )
 
-        # Extract current stack from fuzzer output
-        current_stack = _extract_stack_from_text(output)
+    last_ret = -1
+    for variant_name, asan_opts in asan_variants:
+        env_prefix = f"export ASAN_OPTIONS={asan_opts}; "
+        logger.debug("[%s] verify variant=%s", bug_id, variant_name)
+        for attempt in range(_VERIFY_ATTEMPTS):
+            cmd = (
+                f"{env_prefix}"
+                f"if [ ! -x {fuzzer_path} ]; then "
+                f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
+                f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
+            )
+            logger.debug("[%s] verify cmd (variant=%s attempt %d/%d): %s",
+                         bug_id, variant_name, attempt + 1,
+                         _VERIFY_ATTEMPTS, cmd)
+            ret, output = _exec_capture(container, cmd, timeout=120)
+            last_ret = ret
+            logger.debug(
+                "[%s] verify exit=%d output_len=%d tail=%.500s",
+                bug_id, ret, len(output),
+                output[-500:] if output else "(empty)",
+            )
 
-        # If we have a reference crash log, compare stacks
-        if ref_stack:
-            if _stacks_match(ref_stack, current_stack):
-                logger.info("[%s] Bug triggers OK (stack match)", bug_id)
+            # Extract current stack from fuzzer output
+            current_stack = _extract_stack_from_text(output)
+
+            # If we have a reference crash log, compare stacks
+            if ref_stack and _stacks_match(ref_stack, current_stack):
+                logger.info(
+                    "[%s] Bug triggers OK (stack match, %s)",
+                    bug_id, variant_name,
+                )
                 return True
-            else:
+
+            # Fallback: any sanitizer crash is a match
+            has_summary = bool(re.search(
+                r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
+                output,
+            ))
+            if has_summary:
                 if current_stack:
-                    logger.warning(
-                        "[%s] Stack MISMATCH: ref=%s cur=%s",
-                        bug_id, ref_stack[:3], current_stack[:3],
+                    logger.info(
+                        "[%s] Bug triggers OK (SUMMARY + stack match, %s)",
+                        bug_id, variant_name,
                     )
-                elif attempt == _VERIFY_ATTEMPTS - 1:
-                    logger.warning("[%s] Stack comparison inconclusive (exit=%d)", bug_id, ret)
-                # Fall through to SUMMARY check instead of returning False —
-                # unsymbolized stacks can't match symbolized references, but
-                # the bug may still be triggering.
+                else:
+                    logger.info(
+                        "[%s] Bug triggers OK (SUMMARY match, unsymbolized, %s)",
+                        bug_id, variant_name,
+                    )
+                return True
 
-        # Fallback: any sanitizer crash is a match
-        has_summary = bool(re.search(
-            r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer', output,
-        ))
-        if has_summary:
             if current_stack:
-                logger.info("[%s] Bug triggers OK (SUMMARY + stack match)", bug_id)
-            else:
-                logger.info("[%s] Bug triggers OK (SUMMARY match, unsymbolized)", bug_id)
-            return True
+                logger.info(
+                    "[%s] Bug triggers OK (crash detected, %s)",
+                    bug_id, variant_name,
+                )
+                return True
 
-        if current_stack:
-            logger.info("[%s] Bug triggers OK (crash detected)", bug_id)
-            return True
+            # Log diagnostic info on the last attempt of this variant
+            if attempt == _VERIFY_ATTEMPTS - 1:
+                if ref_stack and current_stack:
+                    logger.warning(
+                        "[%s] Stack MISMATCH (%s): ref=%s cur=%s",
+                        bug_id, variant_name, ref_stack[:3], current_stack[:3],
+                    )
+                elif not current_stack:
+                    logger.debug(
+                        "[%s] No crash under %s after %d attempts (exit=%d)",
+                        bug_id, variant_name, _VERIFY_ATTEMPTS, ret,
+                    )
 
-        if attempt < _VERIFY_ATTEMPTS - 1:
-            logger.debug("[%s] No crash on attempt %d/%d, retrying...",
-                         bug_id, attempt + 1, _VERIFY_ATTEMPTS)
-
-    logger.warning("[%s] Bug does NOT trigger after %d attempts (exit=%d)",
-                   bug_id, _VERIFY_ATTEMPTS, ret)
+    logger.warning(
+        "[%s] Bug does NOT trigger under either ASAN variant after %d attempts each (exit=%d)",
+        bug_id, _VERIFY_ATTEMPTS, last_ret,
+    )
     return False
 
 
