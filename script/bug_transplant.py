@@ -1734,8 +1734,18 @@ def main() -> int:
     # ------------------------------------------------------------------
     # Phase 1: Build Docker images
     # ------------------------------------------------------------------
+    # Pin the project image to the same oss-fuzz commit + base-builder
+    # digest that buildAndtest.py / collect_crash / collect_trace use for
+    # this target. Without these args build_project_image falls through
+    # to its unpinned `docker build` branch, so the agent's `compile`
+    # would run against today's base-builder:latest rather than the
+    # historical digest that produced the cached /mnt/nas binary and the
+    # reference crash log. That mismatch is the layout-drift source of
+    # "bug triggers in transplant container but nowhere else" outcomes.
     logger.info("=== Phase 1: Building Docker images ===")
-    project_image = build_project_image(args.project)
+    project_image = build_project_image(
+        args.project, args.target_commit, args.build_csv,
+    )
     agent_image = build_agent_image(args.project, project_image)
 
     # ------------------------------------------------------------------
