@@ -19,9 +19,14 @@ def run_poc(image: str, fuzz_target: str, poc_host_path: Path,
         "docker", "run", "--rm", "--entrypoint", "",
         "-v", f"{poc_host_path}:/tmp/testcase:ro",
         "-e", f"ASAN_OPTIONS={asan_options}",
-        "-e", "UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1",
+        # Suppress UBSAN stack traces and continue past pre-existing UB (e.g.
+        # ghostscript's gsromfs init shift-overflow) so the real ASan-detected
+        # bug is the only report parsed out of the log.
+        "-e", "UBSAN_OPTIONS=print_stacktrace=0:halt_on_error=0",
         image,
-        f"/out/{fuzz_target}", "/tmp/testcase",
+        # -runs=10 lets stack-use-after-return and some flaky heap bugs fire
+        # consistently — a single execution often misses them.
+        f"/out/{fuzz_target}", "-runs=10", "/tmp/testcase",
     ]
     result = subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -42,16 +47,24 @@ def parse_first_project_frame(output: str, project_marker: str) -> tuple[str, in
     return None
 
 
+PROJECT_REPO_NAME_OVERRIDES = {
+    # OSS-Fuzz project name differs from the upstream checkout directory.
+    "ghostscript": "ghostpdl",
+}
+
+
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("Usage: regen_crashes.py <benchmark_dir> <runner_image>")
+    if len(sys.argv) not in (3, 4):
+        print("Usage: regen_crashes.py <benchmark_dir> <runner_image> [project_repo_name]")
         return 2
     bench_dir = Path(sys.argv[1]).resolve()
     image = sys.argv[2]
+    repo_name_override = sys.argv[3] if len(sys.argv) == 4 else None
 
     metadata_path = bench_dir / "bug_metadata.json"
     metadata = json.loads(metadata_path.read_text())
     project = metadata["project"]
+    repo_name = (repo_name_override or PROJECT_REPO_NAME_OVERRIDES.get(project, project))
     fuzz_target = metadata.get("fuzz_target")
     if not fuzz_target:
         # Try benchmark.yaml
@@ -64,7 +77,7 @@ def main() -> int:
         return 2
 
     asan_opts = "detect_leaks=0:detect_stack_use_after_return=1"
-    project_marker = f"/src/{project}/"
+    project_marker = f"/src/{repo_name}/"
     crashes_dir = bench_dir / "crashes"
     seeds_dir = bench_dir / "seeds"
 
