@@ -35,7 +35,14 @@ def run_poc(image: str, fuzz_target: str, poc_host_path: Path,
     return result.returncode, result.stdout.decode("utf-8", errors="replace")
 
 
-CRASH_LINE_RE = re.compile(r"#\d+\s+0x[0-9a-f]+\s+in\s+(\S+)\s+(/[^:\n]+):(\d+)")
+# Match an ASan stack frame line end-to-end. The function name may contain
+# spaces (C++ signatures like `foo(int, bool)`), so capture it lazily up to
+# the trailing "/...:<line>(:<col>)?" path token. Anchoring to end-of-line via
+# re.MULTILINE prevents the function capture from swallowing the next frame.
+CRASH_LINE_RE = re.compile(
+    r"#\d+\s+0x[0-9a-f]+\s+in\s+(.+?)\s+(/[^\s:]+):(\d+)(?::\d+)?\s*$",
+    re.MULTILINE,
+)
 
 
 def parse_first_project_frame(output: str, project_marker: str) -> tuple[str, int, str] | None:
