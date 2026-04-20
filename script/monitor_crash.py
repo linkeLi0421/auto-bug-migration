@@ -54,8 +54,7 @@ def analyze_crash_file(crash_file, target_crashes_dir):
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            encoding="utf-8",
-            errors="replace",
+            text=True,
             timeout=30  # Timeout after 30 seconds
         )
         
@@ -319,11 +318,10 @@ def main(timeout_hours=10):
     try:
         # Start the fuzzer
         process = subprocess.Popen(
-            fuzzer_cmd,
-            stdout=subprocess.PIPE,
+            fuzzer_cmd, 
+            stdout=subprocess.PIPE, 
             stderr=subprocess.STDOUT,
-            encoding="utf-8",
-            errors="replace",
+            text=True,
             bufsize=1
         )
         

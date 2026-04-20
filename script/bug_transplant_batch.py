@@ -276,10 +276,7 @@ def collect_all_crash_trace_data(
                 cmd += ["--build_csv", args.build_csv]
             if args.runner_image:
                 cmd += ["--runner-image", args.runner_image]
-            result = subprocess.run(
-                cmd, capture_output=True,
-                encoding="utf-8", errors="replace",
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 logger.warning("[%s] collect_crash failed (exit %d)", bug_id, result.returncode)
             elif crash_file.exists():
@@ -300,10 +297,7 @@ def collect_all_crash_trace_data(
                 cmd += ["--build_csv", args.build_csv]
             if args.runner_image:
                 cmd += ["--runner-image", args.runner_image]
-            result = subprocess.run(
-                cmd, capture_output=True,
-                encoding="utf-8", errors="replace",
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 logger.warning("[%s] collect_trace failed (exit %d)", bug_id, result.returncode)
             elif trace_file.exists():
