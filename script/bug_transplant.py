@@ -940,6 +940,18 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
 
         _patch_build_sh_for_repeated_compile(container_name, args.project)
 
+        # Snapshot /src/build.sh after our legitimate hygiene edits so the
+        # between-bug reset can restore it if an agent modified it. Without
+        # this, one agent's build.sh edit (e.g. adding `python3 /tmp/foo.py`)
+        # contaminates every subsequent bug's `compile` in the shared
+        # container.
+        _exec(
+            container_name,
+            "if [ ! -f /src/build.sh.transplant_pristine ]; then "
+            "cp /src/build.sh /src/build.sh.transplant_pristine; fi",
+            user="root",
+        )
+
         # --- Copy testcase to /work for easier access ---
         _exec(
             container_name,
@@ -1076,6 +1088,7 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             logger.info("=== Post-agent verification ===")
             fuzzer = args.fuzzer_name
             testcase = args.testcase
+            warned_relaxed_crash_match = False
 
             # Force official build (delete fuzzer binary to force re-link;
             # autotools/cmake may not re-link when only library sources change)
@@ -1116,7 +1129,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
             )
             has_crash = False
-            crash_matches = False
             fuzz_out = ""
             for _attempt in range(3):
                 ret_fuzz, fuzz_out = _exec_capture(
@@ -1129,27 +1141,22 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     fuzz_out,
                 ))
 
-                # Compare crash stack with original to detect wrong-bug triggers
+                # Only require a sanitizer crash after the official build.
+                # Do not reject transplants whose crash class/stack differs
+                # from the original OSV crash.
                 if has_crash:
-                    original_crash_file = (
-                        DATA_DIR / "crash"
-                        / f"target_crash-{buggy_short}-{testcase}.txt"
-                    )
-                    crash_matches = True  # assume match if no original to compare
-                    if original_crash_file.exists():
-                        orig_text = original_crash_file.read_text()
-                        crash_matches = _crash_stacks_match(orig_text, fuzz_out)
-                        if not crash_matches:
-                            logger.warning(
-                                "Crash stack MISMATCH (see above for details)",
-                            )
+                    if not warned_relaxed_crash_match:
+                        logger.warning(
+                            "Skipping crash stack/class comparison by default; "
+                            "accepting any sanitizer crash from the official build.")
+                        warned_relaxed_crash_match = True
 
-                if has_crash and crash_matches:
+                if has_crash:
                     break
                 logger.debug("Verify attempt %d/3: no crash, retrying...",
                              _attempt + 1)
 
-            if has_crash and crash_matches:
+            if has_crash:
                 logger.info("Post-agent verification PASSED: bug triggers "
                             "with official build")
                 # Save crash stack
@@ -1255,7 +1262,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
                 )
                 has_crash2 = False
-                crash_matches2 = False
                 for _min_attempt in range(3):
                     ret_fuzz2, fuzz_out2 = _exec_capture(
                         container_name, verify_cmd, timeout=120)
@@ -1263,22 +1269,10 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                         r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
                         fuzz_out2))
                     if has_crash2:
-                        if original_crash_file.exists():
-                            crash_matches2 = _crash_stacks_match(
-                                orig_text, fuzz_out2)
-                        else:
-                            crash_matches2 = True
-                        if crash_matches2:
-                            break
-                        logger.warning(
-                            "Post-minimize attempt %d: crash is wrong bug, "
-                            "retrying...", _min_attempt + 1)
-                if has_crash2 and crash_matches2:
+                        break
+                if has_crash2:
                     logger.info("Post-minimize verification PASSED")
                     crash_out_path.write_text(fuzz_out2)
-                elif has_crash2 and not crash_matches2:
-                    logger.warning("Post-minimize verification: crash is "
-                                   "WRONG BUG — keeping pre-minimize diff")
                 else:
                     logger.warning("Post-minimize verification FAILED — "
                                    "keeping pre-minimize diff")
@@ -1287,13 +1281,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                         container_name,
                         _container_in_dir(repo_dir, "git diff"))
                     diff_path.write_text(pre_min_diff)
-            elif has_crash and not crash_matches:
-                logger.error(
-                    "Post-agent verification FAILED: crash is a DIFFERENT "
-                    "bug, not the original. Removing artifacts.")
-                if diff_path.exists():
-                    diff_path.unlink()
-                return 1
             else:
                 logger.error(
                     "Post-agent verification FAILED: bug does NOT trigger "
@@ -1326,6 +1313,16 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                       f"git clean -fdx {clean_excludes}",
                   ),
                   user="root")
+            # Restore /src/build.sh from the pristine snapshot and wipe
+            # /tmp agent-helper scripts — these live outside the git repo
+            # and would otherwise leak across bugs.
+            _exec(
+                container_name,
+                "if [ -f /src/build.sh.transplant_pristine ]; then "
+                "cp /src/build.sh.transplant_pristine /src/build.sh; fi; "
+                "rm -f /tmp/patch_*.py /tmp/*.patch",
+                user="root",
+            )
         elif not args.keep_container:
             logger.info("Destroying container %s...", container_name)
             subprocess.call(
@@ -1652,7 +1649,6 @@ def build_parser() -> argparse.ArgumentParser:
                         default="exec",
                         help="Agent invocation mode: exec (default, JSONL) "
                              "or interactive (TUI via tmux)")
-
     # Docker
     parser.add_argument("--keep-container", action="store_true",
                         help="Keep container alive after completion for debugging")

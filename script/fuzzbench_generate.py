@@ -439,6 +439,11 @@ def generate_build_sh(project: str, target_commit: str, fuzz_target: str,
 
 cd /src/{source_dir}
 
+# Drop stale build artifacts from the merge container so `git checkout`
+# is not blocked by untracked files that would be overwritten.
+git clean -fdx >/dev/null 2>&1 || true
+git reset --hard HEAD >/dev/null 2>&1 || true
+
 # Checkout target commit
 git checkout {target_commit}
 
