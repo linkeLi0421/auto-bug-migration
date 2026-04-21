@@ -66,6 +66,12 @@ Written under `--output-dir`.
   fuzzer, trial.
 - `bit_frequency_by_fuzzer.csv` — per fuzzer × dispatch bit: crash count, total
   gated crashes, lower-bound bit-set frequency.
+- `unmatched_crashes_by_fuzzer.csv` — per fuzzer: total crashes, how many
+  matched a target bug, how many did not, and unique unmatched `crash_key`s.
+- `unmatched_crashes_by_key.csv` — per unique unmatched `(fuzzer, crash_key)`:
+  crash_type, top frame, occurrences, trials seen, first-crash time. Surfaces
+  bugs the fuzzer found outside the transplant set, plus any harness or
+  dispatch-induced noise.
 - `crash_bytes.csv` *(if archives non-empty)* — per crash: first N dispatch
   bytes as hex, matched bug, gated flag.
 - `side_effect_summary.md` — human-readable rollup.

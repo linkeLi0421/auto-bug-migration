@@ -868,7 +868,7 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
              "-e", "ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16",
              compiled_tag,
              f"/out/{fuzz_target}", "-runs=10", "/tmp/testcase"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
         )
 
         # Parse crash output (combine stdout + stderr)
