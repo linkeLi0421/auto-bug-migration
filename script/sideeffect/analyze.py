@@ -312,16 +312,21 @@ def compute_reached_vs_triggered(pivot: dict, bugs: dict[str, BugInfo]) -> list[
 
 def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
                             bugs: dict[str, BugInfo], benchmark: str
-                            ) -> tuple[list[dict], list[dict]]:
+                            ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Classify every crash in local.db against our target bugs.
+
+    Returns (per_crash, per_fuzzer_bit, unmatched_by_key, unmatched_by_fuzzer).
+    """
     bug_targets = _bug_targets_from_metadata(bug_metadata)
     if not bug_targets:
-        return [], []
+        return [], [], [], []
 
     conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
         rows = cur.execute(
-            "select trial.fuzzer, trial.id, crash.time, crash.crash_stacktrace "
+            "select trial.fuzzer, trial.id, crash.time, crash.crash_stacktrace, "
+            "       crash.crash_key, crash.crash_type, crash.crash_state "
             "from crash join trial on crash.trial_id = trial.id "
             "where trial.preempted = 0 and trial.benchmark = ? "
             "order by trial.id, crash.time",
@@ -334,8 +339,13 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
     per_fuzzer_bit_counter: dict[tuple[str, int], int] = defaultdict(int)
     per_fuzzer_total_gated: dict[str, int] = defaultdict(int)
     per_fuzzer_total_always: dict[str, int] = defaultdict(int)
+    per_fuzzer_total_unmatched: dict[str, int] = defaultdict(int)
+    per_fuzzer_total_all: dict[str, int] = defaultdict(int)
+    unmatched_by_key_acc: dict[tuple[str, str], dict] = {}
+    unmatched_trials_by_key: dict[tuple[str, str], set] = defaultdict(set)
 
-    for fuzzer, trial_id, crash_time, stacktrace in rows:
+    for fuzzer, trial_id, crash_time, stacktrace, crash_key, crash_type, crash_state in rows:
+        per_fuzzer_total_all[fuzzer] += 1
         matched = _match_bug_ids_in_stacktrace(stacktrace or "", bug_targets)
         matched_bugs = [bugs[m] for m in matched if m in bugs]
         gated_matched = [b for b in matched_bugs if b.stratum == STRATUM_GATED]
@@ -347,6 +357,25 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
                     per_fuzzer_bit_counter[(fuzzer, bug.bit_index)] += 1
         elif always_matched:
             per_fuzzer_total_always[fuzzer] += 1
+        else:
+            per_fuzzer_total_unmatched[fuzzer] += 1
+            key = (fuzzer, crash_key or "")
+            # Trim newlines in crash_type / crash_state for CSV readability.
+            ctype = (crash_type or "").replace("\n", " | ").strip()
+            cstate = (crash_state or "").replace("\n", " | ").strip()
+            if key not in unmatched_by_key_acc:
+                unmatched_by_key_acc[key] = {
+                    "fuzzer": fuzzer,
+                    "crash_key": (crash_key or "").replace("\n", " | ").strip(),
+                    "crash_type": ctype,
+                    "top_state": cstate.split(" | ")[0] if cstate else "",
+                    "count": 0,
+                    "first_time": int(crash_time),
+                }
+            acc = unmatched_by_key_acc[key]
+            acc["count"] += 1
+            acc["first_time"] = min(acc["first_time"], int(crash_time))
+            unmatched_trials_by_key[key].add(str(trial_id))
 
         per_crash.append({
             "fuzzer": fuzzer,
@@ -359,6 +388,9 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
                 for b in sorted(gated_matched, key=lambda x: x.bit_index or -1)
                 if b.bit_index is not None
             ),
+            "crash_key": (crash_key or "").replace("\n", " | ").strip(),
+            "crash_type": (crash_type or "").replace("\n", " | ").strip(),
+            "is_unmatched": int(not matched_bugs),
         })
 
     max_bit = max(
@@ -366,7 +398,8 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
         default=-1,
     )
     per_fuzzer_bit_rows = []
-    fuzzers = sorted(set(per_fuzzer_total_gated) | set(per_fuzzer_total_always))
+    fuzzers = sorted(set(per_fuzzer_total_gated) | set(per_fuzzer_total_always)
+                     | set(per_fuzzer_total_unmatched))
     for fuzzer in fuzzers:
         total_gated = per_fuzzer_total_gated.get(fuzzer, 0)
         total_always = per_fuzzer_total_always.get(fuzzer, 0)
@@ -381,7 +414,37 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
                 "fraction_of_gated_crashes":
                     round(c / total_gated, 4) if total_gated else 0.0,
             })
-    return per_crash, per_fuzzer_bit_rows
+
+    unmatched_by_key = []
+    for key, acc in sorted(unmatched_by_key_acc.items(),
+                           key=lambda kv: (-kv[1]["count"], kv[0])):
+        unmatched_by_key.append({
+            "fuzzer": acc["fuzzer"],
+            "crash_key": acc["crash_key"],
+            "crash_type": acc["crash_type"],
+            "top_state_frame": acc["top_state"],
+            "occurrences": acc["count"],
+            "trials_seen": len(unmatched_trials_by_key[key]),
+            "first_crash_time_seconds": acc["first_time"],
+        })
+
+    unmatched_by_fuzzer = []
+    for fuzzer in fuzzers:
+        all_count = per_fuzzer_total_all.get(fuzzer, 0)
+        matched_count = (per_fuzzer_total_gated.get(fuzzer, 0)
+                         + per_fuzzer_total_always.get(fuzzer, 0))
+        unmatched_count = per_fuzzer_total_unmatched.get(fuzzer, 0)
+        unique_keys = sum(1 for (fz, _ck) in unmatched_by_key_acc if fz == fuzzer)
+        unmatched_by_fuzzer.append({
+            "fuzzer": fuzzer,
+            "total_crashes": all_count,
+            "matched_crashes": matched_count,
+            "unmatched_crashes": unmatched_count,
+            "matched_frac": round(matched_count / all_count, 4) if all_count else 0.0,
+            "unmatched_unique_crash_keys": unique_keys,
+        })
+
+    return per_crash, per_fuzzer_bit_rows, unmatched_by_key, unmatched_by_fuzzer
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +536,9 @@ def write_markdown(out_dir: Path, stratum_rows: list[dict],
                    reached_rows: list[dict], crash_count: int,
                    raw_crash_sample: int, benchmark: str,
                    coverage_available: bool,
-                   missing_coverage_paths: list[str]) -> None:
+                   missing_coverage_paths: list[str],
+                   unmatched_by_key: list[dict],
+                   unmatched_by_fuzzer: list[dict]) -> None:
     lines = ["# Transplant side-effect analysis", ""]
     lines.append(f"Benchmark: `{benchmark}`  ")
     lines.append(
@@ -633,6 +698,55 @@ def write_markdown(out_dir: Path, stratum_rows: list[dict],
         )
     lines.append("")
 
+    # Unmatched crashes — crashes whose stacktrace did not match any of our
+    # target bugs. Useful for catching bugs outside the transplant set,
+    # dispatch-induced noise, or harness issues.
+    lines.append("## Unmatched crashes (outside target bug set)")
+    lines.append("")
+    lines.append(
+        "Crashes whose stacktrace did not match any transplanted bug's "
+        "crash_file:crash_line (and, when applicable, sanitizer signature). "
+        "These are bugs the fuzzer found that we didn't transplant — could be "
+        "unrelated real bugs, harness/infrastructure crashes, or dispatch-"
+        "mechanism-induced crashes. Full per-crash rows in `bit_inference.csv` "
+        "with `is_unmatched=1`."
+    )
+    lines.append("")
+    if unmatched_by_fuzzer:
+        lines.append(
+            "| fuzzer | total crashes | matched | unmatched | matched frac | unique unmatched crash_keys |"
+        )
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+        for r in unmatched_by_fuzzer:
+            lines.append(
+                f"| {r['fuzzer']} | {r['total_crashes']} | "
+                f"{r['matched_crashes']} | {r['unmatched_crashes']} | "
+                f"{r['matched_frac']:.2%} | {r['unmatched_unique_crash_keys']} |"
+            )
+        lines.append("")
+        if unmatched_by_key:
+            lines.append("### Top unmatched crash signatures (highest occurrence)")
+            lines.append("")
+            lines.append(
+                "| fuzzer | crash_type | top_state_frame | occurrences | trials_seen |"
+            )
+            lines.append("| --- | --- | --- | ---: | ---: |")
+            for r in unmatched_by_key[:30]:
+                ctype_short = (r["crash_type"] or "").split(" | ")[0]
+                lines.append(
+                    f"| {r['fuzzer']} | `{ctype_short}` | "
+                    f"`{r['top_state_frame']}` | {r['occurrences']} | "
+                    f"{r['trials_seen']} |"
+                )
+            if len(unmatched_by_key) > 30:
+                lines.append("")
+                lines.append(f"… and {len(unmatched_by_key) - 30} more. "
+                             "See `unmatched_crashes_by_key.csv`.")
+            lines.append("")
+    else:
+        lines.append("No crashes, or all crashes matched a target bug.")
+        lines.append("")
+
     (out_dir / "side_effect_summary.md").write_text("\n".join(lines) + "\n")
 
 
@@ -748,19 +862,35 @@ def main() -> None:
                "reached", "triggered", "reached_not_triggered"],
               reached_rows)
 
-    per_crash_rows, bit_rows = infer_bits_from_crashes(
-        db_path, bug_metadata, bugs, benchmark)
+    per_crash_rows, bit_rows, unmatched_by_key, unmatched_by_fuzzer = \
+        infer_bits_from_crashes(db_path, bug_metadata, bugs, benchmark)
     write_csv(args.output_dir / "bit_inference.csv",
               ["fuzzer", "trial", "crash_time", "matched_bugs",
-               "matched_strata", "inferred_bits_set"],
+               "matched_strata", "inferred_bits_set",
+               "crash_key", "crash_type", "is_unmatched"],
               per_crash_rows)
     write_csv(args.output_dir / "bit_frequency_by_fuzzer.csv",
               ["fuzzer", "bit", "crashes_implying_bit_set",
                "gated_crashes_total", "always_active_crashes_total",
                "fraction_of_gated_crashes"],
               bit_rows)
-    logger.info("Crash bit inference: %d crashes across %d fuzzers",
-                len(per_crash_rows), len({r['fuzzer'] for r in bit_rows}))
+    write_csv(args.output_dir / "unmatched_crashes_by_key.csv",
+              ["fuzzer", "crash_key", "crash_type", "top_state_frame",
+               "occurrences", "trials_seen", "first_crash_time_seconds"],
+              unmatched_by_key)
+    write_csv(args.output_dir / "unmatched_crashes_by_fuzzer.csv",
+              ["fuzzer", "total_crashes", "matched_crashes",
+               "unmatched_crashes", "matched_frac",
+               "unmatched_unique_crash_keys"],
+              unmatched_by_fuzzer)
+    unmatched_total = sum(r["unmatched_crashes"] for r in unmatched_by_fuzzer)
+    logger.info(
+        "Crash classification: %d total, %d matched to target bugs, %d unmatched (%d unique crash_keys)",
+        len(per_crash_rows),
+        sum(r["matched_crashes"] for r in unmatched_by_fuzzer),
+        unmatched_total,
+        len(unmatched_by_key),
+    )
 
     raw_rows = extract_crash_bytes(args.experiment_dir, benchmark,
                                    bug_metadata, bugs)
@@ -773,7 +903,8 @@ def main() -> None:
 
     write_markdown(args.output_dir, stratum_rows, per_bug_rows, bit_rows,
                    reached_rows, len(per_crash_rows), len(raw_rows), benchmark,
-                   coverage_available, missing_coverage_paths)
+                   coverage_available, missing_coverage_paths,
+                   unmatched_by_key, unmatched_by_fuzzer)
     logger.info("Wrote outputs to %s", args.output_dir)
 
 

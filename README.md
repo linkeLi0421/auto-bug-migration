@@ -117,6 +117,7 @@ open('testcase-OSV-2021-21', 'wb').write(bytes([1]) + d)  # bit 0 = value 1
 | `script/fuzzbench_generate.py` | Generate FuzzBench benchmark from merge output |
 | `script/fuzzbench_run.py` | Build and run FuzzBench benchmark, collect artifacts for triage |
 | `script/fuzzbench_triage.py` | Post-experiment triage (crashes + coverage → bug timeline CSV) |
+| `script/sideeffect/analyze.py` | Side-effect analysis: gated vs. always-active stratum, dispatch-bit inference, raw crash bytes |
 | `script/prompts/bug_transplant.md` | Transplant prompt (testcase patching, crash verification) |
 | `script/prompts/bug_transplant_memory.md` | CLAUDE.md template for shared knowledge |
 | `script/prompts/minimize_patch.md` | Patch minimization prompt |
@@ -214,6 +215,27 @@ This produces:
 
 A bug is **reached** when its crash line (from `bug_metadata.json`) appears in FuzzBench's coverage snapshots. A bug is **triggered** when a crash file contains the matching dispatch bytes.
 
+### Side-effect analysis (`script/sideeffect/analyze.py`)
+
+Quantifies how much the dispatch mechanism perturbs the fuzzing task itself, beyond the intended bug injection (paper §3.1). Reuses `fuzzbench_triage` matching functions in-process — it does NOT consume `triage_results*.csv`.
+
+```bash
+python3 script/sideeffect/analyze.py \
+  --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
+  --bug-metadata fuzzbench/benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
+  --output-dir /tmp/sideeffect_cblosc2
+```
+
+Outputs under `--output-dir`:
+- `stratum_summary.csv` -- per (fuzzer, stratum): trigger/reach fractions, reach-only share, KM medians. Stratum ∈ {`gated`, `always_active`} from each bug's `dispatch_value`.
+- `per_bug_stratum.csv` -- per-bug rollup across fuzzers/trials.
+- `reached_vs_triggered.csv` -- per (fuzzer, stratum, bug) cross-tab.
+- `bit_inference.csv` + `bit_frequency_by_fuzzer.csv` -- dispatch bits inferred from crash stacktraces (which bits must have been set for each gated-bug crash).
+- `crash_bytes.csv` -- first N dispatch bytes from every preserved crash archive (when `experiment-folders/*/trial-*/crashes/*.tar.gz` are non-empty).
+- `side_effect_summary.md` -- rollup rendering.
+
+If per-trial coverage archives (`experiment-folders/*/trial-*/coverage/*.json.gz`) are pruned on disk, reach columns are left empty and the markdown flags the missing paths -- no fallback inputs are loaded. See `script/sideeffect/AGENTS.md`.
+
 ### Manual step-by-step workflow
 
 ```bash
@@ -241,6 +263,12 @@ python3 script/fuzzbench_triage.py \
   --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
   --bug-metadata benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
   --output results.csv
+
+# 5. Side-effect analysis (dispatch mechanism perturbation)
+python3 script/sideeffect/analyze.py \
+  --experiment-dir /tmp/fuzzbench-data/transplant-cblosc2-24h \
+  --bug-metadata benchmarks/c-blosc2_transplant_decompress_frame_fuzzer/bug_metadata.json \
+  --output-dir /tmp/sideeffect_cblosc2
 ```
 
 ### What the generator produces
