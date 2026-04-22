@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Side-effect analysis for bug-transplant FuzzBench experiments.
 
-Derives per-(fuzzer, trial, bug) reach/trigger timings inline by calling into
-``fuzzbench_triage`` — does NOT consume ``triage_results_survival_long.csv``.
-Inputs are the FuzzBench experiment directory (containing local.db and
-coverage/crash archives) and the bug_metadata.json emitted by
-``fuzzbench_generate.py``.
+Derives per-(fuzzer, trial, bug) trigger timings from ``local.db`` by calling
+into ``fuzzbench_triage``'s stacktrace matcher. The script intentionally does
+NOT read per-trial coverage snapshots — those are expensive to parse on the
+NAS and their reach signal is either trivial (hot-path lines covered by every
+trial) or absent (deep crash lines never hit in 24h). Every analysis we care
+about can be computed from the crash table alone.
 
 See ``script/sideeffect/AGENTS.md`` for the analysis design.
 """
@@ -29,7 +30,6 @@ from fuzzbench_triage import (  # noqa: E402
     _match_bug_ids_in_stacktrace,
     load_bug_metadata,
     resolve_local_db_path,
-    scan_coverage_for_bugs,
     scan_crash_dirs,
 )
 
@@ -73,7 +73,7 @@ def build_bug_index(bug_metadata: dict) -> dict[str, BugInfo]:
 
 
 # ---------------------------------------------------------------------------
-# Build the survival matrix directly from local.db + coverage snapshots.
+# Survival matrix from local.db crash table only
 # ---------------------------------------------------------------------------
 
 
@@ -107,62 +107,23 @@ def load_trial_inventory(db_path: Path, benchmark: str
 def build_pivot(trials_by_fuzzer: dict[str, list[str]],
                 bug_ids: list[str],
                 crash_results: dict,
-                coverage_results: dict | None,
                 censor: int) -> dict[tuple[str, str, str], dict]:
-    """Produce one entry per (fuzzer, trial, bug) with observed events.
-
-    When ``coverage_results`` is None (no coverage archives on disk), reach
-    is left unobserved. When coverage scan did run, reach_time is taken from
-    the coverage snapshot; if the scan skipped a bug because it already
-    crashed in that trial, we fall back to trig_t — triggering tautologically
-    implies reach. This matches ``fuzzbench_triage.merge_results``.
-    """
+    """One entry per (fuzzer, trial, bug). Only trigger events are observed."""
     pivot: dict[tuple[str, str, str], dict] = {}
     for fuzzer, trial_ids in trials_by_fuzzer.items():
         for trial_id in trial_ids:
             for bug_id in bug_ids:
                 key = (fuzzer, trial_id, bug_id)
                 trig_t = crash_results.get(key)
-                cov_t = None if coverage_results is None else coverage_results.get(key)
-                if coverage_results is not None and cov_t is None and trig_t is not None:
-                    reach_t = trig_t
-                else:
-                    reach_t = cov_t
                 pivot[key] = {
                     "fuzzer": fuzzer,
                     "trial": trial_id,
                     "bug_id": bug_id,
-                    "reached_time": reach_t,
-                    "reached_observed": 1 if reach_t is not None else 0,
                     "triggered_time": trig_t,
                     "triggered_observed": 1 if trig_t is not None else 0,
                     "censor": censor,
                 }
     return pivot
-
-
-def sorted_missing_coverage(experiment_dir: Path, benchmark: str) -> list[str]:
-    """Return the trial directory paths whose coverage subdir is missing/empty."""
-    exp_folders = experiment_dir / "experiment-folders"
-    if not exp_folders.exists():
-        return []
-    missing = []
-    prefix = benchmark + "-"
-    for fuzzer_dir in sorted(exp_folders.iterdir()):
-        if not fuzzer_dir.is_dir() or not fuzzer_dir.name.startswith(prefix):
-            continue
-        for trial_dir in sorted(fuzzer_dir.iterdir()):
-            if not trial_dir.is_dir():
-                continue
-            coverage_dir = trial_dir / "coverage"
-            if not coverage_dir.exists():
-                missing.append(f"{trial_dir} (no coverage/ subdir)")
-                continue
-            archives = [p for p in coverage_dir.iterdir()
-                        if p.name.endswith(".json.gz") and p.stat().st_size > 0]
-            if not archives:
-                missing.append(f"{coverage_dir} (empty)")
-    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -213,25 +174,14 @@ def compute_stratum_summary(pivot: dict, bugs: dict[str, BugInfo],
                 continue
             n = len(entries)
             trig_obs = sum(e["triggered_observed"] for e in entries)
-            reach_obs = sum(e["reached_observed"] for e in entries)
-            reach_only = sum(
-                1 for e in entries
-                if e["reached_observed"] and not e["triggered_observed"]
-            )
             trig_times = [e["triggered_time"] or e["censor"] for e in entries]
             trig_events = [e["triggered_observed"] for e in entries]
-            reach_times = [e["reached_time"] or e["censor"] for e in entries]
-            reach_events = [e["reached_observed"] for e in entries]
             rows.append({
                 "fuzzer": fuzzer,
                 "stratum": stratum,
                 "n_trial_bug_pairs": n,
                 "triggered_frac": round(trig_obs / n, 4),
-                "reached_frac": round(reach_obs / n, 4),
-                "reached_only_frac_of_reached":
-                    round(reach_only / reach_obs, 4) if reach_obs else 0.0,
                 "km_median_trigger_seconds": km_median(trig_times, trig_events),
-                "km_median_reach_seconds": km_median(reach_times, reach_events),
             })
     return rows
 
@@ -246,15 +196,8 @@ def compute_per_bug_stratum(pivot: dict, bugs: dict[str, BugInfo]) -> list[dict]
         entries = per_bug.get(bug_id, [])
         n = len(entries)
         trig_obs = sum(e["triggered_observed"] for e in entries)
-        reach_obs = sum(e["reached_observed"] for e in entries)
-        reach_only = sum(
-            1 for e in entries
-            if e["reached_observed"] and not e["triggered_observed"]
-        )
         trig_times = [e["triggered_time"] or e["censor"] for e in entries] if entries else []
         trig_events = [e["triggered_observed"] for e in entries] if entries else []
-        reach_times = [e["reached_time"] or e["censor"] for e in entries] if entries else []
-        reach_events = [e["reached_observed"] for e in entries] if entries else []
         rows.append({
             "bug_id": bug_id,
             "stratum": info.stratum,
@@ -264,19 +207,15 @@ def compute_per_bug_stratum(pivot: dict, bugs: dict[str, BugInfo]) -> list[dict]
             "crash_line": info.crash_line if info.crash_line is not None else "",
             "n_trials": n,
             "triggered_trials": trig_obs,
-            "reached_trials": reach_obs,
-            "reached_not_triggered": reach_only,
-            "reached_only_frac_of_reached":
-                round(reach_only / reach_obs, 4) if reach_obs else 0.0,
             "km_median_trigger_seconds": km_median(trig_times, trig_events),
-            "km_median_reach_seconds": km_median(reach_times, reach_events),
         })
     return rows
 
 
-def compute_reached_vs_triggered(pivot: dict, bugs: dict[str, BugInfo]) -> list[dict]:
+def compute_triggered_by_bug_fuzzer(pivot: dict,
+                                    bugs: dict[str, BugInfo]) -> list[dict]:
     per_key: dict[tuple[str, str, str, str], dict] = defaultdict(
-        lambda: {"reached": 0, "triggered": 0, "reached_not_triggered": 0, "n": 0}
+        lambda: {"triggered": 0, "n": 0}
     )
     for entry in pivot.values():
         bug = bugs.get(entry["bug_id"])
@@ -285,10 +224,7 @@ def compute_reached_vs_triggered(pivot: dict, bugs: dict[str, BugInfo]) -> list[
         k = (entry["fuzzer"], bug.stratum, entry["bug_id"], str(bug.dispatch_value))
         acc = per_key[k]
         acc["n"] += 1
-        acc["reached"] += entry["reached_observed"]
         acc["triggered"] += entry["triggered_observed"]
-        if entry["reached_observed"] and not entry["triggered_observed"]:
-            acc["reached_not_triggered"] += 1
 
     rows = []
     for (fuzzer, stratum, bug_id, dv), acc in sorted(per_key.items()):
@@ -298,15 +234,13 @@ def compute_reached_vs_triggered(pivot: dict, bugs: dict[str, BugInfo]) -> list[
             "bug_id": bug_id,
             "dispatch_value": int(dv),
             "trials": acc["n"],
-            "reached": acc["reached"],
             "triggered": acc["triggered"],
-            "reached_not_triggered": acc["reached_not_triggered"],
         })
     return rows
 
 
 # ---------------------------------------------------------------------------
-# Crash bit inference — reuses fuzzbench_triage stack matching
+# Crash bit inference + unmatched-crash surfacing
 # ---------------------------------------------------------------------------
 
 
@@ -360,7 +294,6 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
         else:
             per_fuzzer_total_unmatched[fuzzer] += 1
             key = (fuzzer, crash_key or "")
-            # Trim newlines in crash_type / crash_state for CSV readability.
             ctype = (crash_type or "").replace("\n", " | ").strip()
             cstate = (crash_state or "").replace("\n", " | ").strip()
             if key not in unmatched_by_key_acc:
@@ -448,7 +381,7 @@ def infer_bits_from_crashes(db_path: Path, bug_metadata: dict,
 
 
 # ---------------------------------------------------------------------------
-# Optional raw crash byte extraction
+# Optional raw crash byte extraction (off by default)
 # ---------------------------------------------------------------------------
 
 
@@ -533,104 +466,62 @@ def _fmt_seconds(value) -> str:
 
 def write_markdown(out_dir: Path, stratum_rows: list[dict],
                    per_bug_rows: list[dict], bit_rows: list[dict],
-                   reached_rows: list[dict], crash_count: int,
-                   raw_crash_sample: int, benchmark: str,
-                   coverage_available: bool,
-                   missing_coverage_paths: list[str],
+                   crash_count: int, raw_crash_sample: int, benchmark: str,
                    unmatched_by_key: list[dict],
                    unmatched_by_fuzzer: list[dict]) -> None:
-    lines = ["# Transplant side-effect analysis", ""]
+    lines: list[str] = []
+    lines.append("# Transplant side-effect analysis")
+    lines.append("")
     lines.append(f"Benchmark: `{benchmark}`  ")
     lines.append(
         f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%MZ')}"
     )
     lines.append("")
     lines.append(
-        "Survival data is derived by calling `fuzzbench_triage`'s "
-        "`scan_crash_dirs` (trigger times) and `scan_coverage_for_bugs` "
-        "(reach times) on the experiment's `local.db` + per-trial coverage "
-        "JSON snapshots."
+        "Trigger data is derived by calling `fuzzbench_triage`'s "
+        "`scan_crash_dirs` (stacktrace matcher) on the experiment's "
+        "`local.db`. Coverage snapshots are not read — reach-only metrics "
+        "added no per-fuzzer signal on thin decompress/parse harnesses and "
+        "duplicated the trigger signal on deep ones."
     )
-    lines.append("")
-    if coverage_available:
-        lines.append(
-            "Reach data: live `scan_coverage_for_bugs` over "
-            "`experiment-folders/*/trial-*/coverage/*.json.gz`."
-        )
-    else:
-        lines.append(
-            "> **Reach data is empty.** No usable per-trial coverage JSON "
-            "snapshots were found under "
-            "`experiment-folders/*/trial-*/coverage/*.json.gz`. No fallback "
-            "is applied — `reached_frac` and `reached_only` columns below "
-            "are all zero because the reach event was never observed."
-        )
-        if missing_coverage_paths:
-            lines.append("")
-            lines.append("<details><summary>Trial directories missing coverage data "
-                         f"({len(missing_coverage_paths)})</summary>")
-            lines.append("")
-            lines.append("```")
-            for p in missing_coverage_paths[:40]:
-                lines.append(p)
-            if len(missing_coverage_paths) > 40:
-                lines.append(f"... and {len(missing_coverage_paths) - 40} more")
-            lines.append("```")
-            lines.append("</details>")
     lines.append("")
 
     lines.append("## §3.1 Gated vs. always-active — stratum summary")
     lines.append("")
     lines.append(
-        "| fuzzer | stratum | trial×bug pairs | triggered frac | "
-        "reached frac | reach-only / reached | KM median trigger | KM median reach |"
+        "| fuzzer | stratum | trial×bug pairs | triggered frac | KM median trigger |"
     )
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| --- | --- | ---: | ---: | ---: |")
     for r in stratum_rows:
         if r["n_trial_bug_pairs"] == 0:
             continue
         lines.append(
-            "| {fuzzer} | {stratum} | {n} | {tf:.2%} | {rf:.2%} | {ro:.2%} | {kmt} | {kmr} |".format(
+            "| {fuzzer} | {stratum} | {n} | {tf:.2%} | {kmt} |".format(
                 fuzzer=r["fuzzer"],
                 stratum=r["stratum"],
                 n=r["n_trial_bug_pairs"],
                 tf=r["triggered_frac"],
-                rf=r["reached_frac"],
-                ro=r["reached_only_frac_of_reached"],
                 kmt=_fmt_seconds(r.get("km_median_trigger_seconds")),
-                kmr=_fmt_seconds(r.get("km_median_reach_seconds")),
             )
         )
-    lines.append("")
-    lines.append(
-        "`reach-only / reached` is the share of reached bugs that were never "
-        "triggered — for gated bugs this is direct dispatch-cost evidence; "
-        "for always-active bugs it is intrinsic difficulty. KM median is the "
-        "nonparametric median time across the stratum; `-` means >50% still "
-        "censored at the right-censor horizon."
-    )
     lines.append("")
 
     lines.append("## Per-bug detail (sorted by stratum, then trigger count)")
     lines.append("")
     lines.append(
-        "| bug | stratum | bit | trials | reached | triggered | reached_only | "
-        "reach-only / reached | KM median trigger |"
+        "| bug | stratum | bit | trials | triggered | KM median trigger |"
     )
-    lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
     for r in sorted(
             per_bug_rows,
             key=lambda r: (r["stratum"], -int(r["triggered_trials"] or 0), r["bug_id"])):
         lines.append(
-            "| {b} | {s} | {bit} | {n} | {r_} | {t} | {ro} | {rof:.2%} | {kmt} |".format(
+            "| {b} | {s} | {bit} | {n} | {t} | {kmt} |".format(
                 b=r["bug_id"],
                 s=r["stratum"],
                 bit=r["bit_index"] if r["bit_index"] != "" else "-",
                 n=r["n_trials"],
-                r_=r["reached_trials"],
                 t=r["triggered_trials"],
-                ro=r["reached_not_triggered"],
-                rof=r["reached_only_frac_of_reached"],
                 kmt=_fmt_seconds(r.get("km_median_trigger_seconds")),
             )
         )
@@ -666,50 +557,17 @@ def write_markdown(out_dir: Path, stratum_rows: list[dict],
             f"Raw dispatch-byte extraction: {raw_crash_sample} crash inputs "
             "sampled. See `crash_bytes.csv`."
         )
-    else:
-        lines.append(
-            "Raw dispatch-byte extraction skipped: crash archives under "
-            "`experiment-folders/*/crashes/` are zero-size or missing."
-        )
-    lines.append("")
+        lines.append("")
 
-    lines.append("## Reached-but-not-triggered asymmetry")
-    lines.append("")
-    stratum_counts: dict[str, dict[str, int]] = {
-        STRATUM_GATED: {"reached": 0, "triggered": 0, "reached_only": 0, "n": 0},
-        STRATUM_ALWAYS: {"reached": 0, "triggered": 0, "reached_only": 0, "n": 0},
-    }
-    for r in reached_rows:
-        bucket = stratum_counts[r["stratum"]]
-        bucket["reached"] += r["reached"]
-        bucket["triggered"] += r["triggered"]
-        bucket["reached_only"] += r["reached_not_triggered"]
-        bucket["n"] += r["trials"]
-    lines.append(
-        "| stratum | trial×bug pairs | reached | triggered | reached_only | reached_only share |"
-    )
-    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
-    for stratum in (STRATUM_GATED, STRATUM_ALWAYS):
-        b = stratum_counts[stratum]
-        share = b["reached_only"] / b["reached"] if b["reached"] else 0.0
-        lines.append(
-            f"| {stratum} | {b['n']} | {b['reached']} | {b['triggered']} | "
-            f"{b['reached_only']} | {share:.2%} |"
-        )
-    lines.append("")
-
-    # Unmatched crashes — crashes whose stacktrace did not match any of our
-    # target bugs. Useful for catching bugs outside the transplant set,
-    # dispatch-induced noise, or harness issues.
     lines.append("## Unmatched crashes (outside target bug set)")
     lines.append("")
     lines.append(
         "Crashes whose stacktrace did not match any transplanted bug's "
-        "crash_file:crash_line (and, when applicable, sanitizer signature). "
-        "These are bugs the fuzzer found that we didn't transplant — could be "
-        "unrelated real bugs, harness/infrastructure crashes, or dispatch-"
-        "mechanism-induced crashes. Full per-crash rows in `bit_inference.csv` "
-        "with `is_unmatched=1`."
+        "`(crash_file, crash_line)` target (and, when applicable, sanitizer "
+        "signature). These are bugs the fuzzer found that we didn't "
+        "transplant — could be unrelated real bugs, harness/infrastructure "
+        "crashes, or dispatch-mechanism-induced crashes. Full per-crash rows "
+        "in `bit_inference.csv` with `is_unmatched=1`."
     )
     lines.append("")
     if unmatched_by_fuzzer:
@@ -783,6 +641,9 @@ def main() -> None:
     parser.add_argument("--benchmark",
                         help="Benchmark name (auto-detected when a single "
                              "benchmark is present)")
+    parser.add_argument("--extract-crash-bytes", action="store_true",
+                        help="Also read corpus archives to emit crash_bytes.csv "
+                             "(slow on NAS; off by default)")
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
@@ -818,49 +679,28 @@ def main() -> None:
     crash_results = scan_crash_dirs(args.experiment_dir, benchmark, bug_metadata)
     logger.info("  %d (fuzzer, trial, bug) crash entries", len(crash_results))
 
-    logger.info("scan_coverage_for_bugs: checking crash-line coverage")
-    coverage_results = scan_coverage_for_bugs(
-        args.experiment_dir, benchmark, bug_metadata, None, crash_results)
-    logger.info("  %d (fuzzer, trial, bug) coverage-reached entries",
-                len(coverage_results))
-    coverage_available = bool(coverage_results)
-    missing_coverage_paths: list[str] = []
-    if not coverage_available:
-        missing_coverage_paths = sorted_missing_coverage(
-            args.experiment_dir, benchmark)
-        logger.warning(
-            "No per-trial coverage archives found (checked %d trial dirs). "
-            "Reach data will be left empty.", len(missing_coverage_paths),
-        )
-
-    pivot = build_pivot(
-        trials_by_fuzzer, sorted(bugs), crash_results,
-        coverage_results if coverage_available else None, censor,
-    )
+    pivot = build_pivot(trials_by_fuzzer, sorted(bugs), crash_results, censor)
     all_fuzzers = sorted(trials_by_fuzzer)
     logger.info("Pivot: %d (fuzzer, trial, bug) tuples", len(pivot))
 
     stratum_rows = compute_stratum_summary(pivot, bugs, all_fuzzers)
     write_csv(args.output_dir / "stratum_summary.csv",
               ["fuzzer", "stratum", "n_trial_bug_pairs", "triggered_frac",
-               "reached_frac", "reached_only_frac_of_reached",
-               "km_median_trigger_seconds", "km_median_reach_seconds"],
+               "km_median_trigger_seconds"],
               stratum_rows)
 
     per_bug_rows = compute_per_bug_stratum(pivot, bugs)
     write_csv(args.output_dir / "per_bug_stratum.csv",
               ["bug_id", "stratum", "dispatch_value", "bit_index",
                "crash_file", "crash_line", "n_trials",
-               "triggered_trials", "reached_trials",
-               "reached_not_triggered", "reached_only_frac_of_reached",
-               "km_median_trigger_seconds", "km_median_reach_seconds"],
+               "triggered_trials", "km_median_trigger_seconds"],
               per_bug_rows)
 
-    reached_rows = compute_reached_vs_triggered(pivot, bugs)
-    write_csv(args.output_dir / "reached_vs_triggered.csv",
+    triggered_rows = compute_triggered_by_bug_fuzzer(pivot, bugs)
+    write_csv(args.output_dir / "triggered_by_bug_fuzzer.csv",
               ["fuzzer", "stratum", "bug_id", "dispatch_value", "trials",
-               "reached", "triggered", "reached_not_triggered"],
-              reached_rows)
+               "triggered"],
+              triggered_rows)
 
     per_crash_rows, bit_rows, unmatched_by_key, unmatched_by_fuzzer = \
         infer_bits_from_crashes(db_path, bug_metadata, bugs, benchmark)
@@ -892,18 +732,19 @@ def main() -> None:
         len(unmatched_by_key),
     )
 
-    raw_rows = extract_crash_bytes(args.experiment_dir, benchmark,
-                                   bug_metadata, bugs)
-    if raw_rows:
-        write_csv(args.output_dir / "crash_bytes.csv",
-                  ["fuzzer", "trial", "archive", "filename",
-                   "dispatch_hex", "bits_set"], raw_rows)
-        logger.info("Raw crash-byte extraction: %d inputs sampled",
-                    len(raw_rows))
+    raw_rows: list[dict] = []
+    if args.extract_crash_bytes:
+        raw_rows = extract_crash_bytes(args.experiment_dir, benchmark,
+                                       bug_metadata, bugs)
+        if raw_rows:
+            write_csv(args.output_dir / "crash_bytes.csv",
+                      ["fuzzer", "trial", "archive", "filename",
+                       "dispatch_hex", "bits_set"], raw_rows)
+            logger.info("Raw crash-byte extraction: %d inputs sampled",
+                        len(raw_rows))
 
     write_markdown(args.output_dir, stratum_rows, per_bug_rows, bit_rows,
-                   reached_rows, len(per_crash_rows), len(raw_rows), benchmark,
-                   coverage_available, missing_coverage_paths,
+                   len(per_crash_rows), len(raw_rows), benchmark,
                    unmatched_by_key, unmatched_by_fuzzer)
     logger.info("Wrote outputs to %s", args.output_dir)
 
