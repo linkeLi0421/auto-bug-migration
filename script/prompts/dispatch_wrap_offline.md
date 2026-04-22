@@ -93,6 +93,65 @@ to any file that uses `__bug_dispatch`. Add it once per file, near
 the top with other includes. If the include already exists, do not
 duplicate it.
 
+### Non-C files (scripts, resource files, data)
+
+Dispatch gating is a **protocol**, not a C idiom: at runtime, the
+active branch must be chosen by reading bit `{dispatch_bit}` of
+`__bug_dispatch[{dispatch_byte}]` from the process's memory. If the
+patch modifies a file in another language, translate the same
+protocol using whatever mechanism that language offers — don't give
+up and don't silently drop the change.
+
+Pick the cheapest accessor for the file's language and build it once;
+subsequent bugs in the same language can reuse it.
+
+| File class | Accessor strategy |
+| --- | --- |
+| Interpreted language embedded in the binary (PostScript, Lua, Tcl, …) | Register a one-shot native operator that returns the bit as a bool, then branch inline with the language's `if`/`ifelse`. Example for PostScript: a new `.bug_dispatch_bit` op reading `__bug_dispatch[]`, used as `<byte> <mask> .bug_dispatch_bit {{ NEW }} {{ OLD }} ifelse`. |
+| Scripting language running in a separate process (shell, Python standalone script) | Have the harness write `/tmp/__bug_dispatch` (raw bytes) or export an env var after setting `__bug_dispatch[]`; the script reads it and branches on the bit. |
+| FFI-capable runtime (Python, Ruby, Node) running in-process | Look up the `__bug_dispatch` symbol via `ctypes`/FFI and branch natively. |
+| Pure data resource with no logic (JSON, YAML, images, binary tables) | Don't try to gate inline. Keep both files (e.g. `foo.json` and `foo.bug_{bug_id}.json`) and gate the **loader code** (a C-level `if` that picks which path to open) on the dispatch bit. |
+| Build-time-only file (configure script, CMakeLists, Makefile) | Cannot be runtime-dispatched. Flag this back — the bug will have to be applied unconditionally or skipped, not wrapped. |
+
+Requirements for any accessor you add:
+- Keep it minimal (ideally one short function) and put it next to
+  existing dispatch code so it's easy to find.
+- Surface the accessor source/registration in the resulting diff —
+  don't assume it already exists.
+- The accessor reads the same `__bug_dispatch[]` global the C side
+  uses; do not duplicate the dispatch state.
+- Both OLD and NEW code must still be preserved (the PS `ifelse`,
+  the Python `if/else`, the loader's `if`-picked path, etc.).
+
+**Accessor without call site = no wrap.** Adding the accessor in C
+(or registering it, or exporting it) is only half the job. You MUST
+also modify the original file the bug touched so that the accessor
+is actually called at runtime and selects between OLD/NEW. If the
+input patch modifies `foo.ps`, your wrapped output must *also*
+modify `foo.ps` — the agent that only adds a PostScript operator
+without calling it from the `.ps` file has produced a silently
+broken wrap. Concretely: for every file `F` in the input patch,
+your wrapped patch must touch either `F` itself (wrapping inline) or
+replace it through a loader gate (with the old/new variants both
+present and a C-level `if` selecting between them). It is NOT
+acceptable for the set of files touched by the wrapped patch to be
+a strict subset of the set of files touched by the input patch —
+except for struct/header/macro changes that the earlier sections
+say to apply unconditionally.
+
+Verification protocol before you finish:
+1. List every file in the input patch.
+2. For each file, confirm your wrapped patch either modifies it
+   with the same OLD/NEW content gated on the dispatch bit, OR
+   replaces it through an explicit two-variant + gated loader, OR
+   applies it unconditionally per the struct/macro/header rules.
+3. If a file is uncovered, go back and add the call site — do not
+   ship a wrapped patch that is silently missing branches.
+
+If you cannot find a language-appropriate way to read `__bug_dispatch[]`
+without unreasonable infrastructure, report that explicitly in your
+summary — do not pretend the patch was wrapped.
+
 ---
 
 ## Testcase update
@@ -121,6 +180,8 @@ Local bugs (no dispatch bit) get byte value `0x00` prepended.
 - [ ] Macros use ternary, not if/else
 - [ ] Existing macro ternaries are OR'd into, not replaced
 - [ ] Struct changes (type widening, new fields) applied directly (no dispatch)
+- [ ] Non-C file changes gated via a language-appropriate accessor (new op, FFI lookup, harness-exported param, or two-file + gated loader)
+- [ ] Every file in the input patch is ALSO in the wrapped patch (accessor without call site = broken wrap); exceptions only for struct/macro/header rules above
 - [ ] `#include "__bug_dispatch.h"` added where needed
 - [ ] Testcase has dispatch byte prepended
 - [ ] `compile` succeeds after all changes

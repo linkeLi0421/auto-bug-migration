@@ -188,10 +188,18 @@ def _diff_excludes(project: str) -> str:
 
 
 _DIFF_INCLUDES = (
+    # C/C++ source & headers
     "'*.c' '*.h' '*.cc' '*.cpp' '*.cxx' '*.hpp' '*.hh' '*.hxx' "
     "'*.spec' "
+    # Build files
     "'*.cmake' '*.sh' "
-    "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am'"
+    "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am' "
+    # Interpreted-language resources (needed for cross-language dispatch
+    # wraps — e.g. pdf_draw.ps for ghostscript). Without these, agent
+    # edits to these files get silently stripped from the saved diff.
+    "'*.ps' '*.lua' '*.tcl' '*.py' '*.pl' '*.rb' '*.js' "
+    # Data/config the prompt's two-file + gated-loader pattern may add
+    "'*.json' '*.yaml' '*.yml' '*.toml' '*.conf' '*.ini'"
 )
 
 
@@ -1020,11 +1028,6 @@ def wrap_bug_with_dispatch(
     return True, output
 
 
-_SANITIZER_SUMMARY_RE = re.compile(
-    r"SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer"
-)
-
-
 def _verify_wrapped_dispatch(
     container: str,
     bug: dict,
@@ -1033,7 +1036,17 @@ def _verify_wrapped_dispatch(
 ) -> bool:
     """Run the freshly built fuzzer with bit-on / bit-off and check trigger asymmetry.
 
-    Returns True iff bit-on produces a sanitizer SUMMARY and bit-off does not.
+    Uses ``verify_bug_triggers`` (the same stack-matching + retry logic
+    applied at final verification) so a wrap cannot pass on an
+    unrelated sanitizer SUMMARY or a single flaky crash.
+
+    Returns True iff:
+      * bit-on triggers the bug under one of the two ASAN variants
+        (stack match against the reference crash log when available,
+        sanitizer SUMMARY otherwise), AND
+      * bit-off does NOT trigger any crash across the same 10 attempts
+        per variant.
+
     Skips with warning (returns True) when no payload is available.
     """
     bug_id = bug["bug_id"]
@@ -1052,44 +1065,51 @@ def _verify_wrapped_dispatch(
     prefix_on = (1 << bit_index).to_bytes(nbytes, "little")
     prefix_off = b"\x00" * nbytes
 
-    for tag, blob in (("on", prefix_on + payload), ("off", prefix_off + payload)):
-        path = f"/tmp/_verify_{bug_id}_{tag}"
+    on_name = f"_verify_{bug_id}_on"
+    off_name = f"_verify_{bug_id}_off"
+    for name, blob in ((on_name, prefix_on + payload), (off_name, prefix_off + payload)):
         proc = subprocess.run(
-            ["docker", "exec", "-i", container, "bash", "-c", f"cat > {path}"],
+            ["docker", "exec", "-i", container, "bash", "-c", f"cat > /work/{name}"],
             input=blob, timeout=10,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             check=False,
         )
         if proc.returncode != 0:
-            logger.warning("[%s] Failed to stage verify input (%s)", bug_id, tag)
+            logger.warning("[%s] Failed to stage verify input (%s)", bug_id, name)
             return False
 
+    sanitizer = bug.get("sanitizer", "address") or "address"
+    crash_log = bug.get("crash_log")
     fuzzer_path = f"/out/{fuzzer}"
-    env_prefix = (
-        "export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:"
-        "max_uar_stack_size_log=16:external_symbolizer_path=/out/llvm-symbolizer; "
+
+    # bit-on: must trigger the *reference* bug (not just any SUMMARY).
+    bit_on_ok = verify_bug_triggers(
+        container, bug_id, fuzzer, on_name, sanitizer, crash_log,
+        fuzzer_path=fuzzer_path,
     )
-    results = {}
-    for tag in ("on", "off"):
-        cmd = (
-            f"{env_prefix}{fuzzer_path} -runs=10 /tmp/_verify_{bug_id}_{tag} 2>&1"
+    if not bit_on_ok:
+        logger.warning(
+            "[%s] Dispatch verification FAIL: bit-on did not reproduce the "
+            "reference bug after 10 attempts x 2 ASAN variants",
+            bug_id,
         )
-        _, out = _exec_capture(container, cmd, timeout=120)
-        results[tag] = out
+        return False
 
-    crashed_on = bool(_SANITIZER_SUMMARY_RE.search(results["on"]))
-    crashed_off = bool(_SANITIZER_SUMMARY_RE.search(results["off"]))
-
-    if crashed_on and not crashed_off:
-        return True
-
-    logger.warning(
-        "[%s] Dispatch verification FAIL: bit-on crashed=%s, bit-off crashed=%s",
-        bug_id, crashed_on, crashed_off,
+    # bit-off: must NOT crash (quiet: we expect a non-trigger, so the
+    # usual "Bug does NOT trigger" warning is the success path).
+    bit_off_crash = verify_bug_triggers(
+        container, bug_id, fuzzer, off_name, sanitizer, crash_log,
+        fuzzer_path=fuzzer_path, quiet=True,
     )
-    logger.warning("[%s] bit-on tail: %s", bug_id, results["on"][-500:])
-    logger.warning("[%s] bit-off tail: %s", bug_id, results["off"][-500:])
-    return False
+    if bit_off_crash:
+        logger.warning(
+            "[%s] Dispatch verification FAIL: bit-off also triggered a crash "
+            "(gating is not exclusive)",
+            bug_id,
+        )
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------

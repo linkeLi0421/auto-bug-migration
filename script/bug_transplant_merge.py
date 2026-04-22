@@ -1774,173 +1774,11 @@ def _build_step_feedback(
     return "\n".join(lines)
 
 
-def _stacks_match(reference: list[str], current: list[str], threshold: float = 0.5) -> bool:
-    """Check if current stack matches reference using LCS ratio.
-
-    Filters out sanitizer-internal frames before comparison.
-    """
-    san_re = re.compile(
-        r'^(__asan|__lsan|__tsan|__msan|__ubsan|__sanitizer|__interception)',
-    )
-    ref_app = [f for f in reference if not san_re.match(f)]
-    cur_app = [f for f in current if not san_re.match(f)]
-
-    if not ref_app or not cur_app:
-        return False
-
-    # LCS (longest common subsequence)
-    n, m = len(ref_app), len(cur_app)
-    prev = [0] * (m + 1)
-    for i in range(1, n + 1):
-        curr = [0] * (m + 1)
-        for j in range(1, m + 1):
-            if ref_app[i - 1] == cur_app[j - 1]:
-                curr[j] = prev[j - 1] + 1
-            else:
-                curr[j] = max(prev[j], curr[j - 1])
-        prev = curr
-    lcs_len = prev[m]
-    ratio = lcs_len / max(len(ref_app), len(cur_app), 1)
-    return ratio >= threshold
-
-
-_VERIFY_ATTEMPTS = 10
-
-
-def verify_bug_triggers(
-    container: str,
-    bug_id: str,
-    fuzzer: str,
-    testcase: str,
-    sanitizer: str = "address",
-    crash_log: str | None = None,
-) -> bool:
-    """Run the fuzzer binary for the given sanitizer and check for a crash.
-
-    Retries up to ``_VERIFY_ATTEMPTS`` times per ASAN configuration to
-    handle non-deterministic bugs (same approach as ``fuzz_helper.py
-    reproduce`` which uses ``-runs=10``).  Tries two ASAN_OPTIONS
-    configurations and returns True as soon as either detects the crash:
-
-      * **UAR-off** (default ASAN behavior, matches ``fuzz_helper.py
-        reproduce`` and ``collect_crash``). Required for some
-        heap/global overflows whose detection depends on the allocator
-        landing a buffer at a specific address — turning on
-        ``detect_stack_use_after_return`` reserves a large per-thread
-        fake-stack ``mmap`` region that shifts those allocations and
-        moves the overread out of any ASAN-instrumented redzone, so the
-        crash silently disappears.
-      * **UAR-on** (``detect_stack_use_after_return=1``). Needed to
-        catch actual stack-use-after-return bugs, which ASAN cannot see
-        with the feature disabled.
-
-    Accepting a crash under either configuration preserves coverage of
-    both bug classes. If neither reports, the bug genuinely fails to
-    trigger against this binary + testcase.
-
-    If *crash_log* is provided, extracts the reference stack from it
-    and compares against the fuzzer output using LCS matching.
-    Otherwise falls back to checking for any sanitizer SUMMARY line.
-    """
-    sym_path = "/out/llvm-symbolizer"
-    fuzzer_path = f"/out/{sanitizer}/{fuzzer}"
-
-    ref_stack = None
-    if crash_log:
-        ref_stack = _extract_stack_from_file(crash_log)
-
-    # Try UAR-off first: matches the options used at classification /
-    # collect_crash time, so reference stacks tend to align. Fall back
-    # to UAR-on for stack-use-after-return bugs that only ASAN-report
-    # with the feature enabled.
-    asan_variants = (
-        (
-            "UAR-off",
-            f"detect_leaks=0:external_symbolizer_path={sym_path}",
-        ),
-        (
-            "UAR-on",
-            f"detect_leaks=0:detect_stack_use_after_return=1"
-            f":max_uar_stack_size_log=16:external_symbolizer_path={sym_path}",
-        ),
-    )
-
-    last_ret = -1
-    for variant_name, asan_opts in asan_variants:
-        env_prefix = f"export ASAN_OPTIONS={asan_opts}; "
-        logger.debug("[%s] verify variant=%s", bug_id, variant_name)
-        for attempt in range(_VERIFY_ATTEMPTS):
-            cmd = (
-                f"{env_prefix}"
-                f"if [ ! -x {fuzzer_path} ]; then "
-                f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
-                f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
-            )
-            logger.debug("[%s] verify cmd (variant=%s attempt %d/%d): %s",
-                         bug_id, variant_name, attempt + 1,
-                         _VERIFY_ATTEMPTS, cmd)
-            ret, output = _exec_capture(container, cmd, timeout=120)
-            last_ret = ret
-            logger.debug(
-                "[%s] verify exit=%d output_len=%d tail=%.500s",
-                bug_id, ret, len(output),
-                output[-500:] if output else "(empty)",
-            )
-
-            # Extract current stack from fuzzer output
-            current_stack = _extract_stack_from_text(output)
-
-            # If we have a reference crash log, compare stacks
-            if ref_stack and _stacks_match(ref_stack, current_stack):
-                logger.info(
-                    "[%s] Bug triggers OK (stack match, %s)",
-                    bug_id, variant_name,
-                )
-                return True
-
-            # Fallback: any sanitizer crash is a match
-            has_summary = bool(re.search(
-                r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
-                output,
-            ))
-            if has_summary:
-                if current_stack:
-                    logger.info(
-                        "[%s] Bug triggers OK (SUMMARY + stack match, %s)",
-                        bug_id, variant_name,
-                    )
-                else:
-                    logger.info(
-                        "[%s] Bug triggers OK (SUMMARY match, unsymbolized, %s)",
-                        bug_id, variant_name,
-                    )
-                return True
-
-            if current_stack:
-                logger.info(
-                    "[%s] Bug triggers OK (crash detected, %s)",
-                    bug_id, variant_name,
-                )
-                return True
-
-            # Log diagnostic info on the last attempt of this variant
-            if attempt == _VERIFY_ATTEMPTS - 1:
-                if ref_stack and current_stack:
-                    logger.warning(
-                        "[%s] Stack MISMATCH (%s): ref=%s cur=%s",
-                        bug_id, variant_name, ref_stack[:3], current_stack[:3],
-                    )
-                elif not current_stack:
-                    logger.debug(
-                        "[%s] No crash under %s after %d attempts (exit=%d)",
-                        bug_id, variant_name, _VERIFY_ATTEMPTS, ret,
-                    )
-
-    logger.warning(
-        "[%s] Bug does NOT trigger under either ASAN variant after %d attempts each (exit=%d)",
-        bug_id, _VERIFY_ATTEMPTS, last_ret,
-    )
-    return False
+# `verify_bug_triggers` lives in ``bug_verify`` so bug_transplant.py and
+# the merge pipelines share a single verification protocol (retries,
+# ASAN variants, stack matching). Re-exported here to keep existing
+# import sites working.
+from bug_verify import verify_bug_triggers, _VERIFY_ATTEMPTS  # noqa: E402,F401
 
 
 def verify_all_bugs(
@@ -1970,9 +1808,15 @@ def _find_crash_log(bug_id: str, bug_info: dict) -> str | None:
     crash_dir = DATA_DIR / "crash"
     if not crash_dir.exists():
         return None
-    # Try to find by bug_id in filename
+    # Filenames are `target_crash-<commit>-testcase-<bug_id>.<ext>`.
+    # Match the bug_id strictly so that e.g. OSV-2022-1 does not collide
+    # with OSV-2022-121 / OSV-2022-199 via substring containment.
+    suffix = f"-testcase-{bug_id}"
     for f in crash_dir.iterdir():
-        if bug_id in f.name and f.name.startswith("target_crash-"):
+        if not f.name.startswith("target_crash-"):
+            continue
+        stem, _ = os.path.splitext(f.name)
+        if stem.endswith(suffix):
             return str(f)
     return None
 
