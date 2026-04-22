@@ -862,6 +862,7 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
 
         # Run the PoC - use -runs=10 so stack-use-after-return bugs
         # have enough iterations for ASAN's fake stack to detect stale frames.
+<<<<<<< Updated upstream
         result = subprocess.run(
             ["docker", "run", "--rm",
              "-v", f"{poc_path.resolve()}:/tmp/testcase:ro",
@@ -873,6 +874,24 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
 
         # Parse crash output (combine stdout + stderr)
         crash_text = result.stdout + result.stderr
+=======
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm",
+                 "-v", f"{poc_path.resolve()}:/tmp/testcase:ro",
+                 "-e", "ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16",
+                 compiled_tag,
+                 f"/out/{fuzz_target}", "-runs=10", "/tmp/testcase"],
+                capture_output=True, text=True, timeout=30,
+            )
+            crash_text = result.stdout + result.stderr
+            exit_code = result.returncode
+        except subprocess.TimeoutExpired as e:
+            logger.warning("  %s: PoC replay timed out after 30s, skipping", bug_id)
+            crash_text = (e.stdout or b"").decode("utf-8", errors="replace") + \
+                         (e.stderr or b"").decode("utf-8", errors="replace")
+            exit_code = -1
+>>>>>>> Stashed changes
 
         # Save full crash output
         crash_file = crash_output_dir / f"{bug_id}.txt"
@@ -886,7 +905,7 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
                          parsed["function"] or "?")
         else:
             logger.warning("  %s: no crash line parsed (exit=%d, output=%d bytes)",
-                           bug_id, result.returncode, len(crash_text))
+                           bug_id, exit_code, len(crash_text))
             if crash_text:
                 logger.debug("  %s output tail: %s", bug_id, crash_text[-500:])
 
