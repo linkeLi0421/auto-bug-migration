@@ -855,23 +855,26 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
             logger.debug("  %s: no PoC found", bug_id)
             continue
 
-        # Run the PoC - use -runs=100 so stack-use-after-return bugs have
-        # enough iterations for ASAN's fake stack to detect stale frames,
-        # AND so GC-triggered heap-use-after-free bugs (e.g. ghostpdl's
-        # OSV-2022-339 in gc_trace) get enough allocator churn to trip.
+        # Run the PoC - use -runs=1000 so (a) stack-use-after-return bugs
+        # have enough iterations for ASAN's fake stack to expose stale
+        # frames, (b) GC-triggered heap-use-after-free bugs (e.g.
+        # ghostpdl's OSV-2022-339 in gc_trace) get enough allocator churn
+        # to trip, and (c) allocator-state-sensitive heap-buffer-overflow
+        # bugs (e.g. OSV-2022-232 in pdfi_fapi_get_glyph) line up the
+        # right freelist before the overflowing memcpy happens.
         try:
             result = subprocess.run(
                 ["docker", "run", "--rm",
                  "-v", f"{poc_path.resolve()}:/tmp/testcase:ro",
                  "-e", "ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16",
                  compiled_tag,
-                 f"/out/{fuzz_target}", "-runs=100", "/tmp/testcase"],
-                capture_output=True, text=True, timeout=180,
+                 f"/out/{fuzz_target}", "-runs=1000", "/tmp/testcase"],
+                capture_output=True, text=True, timeout=600,
             )
             crash_text = result.stdout + result.stderr
             exit_code = result.returncode
         except subprocess.TimeoutExpired as e:
-            logger.warning("  %s: PoC replay timed out after 180s, skipping", bug_id)
+            logger.warning("  %s: PoC replay timed out after 600s, skipping", bug_id)
             crash_text = ((e.stdout or b"").decode("utf-8", errors="replace") +
                           (e.stderr or b"").decode("utf-8", errors="replace"))
             exit_code = -1
