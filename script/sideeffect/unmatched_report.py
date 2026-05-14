@@ -116,14 +116,24 @@ def summarize(rows: list[dict]) -> dict:
 
 def render_markdown(summaries: dict[str, dict]) -> str:
     lines: list[str] = []
-    lines.append("# Unmatched-crash analysis across transplant benchmarks")
+    lines.append("# Unmatched-crash analysis")
     lines.append("")
     lines.append(
-        "For each benchmark this report breaks down the crashes whose "
-        "stacktrace did NOT match any transplanted bug target. Source data: "
-        "`unmatched_crashes_by_key.csv` from each benchmark's `sideeffect/` "
-        "output. Total counts reflect `occurrences` (sum over fuzzers and "
-        "trials) — not the number of unique crash signatures."
+        "Companion to `duplication_analysis.md`.  That report takes the "
+        "A/B/C view of **all** crashes and shows how they overlap with "
+        "the merge bug set (local + transplanted).  This report zooms "
+        "into the **unmatched** slice — crashes whose stacktrace did "
+        "NOT triage to any bug in the merge set — and classifies them "
+        "by crash type, top frame, and dispatch-mechanism relevance."
+    )
+    lines.append("")
+    lines.append(
+        "Source data: `unmatched_crashes_by_key.csv` from each "
+        "benchmark's `sideeffect/` output (one row per "
+        "`(fuzzer, crash_key)`).  Occurrence counts are the sum over "
+        "fuzzers and trials; signature counts are unique `crash_key`s "
+        "per fuzzer, so the same global `crash_key` can contribute to "
+        "multiple signature rows if several fuzzers hit it."
     )
     lines.append("")
 
@@ -244,11 +254,16 @@ def render_markdown(summaries: dict[str, dict]) -> str:
     )
     lines.append("")
     lines.append(
-        "1. **Real unpatched bugs at target commit** — real bugs in source code "
-        "that we did not transplant. These are legitimate fuzzer finds the "
-        "benchmark happens to exclude. Their top frames are in project source "
-        "(not in `__bug_dispatch*`), and the crash_type is usually "
-        "`heap-overflow`, `stack-buffer-overflow`, or `use-after-free`."
+        "1. **Real bugs outside the merge set** — real bugs in source code "
+        "that are not represented in the merge bug set (neither local at the "
+        "target commit nor transplanted). These are legitimate fuzzer finds "
+        "the benchmark happens to exclude. Their top frames are in project "
+        "source (not in `__bug_dispatch*`), and the crash_type is usually "
+        "`heap-overflow`, `stack-buffer-overflow`, or `use-after-free`.  "
+        "Some of these are actually the same root cause as a merge-set bug "
+        "but triage couldn't line them up — see the *Bug-set overlap — "
+        "candidates / verified* sections of `duplication_analysis.md`, "
+        "where the loose (crash_state) key recovers them."
     )
     lines.append(
         "2. **Dispatch-mechanism artifacts** — crashes whose top frame is in "
@@ -263,11 +278,11 @@ def render_markdown(summaries: dict[str, dict]) -> str:
     )
     lines.append("")
     lines.append(
-        "For each benchmark, a high matched fraction (see the main side-effect "
-        "reports) and low dispatch-frame count indicates the benchmark is "
-        "measuring what we intended — transplanted bug discovery — with little "
-        "extra noise. A high unmatched fraction with top frames in project "
-        "source points to unpatched bugs worth investigating or transplanting."
+        "A high matched fraction (see `duplication_analysis.md`) and low "
+        "dispatch-frame count indicates the benchmark is measuring what we "
+        "intended — merge-set bug discovery — with little extra noise. A "
+        "high unmatched fraction with top frames in project source points "
+        "to real bugs worth investigating or transplanting into the merge set."
     )
     lines.append("")
     return "\n".join(lines) + "\n"

@@ -132,6 +132,14 @@ WORKDIR /src/{source_dir}
 # Keep ASan stack-use-after-return detection enabled for direct testcase replay.
 ENV ASAN_OPTIONS="detect_leaks=0:detect_stack_use_after_return=1"
 
+# Raise libFuzzer's per-alloc / RSS cap from its 2048MB default. Some transplanted
+# bugs (e.g. c-blosc2 OSV-2021-464) trigger a ~2GB malloc en route to the real
+# memory-safety error; with the default cap libFuzzer aborts with
+# `out-of-memory` and `-ignore_ooms=1` silently drops it. libFuzzer-family
+# runners in fuzzbench/fuzzers/*/fuzzer.py splice $ADDITIONAL_ARGS onto the
+# target command line, so this propagates automatically.
+ENV ADDITIONAL_ARGS="-rss_limit_mb=8192"
+
 # Bug transplant patches (re-applied by build.sh after checkout_commit.py resets source)
 COPY patches/ /src/patches/
 COPY seeds/ /src/benchmark_seeds/
@@ -862,19 +870,6 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
 
         # Run the PoC - use -runs=10 so stack-use-after-return bugs
         # have enough iterations for ASAN's fake stack to detect stale frames.
-<<<<<<< Updated upstream
-        result = subprocess.run(
-            ["docker", "run", "--rm",
-             "-v", f"{poc_path.resolve()}:/tmp/testcase:ro",
-             "-e", "ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=1:max_uar_stack_size_log=16",
-             compiled_tag,
-             f"/out/{fuzz_target}", "-runs=10", "/tmp/testcase"],
-            capture_output=True, encoding="utf-8", errors="replace", timeout=30,
-        )
-
-        # Parse crash output (combine stdout + stderr)
-        crash_text = result.stdout + result.stderr
-=======
         try:
             result = subprocess.run(
                 ["docker", "run", "--rm",
@@ -891,7 +886,6 @@ def collect_crash_lines_from_image(bench_dir: Path, summary: dict,
             crash_text = (e.stdout or b"").decode("utf-8", errors="replace") + \
                          (e.stderr or b"").decode("utf-8", errors="replace")
             exit_code = -1
->>>>>>> Stashed changes
 
         # Save full crash output
         crash_file = crash_output_dir / f"{bug_id}.txt"
