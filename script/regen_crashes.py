@@ -5,6 +5,7 @@ For each bug in bug_metadata.json, runs the corresponding PoC seed file
 against the built fuzz target, captures ASan output, writes
 crashes/<bug_id>.txt, and updates crash_file/crash_line in bug_metadata.json.
 """
+import argparse
 import json
 import re
 import subprocess
@@ -26,7 +27,12 @@ def run_poc(image: str, fuzz_target: str, poc_host_path: Path,
         image,
         # -runs=10 lets stack-use-after-return and some flaky heap bugs fire
         # consistently — a single execution often misses them.
-        f"/out/{fuzz_target}", "-runs=10", "/tmp/testcase",
+        # -rss_limit_mb=8192 raises libFuzzer's per-alloc cap so bugs that
+        # allocate ~2GB en route to the real memory-safety error aren't
+        # killed as out-of-memory before the bug fires (e.g. c-blosc2
+        # OSV-2021-464, htslib OSV-2020-999).
+        f"/out/{fuzz_target}", "-runs=10", "-rss_limit_mb=8192",
+        "/tmp/testcase",
     ]
     result = subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -61,12 +67,23 @@ PROJECT_REPO_NAME_OVERRIDES = {
 
 
 def main() -> int:
-    if len(sys.argv) not in (3, 4):
-        print("Usage: regen_crashes.py <benchmark_dir> <runner_image> [project_repo_name]")
-        return 2
-    bench_dir = Path(sys.argv[1]).resolve()
-    image = sys.argv[2]
-    repo_name_override = sys.argv[3] if len(sys.argv) == 4 else None
+    parser = argparse.ArgumentParser(
+        description="Regenerate crash files for a transplant benchmark.",
+    )
+    parser.add_argument("benchmark_dir", help="Path to the benchmark directory")
+    parser.add_argument("runner_image", help="Docker image with /out/<fuzz_target>")
+    parser.add_argument("project_repo_name", nargs="?", default=None,
+                        help="Override the source dir under /src/ (rarely needed)")
+    parser.add_argument("--bug", action="append", default=None,
+                        help="Only regenerate this bug id (can be repeated). "
+                             "Other bugs' crash files and metadata entries are "
+                             "left untouched.")
+    args = parser.parse_args()
+
+    bench_dir = Path(args.benchmark_dir).resolve()
+    image = args.runner_image
+    repo_name_override = args.project_repo_name
+    bug_filter = set(args.bug) if args.bug else None
 
     metadata_path = bench_dir / "bug_metadata.json"
     metadata = json.loads(metadata_path.read_text())
@@ -94,6 +111,9 @@ def main() -> int:
     updated_bugs = {}
 
     for bug_id, info in metadata["bugs"].items():
+        if bug_filter is not None and bug_id not in bug_filter:
+            updated_bugs[bug_id] = info
+            continue
         poc_candidates = [
             seeds_dir / f"testcase-{bug_id}-patched",
             seeds_dir / f"testcase-{bug_id}",
