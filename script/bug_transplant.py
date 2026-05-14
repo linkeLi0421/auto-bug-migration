@@ -48,6 +48,12 @@ import textwrap
 import time
 from pathlib import Path
 
+# Add script dir to path so the shared bug_verify module resolves both
+# when executed directly (``python3 script/bug_transplant.py``) and when
+# imported as a library (``from bug_transplant import ...``).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from bug_verify import verify_bug_triggers  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 # Lazy-initialized in main(); imported here so the module can be used as a library.
@@ -1117,46 +1123,32 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                 f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
             )
 
-            # Run fuzzer with testcase — retry up to 3 times for
-            # non-deterministic bugs (same as fuzz_helper.py reproduce).
-            fuzzer_path = f"/out/{fuzzer}"
-            sym_path = "/out/llvm-symbolizer"
-            verify_cmd = (
-                f"export ASAN_OPTIONS=detect_leaks=0"
-                f":external_symbolizer_path={sym_path}; "
-                f"if [ ! -x {fuzzer_path} ]; then "
-                f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
-                f"{fuzzer_path} -runs=10 /work/{testcase} 2>&1"
+            # Run fuzzer via the shared verification protocol (10 attempts
+            # x 2 ASAN variants, stack-match against the reference crash).
+            original_crash_file = (
+                DATA_DIR / "crash"
+                / f"target_crash-{buggy_short}-{testcase}.txt"
             )
-            has_crash = False
-            fuzz_out = ""
-            for _attempt in range(3):
-                ret_fuzz, fuzz_out = _exec_capture(
-                    container_name, verify_cmd, timeout=120,
-                )
+            crash_log = (
+                str(original_crash_file) if original_crash_file.exists() else None
+            )
+            trigger_ok = verify_bug_triggers(
+                container_name, args.bug_id, fuzzer, testcase,
+                sanitizer="address", crash_log=crash_log,
+                fuzzer_path=f"/out/{fuzzer}",
+            )
+            # Capture a fresh fuzzer output so the saved crash log reflects
+            # what the verifier just saw (and so the post-minimize diff
+            # step has a reference text for stack-matching).
+            _, fuzz_out = _exec_capture(
+                container_name,
+                f"export ASAN_OPTIONS=detect_leaks=0"
+                f":external_symbolizer_path=/out/llvm-symbolizer; "
+                f"/out/{fuzzer} -runs=10 /work/{testcase} 2>&1",
+                timeout=120,
+            )
 
-                # Check for crash
-                has_crash = bool(re.search(
-                    r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
-                    fuzz_out,
-                ))
-
-                # Only require a sanitizer crash after the official build.
-                # Do not reject transplants whose crash class/stack differs
-                # from the original OSV crash.
-                if has_crash:
-                    if not warned_relaxed_crash_match:
-                        logger.warning(
-                            "Skipping crash stack/class comparison by default; "
-                            "accepting any sanitizer crash from the official build.")
-                        warned_relaxed_crash_match = True
-
-                if has_crash:
-                    break
-                logger.debug("Verify attempt %d/3: no crash, retrying...",
-                             _attempt + 1)
-
-            if has_crash:
+            if trigger_ok:
                 logger.info("Post-agent verification PASSED: bug triggers "
                             "with official build")
                 # Save crash stack
@@ -1261,17 +1253,20 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
                     f"if [ -f /out/{testcase} ]; then cp /out/{testcase} /work/{testcase}; "
                     f"elif [ ! -f /work/{testcase} ]; then cp /corpus/{testcase} /work/{testcase}; fi; true",
                 )
-                has_crash2 = False
-                for _min_attempt in range(3):
-                    ret_fuzz2, fuzz_out2 = _exec_capture(
-                        container_name, verify_cmd, timeout=120)
-                    has_crash2 = bool(re.search(
-                        r'SUMMARY:\s*(Address|Memory|Undefined|Thread|Leak)Sanitizer',
-                        fuzz_out2))
-                    if has_crash2:
-                        break
-                if has_crash2:
+                post_min_ok = verify_bug_triggers(
+                    container_name, args.bug_id, fuzzer, testcase,
+                    sanitizer="address", crash_log=crash_log,
+                    fuzzer_path=f"/out/{fuzzer}",
+                )
+                if post_min_ok:
                     logger.info("Post-minimize verification PASSED")
+                    _, fuzz_out2 = _exec_capture(
+                        container_name,
+                        f"export ASAN_OPTIONS=detect_leaks=0"
+                        f":external_symbolizer_path=/out/llvm-symbolizer; "
+                        f"/out/{fuzzer} -runs=10 /work/{testcase} 2>&1",
+                        timeout=120,
+                    )
                     crash_out_path.write_text(fuzz_out2)
                 else:
                     logger.warning("Post-minimize verification FAILED — "
@@ -1284,9 +1279,8 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
             else:
                 logger.error(
                     "Post-agent verification FAILED: bug does NOT trigger "
-                    "with official compile. The agent may have used a "
-                    "non-standard build. exit=%d tail=%.300s",
-                    ret_fuzz,
+                    "with the reference stack. Removing artifacts. "
+                    "tail=%.300s",
                     fuzz_out[-300:] if fuzz_out else "(empty)",
                 )
                 # Remove unverified diff so downstream doesn't use it
@@ -1336,119 +1330,6 @@ def run_agent_in_container(args: argparse.Namespace) -> int:
         # Clean up temp agents directory (only if we own it)
         if owns_agents_dir:
             shutil.rmtree(agents_dir, ignore_errors=True)
-
-
-def _extract_crash_funcs(text: str, limit: int = 0) -> list:
-    """Extract function names from crash stack frames in /src/ project code.
-
-    Args:
-        text: ASan/MSan/etc. crash output.
-        limit: Max functions to return (0 = all).
-    """
-    funcs = []
-    for m in re.finditer(r'#\d+\s+\S+ in (\S+)\s+/src/', text):
-        funcs.append(m.group(1))
-    return funcs[:limit] if limit else funcs
-
-
-def _extract_sanitizer_class(text: str):
-    """Extract sanitizer error class and access direction from crash output.
-
-    Returns (error_class, direction) e.g. ("heap-buffer-overflow", "READ")
-    or (None, None) if not found.
-    """
-    m = re.search(
-        r'ERROR:\s*\w+Sanitizer:\s*([\w-]+)\s+on address.*?\n'
-        r'(READ|WRITE)\s+of\s+size',
-        text, re.DOTALL,
-    )
-    if m:
-        return m.group(1), m.group(2)
-    # Fallback: try SUMMARY line for class, separate search for direction
-    m_summary = re.search(r'SUMMARY:\s*\w+Sanitizer:\s*([\w-]+)', text)
-    m_dir = re.search(r'(READ|WRITE)\s+of\s+size', text)
-    return (
-        m_summary.group(1) if m_summary else None,
-        m_dir.group(1) if m_dir else None,
-    )
-
-
-def _extract_crash_files(text: str) -> set:
-    """Extract source file basenames from crash stack frames in /src/."""
-    files = set()
-    for m in re.finditer(r'/src/\S+/([\w._-]+\.\w+):\d+', text):
-        files.add(m.group(1))
-    return files
-
-
-def _crash_stacks_match(orig_text: str, new_text: str) -> bool:
-    """Two-tier crash matching: exact (top-3 overlap) then same-vulnerability.
-
-    Tier 1: Any overlap in top-3 project-code functions (fast, high confidence).
-    Tier 2: Same sanitizer class + same access direction + overlapping call
-            chain (any depth) + same source file area.
-    """
-    # Tier 1: top-3 function overlap (original strict check)
-    orig_top3 = _extract_crash_funcs(orig_text, limit=3)
-    new_top3 = _extract_crash_funcs(new_text, limit=3)
-    if orig_top3 and new_top3 and set(orig_top3) & set(new_top3):
-        return True
-
-    # If the reference crash log has no usable data (e.g. build failed during
-    # collect_crash), accept any sanitizer crash rather than rejecting it.
-    if not orig_top3 and not _extract_crash_funcs(orig_text):
-        logger.info("Reference crash log has no stack data — accepting any sanitizer crash")
-        return True
-
-    # Tier 2: same-vulnerability match
-    orig_class, orig_dir = _extract_sanitizer_class(orig_text)
-    new_class, new_dir = _extract_sanitizer_class(new_text)
-
-    # 2a. Same sanitizer class
-    if orig_class and new_class and orig_class != new_class:
-        logger.warning(
-            "Crash class mismatch: original=%s new=%s",
-            orig_class, new_class,
-        )
-        return False
-
-    # 2b. Same access direction
-    if orig_dir and new_dir and orig_dir != new_dir:
-        logger.warning(
-            "Crash direction mismatch: original=%s new=%s",
-            orig_dir, new_dir,
-        )
-        return False
-
-    # 2c. Overlapping call chain (full depth, including allocation stack)
-    orig_all = set(_extract_crash_funcs(orig_text))
-    new_all = set(_extract_crash_funcs(new_text))
-    chain_overlap = orig_all & new_all
-    if not chain_overlap:
-        logger.warning(
-            "No overlapping functions in full call chain: "
-            "original=%s new=%s",
-            sorted(orig_all)[:5], sorted(new_all)[:5],
-        )
-        return False
-
-    # 2d. Same source file area
-    orig_files = _extract_crash_files(orig_text)
-    new_files = _extract_crash_files(new_text)
-    if orig_files and new_files and not orig_files & new_files:
-        logger.warning(
-            "No overlapping crash source files: original=%s new=%s",
-            sorted(orig_files), sorted(new_files),
-        )
-        return False
-
-    logger.info(
-        "Crash accepted via same-vulnerability match: class=%s dir=%s "
-        "shared_funcs=%s shared_files=%s",
-        new_class, new_dir, sorted(chain_overlap),
-        sorted(orig_files & new_files) if orig_files and new_files else "n/a",
-    )
-    return True
 
 
 _CMD_OUTPUT_MAX_LINES = 30
