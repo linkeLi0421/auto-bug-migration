@@ -36,7 +36,6 @@ import templates
 OSS_FUZZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'oss-fuzz')
 BUILD_DIR = os.path.join(OSS_FUZZ_DIR, 'build')
 HOME_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-FUZZBENCH_OUTPUT_DIR = os.path.join(HOME_DIR, 'fuzzbench-output')
 
 BASE_RUNNER_IMAGE = 'gcr.io/oss-fuzz-base/base-runner'
 
@@ -2411,37 +2410,6 @@ def get_trace_log_bash(commit:str, args, apply_patch:bool=True):
   return bash_trace
 
 
-def _export_collect_crash_artifacts(args, crash_log_path, testcase_path):
-  """Mirror helper crash artifacts into fuzzbench-output for later analysis."""
-  if not os.path.exists(crash_log_path):
-    return
-
-  commit_prefix = (args.commit or 'unknown')[:8]
-  export_dir = os.path.join(
-      FUZZBENCH_OUTPUT_DIR,
-      'helper-crashes',
-      args.project.name,
-      commit_prefix,
-      args.test_input)
-  os.makedirs(export_dir, exist_ok=True)
-
-  shutil.copy2(crash_log_path,
-               os.path.join(export_dir, os.path.basename(crash_log_path)))
-  if testcase_path and os.path.exists(testcase_path):
-    shutil.copy2(testcase_path,
-                 os.path.join(export_dir, os.path.basename(testcase_path)))
-
-  metadata_path = os.path.join(export_dir, 'metadata.txt')
-  with open(metadata_path, 'w') as metadata_file:
-    metadata_file.write(f'project={args.project.name}\n')
-    metadata_file.write(f'commit={args.commit or ""}\n')
-    metadata_file.write(f'fuzzer={args.fuzzer_name}\n')
-    metadata_file.write(f'test_input={args.test_input}\n')
-    metadata_file.write(f'crash_log={os.path.basename(crash_log_path)}\n')
-    if testcase_path and os.path.exists(testcase_path):
-      metadata_file.write(f'testcase={os.path.basename(testcase_path)}\n')
-
-
 def get_allowlist_bash(args):
   # Use short commit IDs (6 chars) for filenames to match trace file naming
   short_bc1 = args.buggy_commit1[:8] if len(args.buggy_commit1) > 8 else args.buggy_commit1
@@ -3290,10 +3258,6 @@ def collect_crash(args):
   if cached_out is None:
     clean(args, out_dir)
   docker_run(run_args, architecture=args.architecture)
-  crash_log_path = os.path.join(
-      crash_dir, f'target_crash-{args.commit[:8]}-{args.test_input}.txt')
-  testcase_path = os.path.join(testcases_path, args.test_input)
-  _export_collect_crash_artifacts(args, crash_log_path, testcase_path)
   return True
 
 
