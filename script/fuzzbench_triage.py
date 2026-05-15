@@ -18,6 +18,8 @@ Usage:
         --output results.csv
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import gzip
@@ -32,6 +34,7 @@ import tarfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, Union
 
 logger = logging.getLogger(__name__)
 STACKTRACE_FRAME_RE = re.compile(
@@ -54,7 +57,11 @@ SANITIZER_SIGNATURE_FIELDS = (
 )
 
 
-SanitizerSignature = dict[str, str | int]
+# Use typing.Dict/Union so this runtime value works on Python <3.10 (the
+# OSS-Fuzz containers run Python 3.8). `from __future__ import annotations`
+# would only help if this were used as a type *annotation*, but it's a
+# runtime alias evaluated at module load.
+SanitizerSignature = Dict[str, Union[str, int]]
 
 
 @dataclass(frozen=True)
