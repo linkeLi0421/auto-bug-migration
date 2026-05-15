@@ -96,9 +96,30 @@ compile
    git stash pop
    find {source_dir} -name '{fuzzer_name}' -type f -executable -delete
    rm -f /out/{fuzzer_name}
-   compile && /out/{fuzzer_name} /work/{testcase_name}
-   # Should crash.
+   compile && /out/{fuzzer_name} /work/{testcase_name} > /tmp/last_run.txt 2>&1
+   # Should crash. Run the same-bug oracle to confirm it's the SAME bug
+   # as the reference, not just any sanitizer crash:
+   python3 /script/check_crash_match.py \
+       /data/crash/target_crash-{buggy_short}-{testcase_name}.txt \
+       /tmp/last_run.txt
+   echo "exit=$?"
    ```
+
+   Interpret the oracle's exit code:
+   - **0 (PASS)** — same bug. Safe to save and proceed to minimization.
+   - **1 (FAIL, rejected)** — your patch crashes with a *different* bug
+     (different first project frame). The script-side post-agent verifier
+     will reject this and treat the transplant as a failure. Do NOT save
+     yet — go back, find what blocks the *original* crash path, and try
+     a different change. Common causes:
+     * Patched the wrong function (look for the actual buggy site in the
+       reference stack, not just any function in the fix-hint diff).
+     * Restored too-broad a code region and introduced a new bug in the
+       restored code (especially when the fix removed multiple unrelated
+       changes — restore only the bug-relevant ones).
+     * Weakened a check that wasn't the original vulnerability's check.
+   - **1 (FAIL, no_data)** — no crash at all. Your patch isn't reaching
+     the bug yet; keep iterating.
 
 ## Early exit if impossible
 

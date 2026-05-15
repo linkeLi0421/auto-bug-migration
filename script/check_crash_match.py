@@ -1,21 +1,37 @@
 #!/usr/bin/env python3
 """Check whether two crash logs represent the same bug.
 
-Thin CLI wrapper over `bug_verify.crash_stacks_match` — the same loose-match
-oracle the transplant verification flow uses. Designed to be called from
-inside the OSS-Fuzz container during patch minimization so the minimizer can
-verify "the candidate after this revert still triggers the SAME bug as the
-reference," not just "any sanitizer crash still appears."
+CLI wrapper that classifies a (reference, candidate) crash-log pair as
+``exact``, ``partial``, ``rejected``, or ``no_data`` using the same logic
+``script/rq3_validity.py`` uses for benchmark-level RQ3 reporting.
+
+Designed to be called from inside the OSS-Fuzz container during patch
+minimization (and during post-agent transplant verification) so each step
+verifies "the candidate after this revert still triggers the SAME bug as
+the reference," not just "any sanitizer crash still appears."
+
+Cleaning steps applied to both sides before comparison:
+* Drop sanitizer / libFuzzer / libc / compiler-rt infrastructure frames
+  (so a library-internal `__asan_memcpy` or `fuzzer::Fuzzer::ExecuteCallback`
+  frame doesn't count as a "shared project frame").
+* Strip dispatch-wrap function-name suffixes (`_osv_<year>_<id>` and
+  `_original`) the merge step appends to gated functions.
+
+Verdict:
+* **exact**    — same sanitizer class + same first cleaned project frame
+                 + same top-3 (function, file) fingerprint (line drift OK).
+* **partial**  — same first cleaned project frame regardless of sanitizer
+                 class (SEGV ↔ undefined-behavior at the same site is the
+                 same root cause caught by different instrumentation),
+                 OR same sanitizer class with non-empty cleaned-frame
+                 stack overlap.
+* **rejected** — neither holds. The candidate is a different bug.
+* **no_data**  — at least one log has no sanitizer SUMMARY.
 
 Exit codes:
-  0  PASS  — candidate has a sanitizer SUMMARY AND its project-code stack
-            overlaps the reference's stack (shared function or source file).
-  1  FAIL  — candidate either has no sanitizer SUMMARY at all, or its stack
-            does not overlap the reference (different bug).
-  2  USAGE — bad arguments or missing files.
-
-Output is a one-line PASS / FAIL header followed by short signature
-diagnostics so a calling agent can reason about what changed.
+  0  PASS  — verdict is ``exact`` or ``partial``.
+  1  FAIL  — verdict is ``rejected`` or ``no_data``.
+  2  USAGE — bad arguments or missing reference file.
 """
 from __future__ import annotations
 
@@ -26,22 +42,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from bug_verify import (  # noqa: E402
-    crash_stacks_match,
-    extract_crash_files,
-    extract_crash_funcs,
-    extract_sanitizer_class,
-)
-
-
-def _summary(label: str, text: str) -> str:
-    cls, direction = extract_sanitizer_class(text)
-    funcs = extract_crash_funcs(text)
-    files = extract_crash_files(text)
-    return (
-        f"{label}: class={cls!r} dir={direction!r} "
-        f"top_funcs={funcs[:3]} files={sorted(files)[:5]}"
-    )
+from rq3_validity import classify  # noqa: E402
 
 
 def main() -> int:
@@ -54,7 +55,7 @@ def main() -> int:
     )
     p.add_argument(
         "candidate",
-        help="New crash log produced after a minimization step.",
+        help="New crash log produced after a build / minimization step.",
     )
     args = p.parse_args()
 
@@ -70,37 +71,31 @@ def main() -> int:
     ref_text = ref_path.read_text(errors="replace")
     new_text = new_path.read_text(errors="replace")
 
-    print(_summary("reference", ref_text))
-    print(_summary("candidate", new_text))
+    verdict, details = classify(ref_text, new_text)
 
-    new_class, _ = extract_sanitizer_class(new_text)
-    if not new_class:
-        print("FAIL: candidate has no sanitizer SUMMARY — no crash detected")
+    print(f"reference: class={details['orig_class']!r}  top={details['orig_top']!r}")
+    print(f"           top3={details['orig_top3']!r}")
+    print(f"candidate: class={details['post_class']!r}  top={details['post_top']!r}")
+    print(f"           top3={details['post_top3']!r}")
+    print(f"shared funcs: {details['shared_funcs']}  shared files: {details['shared_files']}")
+
+    if verdict == "exact":
+        print("PASS (exact): same class + same top project frame + same top-3 fingerprint.")
+        return 0
+    if verdict == "partial":
+        print("PASS (partial): same first project frame — same code site, possibly "
+              "different sanitizer instrumentation. Treating as same bug.")
+        return 0
+    if verdict == "no_data":
+        print("FAIL (no_data): candidate has no usable sanitizer SUMMARY — no crash detected.")
         return 1
-
-    if not crash_stacks_match(ref_text, new_text):
-        ref_funcs = set(extract_crash_funcs(ref_text))
-        new_funcs = set(extract_crash_funcs(new_text))
-        ref_files = extract_crash_files(ref_text)
-        new_files = extract_crash_files(new_text)
-        print(
-            "FAIL: candidate stack does not overlap reference — likely a "
-            "different bug. Re-apply the change you just reverted."
-        )
-        print(f"  shared project funcs: {sorted(ref_funcs & new_funcs)}")
-        print(f"  shared project files: {sorted(ref_files & new_files)}")
-        return 1
-
-    ref_class, _ = extract_sanitizer_class(ref_text)
-    if ref_class and new_class and ref_class != new_class:
-        print(
-            f"PASS (with class drift): {ref_class} -> {new_class}. "
-            "Stacks overlap so the same code site is firing under "
-            "different sanitizer instrumentation."
-        )
-    else:
-        print("PASS: candidate matches reference.")
-    return 0
+    # rejected
+    print("FAIL (rejected): candidate's first project frame differs from reference "
+          "and stacks do not align. Different bug. If you just reverted a change, "
+          "re-apply it: `git checkout HEAD -- <file>` (or undo the hunk). The "
+          "binary 'still crashes,' but with a bug you introduced — not the one "
+          "you were trying to preserve.")
+    return 1
 
 
 if __name__ == "__main__":
