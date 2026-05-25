@@ -189,11 +189,16 @@ def verify_bug_triggers(
         env_prefix = f"export ASAN_OPTIONS={asan_opts}; "
         logger.debug("[%s] verify variant=%s", bug_id, variant_name)
         for attempt in range(_VERIFY_ATTEMPTS):
+            # -rss_limit_mb=8192: libFuzzer's 2 GB default makes OOM-adjacent
+            # bugs (e.g. c-blosc2 OSV-2021-464) exit cleanly on RSS before
+            # the actual ASAN crash fires, so the verifier sees no SUMMARY
+            # and reports the bug as non-triggering.
             cmd = (
                 f"{env_prefix}"
                 f"if [ ! -x {fuzzer_path} ]; then "
                 f"echo 'ERROR: {fuzzer_path} not found'; exit 99; fi; "
-                f"{fuzzer_path} -runs={_RUNS_PER_ATTEMPT} /work/{testcase} 2>&1"
+                f"{fuzzer_path} -runs={_RUNS_PER_ATTEMPT} "
+                f"-rss_limit_mb=8192 /work/{testcase} 2>&1"
             )
             ret, output = _exec_capture_cmd(container, cmd, timeout=120)
             last_ret = ret
