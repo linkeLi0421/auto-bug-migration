@@ -422,12 +422,15 @@ def _find_harness_source_paths(
     candidates = " ".join(
         shlex.quote(path) for path in _candidate_fuzzer_source_paths(project, fuzzer)
     )
+    # Trailing `; true` so the loop's RC is always 0 — a non-existent
+    # last candidate would otherwise short-circuit the `&&` chain and
+    # make us discard valid output from earlier iterations.
     ret, out = _exec_capture(
         container,
         "for p in "
         f"{candidates}"
         "; do [ -f \"$p\" ] && grep -q 'LLVMFuzzerTestOneInput' \"$p\" "
-        "&& printf '%s\n' \"$p\"; done",
+        "&& printf '%s\n' \"$p\"; done; true",
     )
     paths = [line.strip() for line in out.splitlines() if line.strip()] if ret == 0 else []
     if paths:
