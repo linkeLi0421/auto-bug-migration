@@ -114,6 +114,38 @@ _SANITIZER_SUMMARY_RE = re.compile(
 )
 
 
+def crash_stacks_match_strict(orig_text: str, new_text: str) -> bool:
+    """Stricter same-bug oracle: cleaned first-project-frame matching.
+
+    Reuses the verdict logic in ``script/rq3_validity.py`` (which itself is
+    pure glue over the helpers in this module + ``sideeffect.duplication_report``).
+
+    Treats verdicts ``exact`` and ``partial`` as a match — same first project
+    frame after stripping sanitizer / libFuzzer / libc infrastructure and
+    dispatch-wrap suffixes is enough; sanitizer-class drift at the same site
+    is OK. Verdicts ``rejected`` (genuinely different bug) and ``no_data``
+    on the candidate side fail.
+
+    The ``no_data`` case where the *reference* lacks a usable SUMMARY (e.g.
+    libFuzzer ``deadly signal``-only originals) falls back to the existing
+    loose ``crash_stacks_match`` so degraded reference logs don't break
+    verification of bugs whose reference is the limiting factor.
+    """
+    # Lazy import: rq3_validity imports from us, so importing it at module
+    # load would be circular.
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from rq3_validity import classify  # noqa: E402
+
+    verdict, _details = classify(orig_text, new_text)
+    if verdict in ("exact", "partial"):
+        return True
+    if verdict == "no_data":
+        return crash_stacks_match(orig_text, new_text)
+    return False
+
+
 def _exec_capture_cmd(container: str, cmd: str, timeout: int = 600) -> tuple[int, str]:
     """Run a command inside *container* and return (rc, combined_output)."""
     docker_cmd = ["docker", "exec", container, "bash", "-c", cmd]
@@ -212,9 +244,9 @@ def verify_bug_triggers(
                 continue
 
             if ref_text is not None:
-                if crash_stacks_match(ref_text, output):
+                if crash_stacks_match_strict(ref_text, output):
                     info_log(
-                        "[%s] Bug triggers OK (stack match, %s)",
+                        "[%s] Bug triggers OK (strict stack match, %s)",
                         bug_id, variant_name,
                     )
                     return True
