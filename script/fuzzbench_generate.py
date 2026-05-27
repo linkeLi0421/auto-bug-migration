@@ -455,28 +455,44 @@ git reset --hard HEAD >/dev/null 2>&1 || true
 # Checkout target commit
 git checkout {target_commit}
 
-# Restore harness sources that live outside the project git repository.
+# Restore harness sources that live outside the project git repository,
+# and compute --exclude flags so harness.diff doesn't re-modify files
+# that have already been restored to their post-dispatch state by the
+# snapshot copy (which would fail with "does not match index").
+HARNESS_EXCLUDES=""
 if [ -f /src/patches/harness_sources/manifest.json ]; then
-    python3 - <<'PY'
+    HARNESS_EXCLUDES=$(python3 - <<'PY'
 import json
 import shutil
 from pathlib import Path
 
 root = Path("/src/patches/harness_sources")
-for entry in json.loads((root / "manifest.json").read_text()):
+manifest = json.loads((root / "manifest.json").read_text())
+excludes = []
+for entry in manifest:
     source = root / entry["snapshot"]
     destination = Path(entry["container_path"])
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
+    # Convert /src/<repo>/<rel> to <rel> (git apply paths are repo-relative).
+    parts = destination.parts
+    if len(parts) >= 3 and parts[1] == "src":
+        rel = Path(*parts[3:])
+    else:
+        rel = destination
+    excludes.append(f"--exclude={{rel}}")
+print(" ".join(excludes))
 PY
+)
 fi
 
-# Apply dispatch harness first (modifies build system), then bug patches
-if ! git apply --check /src/patches/harness.diff 2>/dev/null; then
+# Apply dispatch harness first (modifies build system), then bug patches.
+# $HARNESS_EXCLUDES is empty when no snapshots were restored.
+if ! git apply --check $HARNESS_EXCLUDES /src/patches/harness.diff 2>/dev/null; then
     echo "Trying git apply --3way for harness.diff..."
-    git apply --3way /src/patches/harness.diff
+    git apply --3way $HARNESS_EXCLUDES /src/patches/harness.diff
 else
-    git apply /src/patches/harness.diff
+    git apply $HARNESS_EXCLUDES /src/patches/harness.diff
 fi
 
 if ! git apply --check /src/patches/combined.diff 2>/dev/null; then
