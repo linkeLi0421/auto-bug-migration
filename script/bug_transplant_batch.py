@@ -316,8 +316,14 @@ def prepare_transplant(
     data: list[dict],
     repo_path: str | None,
     target_commit_override: str | None = None,
+    bug_info_dataset: dict | None = None,
 ) -> tuple[set[str], dict[str, dict], set[str], dict]:
     """Select target commit and partition bugs.
+
+    When ``bug_info_dataset`` is provided, the OSV-canonical ``introduced``
+    SHA is preferred over the default later-commit tiebreaker among
+    same-rank candidates. This avoids picking a coincidental later trigger
+    (e.g. an LSAN leak) when the real bug commit is also rank-≥1.
 
     Returns:
         (bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row)
@@ -385,6 +391,33 @@ def prepare_transplant(
                     row["commit_id"],
                 ):
                     bugs_need_transplant[bug_id] = row
+
+    # Override: prefer OSV-canonical introduced commit among same-rank
+    # candidates. Catches cases where the CSV's `0.5|1` weak-match status
+    # ties an incidental later trigger (e.g. LSAN leak on a non-leak bug)
+    # with the real introducing commit.
+    if bug_info_dataset:
+        commit_by_prefix = {row["commit_id"]: row for row in data}
+        for bug_id, picked in list(bugs_need_transplant.items()):
+            introduced = bug_info_dataset.get(bug_id, {}).get("introduced")
+            if not introduced:
+                continue
+            intro_row = None
+            for cid, row in commit_by_prefix.items():
+                if cid.startswith(introduced) or introduced.startswith(cid):
+                    intro_row = row
+                    break
+            if intro_row is None or intro_row is picked:
+                continue
+            intro_rank = _trigger_rank(intro_row["osv_statuses"].get(bug_id))
+            if intro_rank == bug_best_rank[bug_id]:
+                logger.info(
+                    "[%s] preferring OSV-introduced commit %s over later %s "
+                    "(same rank=%d)",
+                    bug_id, intro_row["commit_id"][:12],
+                    picked["commit_id"][:12], intro_rank,
+                )
+                bugs_need_transplant[bug_id] = intro_row
 
     bugs_cant_use = {
         b for b in bug_ids_other
@@ -849,6 +882,7 @@ def main() -> int:
 
     bug_ids_trigger, bugs_need_transplant, bugs_cant_use, target_row = prepare_transplant(
         parsed_data, repo_path, args.target_commit,
+        bug_info_dataset=bug_info_dataset,
     )
     if not target_row:
         logger.error("Failed to select target commit")
