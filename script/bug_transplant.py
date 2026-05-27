@@ -62,6 +62,10 @@ _usage_tracker = None
 # Pin CLI version for reproducibility.
 CODEX_VERSION = "0.116.0"  # @openai/codex
 
+# Model used for all Codex agent sessions. The ChatGPT-account auth in use
+# does not support Codex's default model (gpt-5.2-codex), so pin gpt-5.4.
+DEFAULT_MODEL = "gpt-5.4"
+
 # Codex agent configuration
 CODEX_CONFIG = {
     "npm_package": "@openai/codex",
@@ -107,8 +111,7 @@ def build_codex_command(
                f" {shlex.quote(resume_session)} {escaped}")
     else:
         cmd = f"codex exec --dangerously-bypass-approvals-and-sandbox {escaped}"
-    if model:
-        cmd += f" --model {shlex.quote(model)}"
+    cmd += f" --model {shlex.quote(model or DEFAULT_MODEL)}"
     if mode != "interactive":
         cmd += " --json"
     return cmd

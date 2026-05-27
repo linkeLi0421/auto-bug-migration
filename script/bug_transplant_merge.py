@@ -396,13 +396,20 @@ _HARNESS_SOURCE_TEMPLATES = {
     # Ghostscript's OSS-Fuzz fuzzer sources are copied to /src next to
     # build.sh, not inside the /src/ghostpdl git checkout.
     "ghostscript": ("/src/{fuzzer}.cc",),
+    # c-blosc2's harness sources don't match the fuzzer binary name:
+    # decompress_frame_fuzzer is built from tests/fuzz/fuzz_decompress_frame.c
+    # (strip _fuzzer suffix, prepend fuzz_).
+    "c-blosc2": ("/src/c-blosc2/tests/fuzz/fuzz_{fuzzer_base}.c",),
 }
 
 
 def known_harness_source_paths(project: str, fuzzer: str) -> list[str]:
     """Return project-specific out-of-repo harness source paths."""
+    fuzzer_base = (
+        fuzzer[: -len("_fuzzer")] if fuzzer.endswith("_fuzzer") else fuzzer
+    )
     return [
-        template.format(fuzzer=fuzzer)
+        template.format(fuzzer=fuzzer, fuzzer_base=fuzzer_base)
         for template in _HARNESS_SOURCE_TEMPLATES.get(project, ())
     ]
 
