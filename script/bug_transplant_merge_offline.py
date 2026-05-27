@@ -193,7 +193,8 @@ _DIFF_INCLUDES = (
     "'*.spec' "
     # Build files
     "'*.cmake' '*.sh' "
-    "'CMakeLists.txt' 'Makefile.am' '*/Makefile.am' "
+    "'CMakeLists.txt' '*/CMakeLists.txt' '**/CMakeLists.txt' "
+    "'Makefile.am' '*/Makefile.am' "
     # Interpreted-language resources (needed for cross-language dispatch
     # wraps — e.g. pdf_draw.ps for ghostscript). Without these, agent
     # edits to these files get silently stripped from the saved diff.
