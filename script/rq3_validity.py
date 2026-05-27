@@ -66,6 +66,11 @@ _INFRA_PATH_RE = re.compile(
 # `ndpi_search_kerberos`.
 _DISPATCH_SUFFIX_RE = re.compile(r"(_osv_\d+_\d+|_original)(?=$|\W)")
 
+# Harness entry-point frames that appear in /src/<proj>/fuzz/* and so are
+# not filtered by _INFRA_PATH_RE; treat as non-vulnerability code for the
+# drift tier's overlap count.
+_HARNESS_FUNCS = {"LLVMFuzzerTestOneInput"}
+
 
 def _clean_func(name: str) -> str:
     """Strip dispatch-wrapping bug-ID suffix from a function name."""
@@ -126,9 +131,17 @@ def classify(orig_text: str, post_text: str) -> tuple[str, dict]:
       * **partial**  — same first cleaned project frame (regardless of
                        sanitizer class — UBSAN catching what ASan would
                        have surfaced as SEGV is the same bug), OR same
-                       sanitizer class with non-empty stack overlap.
-      * **rejected** — neither holds: different first project frame AND
-                       no overlap.
+                       sanitizer class with non-empty stack overlap, OR
+                       *drift*: different sanitizer class AND different
+                       top frame but >=2 shared non-harness project funcs.
+                       The drift tier catches cases where heap-layout
+                       changes on the merged binary shift which ASAN
+                       check fires first while the vulnerable code area
+                       is unchanged (e.g. SEGV in restore_space ↔
+                       heap-UAF in ptr_struct_mark, both inside the
+                       same GC traversal).
+      * **rejected** — none of the above: different top, different
+                       class, and no/only-harness overlap.
       * **no_data**  — at least one log lacks a sanitizer SUMMARY.
     """
     orig_class, orig_dir = extract_sanitizer_class(orig_text)
@@ -168,6 +181,21 @@ def classify(orig_text: str, post_text: str) -> tuple[str, dict]:
         return "partial", details
     if orig_class == post_class and ((orig_funcs & post_funcs) or (orig_files & post_files)):
         return "partial", details
+
+    # Drift tier: same vulnerable code area, different sanitizer class.
+    # Heap-layout differences on the merged binary commonly shift which
+    # ASAN check fires first while the underlying vulnerability is the
+    # same. Require >=2 shared non-harness project funcs to avoid
+    # accepting "harness-frame only" coincidences (e.g. ndpi cases
+    # where the sole shared frame is LLVMFuzzerTestOneInput).
+    nontrivial_funcs = (orig_funcs & post_funcs) - _HARNESS_FUNCS
+    if len(nontrivial_funcs) >= 2:
+        details["note"] = (
+            f"sanitizer-class drift: {orig_class} -> {post_class} "
+            f"with {len(nontrivial_funcs)} shared non-harness funcs"
+        )
+        return "partial", details
+
     return "rejected", details
 
 
